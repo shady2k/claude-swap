@@ -32,21 +32,25 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y iproute2 openssl strace util-linux
 
-      - name: Run isolated Linux stand
-        # The stand needs sudo to create fresh namespaces. The shim checks
-        # file ownership, so give this run its own root-owned source and venv.
+      - name: Run isolated Linux stand and shim latency check
+        # Use a fresh runner-owned source and venv with permissions accepted
+        # by the shim. The stand uses sudo only to set up its namespaces.
         run: |
           set -o pipefail
-          stand=$(sudo -n mktemp -d /tmp/cswap-stand.XXXXXXXX)
-          trap 'sudo -n rm -rf -- "$stand"' EXIT
-          sudo -n mkdir "$stand/source"
-          git -c tar.umask=0022 archive HEAD | sudo -n tar --no-same-owner -x -C "$stand/source"
-          sudo -n -H env UV_CACHE_DIR="$stand/cache" UV_PYTHON_INSTALL_DIR="$stand/python" \
-            "$(command -v uv)" --directory "$stand/source" sync --locked --managed-python --python 3.12
-          sudo -n -H env CSWAP_TEST_STAND=1 CSWAP_TEST_STAND_REQUIRED=1 sh -c '
-            cd "$1" && exec .venv/bin/python -m pytest -n 0 -vv -p tests.required_stand \
+          umask 022
+          stand=$(mktemp -d /tmp/cswap-stand.XXXXXXXX)
+          trap 'rm -rf -- "$stand"' EXIT
+          mkdir "$stand/source"
+          git -c tar.umask=0022 archive HEAD | tar -x -C "$stand/source"
+          cd "$stand/source"
+          UV_CACHE_DIR="$stand/cache" UV_PYTHON_INSTALL_DIR="$stand/python" \
+            uv sync --locked --managed-python --python 3.12
+          CSWAP_TEST_SHIM_LATENCY=1 .venv/bin/python -m pytest -n 0 -s -q \
+            tests/test_transparent.py::test_f4_only_shim_and_explicit_shim_refuse_without_recursion
+          CSWAP_TEST_STAND=1 CSWAP_TEST_STAND_REQUIRED=1 CSWAP_STAND_SUDO=1 \
+            CSWAP_STAND_RUN_AS="$(id -u):$(id -g)" \
+            .venv/bin/python -m pytest -n 0 -vv -p tests.required_stand \
               tests/test_stand_linux.py tests/test_stand_mock_linux.py tests/test_stand_shim_linux.py
-          ' sh "$stand/source"
 
   test-windows:
     runs-on: windows-latest

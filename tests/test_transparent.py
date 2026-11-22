@@ -168,6 +168,29 @@ def test_f22_optional_bypass_and_strict_refusal(installed, monkeypatch, args):
     assert args[0].encode() in refusal.stderr
 
 
+@pytest.mark.parametrize("args", [
+    ("--settings", "a", "--settings", "b"),
+    ("--verbose", "--settings", "a"),
+])
+def test_f22_explicit_bypass_precedes_form_validation(installed, monkeypatch, args):
+    root, _, fake = installed
+    monkeypatch.delenv(test_mode.MODE)
+    set_setting(root, "transparent.claudePath", str(fake))
+    transparent.enable(root)
+
+    refusal = invoke(*args)
+    assert refusal.returncode == 4
+    assert b"--settings" in refusal.stderr
+
+    monkeypatch.setenv("CLAUDE_SWAP_BYPASS", "1")
+    result = invoke(*args)
+    assert result.returncode == 27
+    argv, body = result.stdout.split(b"\n", 1)
+    assert json.loads(argv) == list(args)
+    assert body == b"\x00\xff\r\n"
+    assert b"outside the profile route: CLAUDE_SWAP_BYPASS" in result.stderr
+
+
 def test_disable_does_not_delete_replaced_launcher(installed):
     root, shim, _ = installed
     transparent.enable(root)

@@ -1409,6 +1409,30 @@ class TestRunCommand:
         assert excinfo.value.code == 1
         assert "boom" in capsys.readouterr().err
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX directory permissions")
+    def test_run_reports_first_rejected_claude(self, monkeypatch, capsys):
+        # An unusable directory without Claude should not hide the first hit.
+        empty, first, second = (self.backup_dir / name for name in ("empty", "first", "second"))
+        for directory in (empty, first, second):
+            directory.mkdir()
+            if directory != empty:
+                candidate = directory / "claude"
+                candidate.write_text("#!/bin/sh\nexit 0\n")
+                candidate.chmod(0o700)
+            directory.chmod(0o775)
+        monkeypatch.setenv("PATH", os.pathsep.join(map(str, (empty, first, second))))
+        with patch("claude_swap.cli.ClaudeAccountSwitcher",
+                   return_value=MagicMock(backup_dir=self.backup_dir)), \
+             patch.object(sys, "argv", ["cswap", "run", "1"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 4
+        stderr = capsys.readouterr().err
+        assert str(first / "claude") in stderr
+        assert "Writable by group or others" in stderr
+        assert str(second / "claude") not in stderr
+        assert "not found" not in stderr
+
     def test_whatever_the_launch_prints_goes_to_stderr(self, capsys):
         """Stdout is claude's. A notice from anywhere on the way to the
         launch, however it is printed, must not land in it."""

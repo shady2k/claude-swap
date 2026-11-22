@@ -1,9 +1,10 @@
 """The one Claude Code lookup and launch path.
 
-PATH search ignores the client cwd, relative entries, writable directory
-chains and our own shim. The result carries the checked real path and file
-identity; launch rechecks the identity and uses descriptor-based exec for
-native POSIX executables when the platform supports it.
+On POSIX, PATH search ignores the client cwd, relative entries, writable
+directory chains and our own shim. Until PR1, Windows sessions and auth probes
+use the legacy shutil.which lookup without strict path-chain checks; installing
+the Windows shim remains disabled. Launch rechecks the file identity and uses
+descriptor-based exec for native POSIX executables when supported.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import stat
 import sys
 from collections.abc import Sequence
@@ -67,12 +69,16 @@ def is_shim(path: Path | str) -> bool:
 
 
 def _identity(info: os.stat_result) -> tuple[int, ...]:
-    return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    # Windows may infer execute bits from the filename, which fstat does not have.
+    mode = info.st_mode
+    if sys.platform == "win32":
+        mode &= ~(stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return (info.st_dev, info.st_ino, mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
 @dataclass
 class RealClaude:
-    """The validated file, not the PATH entry or symlink that located it."""
+    """The resolved file, not the PATH entry or symlink that located it."""
 
     path: Path
     _identity: tuple[int, ...]
@@ -87,12 +93,13 @@ class RealClaude:
             raise ResolveError(f"Claude executable changed after resolution: {self.path}")
 
     def _open(self):
-        try:
-            checked = fsguard.check_path(self.path)
-        except fsguard.GuardError as exc:
-            raise ResolveError(f"Claude executable changed after resolution: {exc}") from exc
-        if checked != self.path:
-            raise ResolveError(f"Claude executable changed after resolution: {self.path}")
+        if sys.platform != "win32":
+            try:
+                checked = fsguard.check_path(self.path)
+            except fsguard.GuardError as exc:
+                raise ResolveError(f"Claude executable changed after resolution: {exc}") from exc
+            if checked != self.path:
+                raise ResolveError(f"Claude executable changed after resolution: {self.path}")
         if os.name == "nt":
             from claude_swap._win_file_security import open_executable
 
@@ -146,8 +153,10 @@ class RealClaude:
             return spawn.run([str(self.path), *args], **kwargs)
 
 
-def _candidate(path: Path, shim: Path, cwd: Path) -> RealClaude:
-    checked = fsguard.check_path(path)
+def _candidate(path: Path, shim: Path, *, cwd: Path | None = None) -> RealClaude:
+    if not path.is_absolute():
+        raise ResolveError(f"Not an absolute path: {path}")
+    checked = path.resolve(strict=True) if sys.platform == "win32" else fsguard.check_path(path)
     if checked.parent == cwd:
         raise ResolveError(f"Claude candidate is in the current directory: {path}")
     info = checked.lstat()
@@ -167,23 +176,16 @@ def _candidate(path: Path, shim: Path, cwd: Path) -> RealClaude:
     return candidate
 
 
-def _names() -> tuple[str, ...]:
-    if sys.platform != "win32":
-        return ("claude",)
-    # A batch launcher is eligible for an explicit session, not evidence that
-    # the route policy has been verified. No arbitrary PATHEXT interpreters.
-    return ("claude.exe", "claude.com", "claude.cmd", "claude.bat")
-
-
 def path_command(path: str | None = None) -> Path | None:
     """Show the hit in this PATH, even if the resolver would not trust it."""
+    if sys.platform == "win32":
+        found = shutil.which("claude", path=path)
+        return Path(found).absolute() if found is not None else None
     if path is None:
         path = os.environ.get("PATH", os.defpath)
     for entry in path.split(os.pathsep):
-        if sys.platform == "win32" and not entry:
-            continue
-        candidate = Path(entry) / _names()[0]
-        if candidate.is_file() and (sys.platform == "win32" or os.access(candidate, os.X_OK)):
+        candidate = Path(entry) / "claude"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
             return candidate.absolute()
     return None
 
@@ -203,7 +205,7 @@ def resolve(
         except ClaudeSwitchError as exc:
             raise ResolveError(str(exc)) from exc
     shim_dir = paths.get_shim_dir(backup_root)
-    shim = shim_dir / _names()[0]
+    shim = shim_dir / ("claude.exe" if sys.platform == "win32" else "claude")
     try:
         shim_dir = shim_dir.resolve()
         shim = shim.resolve()
@@ -218,36 +220,60 @@ def resolve(
             configured = Path(configured_path)
             if configured.is_absolute() and configured.parent.resolve() == cwd:
                 raise ResolveError(f"Claude candidate is in the current directory: {configured}")
-            return _candidate(configured, shim, cwd)
+            return _candidate(configured, shim, cwd=cwd)
         except (OSError, RuntimeError, ValueError, fsguard.GuardError, ResolveError) as exc:
             raise ResolveError(f"transparent.claudePath: {exc}") from exc
 
-    if path is None:
-        path = os.environ.get("PATH", os.defpath)
-    for entry in path.split(os.pathsep):
-        directory = Path(entry)
-        try:
-            if not directory.is_absolute():
-                raise ResolveError("empty or relative PATH entry")
-            checked = fsguard.check_path(directory)
-            if checked == cwd:
-                raise ResolveError("current directory")
-            if not checked.is_dir():
-                raise ResolveError("not a directory")
-            if checked == shim_dir:
-                continue
-        except (OSError, ValueError, fsguard.GuardError, ResolveError) as exc:
-            if skipped is not None:
-                skipped.append(f"{entry or '(empty)'}: {exc}")
-            continue
-        for name in _names():
-            candidate = checked / name
+    first_rejected = None
+    if sys.platform == "win32":
+        candidate = path_command(path)
+        if candidate is not None:
             try:
+                return _candidate(candidate, shim)
+            except (OSError, RuntimeError, ValueError, ResolveError) as exc:
+                first_rejected = f"{candidate}: {exc}"
+                if skipped is not None:
+                    skipped.append(first_rejected)
+    else:
+        if path is None:
+            path = os.environ.get("PATH", os.defpath)
+        for entry in path.split(os.pathsep):
+            directory = Path(entry)
+            try:
+                if not directory.is_absolute():
+                    raise ResolveError("empty or relative PATH entry")
+                checked = fsguard.check_path(directory)
+                if checked == cwd:
+                    raise ResolveError("current directory")
+                if not checked.is_dir():
+                    raise ResolveError("not a directory")
+                if checked == shim_dir:
+                    continue
+            except (OSError, ValueError, fsguard.GuardError, ResolveError) as exc:
+                if skipped is not None:
+                    skipped.append(f"{entry or '(empty)'}: {exc}")
+                # An unusable PATH directory alone does not mean Claude was found.
+                if first_rejected is None and directory.is_absolute():
+                    rejected = directory / "claude"
+                    try:
+                        rejected.lstat()
+                    except (OSError, ValueError):
+                        pass
+                    else:
+                        first_rejected = f"{rejected}: {exc}"
+                continue
+            try:
+                candidate = checked / "claude"
                 candidate.lstat()
-                return _candidate(candidate, shim, cwd)
+                return _candidate(candidate, shim, cwd=cwd)
             except FileNotFoundError:
                 continue
             except (OSError, ValueError, fsguard.GuardError, ResolveError) as exc:
+                diagnostic = f"{candidate}: {exc}"
+                if first_rejected is None:
+                    first_rejected = diagnostic
                 if skipped is not None:
-                    skipped.append(f"{candidate}: {exc}")
+                    skipped.append(diagnostic)
+    if first_rejected is not None:
+        raise ResolveError(f"Claude candidate rejected: {first_rejected}")
     raise ResolveError("Real 'claude' was not found on PATH. Install Claude Code or set transparent.claudePath.")

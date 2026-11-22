@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_swap import fsguard, real_claude
+from claude_swap import real_claude
 from claude_swap.settings import set_setting
 
 
@@ -54,7 +54,7 @@ def test_path_skips_cwd_untrusted_directories_and_all_shims(tmp_path, monkeypatc
     with pytest.raises(real_claude.ResolveError, match="current directory"):
         real_claude.resolve(backup_root=root, configured_path=cwd_hit)
     with pytest.raises(real_claude.ResolveError, match="not found on PATH"):
-        real_claude.resolve(backup_root=root, path=os.pathsep.join(map(str, entries[:-1])))
+        real_claude.resolve(backup_root=root, path=str(tmp_path / "missing"))
     set_setting(root, "transparent.claudePath", str(nice_link))
     assert real_claude.resolve(backup_root=root, path="").path == real.resolve()
 
@@ -80,10 +80,25 @@ def test_fingerprint_and_probe_use_checked_realpath(tmp_path, monkeypatch):
     assert real_claude.resolve(backup_root=tmp_path, configured_path=alias).fingerprint() != digest
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="native Windows PATH and file APIs")
+def test_windows_path_resolves_claude_in_user_profile(tmp_path, monkeypatch):
+    target = _executable(Path.home() / ".local" / "bin", b"MZ synthetic executable")
+    monkeypatch.setenv("PATH", str(target.parent))
+    monkeypatch.setenv("PATHEXT", ".EXE")
+    monkeypatch.setenv("NoDefaultCurrentDirectoryInExePath", "1")
+    child = real_claude.resolve(backup_root=tmp_path)
+    assert child.path == target.resolve()
+
+    # Exercise the probe's open/identity check, without executing the fixture.
+    captured = []
+    monkeypatch.setattr(real_claude.spawn, "run", lambda argv, **kw: captured.append(argv))
+    child.run(["auth", "status", "--json"])
+    assert captured == [[str(child.path), "auth", "status", "--json"]]
+
+
 def test_windows_fingerprint_without_change_time_is_never_cached(tmp_path, monkeypatch):
     target = _executable(tmp_path / "bin")
     monkeypatch.setattr(real_claude.sys, "platform", "win32")
-    monkeypatch.setattr(fsguard, "check_path", lambda path: path.resolve())
     times = {target.resolve(): None}
     monkeypatch.setattr(real_claude, "_change_time", times.get)
     child = real_claude.resolve(backup_root=tmp_path, configured_path=target)

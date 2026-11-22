@@ -167,6 +167,9 @@ Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP ser
 
 </details>
 
+On POSIX, `cswap run` rejects Claude installations whose path includes directories writable by the group or others.
+On Windows, `cswap run` and its auth probe use the legacy PATH lookup without strict path-chain checks, and the shim remains disabled pending PR1.
+
 On POSIX, the [experimental PATH shim](docs/transparent.md) can intercept ordinary `claude` in the isolated test stand. No production build has been admitted for profile routing.
 
 <details>

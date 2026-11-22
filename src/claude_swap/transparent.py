@@ -231,16 +231,18 @@ def _launch(marker: str, args: list[str], root: Path) -> None:
     bypass = env.pop(_BYPASS, None)
     if bypass is not None and settings.require_proxy:
         raise ConfigError(f"{_BYPASS}: forbidden in strict mode")
-    form = claude_forms.classify(args)
-    if form.error:
-        raise ConfigError(form.error)
-    if form.bypass_reason and settings.require_proxy:
-        raise ConfigError(f"{form.bypass_reason}; see cswap transparent status for the absolute path")
+    reason = _BYPASS if bypass == "1" else None
+    if reason is None:
+        form = claude_forms.classify(args)
+        if form.error:
+            raise ConfigError(form.error)
+        reason = form.bypass_reason
+        if reason and settings.require_proxy:
+            raise ConfigError(f"{reason}; see cswap transparent status for the absolute path")
     if test:
         args, env = _test_layer(directory, args, env)
         event = "launch"
     else:
-        reason = _BYPASS if bypass == "1" else form.bypass_reason
         if not reason:
             if settings.require_proxy or not settings.allow_unverified:
                 raise ConfigError("No Claude build admitted for profile routing (PR3); see cswap transparent status")
