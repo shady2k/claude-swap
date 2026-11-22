@@ -1017,28 +1017,14 @@ class SessionManager:
         self._exec(claude_bin, claude_args, env=dict(os.environ))
 
     def _exec(self, claude_bin: str, claude_args: list[str], env: dict[str, str]) -> NoReturn:
-        """Hand the terminal over to claude. Never returns.
-
-        POSIX: ``execvpe`` replaces the cswap process entirely (the lock is
-        already released — an exec'd claude must never inherit a held flock).
-        Windows: ``os.exec*`` detaches from the console confusingly, so stay
-        resident as a thin wrapper and mirror claude's exit code.
-        """
+        """Check and pin the final test route, then hand over the terminal."""
         if test_mode.active():
             config_home = env.get("CLAUDE_CONFIG_DIR")
             claude_bin = test_mode.check_launch(
                 claude_args, Path(config_home) if config_home else None
             )
             claude_args, env = test_mode.pinned_launch(claude_args, env)
-        argv = [claude_bin, *claude_args]
-        if sys.platform == "win32":
-            try:
-                rc = subprocess.run(argv, env=env).returncode
-            except KeyboardInterrupt:
-                rc = 130  # Ctrl+C went to claude; just mirror the exit
-            sys.exit(rc)
-        os.execvpe(claude_bin, argv, env)
-        raise AssertionError("unreachable")  # pragma: no cover
+        spawn.handoff(claude_bin, claude_args, env)
 
     def _ensure_not_api_key(self, account_num: str, email: str) -> None:
         """Reject API-key accounts in session mode (not supported yet).

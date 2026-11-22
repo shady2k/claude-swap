@@ -149,8 +149,10 @@ def _check_layers(profile: Path | None = None) -> None:
 
 
 def _client_form(args: list[str]) -> None:
-    if any(arg.split("=", 1)[0] in {"--settings", "--setting-sources"} for arg in args):
-        raise TestModeConfigError("--settings / --setting-sources: client layer is forbidden")
+    for arg in args:
+        option = arg.split("=", 1)[0]
+        if option in {"--settings", "--setting-sources"}:
+            raise TestModeConfigError(f"{option}: client layer is forbidden")
     # Only the stand's interactive, print and resume arguments are admitted.
     # Require a multi-word print prompt so a bare CLI verb is never admitted
     # as a prompt, even if it is not one of the commands we name in errors.
@@ -177,8 +179,9 @@ def _client_form(args: list[str]) -> None:
             seen_prompt = True
             index += 1
             continue
-        verb = arg if arg in {"auth", "update", "install", "mcp"} else "unknown"
-        raise TestModeConfigError(f"Claude invocation form: {verb} command or option is forbidden")
+        # Describe the rejected argument without echoing a possible option value.
+        option = arg.split("=", 1)[0] if arg.startswith("-") else arg
+        raise TestModeConfigError(f"Claude invocation form: unknown or forbidden argument {option!r}")
 
 
 def check_launch(args: list[str], profile: Path | None = None) -> str:

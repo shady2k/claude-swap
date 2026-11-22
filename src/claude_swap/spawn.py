@@ -44,7 +44,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, NoReturn
 
 _logger = logging.getLogger("claude-swap")
 
@@ -79,6 +79,24 @@ def run(cmd: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
         if executable is not None and not _inheritable_fds_above_stdio():
             return subprocess.run([executable, *cmd[1:]], close_fds=False, **kwargs)
     return subprocess.run(cmd, **kwargs)
+
+
+def handoff(binary: str, args: Sequence[str], env: dict[str, str]) -> NoReturn:
+    """Hand over the terminal, preserving argv, environment and exit status.
+
+    POSIX replaces the current process. Windows stays in the console and
+    mirrors the child exit status; Ctrl+C is delivered to the child too.
+    Callers must release locks before handing off.
+    """
+    argv = [binary, *args]
+    if sys.platform == "win32":
+        try:
+            rc = subprocess.run(argv, env=env).returncode
+        except KeyboardInterrupt:
+            rc = 130
+        sys.exit(rc)
+    os.execvpe(binary, argv, env)
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _spawn_path_applies(cmd: Any, kwargs: dict[str, Any]) -> bool:

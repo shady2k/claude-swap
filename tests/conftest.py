@@ -773,6 +773,30 @@ def _loopback_only_getaddrinfo(host, *args, **kwargs):
 socket.getaddrinfo = _loopback_only_getaddrinfo
 
 
+class NonLocalConnectBlocked(BaseException):
+    """A test attempted a direct connection outside loopback."""
+
+
+def _loopback_connect_audit(event, args):
+    # Direct socket clients bypass both urlopen and Python's getaddrinfo.
+    # Keep this installed even after a marked test's routing mock unwinds.
+    if event != "socket.connect":
+        return
+    sock, address = args
+    if sock.family == getattr(socket, "AF_UNIX", None):
+        return
+    if sock.family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            if ipaddress.ip_address(address[0]).is_loopback:
+                return
+        except ValueError:
+            pass
+    raise NonLocalConnectBlocked("non-loopback socket.connect blocked under test")
+
+
+sys.addaudithook(_loopback_connect_audit)
+
+
 def _unreachable_urlopen(*args, **kwargs):
     """No test may make a live ``urllib`` request, for the whole test process.
 
