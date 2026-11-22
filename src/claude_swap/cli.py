@@ -9,7 +9,7 @@ import math
 import os
 import sys
 
-from claude_swap import __version__, paths, printer
+from claude_swap import __version__, paths, printer, test_mode
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
 from claude_swap.models import (
@@ -260,12 +260,19 @@ def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
                 )
             )
         manager.exec_default(tail)
+    except test_mode.TestModeConfigError as exc:
+        sys.exit(_test_mode_error(exc))
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+def _test_mode_error(exc: test_mode.TestModeConfigError) -> int:
+    print(f"TestModeConfigError: {exc}", file=sys.stderr)
+    return 4
 
 
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
@@ -1436,9 +1443,13 @@ def _menubar_service(args) -> int:
 
 def main() -> None:
     """Main entry point for the CLI."""
+    argv = sys.argv[1:]
+    try:
+        test_mode.preflight(argv)
+    except test_mode.TestModeConfigError as exc:
+        sys.exit(_test_mode_error(exc))
     force_utf8_output()
     _use_native_tls()
-    argv = sys.argv[1:]
     try:
         from claude_swap.appearance import cli_should_probe, cli_theme
         # `run` execs a child that takes over the terminal, and `--json`

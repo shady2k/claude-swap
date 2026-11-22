@@ -61,7 +61,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from claude_swap import macos_keychain, spawn
+from claude_swap import macos_keychain, spawn, test_mode
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
@@ -772,7 +772,10 @@ class SessionManager:
         Notices on the way are printed plainly. `cswap run` sends them to
         stderr, because stdout is claude's (``cli._run_launch``).
         """
-        claude_bin = shutil.which("claude")
+        if test_mode.active():
+            claude_bin = test_mode.check_launch(claude_args)
+        else:
+            claude_bin = shutil.which("claude")
         if not claude_bin:
             raise SessionError(
                 "'claude' was not found on PATH. Install Claude Code first."
@@ -786,6 +789,10 @@ class SessionManager:
         share_history = self._resolve_share_history(requested_history)
 
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+        if test_mode.active():
+            test_mode.check_launch(
+                claude_args, session_dir_for(self.switcher.backup_dir, account_num, email)
+            )
         # Guard before the same-account direct-launch fast path below (which
         # _exec's claude and never returns) — and before setup_session.
         self._ensure_not_api_key(account_num, email)
@@ -998,6 +1005,10 @@ class SessionManager:
         profile, no auth-override scrubbing), so whatever the default login
         resolves to is what runs.
         """
+        if test_mode.active():
+            raise test_mode.TestModeConfigError(
+                "cswap run invocation form: explicit account required"
+            )
         claude_bin = shutil.which("claude")
         if not claude_bin:
             raise SessionError(
@@ -1013,6 +1024,12 @@ class SessionManager:
         Windows: ``os.exec*`` detaches from the console confusingly, so stay
         resident as a thin wrapper and mirror claude's exit code.
         """
+        if test_mode.active():
+            config_home = env.get("CLAUDE_CONFIG_DIR")
+            claude_bin = test_mode.check_launch(
+                claude_args, Path(config_home) if config_home else None
+            )
+            claude_args, env = test_mode.pinned_launch(claude_args, env)
         argv = [claude_bin, *claude_args]
         if sys.platform == "win32":
             try:
@@ -1052,6 +1069,8 @@ class SessionManager:
         # Defense-in-depth: also guard here (run() guards before its fast path).
         self._ensure_not_api_key(account_num, email)
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
+        if test_mode.active():
+            test_mode.check_launch([], session_dir)
 
         # Deferred invalidation: backup credentials changed while this profile
         # was live, so its credentials are presumed stale even if they still
@@ -1373,11 +1392,17 @@ class SessionManager:
         # subprocess won't resolve it (PATHEXT isn't applied) — it raises
         # FileNotFoundError. `shutil.which` finds the shim; when it finds
         # nothing at all the run below still raises, and that is "unknown".
-        claude_bin = shutil.which("claude") or "claude"
+        probe_args = ["auth", "status", "--json"]
+        if test_mode.active():
+            claude_bin = test_mode.check_launch([], session_dir)
+            probe_args, env = test_mode.pinned_launch(probe_args, _probe_env(session_dir))
+        else:
+            claude_bin = shutil.which("claude") or "claude"
+            env = _probe_env(session_dir)
         try:
             result = spawn.run(
-                [claude_bin, "auth", "status", "--json"],
-                env=_probe_env(session_dir),
+                [claude_bin, *probe_args],
+                env=env,
                 capture_output=True,
                 text=True,
                 timeout=_AUTH_STATUS_TIMEOUT,
