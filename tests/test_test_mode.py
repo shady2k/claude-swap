@@ -127,11 +127,28 @@ def test_f8_rejects_lower_layer(route, no_attempts, monkeypatch, capsys, source)
     (["run", "1", "--", "--settings={}"], "--settings"),
     (["run", "1", "--", "auth", "status"], "auth"),
     (["run", "1", "--", "update"], "update"),
+    (["run", "1", "--", "-p", "update"], "update"),
+    (["run", "1", "--", "--print", "mcp"], "mcp"),
+    (["run", "1", "--", "-p", "auth"], "auth"),
+    (["run", "1", "--", "-p", "install"], "install"),
+    (["run", "1", "--", "-p", "other-command"], "unknown"),
+    (["run", "1", "--", "--print", "--output-format", "json", "update"], "update"),
+    (["run", "1", "--", "-p", "synthetic prompt", "update"], "update"),
+    (["run", "1", "--", "update", "-p", "synthetic prompt"], "update"),
     (["run", "1", "--", "other-command"], "unknown"),
     (["update"], "update"),
 ])
 def test_f8_rejects_invocation_forms(route, no_attempts, monkeypatch, capsys, args, clue):
     _check_cli(monkeypatch, capsys, args, clue)
+
+
+@pytest.mark.parametrize("args", [
+    ["--resume"],
+    ["--resume", "synthetic-session"],
+    ["--print", "--output-format", "json", "synthetic prompt"],
+])
+def test_f8_accepts_stand_client_forms(route, no_attempts, args):
+    assert test_mode.check_launch(args) == str(route[0])
 
 
 def test_f8_cold_profile_pins_auth_probe_and_launch(route, monkeypatch):

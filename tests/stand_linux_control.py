@@ -12,7 +12,7 @@ from tests.stand_linux import DNS_SINK, require_isolation, worker_argv
 
 LOCAL = ("127.0.0.1", 19279)
 FAILED_TARGET = ("192.0.2.42", 443)  # TEST-NET-1; unreachable in the stand.
-QUERY = "alx1119-detector.invalid."
+QUERY = "stand-dns-probe.invalid."
 
 
 def _normal() -> None:
@@ -32,7 +32,7 @@ def _dns() -> None:
             # Intentionally never respond: the child must observe a timeout.
             payload, source = sink.recvfrom(512)
             assert source[0].startswith("127.")
-            assert b"\x10alx1119-detector\x07invalid\x00" in payload.lower()
+            assert b"\x0fstand-dns-probe\x07invalid\x00" in payload.lower()
             assert query.wait(timeout=5) == 0
 
 

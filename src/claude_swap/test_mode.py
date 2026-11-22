@@ -152,11 +152,18 @@ def _client_form(args: list[str]) -> None:
     if any(arg.split("=", 1)[0] in {"--settings", "--setting-sources"} for arg in args):
         raise TestModeConfigError("--settings / --setting-sources: client layer is forbidden")
     # Only the stand's interactive, print and resume arguments are admitted.
-    # Do not let an unrecognized option hide a positional command.
+    # Require a multi-word print prompt so a bare CLI verb is never admitted
+    # as a prompt, even if it is not one of the commands we name in errors.
+    print_mode = False
+    seen_prompt = False
     index = 0
     while index < len(args):
         arg = args[index]
-        if arg in {"-p", "--print", "--resume"}:
+        if arg in {"-p", "--print"}:
+            print_mode = True
+            index += 1
+            continue
+        if arg == "--resume":
             index += 1
             if index < len(args) and not args[index].startswith("-"):
                 index += 1
@@ -165,6 +172,10 @@ def _client_form(args: list[str]) -> None:
             ["text"], ["json"], ["stream-json"]
         ):
             index += 2
+            continue
+        if print_mode and not seen_prompt and not arg.startswith("-") and len(arg.split()) > 1:
+            seen_prompt = True
+            index += 1
             continue
         verb = arg if arg in {"auth", "update", "install", "mcp"} else "unknown"
         raise TestModeConfigError(f"Claude invocation form: {verb} command or option is forbidden")

@@ -8,9 +8,16 @@ import pytest
 from tests.stand_linux import OPT_IN
 
 
-_REQUIRED_MODULES = {
-    "tests/test_stand_linux.py",
-    "tests/test_stand_mock_linux.py",
+# Pin exact node IDs, including both CLI scenarios, so another passing
+# test in the same module cannot stand in for a missing control.
+_REQUIRED_CONTROLS = {
+    "tests/test_stand_linux.py::test_detector_reports_failed_connect_sendto_and_sendmsg",
+    "tests/test_stand_linux.py::test_dns_sink_detects_attempt_from_child_with_no_answer",
+    "tests/test_stand_linux.py::test_runner_fails_closed_without_isolation",
+    "tests/test_stand_mock_linux.py::test_cli_rejects_test_endpoint_before_network[malformed_endpoint]",
+    "tests/test_stand_mock_linux.py::test_cli_rejects_test_endpoint_before_network[missing_endpoint]",
+    "tests/test_stand_mock_linux.py::test_mock_control_direct_tls_is_detected_and_denied",
+    "tests/test_stand_mock_linux.py::test_mock_control_hosts_mapping_stops_before_network",
 }
 
 
@@ -46,12 +53,12 @@ class _RequiredStand:
             self.passed.add(report.nodeid)
 
     def pytest_sessionfinish(self, session, exitstatus):
-        missing = _REQUIRED_MODULES - {nodeid.split("::", 1)[0] for nodeid in self.passed}
+        missing = _REQUIRED_CONTROLS - self.passed
         incomplete = {item.nodeid for item in session.items} - self.passed
         issues = [
             f"{label}: {', '.join(sorted(nodeids))}"
             for label, nodeids in (
-                ("no passing tests in required modules", missing),
+                ("required controls did not pass", missing),
                 ("collected tests did not pass", incomplete),
                 ("skips", self.skipped),
                 ("deselections", self.deselected),
