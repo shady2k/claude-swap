@@ -1455,10 +1455,11 @@ class TestRunCommand:
             from types import SimpleNamespace
             from unittest.mock import patch
 
-            from claude_swap import cli
+            from claude_swap import cli, real_claude
             from tests.cli_unit_child import install
 
             install()
+            resolve = real_claude.resolve
             switcher = SimpleNamespace(
                 backup_dir=Path.cwd(),
                 _logger=None,
@@ -1468,7 +1469,7 @@ class TestRunCommand:
             argv = ["cswap", "run", "--", sys.argv[1], "--output-format", "stream-json"]
             # Python stands in for claude; the handoff itself is the real one.
             with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=switcher), \\
-                 patch("claude_swap.session.shutil.which", return_value=sys.executable), \\
+                 patch("claude_swap.session.real_claude.resolve", lambda **kw: resolve(configured_path=sys.executable, **kw)), \\
                  patch.object(sys, "argv", argv):
                 cli.main()
         """)

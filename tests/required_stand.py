@@ -8,8 +8,8 @@ import pytest
 from tests.stand_linux import OPT_IN
 
 
-# Pin exact node IDs, including both CLI scenarios, so another passing
-# test in the same module cannot stand in for a missing control.
+# Pin exact node IDs so another passing test in the same module cannot
+# stand in for a missing control.
 _REQUIRED_CONTROLS = {
     "tests/test_stand_linux.py::test_detector_reports_failed_connect_sendto_and_sendmsg",
     "tests/test_stand_linux.py::test_dns_sink_detects_attempt_from_child_with_no_answer",
@@ -18,6 +18,14 @@ _REQUIRED_CONTROLS = {
     "tests/test_stand_mock_linux.py::test_cli_rejects_test_endpoint_before_network[missing_endpoint]",
     "tests/test_stand_mock_linux.py::test_mock_control_direct_tls_is_detected_and_denied",
     "tests/test_stand_mock_linux.py::test_mock_control_hosts_mapping_stops_before_network",
+    *(f"tests/test_stand_shim_linux.py::test_path_shim_refuses_before_launch[{name}]" for name in (
+        "missing_endpoint", "loopback_endpoint", "public_endpoint", "public_base", "public_proxy",
+        "unlisted_claude", "project_env", "user_env", "client_settings", "auth", "update", "unknown", "bypass",
+    )),
+    "tests/test_stand_shim_linux.py::test_path_shim_hosts_control_stops_before_launch",
+    "tests/test_stand_shim_linux.py::test_path_shim_route[shim_positive]",
+    "tests/test_stand_shim_linux.py::test_path_shim_route[shim_direct]",
+    "tests/test_stand_shim_linux.py::test_path_shim_trace_detects_external_attempt",
 }
 
 

@@ -13,15 +13,19 @@ import ipaddress
 import json
 import os
 import re
-import shutil
 import socket
 import ssl
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlsplit
 from urllib.request import Request
 
+from claude_swap import claude_forms
 from claude_swap.exceptions import ClaudeSwitchError
+
+if TYPE_CHECKING:
+    from claude_swap.real_claude import RealClaude
 
 MODE = "CLAUDE_SWAP_TEST_MODE"
 ENDPOINT = "CLAUDE_SWAP_TEST_ENDPOINT"
@@ -37,6 +41,7 @@ _ROUTE_KEYS = _PROXY_KEYS | {
     "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR", "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
 }
+_LAYER_KEYS = _ROUTE_KEYS | {"CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR"}
 _LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", re.ASCII)
 
 
@@ -97,18 +102,27 @@ def _route() -> None:
         _ca_file()
 
 
-def claude_binary() -> str:
-    """Resolve PATH, then compare with a stand-supplied absolute allowlist."""
-    candidate = shutil.which("claude")
-    if candidate:
-        for entry in os.environ.get(ALLOW, "").split(os.pathsep):
-            if Path(entry).is_absolute():
-                try:
-                    if os.path.samefile(entry, candidate):
-                        return os.path.abspath(candidate)
-                except OSError:
-                    continue
-    raise TestModeConfigError(f"{ALLOW}: PATH-selected claude is not allowed")
+def claude_binary(*, backup_root: Path | None = None) -> RealClaude:
+    """Resolve once and require the result to be in the stand's allowlist."""
+    from claude_swap import real_claude
+
+    try:
+        candidate = real_claude.resolve(backup_root=backup_root)
+    except ClaudeSwitchError:
+        raise TestModeConfigError(f"{ALLOW}: no allowed claude resolved") from None
+    _check_allowed(candidate)
+    return candidate
+
+
+def _check_allowed(candidate: RealClaude) -> None:
+    for entry in os.environ.get(ALLOW, "").split(os.pathsep):
+        if Path(entry).is_absolute():
+            try:
+                if os.path.samefile(entry, candidate.path):
+                    return
+            except OSError:
+                continue
+    raise TestModeConfigError(f"{ALLOW}: resolved claude is not allowed")
 
 
 def _managed_settings() -> Path:
@@ -144,60 +158,40 @@ def _check_layers(profile: Path | None = None) -> None:
         except (OSError, AttributeError, ValueError):
             raise TestModeConfigError(f"{file}: cannot check env settings") from None
         for key in env:
-            if key.upper() in _ROUTE_KEYS:
+            if key.upper() in _LAYER_KEYS:
                 raise TestModeConfigError(f"{file}: env.{key} is forbidden in test mode")
 
 
-def _client_form(args: list[str]) -> None:
-    for arg in args:
-        option = arg.split("=", 1)[0]
-        if option in {"--settings", "--setting-sources"}:
-            raise TestModeConfigError(f"{option}: client layer is forbidden")
-    # Only the stand's interactive, print and resume arguments are admitted.
-    # Require a multi-word print prompt so a bare CLI verb is never admitted
-    # as a prompt, even if it is not one of the commands we name in errors.
-    print_mode = False
-    seen_prompt = False
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if arg in {"-p", "--print"}:
-            print_mode = True
-            index += 1
-            continue
-        if arg == "--resume":
-            index += 1
-            if index < len(args) and not args[index].startswith("-"):
-                index += 1
-            continue
-        if arg == "--output-format" and args[index + 1:index + 2] in (
-            ["text"], ["json"], ["stream-json"]
-        ):
-            index += 2
-            continue
-        if print_mode and not seen_prompt and not arg.startswith("-") and len(arg.split()) > 1:
-            seen_prompt = True
-            index += 1
-            continue
-        # Describe the rejected argument without echoing a possible option value.
-        option = arg.split("=", 1)[0] if arg.startswith("-") else arg
-        raise TestModeConfigError(f"Claude invocation form: unknown or forbidden argument {option!r}")
+def _check_form(args: list[str]) -> None:
+    form = claude_forms.classify(args)
+    if form.error:
+        raise TestModeConfigError(form.error)
+    if form.settings is not None:
+        raise TestModeConfigError("--settings: client layer is forbidden")
+    if form.setting_sources:
+        raise TestModeConfigError("--setting-sources: client layer is forbidden")
+    if form.bypass_reason:
+        raise TestModeConfigError(f"Claude invocation form: {form.bypass_reason}")
 
 
-def check_launch(args: list[str], profile: Path | None = None) -> str:
+def check_launch(
+    args: list[str], profile: Path | None = None, *, backup_root: Path | None = None,
+    binary: RealClaude | None = None,
+) -> RealClaude:
     _route()
-    binary = claude_binary()
-    _client_form(args)
+    _check_form(args)
     _check_layers(profile)
+    if binary is None:
+        return claude_binary(backup_root=backup_root)
+    _check_allowed(binary)
     return binary
 
 
-def preflight(argv: list[str]) -> None:
-    """Check the existing cswap entry point before parsing or dispatch."""
+def preflight(argv: list[str]) -> RealClaude | None:
+    """Check the cswap entry point; return the checked executable for `run`."""
     if not active():
-        return
+        return None
     _route()
-    claude_binary()
     _check_layers()
     if argv[:1] == ["run"]:
         args = argv[1:]
@@ -205,11 +199,16 @@ def preflight(argv: list[str]) -> None:
         head, tail = args[:index], args[index + 1:]
         if not head or not head[0] or head[0].startswith("-"):
             raise TestModeConfigError("cswap run invocation form: explicit account required")
-        _client_form(tail)
-    elif argv not in (["help"], ["--help"], ["-h"], ["--version"]):
+        _check_form(tail)
+        return claude_binary()
+    if argv not in (
+        ["help"], ["--help"], ["-h"], ["--version"],
+        ["transparent", "enable"], ["transparent", "status"], ["transparent", "disable"],
+    ):
         # Do not dispatch unrelated surfaces (update, service helpers, etc.).
         verb = argv[0] if argv and argv[0] in {"auth", "update", "upgrade", "install", "mcp"} else "unsupported"
         raise TestModeConfigError(f"cswap invocation form: {verb}")
+    return None
 
 
 def _ca_file() -> str:

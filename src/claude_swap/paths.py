@@ -137,6 +137,11 @@ def get_backup_root() -> Path:
     return get_legacy_backup_root()
 
 
+def get_shim_dir(backup_root: Path | None = None) -> Path:
+    """The private PATH shim directory (not the Claude installation)."""
+    return (get_backup_root() if backup_root is None else backup_root) / "shim"
+
+
 # Names that any prior cswap run may have created in the backup root without
 # user data being present (logger output, update-check + usage cache). The
 # migration treats a target containing only these as effectively empty, since

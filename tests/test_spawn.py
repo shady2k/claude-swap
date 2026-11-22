@@ -126,6 +126,181 @@ class TestDecision:
         assert recorder == [(ARGV, {"capture_output": True})]
 
 
+def test_package_process_creation_has_one_boundary():
+    import ast
+
+    launch_methods = {
+        "subprocess": {"Popen", "run", "call", "check_call", "check_output", "getoutput", "getstatusoutput"},
+        "os": {"fork", "forkpty", "posix_spawn", "posix_spawnp", "popen", "system"},
+    }
+    violations = []
+    for module in Path(spawn.__file__).parent.rglob("*.py"):
+        for node in ast.walk(ast.parse(module.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            library = node.func.value
+            if not isinstance(library, ast.Name):
+                continue
+            name = node.func.attr
+            if name in launch_methods.get(library.id, ()) or (
+                library.id == "os" and name.startswith(("exec", "spawn"))
+            ):
+                if module.name != "spawn.py":
+                    violations.append(f"{module.name}:{node.lineno}")
+    assert not violations
+
+
+class TestTerminalHandoff:
+    @pytest.mark.parametrize("fd", [None, 17])
+    def test_posix_execve_preserves_argv_and_env(self, monkeypatch, fd):
+        binary = os.path.abspath("claude-bin")
+        args = ["--settings", "a b.json", "", 'a"b', "one\\two"]
+        env = {"A": "B"}
+        monkeypatch.setattr(sys, "platform", "linux")
+
+        class Replaced(BaseException):
+            pass
+
+        def execve(executable, argv, actual_env):
+            assert executable == (binary if fd is None else fd)
+            assert argv == [binary, *args]
+            assert actual_env is env
+            raise Replaced
+
+        monkeypatch.setattr(os, "execve", execve)
+        monkeypatch.setattr(os, "supports_fd", {execve})
+        with pytest.raises(Replaced):
+            spawn.handoff(binary, args, env, fd=fd)
+
+    def test_unavailable_fd_handoff_does_not_fall_back_to_path(self, monkeypatch):
+        monkeypatch.setattr(os, "supports_fd", set())
+        with pytest.raises(OSError, match="file descriptor"):
+            spawn.handoff(os.path.abspath("claude-bin"), [], {}, fd=17)
+
+    def test_windows_passes_through_argv_and_child_status(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "win32")
+        binary = os.path.abspath("claude-bin.exe")
+
+        def run(argv, **kwargs):
+            assert argv == [binary, "with spaces", ""]
+            assert kwargs == {"env": {"A": "B"}}
+            return subprocess.CompletedProcess(argv, 53)
+
+        monkeypatch.setattr(spawn.subprocess, "run", run)
+        with pytest.raises(SystemExit) as exits:
+            spawn.handoff(binary, ["with spaces", ""], {"A": "B"})
+        assert exits.value.code == 53
+
+
+class TestWindowsJob:
+    @pytest.mark.parametrize("failure", [None, "create", "limits", "assign"])
+    def test_assigns_self_before_returning_and_closes_only_on_failure(
+        self, failure, monkeypatch
+    ):
+        import ctypes
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        events = []
+
+        def mk(name, fn):
+            def call(*args):
+                events.append(name)
+                return fn(*args)
+            return Mock(side_effect=call)
+
+        def create(attributes, name):
+            assert attributes is name is None  # no inherited or shareable handle
+            return None if failure == "create" else 11
+
+        def set_limits(handle, info_class, info, size):
+            assert handle == 11 and info_class == 9
+            assert size == ctypes.sizeof(info._obj)
+            assert info._obj.BasicLimitInformation.LimitFlags == 0x2000  # no breakaway
+            return failure != "limits"
+
+        def assign(handle, process):
+            assert (handle, process) == (11, 22)
+            return failure != "assign"
+
+        kernel = SimpleNamespace(
+            CreateJobObjectW=mk("create", create),
+            SetInformationJobObject=mk("limits", set_limits),
+            AssignProcessToJobObject=mk("assign", assign),
+            GetCurrentProcess=mk("current", lambda: 22),
+            CloseHandle=mk("close", lambda h: h == 11),
+        )
+        monkeypatch.setattr(ctypes, "WinDLL", lambda *a, **kw: kernel, raising=False)
+        monkeypatch.setattr(ctypes, "get_last_error", lambda: 5, raising=False)
+        monkeypatch.setattr(ctypes, "WinError", lambda n: OSError(n, "denied"), raising=False)
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(spawn, "_job_handle", None)
+        if failure:
+            with pytest.raises(OSError, match="denied"):
+                spawn.ensure_windows_job()
+            assert spawn._job_handle is None
+        else:
+            spawn.ensure_windows_job()
+            spawn.ensure_windows_job()
+            assert spawn._job_handle == 11
+        assert events == {
+            None: ["create", "limits", "current", "assign"],
+            "create": ["create"],
+            "limits": ["create", "limits", "close"],
+            "assign": ["create", "limits", "current", "assign", "close"],
+        }[failure]
+
+
+class TestPythonHelpers:
+    def test_checks_interpreter_and_backup_root_and_scrubs_environment(self, monkeypatch, tmp_path):
+        from claude_swap import fsguard, python_chain
+
+        executable = tmp_path / "venv" / "bin" / "python"
+        backup_root = tmp_path / "backup"
+        backup_root.mkdir()
+        monkeypatch.setattr(python_chain, "check_python_chain", lambda: executable)
+        checked = []
+
+        def check_path(path):
+            checked.append(path)
+            return path
+
+        monkeypatch.setattr(fsguard, "check_path", check_path)
+        for key in (*python_chain.LOADER_VARS, "PYTHONPATH", "PYTHONSTARTUP", "PATH", "ANTHROPIC_API_KEY"):
+            monkeypatch.setenv(key, "untrusted")
+        monkeypatch.setenv("CLAUDE_SWAP_TEST_MODE", "1")
+        monkeypatch.setenv("CLAUDE_SWAP_TEST_ENDPOINT", "https://claude-swap.test")
+
+        def run(argv, *, cwd, env, **options):
+            assert argv == [str(executable), "-I", "-m", "claude_swap.probe", "one two"]
+            assert cwd == backup_root
+            assert options == {"capture_output": True}
+            assert env["CLAUDE_SWAP_TEST_MODE"] == "1"
+            assert env["CLAUDE_SWAP_TEST_ENDPOINT"] == "https://claude-swap.test"
+            assert not set(python_chain.LOADER_VARS) & env.keys()
+            assert not {"PATH", "PYTHONPATH", "PYTHONSTARTUP", "ANTHROPIC_API_KEY"} & env.keys()
+            return subprocess.CompletedProcess(argv, 0)
+
+        monkeypatch.setattr(spawn, "run", run)
+        spawn.run_python("claude_swap.probe", ["one two"], backup_root=backup_root, capture_output=True)
+        assert checked == [backup_root]
+
+    def test_guard_failure_does_not_spawn(self, monkeypatch, tmp_path):
+        from claude_swap import fsguard, python_chain
+        from claude_swap.exceptions import ConfigError
+
+        def bad():
+            raise fsguard.GuardError("Untrusted interpreter")
+
+        def unexpected(*args, **kwargs):
+            pytest.fail("untrusted Python launch context reached spawn")
+
+        monkeypatch.setattr(python_chain, "check_python_chain", bad)
+        monkeypatch.setattr(spawn, "run", unexpected)
+        with pytest.raises(ConfigError, match="Untrusted interpreter"):
+            spawn.run_python("claude_swap.probe", [], backup_root=tmp_path)
+
+
 # ---------------------------------------------------------------------------
 # the descriptor gate
 # ---------------------------------------------------------------------------

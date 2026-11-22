@@ -32,7 +32,8 @@ It works on the same files and Keychain items Claude Code uses, and takes Claude
 - `credentials.py`: `CredentialStore`, which decides Keychain or file and reads and writes both. `macos_keychain.py` wraps the `security` tool.
 - `paths.py`: resolves Claude Code's config and credential paths the way Claude Code does, and the backup root.
 - `claude_locks.py`: Claude Code's lock protocol. `locking.py`: cswap's own `FileLock`.
-- `process_detection.py`: finds running Claude Code instances. `spawn.py`: runs helper processes without `fork()`.
+- `process_detection.py`: finds running Claude Code instances. `spawn.py`: owns subprocess creation and terminal handoff.
+- `transparent.py`: installs the PATH shim and applies launch policy without running CLI migrations. `claude_forms.py` classifies arguments. `real_claude.py` resolves the original Claude Code for the shim and session launches, including auth probes. `fsguard.py` and `python_chain.py` check the executable chains.
 - `fsutil.py`: atomic writes and link helpers. It imports nothing from the package.
 
 ## Finding things in `switcher.py`

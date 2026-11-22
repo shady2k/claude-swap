@@ -1,4 +1,10 @@
-"""Linux-only, opt-in launcher and independent syscall audit for the test stand."""
+"""Linux-only, opt-in launcher and independent syscall audit for the test stand.
+
+For a trusted checkout, an ordinary user with passwordless sudo can set
+``CSWAP_STAND_SUDO=1`` and ``CSWAP_STAND_RUN_AS=$(id -u):$(id -g)``.
+Only namespace setup uses root; strace and all workers run as the caller.
+The setup imports this checkout under sudo; do not use it with untrusted code.
+"""
 
 from __future__ import annotations
 
@@ -27,11 +33,22 @@ TIMEOUT = 30  # seconds, including setup, tracing and test execution
 
 Role = tuple[str, ...]  # Fixed module and arguments, identified by execve.
 Target = tuple[str, int]
-MOCK_SCENARIOS = ("positive", "cli_positive", "direct", "denied_connect")
+MOCK_SCENARIOS = (
+    "positive", "cli_positive", "direct", "denied_connect", "shim_positive", "shim_direct",
+)
 MOCK_CLI_CONTROLS = ("missing_endpoint", "malformed_endpoint")
+SHIM_REFUSALS = (
+    "missing_endpoint", "loopback_endpoint", "public_endpoint", "public_base", "public_proxy",
+    "unlisted_claude", "project_env", "user_env", "client_settings", "auth", "update", "unknown", "bypass",
+)
+_SHIM_SPAWN_ROLES = {
+    *(("stand_mock", "client", name) for name in ("shim_positive", "shim_direct")),
+    *(("stand_shim", name) for name in (*SHIM_REFUSALS, "escape")),
+}
 ROOT_ROLES = {
     *(("stand_mock", scenario) for scenario in (*MOCK_SCENARIOS, *MOCK_CLI_CONTROLS)),
     *(("stand_linux_control", name) for name in ("normal", "dns", "failed")),
+    *(("stand_shim", name) for name in (*SHIM_REFUSALS, "escape")),
 }
 
 
@@ -129,6 +146,25 @@ def _enter(module: str, args: list[str]) -> int:
                 or not _is_loopback_network(route.get("dst", "default"))
             ):
                 raise StandError("the stand has a route outside loopback")
+    if identity := os.environ.get("CSWAP_STAND_RUN_AS"):
+        # Port 53 is private to this namespace. Keep the DNS detector's
+        # low-port sink usable after dropping privileges to the caller.
+        Path("/proc/sys/net/ipv4/ip_unprivileged_port_start").write_text("53\n", encoding="ascii")
+        uid, gid = identity.split(":")
+        setpriv = _tool("setpriv")
+        os.execv(setpriv, [
+            setpriv, "--reuid", uid, "--regid", gid, "--clear-groups", "--no-new-privs",
+            sys.executable, "-Es", "-m", "tests.stand_linux", "trace", module, *args,
+        ])
+    return _trace(module, args)
+
+
+def _trace(module: str, args: list[str]) -> int:
+    if (identity := os.environ.get("CSWAP_STAND_RUN_AS")) and (
+        os.geteuid() == 0 or os.getegid() == 0 or identity != f"{os.geteuid()}:{os.getegid()}"
+    ):
+        raise StandError("stand could not drop to the requested uid:gid")
+    run_dir = Path(os.environ["CSWAP_STAND_ROOT"])
     (run_dir / "isolated").write_text(f"{_namespace('net')}\n{_namespace('mnt')}\n")
     require_isolation()
     result = subprocess.run([
@@ -169,6 +205,12 @@ def _worker(module: str, args: list[str]) -> None:
     )
 
     blocked_resolver = None
+    if role in _SHIM_SPAWN_ROLES:
+        from tests.stand_shim import command
+
+        shim_command = command(role[-1])
+    else:
+        shim_command = None
 
     def restrict_worker(event: str, values: tuple) -> None:
         nonlocal blocked_resolver
@@ -187,6 +229,8 @@ def _worker(module: str, args: list[str]) -> None:
                     raise StandError(f"stand connect destination not allowed for {role!r}")
         if event == "subprocess.Popen":
             executable, argv, _cwd, _env = values
+            if shim_command and executable == "claude" and argv == shim_command:
+                return
             if (
                 isinstance(argv, (list, tuple)) and argv and argv[0] == executable
                 and (tuple(argv) in commands or (
@@ -201,6 +245,10 @@ def _worker(module: str, args: list[str]) -> None:
     sys.addaudithook(restrict_worker)
     sys.argv = [f"tests.{module}", *args]
     try:
+        if module == "stand_shim":
+            from tests.stand_shim import main
+
+            raise SystemExit(main(args[0]))
         runpy.run_module(f"tests.{module}", run_name="__main__")
     finally:
         if blocked_resolver is not None:
@@ -229,6 +277,7 @@ class StandRun:
     returncode: int
     attempts: tuple[Attempt, ...]
     violations: tuple[str, ...]
+    shim_execs: tuple[str, ...]
 
     def require_clean(self) -> None:
         if self.violations:
@@ -273,22 +322,27 @@ def _targets(call: str, line: str) -> list[tuple[Target | None, Target | None]]:
     return targets or [(None, None)]
 
 
-def _exec_argv(line: str) -> list[str] | None:
+def _exec_command(line: str) -> tuple[str, list[str]] | None:
     match = _EXEC.match(line)
     if match:
         try:
-            argv = json.loads(match[2])
-            if argv and argv[0] == match[1]:
-                return argv
+            return match[1], json.loads(match[2])
         except ValueError:
             pass
+    return None
+
+
+def _exec_argv(line: str) -> list[str] | None:
+    command = _exec_command(line)
+    if command and command[1] and command[0] == command[1][0]:
+        return command[1]
     return None
 
 
 def _audit(
     run_dir: Path, root_role: Role, allowed: dict[Role, set[Target]],
     listeners: dict[Role, set[Target]],
-) -> tuple[tuple[Attempt, ...], tuple[str, ...]]:
+) -> tuple[tuple[Attempt, ...], tuple[str, ...], tuple[str, ...]]:
     by_pid = {
         int(path.suffix[1:]): path.read_text().splitlines() for path in run_dir.glob("trace.*")
     }
@@ -319,6 +373,34 @@ def _audit(
     violations = []
     openssl = shutil.which("openssl", path=SYSTEM_PATH)
     child_commands = {tuple(worker_argv(*role)): role for role in _child_roles(root_role)}
+    shim_execs = []
+    shim_roles = (_child_roles(root_role) | {root_role}) & _SHIM_SPAWN_ROLES
+    if shim_roles:
+        from tests import stand_shim
+
+        shim_role, = shim_roles
+        scenario = shim_role[-1]
+        shim_path = str(stand_shim.shim_path(run_dir))
+        fake_path = str(stand_shim.fake_path(run_dir))
+        claude_command = stand_shim.command(scenario)
+
+    def shim_transition(role: Role, line: str) -> Role | None:
+        if not shim_roles or (command := _exec_command(line)) is None:
+            return None
+        path, argv = command
+        if role == shim_role and path == shim_path and argv == claude_command:
+            return ("path-shim",)
+        if role == ("path-shim",) and path == sys.executable and argv == [
+            sys.executable, "-I", "-m", "claude_swap.transparent",
+            f"--cswap-shim=0:{Path(shim_path).parent}", *claude_command[1:]
+        ]:
+            return ("shim-python",)
+        if role == ("shim-python",) and scenario not in SHIM_REFUSALS and (
+            path == fake_path and len(argv) >= 3 and argv[:2] == [fake_path, "--settings"] and
+            stand_shim.is_layer_path(run_dir, argv[2]) and argv[3:] == claude_command[1:]
+        ):
+            return ("shim-claude",)
+        return None
 
     def visit(pid: int, role: Role) -> None:
         for line in by_pid[pid][1 if pid == root else 0:]:
@@ -327,6 +409,8 @@ def _audit(
                 continue
             call = syscall[1]
             if call in {"clone", "clone3", "fork", "vfork"}:
+                if role in {("path-shim",), ("shim-python",)} and "CLONE_THREAD" not in line:
+                    violations.append(f"pid {pid}: shim spawned a process instead of handing off")
                 if "CLONE_NEW" in line or "CLONE_UNTRACED" in line:
                     violations.append(f"pid {pid}: unexpected process isolation flags in {call}")
                 result = _RESULT.search(line)
@@ -338,6 +422,10 @@ def _audit(
                     new_role = child_commands[tuple(argv)]
                 elif role == ("stand_mock", "serve") and argv and argv[0] == openssl:
                     new_role = ("openssl",)
+                elif transition := shim_transition(role, line):
+                    new_role = transition
+                    if line.endswith(" = 0"):
+                        shim_execs.append(new_role[0])
                 else:
                     violations.append(f"pid {pid}: non-allowlisted {call}")
                     new_role = ()
@@ -365,7 +453,7 @@ def _audit(
                         )
 
     visit(root, root_role)
-    return tuple(attempts), tuple(violations)
+    return tuple(attempts), tuple(violations), tuple(shim_execs)
 
 
 class LinuxStand:
@@ -392,7 +480,10 @@ class LinuxStand:
             raise StandError("stand entry point is not allowlisted")
         policy = {role: allowed or set(), **(children or {})}
         inbound = listeners or {}
-        if (policy.keys() | inbound.keys()) - ({role} | _child_roles(role)):
+        roles = {role} | _child_roles(role)
+        if roles & _SHIM_SPAWN_ROLES:
+            roles.add(("shim-claude",))
+        if (policy.keys() | inbound.keys()) - roles:
             raise StandError("stand policy specified an unknown process role")
         for endpoints in (*policy.values(), *inbound.values()):
             for addr, port in endpoints:
@@ -420,12 +511,29 @@ class LinuxStand:
             _tool("unshare"), "-n", "-m", "--propagation", "private", "--",
             sys.executable, "-Es", "-m", "tests.stand_linux", "enter", module, *args,
         ]
+        timeout = TIMEOUT
+        if (identity := os.environ.get("CSWAP_STAND_RUN_AS")) or os.environ.get("CSWAP_STAND_SUDO"):
+            if (
+                os.environ.get("CSWAP_STAND_SUDO") != "1"
+                or os.geteuid() == 0 or os.getegid() == 0
+                or identity != f"{os.geteuid()}:{os.getegid()}"
+            ):
+                raise StandError("sudo stand requires CSWAP_STAND_RUN_AS set to the caller's non-root uid:gid")
+            env["CSWAP_STAND_RUN_AS"] = identity
+            # The caller cannot signal root setup if it stalls. Put the same
+            # timeout inside sudo and give it time to terminate its own group.
+            argv = [
+                _tool("sudo"), "-n", "--", _tool("env"), "-i",
+                *(f"{key}={value}" for key, value in env.items()),
+                _tool("timeout"), "--signal=KILL", str(TIMEOUT), *argv,
+            ]
+            timeout += 5
         with subprocess.Popen(
             argv, cwd=PROJECT, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, start_new_session=True,
         ) as process:
             try:
-                stdout, stderr = process.communicate(timeout=TIMEOUT)
+                stdout, stderr = process.communicate(timeout=timeout)
             except subprocess.TimeoutExpired as exc:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.communicate()
@@ -439,14 +547,16 @@ class LinuxStand:
             raise StandError("stand did not confirm fresh namespaces")
         if traced_rc != process.returncode or traced_rc < 0 or "strace:" in stderr:
             raise StandError(f"strace did not complete normally: {stderr}")
-        attempts, violations = _audit(run_dir, role, policy, inbound)
-        return StandRun(stdout, stderr, process.returncode, attempts, violations)
+        attempts, violations, shim_execs = _audit(run_dir, role, policy, inbound)
+        return StandRun(stdout, stderr, process.returncode, attempts, violations, shim_execs)
 
 
 if __name__ == "__main__":
     stage, module, *args = sys.argv[1:]
     if stage == "enter":
         raise SystemExit(_enter(module, args))
+    if stage == "trace":
+        raise SystemExit(_trace(module, args))
     if stage == "worker":
         _worker(module, args)
     else:

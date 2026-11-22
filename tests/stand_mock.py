@@ -264,6 +264,10 @@ def _cli_positive(ca: Path) -> dict:
 
     _configure_route(ca)
     claude = _fake_claude_path()
+    from tests.stand_shim import install
+
+    # Explicit session and its cold auth probe must both skip the PATH shim.
+    install(Path(claude))
     # This privileged worker already passed the network and mount namespace checks.
     os.environ["CONTAINER"] = "cswap-test-stand"
     os.environ["NO_PROXY"] = "*"
@@ -329,7 +333,7 @@ def _cli_positive(ca: Path) -> dict:
             response = _https_probe()
         raise SystemExit(0)
 
-    with patch.object(spawn, "run", auth_status), patch.object(os, "execvpe", final_exec):
+    with patch.object(spawn, "run", auth_status), patch.object(os, "execve", final_exec):
         try:
             _run_cli("--no-share", "--no-share-history", "--require-session")
         except SystemExit as exc:
@@ -376,6 +380,15 @@ def _client_worker(scenario: str) -> int:
         response = _https_probe()
     elif scenario == "cli_positive":
         response = _cli_positive(ca)
+    elif scenario in {"shim_positive", "shim_direct"}:
+        from tests.stand_shim import launch
+
+        result = launch(scenario, ca)
+        if result.returncode != 0:
+            raise RuntimeError(f"PATH shim failed ({result.returncode}): {result.stderr}")
+        if result.stderr:
+            raise RuntimeError(f"PATH shim emitted stderr: {result.stderr}")
+        response = json.loads(result.stdout)
     elif scenario == "direct":
         _attempt_direct(ca)
     elif scenario == "denied_connect":

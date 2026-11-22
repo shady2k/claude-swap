@@ -132,7 +132,15 @@ class UsageSettings:
     fable_probe: bool = False
 
 
+@dataclass(frozen=True)
+class TransparentSettings:
+    claude_path: str | None = None
+    require_proxy: bool = False
+    allow_unverified: bool = False
+
+
 _SECTION_DEFAULT_SOURCES = {
+    "transparent": TransparentSettings,
     "autoswitch": AutoSwitchSettings,
     "ui": UiSettings,
     "run": RunSettings,
@@ -221,6 +229,18 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "run", "shareHistory", "share_history", "bool",
             help="cswap run shares one chat history across accounts",
+        ),
+        SettingSpec(
+            "transparent", "claudePath", "claude_path", "string",
+            help="Absolute path to the original Claude Code executable",
+        ),
+        SettingSpec(
+            "transparent", "requireProxy", "require_proxy", "bool",
+            help="Refuse launches without a verified profile proxy",
+        ),
+        SettingSpec(
+            "transparent", "allowUnverified", "allow_unverified", "bool",
+            help="Allow unverified builds only outside strict proxy mode",
         ),
         SettingSpec(
             "updates", "check", "check", "bool",
@@ -596,6 +616,8 @@ def parse_setting_value(spec: SettingSpec, raw_value: str):
         return raw_value
     if spec.kind == "string":
         value = raw_value.strip()
+        if spec.dotted == "transparent.claudePath" and not Path(value).is_absolute():
+            raise ConfigError("transparent.claudePath must be an absolute path")
         if not value:
             raise ConfigError(
                 f"{spec.dotted} expects a non-empty value; use "
@@ -663,6 +685,29 @@ def _read_raw_for_write(path: Path) -> dict:
     return raw
 
 
+def _transparent(raw: dict) -> TransparentSettings:
+    section = raw.get("transparent", {})
+    if not isinstance(section, dict):
+        raise ConfigError("transparent: expected a settings object")
+    claude_path = section.get("claudePath")
+    if claude_path is not None and (
+        not isinstance(claude_path, str) or not Path(claude_path).is_absolute()
+    ):
+        raise ConfigError("transparent.claudePath must be an absolute path")
+    require_proxy = section.get("requireProxy", False)
+    allow_unverified = section.get("allowUnverified", False)
+    if not isinstance(require_proxy, bool) or not isinstance(allow_unverified, bool):
+        raise ConfigError("transparent.requireProxy and transparent.allowUnverified must be booleans")
+    if require_proxy and allow_unverified:
+        raise ConfigError("transparent.requireProxy and transparent.allowUnverified cannot both be true")
+    return TransparentSettings(claude_path, require_proxy, allow_unverified)
+
+
+def load_transparent_settings(backup_root: Path) -> TransparentSettings:
+    """Do not silently downgrade a malformed launch policy to optional."""
+    return _transparent(_read_raw_for_write(settings_path(backup_root)))
+
+
 def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
     """Validate and persist one key for `cswap config set`; returns the value.
 
@@ -681,6 +726,8 @@ def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
         section = {}
     section[spec.json_key] = value
     raw[spec.section] = section
+    if spec.section == "transparent":
+        _transparent(raw)
     atomic_write_json(path, raw)
     return value
 
@@ -715,6 +762,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
         "run": load_run_settings(backup_root),
         "updates": load_update_settings(backup_root),
         "usage": load_usage_settings(backup_root),
+        "transparent": _transparent(raw),
     }
     rows = []
     for spec in SETTING_SPECS.values():

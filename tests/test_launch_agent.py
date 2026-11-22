@@ -225,7 +225,7 @@ def test_resolve_program_ignores_an_argv0_that_is_not_cswap(tmp_path):
 
 
 def test_install_writes_the_plist_and_bootstraps_it(tmp_path):
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
         result = launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID, backup_dir=tmp_path)
 
@@ -236,7 +236,7 @@ def test_install_writes_the_plist_and_bootstraps_it(tmp_path):
 
 
 def test_install_creates_the_log_directory(tmp_path):
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
         result = launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID, backup_dir=tmp_path)
     assert Path(result["stderr_log"]).parent.is_dir()
@@ -246,7 +246,7 @@ def test_install_creates_the_log_directory(tmp_path):
 def test_install_writes_the_plist_owner_only(tmp_path):
     # A forwarded proxy URL can carry credentials, so the plist gets 0600
     # rather than whatever the umask leaves write_bytes with.
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
         result = launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID, backup_dir=tmp_path)
     assert stat.S_IMODE(Path(result["plist"]).stat().st_mode) == 0o600
@@ -266,7 +266,7 @@ def test_install_boots_out_first_when_already_loaded(tmp_path):
             state["loaded"] = False
         return _completed(0)
 
-    with patch.object(launch_agent.subprocess, "run", side_effect=run) as ran:
+    with patch.object(launch_agent.spawn, "run", side_effect=run) as ran:
         launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID, backup_dir=tmp_path)
 
     subcommands = [c.args[0][1] for c in ran.call_args_list]
@@ -274,7 +274,7 @@ def test_install_boots_out_first_when_already_loaded(tmp_path):
 
 
 def test_install_does_not_boot_out_when_nothing_is_loaded(tmp_path):
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
         launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID, backup_dir=tmp_path)
 
@@ -296,7 +296,7 @@ def test_install_waits_for_the_old_job_to_go_away_before_bootstrapping(tmp_path)
         return _completed(0)
 
     with patch.object(launch_agent.time, "sleep") as slept:
-        with patch.object(launch_agent.subprocess, "run", side_effect=run) as ran:
+        with patch.object(launch_agent.spawn, "run", side_effect=run) as ran:
             launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID, backup_dir=tmp_path)
 
     assert slept.called, "did not wait for the old job at all"
@@ -308,14 +308,14 @@ def test_install_waits_for_the_old_job_to_go_away_before_bootstrapping(tmp_path)
 
 def test_wait_until_unloaded_gives_up_after_the_timeout(tmp_path):
     with patch.object(launch_agent.time, "sleep"):
-        with patch.object(launch_agent.subprocess, "run") as run:
+        with patch.object(launch_agent.spawn, "run") as run:
             run.side_effect = _router({"print": _completed(0)})
             assert launch_agent._wait_until_unloaded(uid=UID, timeout=0.0) is False
 
 
 def test_install_names_the_lingering_predecessor_when_bootstrap_fails(tmp_path):
     with patch.object(launch_agent, "_wait_until_unloaded", return_value=False):
-        with patch.object(launch_agent.subprocess, "run") as run:
+        with patch.object(launch_agent.spawn, "run") as run:
             run.side_effect = _router(
                 {"print": _completed(0), "bootstrap": _completed(5, stderr="Operation already in progress")}
             )
@@ -324,7 +324,7 @@ def test_install_names_the_lingering_predecessor_when_bootstrap_fails(tmp_path):
 
 
 def test_install_raises_with_launchctl_detail_when_bootstrap_fails(tmp_path):
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router(
             {"print": _completed(1), "bootstrap": _completed(5, stderr="Input/output error")}
         )
@@ -346,7 +346,7 @@ def test_uninstall_boots_out_and_removes_the_plist(tmp_path):
     target.parent.mkdir(parents=True)
     target.write_bytes(b"x")
 
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(0)})
         result = launch_agent.uninstall(home=tmp_path, uid=UID, backup_dir=tmp_path)
 
@@ -360,7 +360,7 @@ def test_uninstall_boots_out_and_removes_the_plist(tmp_path):
 
 
 def test_uninstall_is_quiet_when_nothing_is_installed(tmp_path):
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
         result = launch_agent.uninstall(home=tmp_path, uid=UID, backup_dir=tmp_path)
     assert result["was_loaded"] is False and result["removed_plist"] is False
@@ -370,14 +370,14 @@ def test_uninstall_removes_a_plist_that_was_never_bootstrapped(tmp_path):
     target = launch_agent.plist_path(home=tmp_path)
     target.parent.mkdir(parents=True)
     target.write_bytes(b"x")
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
         result = launch_agent.uninstall(home=tmp_path, uid=UID, backup_dir=tmp_path)
     assert result["removed_plist"] is True and not target.exists()
 
 
 def test_uninstall_raises_when_bootout_fails_and_the_service_stays_loaded(tmp_path):
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(0), "bootout": _completed(3, stderr="in use")})
         with pytest.raises(ClaudeSwitchError, match="in use"):
             launch_agent.uninstall(home=tmp_path, uid=UID, backup_dir=tmp_path)
@@ -396,7 +396,7 @@ def test_uninstall_tolerates_a_bootout_race_that_already_unloaded_it(tmp_path):
             return _completed(3, stderr="No such process")
         return _completed(0)
 
-    with patch.object(launch_agent.subprocess, "run", side_effect=run):
+    with patch.object(launch_agent.spawn, "run", side_effect=run):
         result = launch_agent.uninstall(home=tmp_path, uid=UID, backup_dir=tmp_path)
     assert result["was_loaded"] is True
 
@@ -406,7 +406,7 @@ def test_uninstall_tolerates_a_bootout_race_that_already_unloaded_it(tmp_path):
 
 def test_status_reads_state_and_pid_from_launchctl_print(tmp_path):
     printed = "\tstate = running\n\tpid = 25026\n\tlast exit code = (never exited)\n"
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(0, stdout=printed)})
         result = launch_agent.status(home=tmp_path, uid=UID, backup_dir=tmp_path)
 
@@ -416,7 +416,7 @@ def test_status_reads_state_and_pid_from_launchctl_print(tmp_path):
 
 
 def test_status_reports_not_loaded_without_inventing_a_pid(tmp_path):
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
         result = launch_agent.status(home=tmp_path, uid=UID, backup_dir=tmp_path)
     assert result["loaded"] is False
@@ -429,7 +429,7 @@ def test_status_separates_installed_from_loaded(tmp_path):
     target = launch_agent.plist_path(home=tmp_path)
     target.parent.mkdir(parents=True)
     target.write_bytes(b"x")
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
         result = launch_agent.status(home=tmp_path, uid=UID, backup_dir=tmp_path)
     assert result["installed"] is True and result["loaded"] is False
@@ -453,7 +453,7 @@ def test_status_reads_the_jobs_own_state_not_a_nested_blocks(tmp_path):
         "\t}\n"
         "}\n"
     )
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(0, stdout=printed)})
         result = launch_agent.status(home=tmp_path, uid=UID, backup_dir=tmp_path)
 
@@ -463,14 +463,14 @@ def test_status_reads_the_jobs_own_state_not_a_nested_blocks(tmp_path):
 
 def test_status_keeps_multi_word_launchd_states(tmp_path):
     # Before the process spawns, launchd reports "spawn scheduled".
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(0, stdout="\tstate = spawn scheduled\n")})
         result = launch_agent.status(home=tmp_path, uid=UID, backup_dir=tmp_path)
     assert result["state"] == "spawn scheduled"
 
 
 def test_status_ignores_a_non_numeric_pid_line(tmp_path):
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(0, stdout="\tpid = (none)\n")})
         result = launch_agent.status(home=tmp_path, uid=UID, backup_dir=tmp_path)
     assert result["pid"] is None
@@ -571,7 +571,7 @@ def _session_plist(home, data):
 
 
 def _ensure(fake, home, data, **kw):
-    with patch.object(launch_agent.subprocess, "run", side_effect=fake):
+    with patch.object(launch_agent.spawn, "run", side_effect=fake):
         return launch_agent.ensure(
             home=home, backup_dir=data, program=PROGRAM, uid=UID, **kw
         )
@@ -749,10 +749,10 @@ def test_btm_record_disallowed_ignores_other_items_and_a_missing_record():
 
 
 def test_btm_disallowed_is_false_when_the_dump_cannot_be_read():
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.return_value = _completed(1, stderr="Must be run as root")
         assert launch_agent._btm_disallowed() is False
-    with patch.object(launch_agent.subprocess, "run", side_effect=FileNotFoundError):
+    with patch.object(launch_agent.spawn, "run", side_effect=FileNotFoundError):
         assert launch_agent._btm_disallowed() is False
 
 
@@ -767,26 +767,26 @@ def test_launchd_disabled_reads_both_launchctl_spellings(value, disabled):
         '\t\t"com.other.agent" => disabled\n'
         "\t}\n"
     )
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print-disabled": _completed(0, stdout=listing)})
         assert launch_agent._launchd_disabled(uid=UID) is disabled
 
 
 def test_launchd_disabled_is_false_when_the_list_cannot_be_read():
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print-disabled": _completed(1, stderr="nope")})
         assert launch_agent._launchd_disabled(uid=UID) is False
 
 
 def test_running_as_service_matches_the_jobs_pid_to_this_process():
     mine = f"\tstate = running\n\tpid = {os.getpid()}\n"
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(0, stdout=mine)})
         assert launch_agent.running_as_service(uid=UID) is True
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(0, stdout="\tstate = running\n\tpid = 1\n")})
         assert launch_agent.running_as_service(uid=UID) is False
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
         assert launch_agent.service_pid(uid=UID) is None
 
@@ -804,7 +804,7 @@ def test_set_start_at_login_off_moves_the_plist_without_touching_launchd(tmp_pat
     login = _login_plist(home, https_proxy="http://proxy:3128")
     original = login.read_bytes()
 
-    with patch.object(launch_agent.subprocess, "run", side_effect=_never_called):
+    with patch.object(launch_agent.spawn, "run", side_effect=_never_called):
         result = launch_agent.set_start_at_login(False, home=home, backup_dir=data)
 
     session = launch_agent.session_plist_path(backup_dir=data)
@@ -817,7 +817,7 @@ def test_set_start_at_login_on_moves_it_back(tmp_path):
     home, data = _homes(tmp_path)
     session = _session_plist(home, data)
 
-    with patch.object(launch_agent.subprocess, "run", side_effect=_never_called):
+    with patch.object(launch_agent.spawn, "run", side_effect=_never_called):
         launch_agent.set_start_at_login(True, home=home, backup_dir=data)
 
     assert launch_agent.start_at_login_enabled(home=home) is True
@@ -829,7 +829,7 @@ def test_set_start_at_login_with_no_plist_writes_one_so_the_choice_is_kept(tmp_p
     # A --foreground run from a shell has no plist anywhere yet.
     home, data = _homes(tmp_path)
 
-    with patch.object(launch_agent.subprocess, "run", side_effect=_never_called):
+    with patch.object(launch_agent.spawn, "run", side_effect=_never_called):
         result = launch_agent.set_start_at_login(
             enabled, home=home, backup_dir=data, program=PROGRAM
         )
@@ -843,7 +843,7 @@ def test_set_start_at_login_with_no_plist_writes_one_so_the_choice_is_kept(tmp_p
 def test_uninstall_removes_the_session_plist_too(tmp_path):
     home, data = _homes(tmp_path)
     session = _session_plist(home, data)
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
         result = launch_agent.uninstall(home=home, uid=UID, backup_dir=data)
     assert result["removed_plist"] is True
@@ -853,7 +853,7 @@ def test_uninstall_removes_the_session_plist_too(tmp_path):
 def test_install_removes_a_session_plist_so_login_wins(tmp_path):
     home, data = _homes(tmp_path)
     session = _session_plist(home, data)
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
         result = launch_agent.install(home=home, program=PROGRAM, uid=UID, backup_dir=data)
     assert result["start_at_login"] is True
@@ -865,7 +865,7 @@ def test_status_reports_start_at_login_and_the_system_settings_switch(tmp_path):
     home, data = _homes(tmp_path)
     session = _session_plist(home, data)
     fake = _FakeLaunchd(loaded=True, pid=4242, switched_off=True)
-    with patch.object(launch_agent.subprocess, "run", side_effect=fake):
+    with patch.object(launch_agent.spawn, "run", side_effect=fake):
         result = launch_agent.status(home=home, uid=UID, backup_dir=data)
     assert result["start_at_login"] is False
     assert result["configured"] is True
@@ -893,7 +893,7 @@ def test_uninstall_removes_the_bundle_the_logs_and_launchds_override(
     err_log.write_text("y")
     fake = _FakeLaunchd(loaded=False, launchd_disabled=True)
 
-    with patch.object(launch_agent.subprocess, "run", side_effect=fake):
+    with patch.object(launch_agent.spawn, "run", side_effect=fake):
         result = launch_agent.uninstall(home=home, uid=UID, backup_dir=data)
 
     assert ["launchctl", "enable", f"gui/{UID}/{launch_agent.LABEL}"] in fake.calls
@@ -908,7 +908,7 @@ def test_uninstall_removes_the_bundle_the_logs_and_launchds_override(
 def test_uninstall_leaves_launchds_override_alone_when_not_disabled(tmp_path):
     home, data = _homes(tmp_path)
     fake = _FakeLaunchd(loaded=False)
-    with patch.object(launch_agent.subprocess, "run", side_effect=fake):
+    with patch.object(launch_agent.spawn, "run", side_effect=fake):
         result = launch_agent.uninstall(home=home, uid=UID, backup_dir=data)
     assert "enable" not in fake.subcommands
     assert result["cleared_override"] is False
@@ -918,7 +918,7 @@ def test_uninstall_leaves_launchds_override_alone_when_not_disabled(tmp_path):
 def test_uninstall_reports_a_bundle_it_could_not_remove(tmp_path, monkeypatch):
     home, data = _homes(tmp_path)
     monkeypatch.setattr(app_bundle, "remove", lambda *a, **k: (_ for _ in ()).throw(OSError("busy")))
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
         result = launch_agent.uninstall(home=home, uid=UID, backup_dir=data)
     assert result["bundle_error"] == "busy"
@@ -948,7 +948,7 @@ def test_install_reports_a_profile_that_moved(tmp_path, monkeypatch):
     home, data = _homes(tmp_path)
     _login_plist(home, CLAUDE_CONFIG_DIR="/old/profile")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/new/profile")
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
         result = launch_agent.install(home=home, program=PROGRAM, uid=UID, backup_dir=data)
     assert result["profile_changes"] == [("CLAUDE_CONFIG_DIR", "/old/profile", "/new/profile")]
@@ -959,7 +959,7 @@ def test_install_reports_a_profile_that_moved(tmp_path, monkeypatch):
 def test_a_first_install_has_no_profile_to_compare_against(tmp_path, monkeypatch):
     home, data = _homes(tmp_path)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/new/profile")
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
         result = launch_agent.install(home=home, program=PROGRAM, uid=UID, backup_dir=data)
     assert result["profile_changes"] == []
@@ -994,7 +994,7 @@ def test_worker_build_is_stale_for_the_running_pids_own_older_stamp(tmp_path, mo
         "claude_swap.update_check.install_identity",
         lambda: {"version": "1.0.0", "source": None},
     )
-    with patch.object(launch_agent.subprocess, "run", side_effect=_FakeLaunchd()):
+    with patch.object(launch_agent.spawn, "run", side_effect=_FakeLaunchd()):
         assert launch_agent.worker_build_is_stale(4242, data) is True
 
 
@@ -1006,24 +1006,24 @@ def test_an_unstamped_worker_is_restarted_once_it_is_past_the_grace_period(tmp_p
     """
     _home, data = _homes(tmp_path)
     old = _FakeLaunchd(etime="05:00")
-    with patch.object(launch_agent.subprocess, "run", side_effect=old):
+    with patch.object(launch_agent.spawn, "run", side_effect=old):
         assert launch_agent.worker_build_is_stale(4242, data) is True
     # Someone else's stamp counts as no stamp of its own.
     _stamp(data, pid=4243, version="1.0.0")
-    with patch.object(launch_agent.subprocess, "run", side_effect=old):
+    with patch.object(launch_agent.spawn, "run", side_effect=old):
         assert launch_agent.worker_build_is_stale(4242, data) is True
 
 
 def test_an_unstamped_worker_still_starting_up_is_left_alone(tmp_path):
     _home, data = _homes(tmp_path)
     young = _FakeLaunchd(etime="00:10")
-    with patch.object(launch_agent.subprocess, "run", side_effect=young):
+    with patch.object(launch_agent.spawn, "run", side_effect=young):
         assert launch_agent.worker_build_is_stale(4242, data) is False
 
 
 def test_an_unstamped_worker_is_left_alone_when_ps_cannot_date_it(tmp_path):
     _home, data = _homes(tmp_path)
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.return_value = _completed(1)
         assert launch_agent.worker_build_is_stale(4242, data) is False
 
@@ -1037,7 +1037,7 @@ def test_an_unstamped_worker_is_not_restarted_when_no_stamp_could_be_written(tmp
     _home, data = _homes(tmp_path)
     data.chmod(0o500)
     try:
-        with patch.object(launch_agent.subprocess, "run", side_effect=_FakeLaunchd(etime="05:00")):
+        with patch.object(launch_agent.spawn, "run", side_effect=_FakeLaunchd(etime="05:00")):
             assert launch_agent.worker_build_is_stale(4242, data) is False
     finally:
         data.chmod(0o700)
@@ -1070,7 +1070,7 @@ def test_install_compares_against_the_session_plist_when_start_at_login_is_off(t
         launch_agent.build_plist(PROGRAM, home=home, env={"CLAUDE_CONFIG_DIR": "/old/profile"})
     )
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/new/profile")
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
         result = launch_agent.install(home=home, program=PROGRAM, uid=UID, backup_dir=data)
     assert result["profile_changes"] == [("CLAUDE_CONFIG_DIR", "/old/profile", "/new/profile")]
@@ -1128,7 +1128,7 @@ def test_status_reports_the_running_build_and_whether_it_is_stale(tmp_path, monk
         lambda: {"version": "1.0.0", "source": None},
     )
     fake = _FakeLaunchd(loaded=True, pid=4242)
-    with patch.object(launch_agent.subprocess, "run", side_effect=fake):
+    with patch.object(launch_agent.spawn, "run", side_effect=fake):
         result = launch_agent.status(home=home, uid=UID, backup_dir=data)
     assert result["running_build"] == "0.9.0 (abcdef0)"
     assert result["installed_build"] == "1.0.0"
@@ -1138,7 +1138,7 @@ def test_status_reports_the_running_build_and_whether_it_is_stale(tmp_path, monk
 def test_uninstall_removes_the_worker_stamp(tmp_path):
     home, data = _homes(tmp_path)
     stamp = _stamp(data, pid=1)
-    with patch.object(launch_agent.subprocess, "run") as run:
+    with patch.object(launch_agent.spawn, "run") as run:
         run.side_effect = _router({"print": _completed(1)})
         result = launch_agent.uninstall(home=home, uid=UID, backup_dir=data)
     assert not stamp.exists()

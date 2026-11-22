@@ -61,7 +61,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from claude_swap import macos_keychain, spawn, test_mode
+from claude_swap import macos_keychain, real_claude, test_mode
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
@@ -756,6 +756,7 @@ class SessionManager:
         share: bool = True,
         share_history: bool | None = None,
         require_session: bool = False,
+        *, binary: real_claude.RealClaude | None = None,
     ) -> NoReturn:
         """Launch Claude Code as the given account in the current terminal.
 
@@ -772,14 +773,13 @@ class SessionManager:
         Notices on the way are printed plainly. `cswap run` sends them to
         stderr, because stdout is claude's (``cli._run_launch``).
         """
+        backup_root = self.switcher.backup_dir
         if test_mode.active():
-            claude_bin = test_mode.check_launch(claude_args)
-        else:
-            claude_bin = shutil.which("claude")
-        if not claude_bin:
-            raise SessionError(
-                "'claude' was not found on PATH. Install Claude Code first."
+            binary = test_mode.check_launch(
+                claude_args, backup_root=backup_root, binary=binary
             )
+        elif binary is None:
+            binary = real_claude.resolve(backup_root=backup_root)
         # Resolved here for the fast path below, which never reaches
         # setup_session. setup_session is then handed the request, not the
         # answer: it resolves it the same way, and only the request says
@@ -791,7 +791,8 @@ class SessionManager:
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         if test_mode.active():
             test_mode.check_launch(
-                claude_args, session_dir_for(self.switcher.backup_dir, account_num, email)
+                claude_args, session_dir_for(backup_root, account_num, email),
+                backup_root=backup_root, binary=binary,
             )
         # Guard before the same-account direct-launch fast path below (which
         # _exec's claude and never returns) — and before setup_session.
@@ -848,7 +849,7 @@ class SessionManager:
             env = dict(os.environ)
             # Run on the default login, not on the preset profile.
             env.pop("CLAUDE_CONFIG_DIR", None)
-            self._exec(claude_bin, claude_args, env=env)
+            self._exec(binary, claude_args, env=env)
         if config_dir_preset:
             warning(
                 f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
@@ -863,7 +864,7 @@ class SessionManager:
             )
 
         session_dir, account_num, email = self.setup_session(
-            identifier, share, requested_history
+            identifier, share, requested_history, binary=binary
         )
 
         print(
@@ -874,7 +875,7 @@ class SessionManager:
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
-        self._exec(claude_bin, claude_args, env=env)
+        self._exec(binary, claude_args, env=env)
 
     def _history_on_the_fast_path(
         self, session_dir: Path, share_history: bool
@@ -996,7 +997,9 @@ class SessionManager:
             and expires_at <= time.time() * 1000
         )
 
-    def exec_default(self, claude_args: list[str]) -> NoReturn:
+    def exec_default(
+        self, claude_args: list[str], *, binary: real_claude.RealClaude | None = None
+    ) -> NoReturn:
         """Launch plain Claude Code with the current default login.
 
         Used by `cswap run` (no account) when the cwd has no mapping, or its
@@ -1009,22 +1012,25 @@ class SessionManager:
             raise test_mode.TestModeConfigError(
                 "cswap run invocation form: explicit account required"
             )
-        claude_bin = shutil.which("claude")
-        if not claude_bin:
-            raise SessionError(
-                "'claude' was not found on PATH. Install Claude Code first."
-            )
-        self._exec(claude_bin, claude_args, env=dict(os.environ))
+        if binary is None:
+            binary = real_claude.resolve(backup_root=self.switcher.backup_dir)
+        self._exec(binary, claude_args, env=dict(os.environ))
 
-    def _exec(self, claude_bin: str, claude_args: list[str], env: dict[str, str]) -> NoReturn:
+    def _exec(
+        self, claude_bin: real_claude.RealClaude, claude_args: list[str], env: dict[str, str]
+    ) -> NoReturn:
         """Check and pin the final test route, then hand over the terminal."""
         if test_mode.active():
             config_home = env.get("CLAUDE_CONFIG_DIR")
-            claude_bin = test_mode.check_launch(
-                claude_args, Path(config_home) if config_home else None
+            test_mode.check_launch(
+                claude_args, Path(config_home) if config_home else None,
+                backup_root=self.switcher.backup_dir, binary=claude_bin,
             )
             claude_args, env = test_mode.pinned_launch(claude_args, env)
-        spawn.handoff(claude_bin, claude_args, env)
+        try:
+            claude_bin.handoff(claude_args, env)
+        except OSError as exc:
+            raise real_claude.ResolveError(f"Could not launch {claude_bin.path}: {exc}") from exc
 
     def _ensure_not_api_key(self, account_num: str, email: str) -> None:
         """Reject API-key accounts in session mode (not supported yet).
@@ -1043,7 +1049,8 @@ class SessionManager:
     # -- bootstrap -------------------------------------------------------
 
     def setup_session(
-        self, identifier: str, share: bool, share_history: bool | None = None
+        self, identifier: str, share: bool, share_history: bool | None = None,
+        *, binary: real_claude.RealClaude | None = None,
     ) -> tuple[Path, str, str]:
         """Ensure a valid session profile exists; returns (dir, num, email).
 
@@ -1056,7 +1063,11 @@ class SessionManager:
         self._ensure_not_api_key(account_num, email)
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
         if test_mode.active():
-            test_mode.check_launch([], session_dir)
+            binary = test_mode.check_launch(
+                [], session_dir, backup_root=self.switcher.backup_dir, binary=binary,
+            )
+        elif binary is None:
+            binary = real_claude.resolve(backup_root=self.switcher.backup_dir)
 
         # Deferred invalidation: backup credentials changed while this profile
         # was live, so its credentials are presumed stale even if they still
@@ -1066,7 +1077,7 @@ class SessionManager:
         stale = is_session_stale(session_dir) and profile_is_quiescent(session_dir)
 
         # Cheap reuse check without the lock: most launches hit this.
-        if not stale and self._is_session_valid(session_dir, email, org_uuid):
+        if not stale and self._is_session_valid(session_dir, email, org_uuid, binary=binary):
             self._sync_sharing(session_dir, share, share_history)
             return session_dir, account_num, email
 
@@ -1150,7 +1161,7 @@ class SessionManager:
             if is_session_stale(session_dir) and profile_is_quiescent(session_dir):
                 self.switcher._invalidate_session_credentials(account_num, email)
                 clear_session_stale(session_dir)
-            if self._is_session_valid(session_dir, email, org_uuid):
+            if self._is_session_valid(session_dir, email, org_uuid, binary=binary):
                 # Valid, but possibly not on the generation WE just paid for.
                 # The consume above runs outside this lock (it POSTs), so a
                 # peer `cswap run` can bootstrap while we wait — and its
@@ -1181,7 +1192,7 @@ class SessionManager:
             self._bootstrap(session_dir, account_num, email, org_uuid)
             self._sync_sharing(session_dir, share, share_history)
 
-            verdict = self._session_validity(session_dir, email, org_uuid)
+            verdict = self._session_validity(session_dir, email, org_uuid, binary=binary)
             # NEITHER probe-failure verdict may reach `_cleanup_failed_session`
             # below: it deletes the Keychain entry and the whole directory, and
             # running it here would destroy a profile we never managed to look
@@ -1348,7 +1359,8 @@ class SessionManager:
     # -- validation ------------------------------------------------------
 
     def _session_validity(
-        self, session_dir: Path, email: str, org_uuid: str
+        self, session_dir: Path, email: str, org_uuid: str,
+        *, binary: real_claude.RealClaude | None = None,
     ) -> str:
         """``"valid"`` / ``"invalid"`` / ``"unknown"`` / ``"unreachable"``.
 
@@ -1374,20 +1386,19 @@ class SessionManager:
         """
         if not session_dir.is_dir():
             return "invalid"
-        # On Windows `claude` is a `.cmd` shim, and a bare "claude" passed to
-        # subprocess won't resolve it (PATHEXT isn't applied) — it raises
-        # FileNotFoundError. `shutil.which` finds the shim; when it finds
-        # nothing at all the run below still raises, and that is "unknown".
         probe_args = ["auth", "status", "--json"]
-        if test_mode.active():
-            claude_bin = test_mode.check_launch([], session_dir)
-            probe_args, env = test_mode.pinned_launch(probe_args, _probe_env(session_dir))
-        else:
-            claude_bin = shutil.which("claude") or "claude"
-            env = _probe_env(session_dir)
+        env = _probe_env(session_dir)
+        backup_root = self.switcher.backup_dir
         try:
-            result = spawn.run(
-                [claude_bin, *probe_args],
+            if test_mode.active():
+                binary = test_mode.check_launch(
+                    [], session_dir, backup_root=backup_root, binary=binary
+                )
+                probe_args, env = test_mode.pinned_launch(probe_args, env)
+            elif binary is None:
+                binary = real_claude.resolve(backup_root=backup_root)
+            result = binary.run(
+                probe_args,
                 env=env,
                 capture_output=True,
                 text=True,
@@ -1402,7 +1413,7 @@ class SessionManager:
             # profile is bad" the same value again, which is the conflation
             # this whole tri-state exists to undo.
             return "unknown"
-        except OSError:
+        except (OSError, real_claude.ResolveError):
             return "unreachable"
         if result.returncode != 0:
             return "invalid"
@@ -1427,7 +1438,10 @@ class SessionManager:
             return "invalid"
         return "valid"
 
-    def _is_session_valid(self, session_dir: Path, email: str, org_uuid: str) -> bool:
+    def _is_session_valid(
+        self, session_dir: Path, email: str, org_uuid: str,
+        *, binary: real_claude.RealClaude | None = None,
+    ) -> bool:
         """Whether the profile is usable as far as we can tell.
 
         Reuse-shaped view of :meth:`_session_validity`, and best-effort by
@@ -1449,7 +1463,7 @@ class SessionManager:
         difference between a correct cleanup and deleting a working profile,
         and this boolean cannot express it.
         """
-        verdict = self._session_validity(session_dir, email, org_uuid)
+        verdict = self._session_validity(session_dir, email, org_uuid, binary=binary)
         if verdict == "unknown":
             return _artifacts_say_usable(session_dir, email, org_uuid)
         return verdict == "valid"

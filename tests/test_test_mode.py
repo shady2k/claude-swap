@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from claude_swap import cli, paths, session, test_mode
+from claude_swap import cli, paths, real_claude, session, test_mode
 
 
 def test_default_mode_reaches_subprocess_without_stand_configuration():
@@ -44,7 +44,7 @@ def route(monkeypatch, tmp_path):
     fake.touch()
     managed = tmp_path / "managed-settings.json"
     monkeypatch.setattr(test_mode, "_managed_settings", lambda: managed)
-    monkeypatch.setattr(test_mode.shutil, "which", lambda name: str(fake))
+    monkeypatch.setattr(real_claude, "resolve", lambda **_: SimpleNamespace(path=fake))
     values = {
         test_mode.MODE: "1",
         test_mode.ENDPOINT: "https://api.mock.example",
@@ -68,7 +68,7 @@ def no_attempts(monkeypatch):
     for name in ("socket", "getaddrinfo", "gethostbyname"):
         monkeypatch.setattr(socket, name, reject)
     monkeypatch.setattr(subprocess, "Popen", reject)
-    monkeypatch.setattr(os, "execvpe", reject)
+    monkeypatch.setattr(os, "execve", reject)
     monkeypatch.setattr(os, "posix_spawn", reject, raising=False)
     yield
     assert not attempts
@@ -107,7 +107,8 @@ def test_f8_rejects_configuration(route, no_attempts, monkeypatch, capsys, key, 
 
 
 @pytest.mark.parametrize("source", ["user", "project", "local", "managed"])
-def test_f8_rejects_lower_layer(route, no_attempts, monkeypatch, capsys, source):
+@pytest.mark.parametrize("key", ["HTTPS_PROXY", "CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR"])
+def test_f8_rejects_lower_layer(route, no_attempts, monkeypatch, capsys, source, key):
     _, managed, _ = route
     file = {
         "user": paths.get_claude_config_home() / "settings.json",
@@ -116,8 +117,8 @@ def test_f8_rejects_lower_layer(route, no_attempts, monkeypatch, capsys, source)
         "managed": managed,
     }[source]
     file.parent.mkdir(parents=True, exist_ok=True)
-    file.write_text(json.dumps({"env": {"HTTPS_PROXY": "never-log-this"}}))
-    stderr = _check_cli(monkeypatch, capsys, ["run", "1"], f"{file}: env.HTTPS_PROXY")
+    file.write_text(json.dumps({"env": {key: "never-log-this"}}))
+    stderr = _check_cli(monkeypatch, capsys, ["run", "1"], f"{file}: env.{key}")
     assert "never-log-this" not in stderr
 
 
@@ -133,7 +134,6 @@ def test_f8_rejects_lower_layer(route, no_attempts, monkeypatch, capsys, source)
     (["run", "1", "--", "--print", "mcp"], "mcp"),
     (["run", "1", "--", "-p", "auth"], "auth"),
     (["run", "1", "--", "-p", "install"], "install"),
-    (["run", "1", "--", "-p", "other-command"], "other-command"),
     (["run", "1", "--", "--print", "--output-format", "json", "update"], "update"),
     (["run", "1", "--", "-p", "synthetic prompt", "update"], "update"),
     (["run", "1", "--", "update", "-p", "synthetic prompt"], "update"),
@@ -148,9 +148,41 @@ def test_f8_rejects_invocation_forms(route, no_attempts, monkeypatch, capsys, ar
     ["--resume"],
     ["--resume", "synthetic-session"],
     ["--print", "--output-format", "json", "synthetic prompt"],
+    ["--model", "auth", "synthetic prompt"],
+    ["-p", "oneword"],
+    ["--print", "--", "oneword"],
+    ["synthetic prompt"],
 ])
 def test_f8_accepts_stand_client_forms(route, no_attempts, args):
-    assert test_mode.check_launch(args) == str(route[0])
+    assert test_mode.check_launch(args).path == route[0]
+
+
+def test_preflight_binary_can_be_reused_for_checked_launch(route, no_attempts, monkeypatch):
+    binary = SimpleNamespace(path=route[0])
+    calls = []
+
+    def resolve(**kwargs):
+        calls.append(kwargs)
+        return binary
+
+    monkeypatch.setattr(real_claude, "resolve", resolve)
+    tail = ["-p", "hello"]
+    checked = test_mode.preflight(["run", "1", "--", *tail])
+    assert checked is binary
+    assert test_mode.check_launch(tail, binary=checked) is binary
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("verb", ["enable", "status", "disable"])
+def test_transparent_admin_checks_route_without_resolving_claude(route, no_attempts, monkeypatch, verb):
+    def cannot_resolve(**kwargs):
+        pytest.fail("admin preflight should not resolve claude")
+
+    monkeypatch.setattr(real_claude, "resolve", cannot_resolve)
+    test_mode.preflight(["transparent", verb])
+    monkeypatch.delenv(test_mode.ENDPOINT)
+    with pytest.raises(test_mode.TestModeConfigError, match=test_mode.ENDPOINT):
+        test_mode.preflight(["transparent", verb])
 
 
 def test_f8_cold_profile_pins_auth_probe_and_launch(route, monkeypatch):
@@ -170,8 +202,7 @@ def test_f8_cold_profile_pins_auth_probe_and_launch(route, monkeypatch):
     monkeypatch.setattr(manager, "_sync_sharing", lambda *_: None)
     calls = []
 
-    def record(binary, args, env):
-        assert binary == str(fake)
+    def record(args, env):
         assert args[0] == "--settings"
         pinned = {key: values[key] for key in (test_mode.CLAUDE_BASE, test_mode.PROXY)}
         assert json.loads(args[1]) == {"env": pinned}
@@ -180,8 +211,8 @@ def test_f8_cold_profile_pins_auth_probe_and_launch(route, monkeypatch):
         assert "ANTHROPIC_API_KEY" not in env
         calls.append(args[2:])
 
-    def probe(argv, *, env, **kwargs):
-        record(argv[0], argv[1:], env)
+    def probe(args, *, env, **kwargs):
+        record(args, env)
         return SimpleNamespace(returncode=0, stdout=json.dumps({
             "loggedIn": True, "authMethod": "claude.ai", "email": "synthetic@example.test",
         }))
@@ -189,17 +220,14 @@ def test_f8_cold_profile_pins_auth_probe_and_launch(route, monkeypatch):
     class Finished(Exception):
         pass
 
-    def launch(binary, argv, env):
-        record(binary, argv[1:], env)
+    def launch(args, env, **kwargs):
+        record(args, env)
         raise Finished
 
+    binary = SimpleNamespace(path=fake, run=probe, handoff=launch)
     monkeypatch.setenv("NO_PROXY", "*")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
-    monkeypatch.setattr(session.spawn, "run", probe)
-    if sys.platform == "win32":
-        monkeypatch.setattr(session.subprocess, "run", lambda argv, env: launch(argv[0], argv, env))
-    else:
-        monkeypatch.setattr(os, "execvpe", launch)
+    monkeypatch.setattr(real_claude, "resolve", lambda **_: binary)
     assert not profile.exists()
     with pytest.raises(Finished):
         manager.run("1", ["-p", "synthetic prompt"])

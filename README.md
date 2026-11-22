@@ -167,6 +167,8 @@ Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP ser
 
 </details>
 
+On POSIX, the [experimental PATH shim](docs/transparent.md) can intercept ordinary `claude` in the isolated test stand. No production build has been admitted for profile routing.
+
 <details>
 <summary>Map accounts to directories — auto-pick per repo</summary>
 

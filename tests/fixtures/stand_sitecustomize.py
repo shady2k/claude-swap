@@ -59,9 +59,38 @@ def install():
             return None
         return number
 
+    shim = policy["shim"]
+    shim_main = bool(shim and sys.orig_argv == [
+        policy["python"], "-I", "-m", "claude_swap.transparent",
+        f'--cswap-shim=0:{shim["dir"]}', *shim["argv"],
+    ])
+    shim_script = script_id(shim["script"]) if shim else None
+
     def safe_env(env):
         live = os.environ if env is None else env
         return live == policy["env"]
+
+    def shim_child_env(env):
+        return env == {**shim["child_env"], "CLAUDE_SWAP_LAUNCHED": str(os.getpid())}
+
+    def exec_shim_child(args):
+        path, argv, env = args
+        if not (shim_main and shim_script and path == shim["fake"] and shim_child_env(env)):
+            return False
+        if len(argv) < 3 or list(argv[:2]) != [path, "--settings"] or list(argv[3:]) != shim["argv"]:
+            return False
+        layer = Path(argv[2])
+        if not layer.is_absolute() or not layer.resolve().is_relative_to(shim["dir"]):
+            return False
+        try:
+            if hashlib.sha256(Path(path).read_bytes()).hexdigest() != shim["fake_digest"]:
+                return False
+        except OSError:
+            return False
+        if script_id(shim["script"]) != shim_script:
+            return False
+        record("exec", script=shim_script)
+        return True
 
     def hook(event, args):
         # Only detector controls may allocate an unconnected, non-raw
@@ -70,6 +99,8 @@ def install():
             _, family, kind, proto = args
             if family == socket.AF_INET and kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM) and proto == 0:
                 return
+        if event == "os.exec" and exec_shim_child(args):
+            return
         if event.startswith("socket.") or event in process_events:
             blocked(event)
         elif event in audit_events and not getattr(active_launch, "allowed", False):
@@ -111,11 +142,12 @@ def install():
 
     sys.addaudithook(hook)
     subprocess.Popen = StandPopen
-    number = script_id(sys.argv[0])
+    number = 0 if shim_main else script_id(sys.argv[0])
+    env_ok = shim_child_env(os.environ) if shim_script and number == shim_script else safe_env(None)
     if (
         not sys.flags.isolated or not sys.flags.ignore_environment or not sys.flags.no_user_site
         or os.path.normcase(sys.executable) != os.path.normcase(policy["python"])
-        or number is None or not safe_env(None)
+        or number is None or not env_ok
     ):
         blocked("startup")
     sys.path.insert(0, policy["source"])

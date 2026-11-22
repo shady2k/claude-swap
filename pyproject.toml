@@ -37,6 +37,7 @@ Issues = "https://github.com/realiti4/claude-swap/issues"
 [project.scripts]
 claude-swap = "claude_swap.cli:main"
 cswap = "claude_swap.cli:main"
+cswap-shim = "claude_swap.transparent:main"
 
 [build-system]
 requires = ["hatchling"]

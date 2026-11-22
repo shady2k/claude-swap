@@ -115,6 +115,39 @@ def test_f17v_blocked_escape_in_grandchild_is_a_detected_attempt(tmp_path, call,
         stand.assert_clean()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows shim not admitted before launcher verification")
+@pytest.mark.parametrize(("call", "event"), [
+    ("print('synthetic Claude')", None),
+    ("socket.socket(socket.AF_INET, socket.SOCK_DGRAM).bind(('127.0.0.1', 0))", "socket.bind"),
+    ("socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b'data', ('127.0.0.1', 9))", "socket.sendto"),
+    ("socket.socket().connect(('192.0.2.1', 443))", "socket.connect"),
+    ("socket.getaddrinfo('audit-escape.invalid', 443)", "socket.getaddrinfo"),
+    ("subprocess.Popen(['/not-allowlisted', 'probe'])", "subprocess.Popen"),
+])
+def test_f20_audits_plain_claude_through_the_installed_shim(tmp_path, call, event):
+    stand = StandAudit(tmp_path, probe_socket_operations=True)
+    installer = _script(tmp_path, "installer.py", """
+        import runpy
+        import sys
+
+        sys.argv[:] = ["cswap", "transparent", "enable"]
+        runpy.run_module("claude_swap", run_name="__main__", alter_sys=True)
+    """)
+    result = stand.run_shim(installer, "import socket, subprocess\n" + call, "--", "prompt")
+    records = stand.records()
+    assert [r["kind"] for r in records[:4]] == ["startup", "startup", "exec", "startup"], result.stderr
+    assert records[1]["pid"] == records[2]["pid"] == records[3]["pid"]
+    if event is None:
+        stand.assert_clean()
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "synthetic Claude" and not result.stderr
+    else:
+        assert result.returncode != 0 and not result.stdout
+        assert records[-1]["event"] == event
+        with pytest.raises(AssertionError, match="stand blocked"):
+            stand.assert_clean()
+
+
 @pytest.mark.parametrize(("call", "event"), [
     ("socket.socket()", "socket.__new__"),
     ("socket.socket(socket.AF_INET, socket.SOCK_DGRAM).bind(('127.0.0.1', 0))", "socket.bind"),

@@ -369,7 +369,7 @@ class TestSessionGuard:
 
     def test_run_rejects_before_exec(self, temp_home: Path, monkeypatch):
         mgr = SessionManager(self._seed_api_key_account())
-        monkeypatch.setattr(session_mod.shutil, "which", lambda name: "/fake/claude")
+        monkeypatch.setattr(session_mod.real_claude, "resolve", lambda **kwargs: object())
         with pytest.raises(SessionError, match="does not support API-key accounts"):
             mgr.run("2", [], share=True)
 

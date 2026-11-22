@@ -193,6 +193,24 @@ def seeded_switcher(temp_home: Path, macos_platform) -> ClaudeAccountSwitcher:
     return switcher
 
 
+class _ClaudeStub:
+    path = "/fake/bin/claude"
+
+    def run(self, args, **kwargs):
+        from claude_swap import spawn
+
+        return spawn.run([self.path, *args], **kwargs)
+
+
+def _not_found(**kwargs):
+    raise session_mod.real_claude.ResolveError("not found on PATH")
+
+
+@pytest.fixture(autouse=True)
+def _stub_claude_resolution(monkeypatch):
+    monkeypatch.setattr(session_mod.real_claude, "resolve", lambda **kwargs: _ClaudeStub())
+
+
 @pytest.fixture
 def manager(seeded_switcher) -> SessionManager:
     return SessionManager(seeded_switcher)
@@ -910,14 +928,10 @@ class TestIsSessionValid:
     def test_invokes_pathext_resolved_launcher(
         self, manager, tmp_path, monkeypatch, valid_payload
     ):
-        """The probe must call the resolved launcher, not bare "claude".
-
-        On Windows `claude` is a `.cmd` shim that a bare "claude" won't
-        resolve, so validation would always fail. Use shutil.which instead.
-        """
+        """The probe must call the resolved launcher, not bare "claude"."""
         tmp_path.mkdir(exist_ok=True)
         resolved = "/fake/bin/claude.CMD"
-        monkeypatch.setattr(session_mod.shutil, "which", lambda name: resolved)
+        monkeypatch.setattr(_ClaudeStub, "path", resolved)
         seen_argv = {}
 
         def capture_run(argv, *a, **k):
@@ -1601,31 +1615,34 @@ class _ExecCalled(Exception):
 
 @pytest.fixture
 def capture_exec(monkeypatch):
-    # Patch the handoff at the _exec() seam rather than the primitive beneath
-    # it: _exec() dispatches to os.execvpe on POSIX but subprocess.run on
-    # Windows, and patching subprocess.run here would also swallow the
-    # `claude auth status` probe that some of these tests stub separately.
+    # Leave the separate auth status probe fixture in control of probe results.
     def fake_exec(self, claude_bin, claude_args, env):
-        raise _ExecCalled(claude_bin, [claude_bin, *claude_args], env)
+        raise _ExecCalled(claude_bin.path, [claude_bin.path, *claude_args], env)
 
     monkeypatch.setattr(session_mod.SessionManager, "_exec", fake_exec)
-    monkeypatch.setattr(
-        session_mod.shutil, "which", lambda name: f"/fake/bin/{name}"
-    )
 
 
 class TestRun:
     def test_claude_not_on_path(self, manager, monkeypatch):
-        monkeypatch.setattr(session_mod.shutil, "which", lambda name: None)
+        monkeypatch.setattr(session_mod.real_claude, "resolve", _not_found)
         with pytest.raises(SessionError, match="not found on PATH"):
             manager.run("2", [])
 
     def test_exec_env_and_forwarded_args(
-        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates, monkeypatch
     ):
+        calls = []
+
+        def resolve(**kwargs):
+            calls.append(kwargs["backup_root"])
+            return _ClaudeStub()
+
+        monkeypatch.setattr(session_mod.real_claude, "resolve", resolve)
         with pytest.raises(_ExecCalled) as exc:
             manager.run("2", ["--resume", "--model", "x"])
 
+        assert calls == [manager.switcher.backup_dir]
+        assert auth_status_tracks_seed
         call = exc.value
         assert call.binary == "/fake/bin/claude"
         assert call.argv == ["/fake/bin/claude", "--resume", "--model", "x"]
@@ -1855,43 +1872,20 @@ class TestRun:
         assert exc.value.env["ANTHROPIC_API_KEY"] == "sk-ant-key"
 
     def test_exec_default_claude_not_on_path(self, manager, monkeypatch):
-        monkeypatch.setattr(session_mod.shutil, "which", lambda name: None)
+        monkeypatch.setattr(session_mod.real_claude, "resolve", _not_found)
         with pytest.raises(SessionError, match="not found on PATH"):
             manager.exec_default([])
 
 
 class TestExec:
-    """The _exec() terminal handoff dispatches per-platform (runs on any host)."""
+    def test_session_hands_off_to_the_resolved_binary(self, manager):
+        def handoff(args, env):
+            raise _ExecCalled("real", args, env)
 
-    def test_posix_replaces_process_with_execvpe(self, manager, monkeypatch):
-        def fake_execvpe(binary, argv, env):
-            # os.execvpe never returns; raising models that (and lets _exec's
-            # "unreachable" guard stay unhit, as it would be in real life).
-            raise _ExecCalled(binary, argv, env)
-
-        monkeypatch.setattr(session_mod.sys, "platform", "linux")
-        monkeypatch.setattr(session_mod.os, "execvpe", fake_execvpe)
+        child = SimpleNamespace(handoff=handoff)
         with pytest.raises(_ExecCalled) as exc:
-            manager._exec("/bin/claude", ["--resume"], {"A": "B"})
-        assert (exc.value.binary, exc.value.argv, exc.value.env) == (
-            "/bin/claude",
-            ["/bin/claude", "--resume"],
-            {"A": "B"},
-        )
-
-    def test_windows_runs_subprocess_and_mirrors_exit_code(self, manager, monkeypatch):
-        seen = {}
-
-        def fake_run(argv, env=None, **kwargs):
-            seen["call"] = (argv, env)
-            return SimpleNamespace(returncode=7)
-
-        monkeypatch.setattr(session_mod.sys, "platform", "win32")
-        monkeypatch.setattr(session_mod.subprocess, "run", fake_run)
-        with pytest.raises(SystemExit) as exc:
-            manager._exec("/bin/claude", ["--resume"], {"A": "B"})
-        assert exc.value.code == 7
-        assert seen["call"] == (["/bin/claude", "--resume"], {"A": "B"})
+            manager._exec(child, ["--resume"], {"A": "B"})
+        assert (exc.value.argv, exc.value.env) == (["--resume"], {"A": "B"})
 
 
 # ---------------------------------------------------------------------------
@@ -3722,10 +3716,6 @@ class TestShareHistoryWindows:
 
     def test_run_accepts_the_flag(self, win_history, monkeypatch):
         source, session_dir, mgr = win_history
-        monkeypatch.setattr(
-            session_mod.shutil, "which", lambda _name: "/usr/bin/claude"
-        )
-
         def past_the_resolver(_identifier):
             raise RuntimeError("resolved: the launch goes on")
 
@@ -4122,7 +4112,7 @@ class TestShareHistoryDecision:
         manager.switcher.platform = Platform.WINDOWS
         handed_over = []
 
-        def setup_session(identifier, share, share_history=None):
+        def setup_session(identifier, share, share_history=None, *, binary=None):
             handed_over.append(share_history)
             raise SessionError("stop here")
 
@@ -5233,7 +5223,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         # hits — on a profile seeded BEFORE our rotation.
         calls = {"n": 0}
 
-        def peer_bootstraps_while_we_wait(self, sdir, email, org_uuid):
+        def peer_bootstraps_while_we_wait(self, sdir, email, org_uuid, *, binary=None):
             calls["n"] += 1
             if calls["n"] == 1:
                 return False  # pre-lock: nothing there yet
@@ -5282,7 +5272,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
 
         calls = {"n": 0}
 
-        def peer_bootstraps_while_we_wait(self, sdir, email, org_uuid):
+        def peer_bootstraps_while_we_wait(self, sdir, email, org_uuid, *, binary=None):
             calls["n"] += 1
             if calls["n"] == 1:
                 return False
