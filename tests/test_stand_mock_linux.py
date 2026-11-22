@@ -6,6 +6,7 @@ import sys
 
 import pytest
 
+from claude_swap.test_mode import ENDPOINT
 from tests import stand_mock as mock
 
 if sys.platform != "linux":
@@ -48,14 +49,26 @@ def test_mock_control_hosts_mapping_stops_before_network(linux_stand):
     assert "hosts file contains a mapping" in result.stderr
 
 
-def test_mock_positive_https_through_connect(linux_stand):
+@pytest.mark.parametrize("scenario", ["missing_endpoint", "malformed_endpoint"])
+def test_cli_rejects_test_endpoint_before_network(linux_stand, scenario):
+    result = linux_stand.run("stand_mock", scenario)
+    result.require_clean()
+    assert result.attempts == ()
+    assert result.returncode == 4, result.stderr
+    assert result.stdout == ""
+    assert f"TestModeConfigError: {ENDPOINT}:" in result.stderr
+    assert "HTTPS origin" in result.stderr
+
+
+@pytest.mark.parametrize("scenario", ["positive", "cli_positive"])
+def test_mock_positive_https_through_connect(linux_stand, scenario):
     result, journal = _run(
-        linux_stand, "positive", server_allowed={mock.ORIGIN}, client_allowed={mock.PROXY},
+        linux_stand, scenario, server_allowed={mock.ORIGIN}, client_allowed={mock.PROXY},
     )
     assert result.returncode == 0, result.stderr
     connects = [attempt for attempt in result.attempts if attempt.syscall == "connect"]
     assert {(attempt.role, attempt.target) for attempt in connects} == {
-        (("stand_mock", "client", "positive"), mock.PROXY),
+        (("stand_mock", "client", scenario), mock.PROXY),
         (("stand_mock", "serve"), mock.ORIGIN),
     }
     assert len(connects) == len({attempt.pid for attempt in connects}) == 2

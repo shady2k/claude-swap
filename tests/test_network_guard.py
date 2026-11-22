@@ -5,13 +5,12 @@ from __future__ import annotations
 
 import os
 import socket
-import urllib.error
 import urllib.request
 from unittest.mock import patch
 
 import pytest
 
-from claude_swap import oauth
+from claude_swap import oauth, test_mode
 from tests.test_cli import _subprocess_env
 
 
@@ -49,6 +48,6 @@ def test_the_suite_never_reaches_the_vendors_usage_api(monkeypatch):
         raise OSError("lookup refused")
 
     monkeypatch.setattr("socket.getaddrinfo", refuse)
-    with pytest.raises(urllib.error.URLError):
+    with pytest.raises(test_mode.TestModeConfigError, match=test_mode.ENDPOINT):
         oauth.request_usage_data("sk-x")
     assert lookups == []

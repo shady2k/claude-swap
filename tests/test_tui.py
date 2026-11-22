@@ -27,6 +27,9 @@ from claude_swap.tui import data as tui_data
 from claude_swap.usage_store import UsageEntry
 
 
+pytestmark = pytest.mark.mock_stand_routing
+
+
 # ---------------------------------------------------------------------------
 # Builders
 # ---------------------------------------------------------------------------

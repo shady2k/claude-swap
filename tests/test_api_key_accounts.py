@@ -39,6 +39,9 @@ from claude_swap.session import SessionManager
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.transfer import export_accounts, import_accounts
 
+
+pytestmark = pytest.mark.mock_stand_routing
+
 API_KEY = "sk-ant-api03-" + "a1b2c3d4e5" * 4  # 53 chars
 OTHER_KEY = "sk-ant-api03-" + "z9y8x7w6v5" * 4
 # The Console also issues identity-backed keys under other family prefixes — a

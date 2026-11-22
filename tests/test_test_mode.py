@@ -13,6 +13,26 @@ import pytest
 from claude_swap import cli, paths, session, test_mode
 
 
+def test_default_mode_reaches_subprocess_without_stand_configuration():
+    assert test_mode.active()
+    assert test_mode.ENDPOINT not in os.environ
+    parent_home = Path.home()
+    script = """
+from pathlib import Path
+import os
+from claude_swap import test_mode
+assert test_mode.active()
+assert test_mode.ENDPOINT not in os.environ
+assert Path.home() == Path(os.environ['HOME'])
+print(Path.home())
+"""
+    child = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=30,
+    )
+    assert child.returncode == 0, child.stderr
+    assert Path(child.stdout.strip()) == parent_home
+
+
 @pytest.fixture
 def route(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)

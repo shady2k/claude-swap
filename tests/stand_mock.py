@@ -7,12 +7,14 @@ The HTTPS listener records and closes connections without the preamble.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+import base64
+from contextlib import chdir, contextmanager
 import http.client
 from http.server import BaseHTTPRequestHandler
 import json
 import os
 from pathlib import Path
+import runpy
 import secrets
 import select
 import socket
@@ -22,6 +24,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+from unittest.mock import patch
 from urllib.request import Request
 
 HOST = "api.mock.example"
@@ -203,19 +207,136 @@ def _serve():
             yield ca, records
 
 
-def _positive(ca: Path) -> dict:
+def _https_probe() -> dict:
     from claude_swap import test_mode
 
-    os.environ.update({
-        test_mode.MODE: "1",
-        test_mode.ENDPOINT: BASE,
-        test_mode.CLAUDE_BASE: BASE,
-        test_mode.PROXY: f"http://{PROXY[0]}:{PROXY[1]}",
-        test_mode.CA: str(ca),
-    })
     request = Request(test_mode.service_url(f"https://unused.invalid{PROBE}"))
     with test_mode.open_service(request, timeout=TIMEOUT) as response:
         return json.load(response)
+
+
+def _configure_route(ca: Path | None = None) -> None:
+    from claude_swap import test_mode
+
+    os.environ.update({
+        test_mode.ENDPOINT: BASE,
+        test_mode.CLAUDE_BASE: BASE,
+        test_mode.PROXY: f"http://{PROXY[0]}:{PROXY[1]}",
+    })
+    if ca is not None:
+        os.environ[test_mode.CA] = str(ca)
+
+
+def _fake_claude_path() -> str:
+    from claude_swap import test_mode
+
+    claude = Path(os.environ["PATH"]) / "claude"
+    claude.write_text("#!/bin/sh\nexit 99\n", encoding="ascii")
+    claude.chmod(0o700)
+    os.environ[test_mode.ALLOW] = str(claude)
+    return str(claude)
+
+
+PRINT_ARGS = ["-p", "synthetic prompt"]
+
+
+def _run_cli(*options: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="stand-cli-") as directory, chdir(directory):
+        sys.argv = ["cswap", "run", "1", *options, "--", *PRINT_ARGS]
+        runpy.run_module("claude_swap", run_name="__main__", alter_sys=True)
+
+
+def _cli_endpoint_control(scenario: str) -> None:
+    from claude_swap import test_mode
+
+    _check_stand()
+    _configure_route()
+    _fake_claude_path()
+    if scenario == "malformed_endpoint":
+        os.environ[test_mode.ENDPOINT] = f"http://{HOST}"
+    else:
+        del os.environ[test_mode.ENDPOINT]
+    _run_cli()
+
+
+def _cli_positive(ca: Path) -> dict:
+    from claude_swap import paths, session, spawn, test_mode
+
+    _configure_route(ca)
+    claude = _fake_claude_path()
+    # This privileged worker already passed the network and mount namespace checks.
+    os.environ["CONTAINER"] = "cswap-test-stand"
+    os.environ["NO_PROXY"] = "*"
+    os.environ["ANTHROPIC_API_KEY"] = "unused-synthetic-override"
+
+    email = "account@example.test"
+    backup = paths.get_backup_root()
+    assert backup.is_relative_to(Path(os.environ["CSWAP_STAND_ROOT"]))
+    (backup / "configs").mkdir(parents=True)
+    (backup / "credentials").mkdir()
+    credentials = json.dumps({"claudeAiOauth": {
+        "accessToken": "synthetic-access-token",
+        "expiresAt": int((time.time() + 3600) * 1000),
+    }})
+    (backup / "credentials" / f".creds-1-{email}.enc").write_bytes(
+        base64.b64encode(credentials.encode("utf-8"))
+    )
+    identity = {"emailAddress": email, "organizationUuid": ""}
+    (backup / "configs" / f".claude-config-1-{email}.json").write_text(
+        json.dumps({"oauthAccount": identity}), encoding="utf-8",
+    )
+    (backup / "sequence.json").write_text(json.dumps({"accounts": {
+        "1": {"email": email, "organizationUuid": ""},
+    }}), encoding="utf-8")
+    profile = session.session_dir_for(backup, "1", email)
+    assert not profile.exists()
+
+    pinned = {
+        test_mode.CLAUDE_BASE: BASE,
+        test_mode.PROXY: f"http://{PROXY[0]}:{PROXY[1]}",
+        "NODE_EXTRA_CA_CERTS": str(ca),
+    }
+    auth_checked = False
+    response = None
+
+    def check_launch(argv, env, args):
+        assert argv[:2] == [claude, "--settings"]
+        assert json.loads(argv[2]) == {"env": pinned}
+        assert argv[3:] == args
+        assert all(env[key] == value for key, value in pinned.items())
+        assert "NO_PROXY" not in env and "ANTHROPIC_API_KEY" not in env
+        assert env["CLAUDE_CONFIG_DIR"] == str(profile)
+        assert (profile / ".credentials.json").read_text(encoding="utf-8") == credentials
+        assert json.loads((profile / ".claude.json").read_text(encoding="utf-8"))[
+            "oauthAccount"
+        ] == identity
+
+    def auth_status(argv, *, env, **kwargs):
+        nonlocal auth_checked
+        check_launch(argv, env, ["auth", "status", "--json"])
+        auth_checked = True
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({
+            "loggedIn": True, "authMethod": "claude.ai", "email": email,
+        }))
+
+    def final_exec(binary, argv, env):
+        nonlocal response
+        assert binary == claude and auth_checked
+        check_launch(argv, env, PRINT_ARGS)
+        # Exercise the synthetic HTTPS path under the environment that the
+        # real CLI prepared, without relaxing the native exec allowlist.
+        with patch.dict(os.environ, env, clear=True):
+            response = _https_probe()
+        raise SystemExit(0)
+
+    with patch.object(spawn, "run", auth_status), patch.object(os, "execvpe", final_exec):
+        try:
+            _run_cli("--no-share", "--no-share-history", "--require-session")
+        except SystemExit as exc:
+            if exc.code != 0:
+                raise
+    assert response is not None, "CLI did not reach the fake Claude launch"
+    return response
 
 
 def _attempt_direct(ca: Path) -> None:
@@ -251,7 +372,10 @@ def _client_worker(scenario: str) -> int:
     ca = Path(sys.stdin.readline().strip())
     response = None
     if scenario == "positive":
-        response = _positive(ca)
+        _configure_route(ca)
+        response = _https_probe()
+    elif scenario == "cli_positive":
+        response = _cli_positive(ca)
     elif scenario == "direct":
         _attempt_direct(ca)
     elif scenario == "denied_connect":
@@ -293,7 +417,12 @@ if __name__ == "__main__":
             sys.exit(_serve_worker())
         if sys.argv[1:2] == ["client"]:
             sys.exit(_client_worker(sys.argv[2]))
-        sys.exit(main(sys.argv[1]))
+        from tests.stand_linux import MOCK_CLI_CONTROLS
+
+        if sys.argv[1] in MOCK_CLI_CONTROLS:
+            _cli_endpoint_control(sys.argv[1])
+        else:
+            sys.exit(main(sys.argv[1]))
     except HostsPreflightError as exc:
         print(exc, file=sys.stderr)
         sys.exit(4)

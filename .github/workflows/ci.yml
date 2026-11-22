@@ -27,6 +27,19 @@ jobs:
       - name: Run tests
         run: uv run pytest
 
+      - name: Install isolated stand tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iproute2 openssl strace util-linux
+
+      - name: Run isolated Linux stand
+        # The stand creates fresh network and mount namespaces for each
+        # scenario. Use sudo only for this suite, not the regular tests.
+        run: >-
+          sudo -n -H env CSWAP_TEST_STAND=1 CSWAP_TEST_STAND_REQUIRED=1
+          .venv/bin/python -m pytest -n 0 -vv -p tests.required_stand
+          tests/test_stand_linux.py tests/test_stand_mock_linux.py
+
   test-windows:
     runs-on: windows-latest
 

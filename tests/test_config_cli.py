@@ -12,6 +12,9 @@ import pytest
 from claude_swap import cli
 
 
+pytestmark = pytest.mark.mock_stand_routing
+
+
 def _run(argv: list[str], capsys) -> tuple[int, str, str]:
     """Run `cswap config <argv>`; returns (exit_code, stdout, stderr).
 

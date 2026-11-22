@@ -27,9 +27,10 @@ TIMEOUT = 30  # seconds, including setup, tracing and test execution
 
 Role = tuple[str, ...]  # Fixed module and arguments, identified by execve.
 Target = tuple[str, int]
-MOCK_SCENARIOS = ("positive", "direct", "denied_connect")
+MOCK_SCENARIOS = ("positive", "cli_positive", "direct", "denied_connect")
+MOCK_CLI_CONTROLS = ("missing_endpoint", "malformed_endpoint")
 ROOT_ROLES = {
-    *(("stand_mock", scenario) for scenario in MOCK_SCENARIOS),
+    *(("stand_mock", scenario) for scenario in (*MOCK_SCENARIOS, *MOCK_CLI_CONTROLS)),
     *(("stand_linux_control", name) for name in ("normal", "dns", "failed")),
 }
 
@@ -167,13 +168,23 @@ def _worker(module: str, args: list[str]) -> None:
         set(),
     )
 
+    blocked_resolver = None
+
     def restrict_worker(event: str, values: tuple) -> None:
-        # Mock workers get a preventive Python gate as well as the syscall
-        # detector. The standalone controls deliberately exercise strace alone.
-        if module == "stand_mock" and event == "socket.connect":
-            _, address = values
-            if not isinstance(address, tuple) or address[:2] not in destinations:
-                raise StandError(f"stand connect destination not allowed for {role!r}")
+        nonlocal blocked_resolver
+        # Mock workers use numeric addresses and must never ask the resolver.
+        # The standalone controls deliberately exercise strace alone.
+        if module == "stand_mock":
+            if event in {
+                "socket.getaddrinfo", "socket.gethostbyname", "socket.gethostbyaddr",
+                "socket.getnameinfo",
+            }:
+                blocked_resolver = event
+                raise StandError(f"stand resolver call not allowed for {role!r}: {event}")
+            if event == "socket.connect":
+                _, address = values
+                if not isinstance(address, tuple) or address[:2] not in destinations:
+                    raise StandError(f"stand connect destination not allowed for {role!r}")
         if event == "subprocess.Popen":
             executable, argv, _cwd, _env = values
             if (
@@ -189,7 +200,12 @@ def _worker(module: str, args: list[str]) -> None:
 
     sys.addaudithook(restrict_worker)
     sys.argv = [f"tests.{module}", *args]
-    runpy.run_module(f"tests.{module}", run_name="__main__")
+    try:
+        runpy.run_module(f"tests.{module}", run_name="__main__")
+    finally:
+        if blocked_resolver is not None:
+            # A caught refusal is still an attempted lookup.
+            raise StandError(f"stand blocked resolver call: {blocked_resolver}") from None
 
 
 @dataclass(frozen=True)

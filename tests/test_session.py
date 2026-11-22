@@ -57,6 +57,9 @@ from claude_swap.session import (
 from claude_swap.settings import set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 
+
+pytestmark = pytest.mark.mock_stand_routing
+
 ACCOUNT_EMAIL = "account2@example.com"
 ACCOUNT_NUM = "2"
 ORG_UUID = "org-uuid-2"

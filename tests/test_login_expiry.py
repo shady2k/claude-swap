@@ -23,6 +23,9 @@ from claude_swap.usage_store import UsageEntry
 
 from tests.test_tui import FakeSwitcher, fake_engine, make_account, make_app, make_entry
 
+
+pytestmark = pytest.mark.mock_stand_routing
+
 NOW = 1_000_000.0
 DAY = 86400
 DUE = 5 * DAY + 12 * 3600 + 30  # "5d 12h" (with 30 s for the render to happen in)

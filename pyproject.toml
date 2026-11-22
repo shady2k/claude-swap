@@ -62,6 +62,7 @@ pythonpath = ["src"]
 addopts = "-n auto --dist loadgroup"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
+    "mock_stand_routing: test ordinary behavior with test-mode routing mocked in-process (network and storage guards remain active)",
     "no_keychain_fake: opt out of the autouse in-memory Keychain guard (test mocks subprocess itself, or runs against a temp keychain on GitHub Actions)",
     "no_oauth_profile_fake: opt out of the autouse fetch_oauth_profile stub (test exercises fetch_oauth_profile itself against a mocked urlopen)",
 ]
