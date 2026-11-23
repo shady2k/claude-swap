@@ -63,6 +63,7 @@ def configuration(label: str, directory: Path, detached: bool) -> dict:
                              "--target", str(directory), str(int(detached))],
         "RunAtLoad": True,
         "KeepAlive": False,
+        "LaunchOnlyOnce": True,
         "AbandonProcessGroup": False,
         "EnvironmentVariables": {"HOME": str(directory / "home"),
                                  "PATH": "/usr/bin:/bin"},

@@ -23,6 +23,7 @@ def test_probe_refuses_other_platform_before_launch(tmp_path, monkeypatch):
 def test_job_configuration_is_single_run_synthetic_and_isolated(tmp_path):
     config = probe.configuration("unique-test-label", tmp_path, True)
     assert config["KeepAlive"] is False
+    assert config["LaunchOnlyOnce"] is True
     assert config["AbandonProcessGroup"] is False
     assert config["EnvironmentVariables"] == {
         "HOME": str(tmp_path / "home"), "PATH": "/usr/bin:/bin"}
