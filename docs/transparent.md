@@ -17,14 +17,22 @@ profile before reuse or preparation. Reservations and `profileGen` live under
 (including auto-switch), and replacement import refuse affected busy slots even
 when disabled or removed from the transparent pool.
 
-Explicit account launches also require build and invocation admission before
-reuse, including when the shim is disabled. No production build is admitted.
+Isolated explicit account launches also require build and invocation admission
+before reuse, including when the shim is disabled. A launch using the unchanged
+default login does not prepare an isolated profile. No production build is admitted.
 Only the isolated synthetic Linux route can publish a running reservation.
-A running reservation is retained until its owner explicitly confirms complete
-termination; a PID disappearing is not evidence that successors have exited.
-Automatic completion/reclamation is not implemented. Consequently a published
-record remains busy after process exit, and non-Linux publication fails closed.
-These restrictions make this ownership implementation incomplete for normal use.
+Linux launches use a dedicated single-threaded subreaper supervisor. The
+reservation is released only after it has reaped the leader and all descendants,
+including descendants that change session. A failed handoff also releases it
+once the tree is empty. Supervisor death or an uncertain wait leaves it busy;
+a PID disappearing alone does not prove completion. Non-Linux publication
+fails closed; Windows job completion is not verified.
+
+Invalidation, deletion and backup credential changes advance the external
+profile generation, including for disabled accounts outside the pool. Purge
+refuses busy or unknown owners and keeps ownership records, generation
+tombstones and the account lock file. These restrictions still leave production
+build admission and non-Linux lifecycle support incomplete.
 
 ## Shared history consent
 

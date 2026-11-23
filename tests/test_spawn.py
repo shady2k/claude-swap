@@ -479,3 +479,143 @@ print("SPAWN-DONE", file=sys.stderr, flush=True)
             pytest.skip("libmalloc's fork hook did not arm on this macOS")
         assert "SPAWN-DONE" in fixed
         assert "MallocStackLogging" not in fixed, fixed
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux subreaper supervision")
+def test_supervision_waits_for_detached_descendant(tmp_path):
+    marker = tmp_path / "finished"
+    code = r"""
+import os, sys, time
+from claude_swap import spawn
+marker = sys.argv[1]
+def launch():
+    if os.fork() == 0:
+        os.setsid()
+        time.sleep(0.15)
+        with open(marker, "w") as stream:
+            stream.write("complete")
+        os._exit(0)
+    os._exit(7)
+assert spawn.supervise(launch) == 7
+assert os.path.exists(marker), "returned with a descendant still live"
+"""
+    result = subprocess.run([sys.executable, "-c", code, str(marker)],
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux subreaper supervision")
+def test_supervision_exec_failure_confirms_empty_tree():
+    code = r"""
+import os
+from claude_swap import spawn
+def launch():
+    os.execve("/no/such/cswap-synthetic-executable", ["missing"], {})
+assert spawn.supervise(launch) == 127
+"""
+    result = subprocess.run([sys.executable, "-c", code],
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+def test_supervision_rejects_unsupported_platform(monkeypatch):
+    monkeypatch.setattr(spawn.sys, "platform", "darwin")
+    with pytest.raises(OSError, match="supervision"):
+        spawn.require_supervision()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux subreaper supervision")
+def test_supervision_failed_fork_confirms_no_child():
+    code = r"""
+from claude_swap import spawn
+def failed_fork():
+    raise OSError("synthetic fork failure")
+spawn.os.fork = failed_fork
+assert spawn.supervise(lambda: None) == 127
+"""
+    result = subprocess.run([sys.executable, "-c", code],
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux subreaper supervision")
+def test_supervision_rejects_existing_children():
+    code = r"""
+import os, signal
+from claude_swap import spawn
+pid = os.fork()
+if pid == 0:
+    signal.pause()
+    os._exit(0)
+try:
+    try:
+        spawn.require_supervision()
+    except OSError:
+        pass
+    else:
+        raise AssertionError("accepted existing children")
+finally:
+    os.kill(pid, signal.SIGKILL)
+    os.waitpid(pid, 0)
+"""
+    result = subprocess.run([sys.executable, "-c", code],
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux subreaper supervision")
+def test_supervisor_forwards_sigterm_to_child(tmp_path):
+    code = r"""
+import os, signal, sys
+from pathlib import Path
+from claude_swap import spawn
+ready = Path(sys.argv[1])
+# Blocking before fork prevents a delivery race while installing the child's
+# handler and the supervisor's forwarding handler.
+signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+def launch():
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    ready.write_text(str(os.getppid()))
+    signal.sigwait({signal.SIGTERM})
+    os._exit(23)
+assert spawn.supervise(launch) == 23
+"""
+    proc = subprocess.Popen([sys.executable, "-c", code, str(tmp_path / "ready")])
+    try:
+        import time
+        deadline = time.monotonic() + 5
+        while not (tmp_path / "ready").exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        proc.send_signal(__import__("signal").SIGTERM)
+        assert proc.wait(timeout=5) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux subreaper supervision")
+def test_supervised_exec_unblocks_inherited_termination_mask(tmp_path):
+    code = r"""
+import os, signal, sys
+from claude_swap import spawn
+signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGHUP})
+def launch():
+    child = "import signal,time,pathlib;pathlib.Path(%r).write_text('ready');time.sleep(30)" % sys.argv[1]
+    os.execv(sys.executable, [sys.executable, "-c", child])
+assert spawn.supervise(launch) == 143
+"""
+    proc = subprocess.Popen([sys.executable, "-c", code, str(tmp_path / "ready")])
+    try:
+        import time
+        deadline = time.monotonic() + 5
+        while not (tmp_path / "ready").exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        proc.send_signal(__import__("signal").SIGTERM)
+        assert proc.wait(timeout=5) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()

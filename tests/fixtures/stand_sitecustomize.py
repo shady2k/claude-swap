@@ -100,11 +100,51 @@ def install():
         live = os.environ if env is None else env
         return live == policy["env"]
 
+    supervisor_pid = os.getpid()
+    if sys.platform == "linux" and shim_script and script_id(sys.argv[0]) == shim_script:
+        observations = [json.loads(line) for line in Path(journal).read_text().splitlines()]
+        splits = [entry for entry in observations if entry["kind"] == "supervise"]
+        if len(splits) != 1:
+            exit_startup("supervisor")
+        supervisor_pid = splits[0]["pid"]
+    fork_used = False
+    exec_used = False
+
     def expected_shim_child_env():
-        return {**shim["child_env"], "CLAUDE_SWAP_LAUNCHED": str(os.getpid())}
+        return {**shim["child_env"], "CLAUDE_SWAP_LAUNCHED": str(supervisor_pid)}
+
+    def supervised_fork():
+        nonlocal fork_used
+        if not (sys.platform == "linux" and shim_main and not fork_used and os.getpid() == supervisor_pid):
+            return False
+        module = sys.modules.get("claude_swap.spawn")
+        caller = sys._getframe(2)
+        function = getattr(module, "supervise", None)
+        if not (function and caller.f_code is function.__code__
+                and Path(caller.f_code.co_filename).resolve() == Path(policy["source"]) / "claude_swap" / "spawn.py"):
+            return False
+        # The real shim must have published its selected profile before the split.
+        profile = Path(shim["child_env"]["CLAUDE_CONFIG_DIR"])
+        backup = profile.parents[1]
+        try:
+            records = [json.loads(path.read_text()) for path in
+                       (backup / "profile-ownership" / "launches").glob("*.json")]
+            owned = [entry for entry in records if entry.get("state") == "running"
+                     and entry.get("pid") == supervisor_pid and entry.get("ownerPid") == supervisor_pid
+                     and entry.get("profile") == str(profile) and entry.get("accountNum") == "1"]
+            if len(owned) != 1:
+                return False
+        except (OSError, ValueError):
+            return False
+        fork_used = True  # Consumed before fork, so the child inherits no permit.
+        record("supervise")
+        return True
 
     def exec_shim_child(args):
+        nonlocal exec_used
         path, argv, env = args
+        if sys.platform == "linux" and (not fork_used or os.getpid() == supervisor_pid or exec_used):
+            return False
         if not (shim_main and shim_script and path == shim["fake"] and env == expected_shim_child_env()):
             return False
         if len(argv) < 3 or list(argv[:2]) != [path, "--settings"] or list(argv[3:]) != shim["argv"]:
@@ -119,6 +159,7 @@ def install():
             return False
         if script_id(shim["script"]) != shim_script:
             return False
+        exec_used = True
         record("exec", script=shim_script)
         return True
 
@@ -129,6 +170,8 @@ def install():
             _, family, kind, proto = args
             if family == socket.AF_INET and kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM) and proto == 0:
                 return
+        if event == "os.fork" and supervised_fork():
+            return
         if event == "os.exec" and exec_shim_child(args):
             return
         if event.startswith("socket.") or event in process_events:

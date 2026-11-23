@@ -7,11 +7,53 @@ import os
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 import pytest
 
 from tests import stand_startup_diagnostic
 from tests.stand_audit import StandAudit
+
+
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux syscall trace")
+@pytest.mark.parametrize("control", ["supervised", "no-subreaper", "extra-fork", "parent-exec", "parent-network"])
+def test_supervised_shim_trace_requires_one_pinned_child(tmp_path, control):
+    from tests import stand_linux, stand_shim
+
+    role = ("stand_shim", "escape")
+    def exec_line(path, argv):
+        return f'execve({json.dumps(path)}, {json.dumps(argv)}, 0x1 /* env */) = 0'
+
+    shim = str(stand_shim.shim_path(tmp_path))
+    fake = str(stand_shim.fake_path(tmp_path))
+    command = stand_shim.command("escape")
+    layer = str(tmp_path / "data" / "claude-swap" / "layer.json")
+    lines = [exec_line(sys.executable, stand_linux.worker_argv(*role)),
+             exec_line(shim, command),
+             exec_line(sys.executable, [sys.executable, "-I", "-m", "claude_swap.transparent",
+                       f"--cswap-shim=0:{Path(shim).parent}", *command[1:]])]
+    if control != "no-subreaper":
+        lines.append("prctl(PR_SET_CHILD_SUBREAPER, 1) = 0")
+    lines.append("clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x1) = 102")
+    child = [exec_line(fake, [fake, "--settings", layer, *command[1:]]), "+++ exited with 0 +++"]
+    if control == "extra-fork":
+        lines.append("clone(child_stack=NULL, flags=SIGCHLD) = 103")
+        (tmp_path / "trace.103").write_text("+++ exited with 0 +++\n")
+    if control == "parent-exec":
+        lines.append(exec_line(fake, [fake, "--settings", layer, *command[1:]]))
+    if control == "parent-network":
+        lines.append('connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.1")}, 16) = -1 ENETUNREACH (Network is unreachable)')
+    lines.append("+++ exited with 0 +++")
+    (tmp_path / "trace.101").write_text("\n".join(lines) + "\n")
+    (tmp_path / "trace.102").write_text("\n".join(child) + "\n")
+    _, violations, execs = stand_linux._audit(tmp_path, role, {}, {})
+    if control == "supervised":
+        assert not violations
+        assert execs == ("path-shim", "shim-python", "shim-claude")
+    else:
+        assert violations
 
 
 def _script(tmp_path, name, source):
@@ -229,6 +271,8 @@ def test_f17v_blocked_escape_in_grandchild_is_a_detected_attempt(tmp_path, call,
     ("socket.socket().connect(('192.0.2.1', 443))", "socket.connect"),
     ("socket.getaddrinfo('audit-escape.invalid', 443)", "socket.getaddrinfo"),
     ("subprocess.Popen(['/not-allowlisted', 'probe'])", "subprocess.Popen"),
+    pytest.param("os.fork()", "os.fork", marks=pytest.mark.skipif(sys.platform != "linux", reason="Linux fork control")),
+    pytest.param("from claude_swap.spawn import supervise; supervise(lambda: None)", "os.fork", marks=pytest.mark.skipif(sys.platform != "linux", reason="Linux supervisor control")),
 ])
 def test_f20_audits_plain_claude_through_the_installed_shim(tmp_path, call, event):
     stand = StandAudit(tmp_path, probe_socket_operations=True)
@@ -239,11 +283,15 @@ def test_f20_audits_plain_claude_through_the_installed_shim(tmp_path, call, even
         sys.argv[:] = ["cswap", "transparent", "enable", "--accept-shared-history", "--account", "1"]
         runpy.run_module("claude_swap", run_name="__main__", alter_sys=True)
     """)
-    result = stand.run_shim(installer, "import socket, subprocess\n" + call, "--", "prompt")
+    result = stand.run_shim(installer, "import os, socket, subprocess\n" + call, "--", "prompt")
     records = stand.records()
-    assert [r["kind"] for r in records[:4]] == ["startup", "startup", "exec", "startup"], result.stderr
-    assert records[1]["pid"] == records[2]["pid"] == records[3]["pid"]
-    assert [r["stage"] for r in records[:4] if r["kind"] == "startup"] == ["root", "root", "descendant"]
+    launch = records[:5] if sys.platform == "linux" else records[:4]
+    expected = ["startup", "startup", "supervise", "exec", "startup"] if sys.platform == "linux" else ["startup", "startup", "exec", "startup"]
+    assert [r["kind"] for r in launch] == expected, result.stderr
+    assert launch[-2]["pid"] == launch[-1]["pid"]
+    if sys.platform == "linux":
+        assert launch[1]["pid"] == launch[2]["pid"] != launch[-1]["pid"]
+    assert [r["stage"] for r in launch if r["kind"] == "startup"] == ["root", "root", "descendant"]
     if event is None:
         stand.assert_clean()
         assert result.returncode == 0, result.stderr

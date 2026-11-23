@@ -102,7 +102,7 @@ Read next: the docstrings of `consume_backup_grant` and `_fetch_active_usage`.
 
 ### Session mode
 
-`cswap run` calls `SessionManager.run`. `setup_session` creates or reuses the account's profile directory, seeds it with the slot's credential, and links the user's settings and history from `~/.claude` into it. Claude Code is then started with `CLAUDE_CONFIG_DIR` pointing at the profile, which leaves the default login untouched.
+`cswap run` calls `SessionManager.run`. `setup_session` creates or reuses the account's profile directory, seeds it with the slot's credential, and links the user's settings and history from `~/.claude` into it. Claude Code is then started with `CLAUDE_CONFIG_DIR` pointing at the profile, which leaves the default login untouched. Both session and routed transparent launches publish the reserved profile through `profile_ownership.mark_running_locked` under ownership state → account locks. On admitted Linux launches, `spawn.supervise` waits for all descendants before the launcher releases running ownership; a supervisor failure leaves it busy.
 
 If the account is already the active default login, it starts plain `claude` instead, because two copies of one credential drift apart.
 
@@ -121,7 +121,7 @@ Read next: the module docstring of `autoswitch.py`. The rules as users see them 
 ## Rules that hold everywhere
 
 - **Lock order.** Profile ownership state lock, then cswap's lock, then Claude Code's credential lock, then its config lock. Ownership checks at mutation and publication require state before cswap. Never the other way round.
-- **No network under a lock.** A switch does only local I/O under its locks, and the usage store never holds its lock across a fetch. The single deliberate exception is the token refresh described above.
+- **No network under a lock.** A switch does only local I/O under its locks, and the usage store never holds its lock across a fetch. The single deliberate exception is the active token refresh described above: it holds ownership state, the account lock and Claude Code's credential lock so publication cannot race a backup write. Backup-token refresh posts outside the ownership and account locks.
 - **A used refresh token's successor is never dropped.** Once the refresh is posted, the new credential is persisted or stashed, whatever else fails.
 - **A live credential enters a slot only when it is known to belong there.** Writing another account's credential into a slot destroys that slot's only refresh token.
 - **The usage store persists readings and fetch state only.** Labels such as "token expired" are derived on every pass and never written.

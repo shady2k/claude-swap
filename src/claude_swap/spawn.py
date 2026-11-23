@@ -288,3 +288,107 @@ def _note_fallback(fd: int) -> None:
     if not _fallback_logged:
         _fallback_logged = True
         _logger.debug("spawn: descriptor %d is inheritable, keeping the fork path", fd)
+
+
+def require_supervision() -> None:
+    """Reject launch contexts where descendant completion cannot be proved.
+
+    Linux subreapers adopt orphaned descendants even when they change session
+    or process group. A dedicated, single-threaded launcher with no existing
+    children can therefore wait until ECHILD to prove tree completion. Other
+    platforms are deliberately unsupported rather than treating leader exit
+    as tree completion.
+    """
+    import signal
+
+    if sys.platform != "linux":
+        raise OSError("Profile tree supervision is unsupported on this platform")
+    tasks = list(Path("/proc/self/task").iterdir())
+    if len(tasks) != 1 or threading.active_count() != 1:
+        raise OSError("Profile tree supervision requires a single-threaded launcher")
+    if (tasks[0] / "children").read_text().strip():
+        raise OSError("Profile tree supervision requires a launcher without children")
+    if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+        raise OSError("Profile tree supervision requires the default SIGCHLD handler")
+
+
+def supervise(handoff) -> int:
+    """Run a terminal handoff and return only after every descendant exits.
+
+    The caller publishes running ownership before entering and releases it
+    only on normal return. Any supervisor failure or death leaves ownership
+    busy. This process must remain a dedicated launcher: it may not create
+    unrelated children concurrently. No timeout can establish completion.
+    """
+    import ctypes
+    import signal
+
+    require_supervision()
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
+                      ctypes.c_ulong, ctypes.c_ulong]
+    prctl.restype = ctypes.c_int
+    # PR_SET_CHILD_SUBREAPER. Set before forking, so even an immediate orphan
+    # is adopted by this supervisor rather than escaping to init.
+    if prctl(36, 1, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    forwarded = (signal.SIGTERM, signal.SIGHUP)
+    # Prevent TERM/HUP from killing the supervisor between fork and handler
+    # installation. The child deliberately unblocks these before exec.
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, forwarded)
+    old_handlers = {}
+    leader_alive = True
+    pid = None
+
+    def forward(signum, frame):
+        if not leader_alive or pid is None:
+            return
+        try:
+            os.kill(pid, signum)
+        except ProcessLookupError:
+            pass
+
+    try:
+        try:
+            pid = os.fork()
+        except OSError:
+            # A failed fork creates no child; the precondition excludes
+            # existing children, so returning proves the tree is empty.
+            return 127
+        if pid == 0:
+            try:
+                signal.pthread_sigmask(signal.SIG_UNBLOCK, forwarded)
+                handoff()
+            except BaseException:
+                # Do not print callback exceptions that may contain secrets.
+                os._exit(127)
+            os._exit(127)
+
+        # Terminal INT/QUIT reach the child directly. TERM/HUP addressed to
+        # the supervisor must reach the child without abandoning reaping.
+        for sig in (signal.SIGINT, signal.SIGQUIT):
+            old_handlers[sig] = signal.signal(sig, signal.SIG_IGN)
+        for sig in forwarded:
+            old_handlers[sig] = signal.signal(sig, forward)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, forwarded)
+        result = None
+        while True:
+            try:
+                reaped, status = os.waitpid(-1, 0)
+            except InterruptedError:
+                continue
+            except ChildProcessError:
+                if result is None:
+                    raise OSError("Profile leader completion could not be observed")
+                return result
+            if reaped == pid:
+                leader_alive = False
+                result = os.waitstatus_to_exitcode(status)
+                if result < 0:
+                    result = 128 - result
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        for sig, handler in old_handlers.items():
+            signal.signal(sig, handler)

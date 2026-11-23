@@ -5774,7 +5774,7 @@ class TestPurgeLegacyCleanup:
             switcher.purge()
 
         assert not legacy.exists()
-        assert not backup_dir.exists()
+        assert {p.name for p in backup_dir.iterdir()} <= {"profile-ownership", switcher.lock_file.name}
 
     def test_purge_prompt_lists_legacy_when_present(
         self, temp_home: Path, monkeypatch: pytest.MonkeyPatch, capsys
@@ -5887,7 +5887,8 @@ class TestPurgeQuarantineWarning:
         with patch("builtins.input", return_value="y"):
             switcher.purge()
 
-        assert not switcher.backup_dir.exists()  # purge did run
+        assert not switcher.credentials_dir.exists()  # purge did run
+        assert (switcher.backup_dir / "profile-ownership" / "state.lock").exists()
         assert lock.exists()
 
 
@@ -14467,8 +14468,14 @@ class TestProfileOwnershipMutationGuards:
 
         @contextmanager
         def barrier(root):
-            # The operation has completed its preliminary checks. Simulate a
-            # concurrent launcher winning ownership immediately before mutation.
+            # Removal also checks ownership before its confirmation prompt.
+            # Leave that preliminary read clean and race at mutation instead.
+            if operation == "remove" and not events:
+                with real_ownership_lock(root):
+                    events.append("precheck")
+                    yield
+                return
+            # Simulate a launcher winning immediately before mutation.
             with real_ownership_lock(root):
                 profile_ownership.reserve_locked(
                     root, "1", switcher._session_dir("1", sample_sequence_data["accounts"]["1"]["email"])
@@ -14497,7 +14504,137 @@ class TestProfileOwnershipMutationGuards:
                 switcher.move_account("1", "3")
             else:
                 switcher.remove_account("1", assume_yes=True)
-        assert events[:2] == ["ownership", "account"]
+        mutation_events = events[1:] if operation == "remove" else events
+        assert mutation_events[:2] == ["ownership", "account"]
         for relative, content in before.items():
             assert (switcher.backup_dir / relative).read_bytes() == content
         assert not switcher._session_dir("3", sample_sequence_data["accounts"]["1"]["email"]).exists()
+
+
+class TestExternalProfileGeneration:
+    @pytest.mark.parametrize("live,exists", [(False, False), (False, True), (True, True)])
+    @pytest.mark.parametrize("disabled", [False, True])
+    def test_backup_write_invalidates_external_generation(self, temp_home, monkeypatch, live, exists, disabled):
+        from claude_swap import profile_ownership as ownership
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "accounts": {"1": {"email": "synthetic@example.com", "disabled": disabled}},
+            "sequence": [], "activeAccountNumber": None,
+        })
+        profile = switcher._session_dir("1", "synthetic@example.com")
+        if exists:
+            profile.mkdir(parents=True)
+            (profile / ".credentials.json").write_text("synthetic")
+        with ownership.ownership_lock(switcher.backup_dir):
+            first = ownership.reserve_locked(switcher.backup_dir, "1", profile)
+            ownership.release_locked(switcher.backup_dir, first["launchId"])
+        monkeypatch.setattr(switcher, "_live_session_pids", lambda *args: [123] if live else [])
+        switcher._post_backup_write("1", "synthetic@example.com")
+        with ownership.ownership_lock(switcher.backup_dir):
+            second = ownership.reserve_locked(switcher.backup_dir, "1", profile)
+        assert second["profileGen"] != first["profileGen"]
+
+    @pytest.mark.parametrize("exists", [False, True])
+    def test_deletion_advances_external_generation_even_without_profile(self, temp_home, exists):
+        from claude_swap import profile_ownership as ownership
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        profile = switcher._session_dir("1", "synthetic@example.com")
+        if exists:
+            profile.mkdir(parents=True)
+        with ownership.ownership_lock(switcher.backup_dir):
+            first = ownership.reserve_locked(switcher.backup_dir, "1", profile)
+            ownership.release_locked(switcher.backup_dir, first["launchId"])
+        switcher._delete_session_profile("1", "synthetic@example.com")
+        with ownership.ownership_lock(switcher.backup_dir):
+            second = ownership.reserve_locked(switcher.backup_dir, "1", profile)
+        assert second["profileGen"] != first["profileGen"]
+
+
+def test_purge_preserves_external_generation_and_rechecks_reservations(temp_home, monkeypatch):
+    from claude_swap import profile_ownership as ownership
+
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    switcher._init_sequence_file()
+    profile = switcher._session_dir("1", "synthetic@example.com")
+    with ownership.ownership_lock(switcher.backup_dir):
+        record = ownership.reserve_locked(switcher.backup_dir, "1", profile)
+    monkeypatch.setattr("builtins.input", lambda *args: "y")
+    with pytest.raises(SessionError):
+        switcher.purge()
+    with ownership.ownership_lock(switcher.backup_dir):
+        ownership.release_locked(switcher.backup_dir, record["launchId"])
+    switcher.purge()
+    with ownership.ownership_lock(switcher.backup_dir):
+        after = ownership.reserve_locked(switcher.backup_dir, "1", profile)
+    assert after["profileGen"] != record["profileGen"]
+
+
+@pytest.mark.parametrize("exists", [False, True])
+def test_direct_profile_invalidation_advances_external_generation(temp_home, exists):
+    from claude_swap import profile_ownership as ownership
+
+    switcher = ClaudeAccountSwitcher()
+    profile = switcher._session_dir("1", "synthetic@example.com")
+    if exists:
+        profile.mkdir(parents=True)
+    with ownership.ownership_lock(switcher.backup_dir):
+        before = ownership.reserve_locked(switcher.backup_dir, "1", profile)
+        ownership.release_locked(switcher.backup_dir, before["launchId"])
+    switcher._invalidate_session_credentials("1", "synthetic@example.com")
+    with ownership.ownership_lock(switcher.backup_dir):
+        after = ownership.reserve_locked(switcher.backup_dir, "1", profile)
+    assert after["profileGen"] != before["profileGen"]
+
+
+@pytest.mark.parametrize("state", ["reserved", "running"])
+def test_backup_write_preserves_external_owned_profile_without_session_record(temp_home, monkeypatch, state):
+    from claude_swap import profile_ownership as ownership
+    from claude_swap.session import is_session_stale
+
+    switcher = ClaudeAccountSwitcher()
+    profile = switcher._session_dir("1", "synthetic@example.com")
+    profile.mkdir(parents=True)
+    credential = profile / ".credentials.json"
+    credential.write_text("synthetic-profile-credential")
+    monkeypatch.setattr(ownership, "process_start_ticks", lambda pid: "synthetic-ticks")
+    monkeypatch.setattr(switcher, "_live_session_pids", lambda *args: [])
+    with ownership.ownership_lock(switcher.backup_dir):
+        record = ownership.reserve_locked(switcher.backup_dir, "1", profile)
+        if state == "running":
+            ownership.mark_running_locked(switcher.backup_dir, record["launchId"], os.getpid())
+    switcher._post_backup_write("1", "synthetic@example.com")
+    assert credential.read_text() == "synthetic-profile-credential"
+    assert is_session_stale(profile)
+    with ownership.ownership_lock(switcher.backup_dir):
+        assert ownership.profile_busy_locked(switcher.backup_dir, "1", profile)
+
+
+def test_destructive_guard_checks_external_owner_without_session_record(temp_home):
+    from claude_swap import profile_ownership as ownership
+
+    switcher = ClaudeAccountSwitcher()
+    profile = switcher._session_dir("1", "synthetic@example.com")
+    with ownership.ownership_lock(switcher.backup_dir):
+        ownership.reserve_locked(switcher.backup_dir, "1", profile)
+    with pytest.raises(SessionError, match="busy"):
+        switcher._ensure_no_live_session("1", "synthetic@example.com", "synthetic-action")
+
+
+def test_backup_write_preserves_profile_with_unreadable_session_record(temp_home):
+    from claude_swap.session import is_session_stale
+
+    switcher = ClaudeAccountSwitcher()
+    profile = switcher._session_dir("1", "synthetic@example.com")
+    sessions = profile / "sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "unknown.json").write_text("not-json")
+    credential = profile / ".credentials.json"
+    credential.write_text("synthetic-profile-credential")
+    switcher._post_backup_write("1", "synthetic@example.com")
+    assert credential.read_text() == "synthetic-profile-credential"
+    assert is_session_stale(profile)

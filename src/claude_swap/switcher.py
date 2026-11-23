@@ -14,7 +14,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from claude_swap import macos_keychain
+from claude_swap import macos_keychain, profile_ownership
 
 from claude_swap.exceptions import (
     AccountNotFoundError,
@@ -919,18 +919,24 @@ class ClaudeAccountSwitcher:
         worse than the drift caveat — but gets a stale marker so setup_session
         re-bootstraps it once it is no longer live.
         """
-        if self._live_session_pids(account_num, email):
-            from claude_swap.session import mark_session_stale
-
-            if not mark_session_stale(self._session_dir(account_num, email)):
-                self._logger.error(
-                    "Account %s's backup credentials changed but its live "
-                    "session profile could not be marked stale; it may keep "
-                    "serving the superseded generation once it exits.",
-                    account_num,
+        with profile_ownership.ownership_lock(self.backup_dir):
+            if self._live_session_pids(account_num, email) or profile_ownership.profile_busy_locked(
+                self.backup_dir, account_num, self._session_dir(account_num, email)
+            ):
+                profile_ownership.invalidate_generation_locked(
+                    self.backup_dir, self._session_dir(account_num, email)
                 )
-        else:
-            self._invalidate_session_credentials(account_num, email)
+                from claude_swap.session import mark_session_stale
+
+                if not mark_session_stale(self._session_dir(account_num, email)):
+                    self._logger.error(
+                        "Account %s's backup credentials changed but its live "
+                        "session profile could not be marked stale; it may keep "
+                        "serving the superseded generation once it exits.",
+                        account_num,
+                    )
+            else:
+                self._invalidate_session_credentials(account_num, email)
 
     def _read_account_credentials(
         self, account_num: str, email: str, *, cached: bool = False
@@ -971,29 +977,30 @@ class ClaudeAccountSwitcher:
         ``Exception`` disarmed exactly that guard for every write routing
         through here.
         """
-        self._store._write_account_credentials(account_num, email, credentials)
-        try:
-            self._post_backup_write(account_num, email)
-        except OSError:
-            from claude_swap.session import mark_session_stale
+        with profile_ownership.ownership_lock(self.backup_dir):
+            self._store._write_account_credentials(account_num, email, credentials)
+            try:
+                self._post_backup_write(account_num, email)
+            except OSError:
+                from claude_swap.session import mark_session_stale
 
-            if mark_session_stale(self._session_dir(account_num, email)):
-                self._logger.warning(
-                    "Stored account %s's credential but could not invalidate "
-                    "its session profile; marked it stale so the next run "
-                    "re-bootstraps.", account_num, exc_info=True,
-                )
-            else:
-                # Nothing recorded the superseded profile: the marker is what
-                # forces the re-bootstrap, and the local reuse check cannot
-                # see a revoked-but-unexpired token. Say so at ERROR rather
-                # than let a silent warning imply the fallback worked.
-                self._logger.error(
-                    "Stored account %s's credential but could NOT invalidate "
-                    "its session profile OR mark it stale; the profile may "
-                    "keep serving the superseded generation until its token "
-                    "expires.", account_num, exc_info=True,
-                )
+                if mark_session_stale(self._session_dir(account_num, email)):
+                    self._logger.warning(
+                        "Stored account %s's credential but could not invalidate "
+                        "its session profile; marked it stale so the next run "
+                        "re-bootstraps.", account_num, exc_info=True,
+                    )
+                else:
+                    # Nothing recorded the superseded profile: the marker is what
+                    # forces the re-bootstrap, and the local reuse check cannot
+                    # see a revoked-but-unexpired token. Say so at ERROR rather
+                    # than let a silent warning imply the fallback worked.
+                    self._logger.error(
+                        "Stored account %s's credential but could NOT invalidate "
+                        "its session profile OR mark it stale; the profile may "
+                        "keep serving the superseded generation until its token "
+                        "expires.", account_num, exc_info=True,
+                    )
 
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
         self._store._delete_account_credentials(account_num, email)
@@ -2465,7 +2472,7 @@ class ClaudeAccountSwitcher:
         the persist callback ``_fetch_account_usage`` uses. The caller must NOT
         hold ``self.lock_file`` (FileLock is non-reentrant).
         """
-        with FileLock(self.lock_file):
+        with profile_ownership.ownership_lock(self.backup_dir), FileLock(self.lock_file):
             self._write_account_credentials(account_num, email, credentials)
 
     def account_identity(self, account_num: str) -> dict:
@@ -2616,7 +2623,7 @@ class ClaudeAccountSwitcher:
         )
 
         try:
-            with FileLock(self.lock_file):
+            with profile_ownership.ownership_lock(self.backup_dir), FileLock(self.lock_file):
                 current, unreadable = self._read_account_credentials_ex(
                     account_num, email
                 )
@@ -2856,7 +2863,7 @@ class ClaudeAccountSwitcher:
         outcome_creds = result.credentials
         try:
             try:
-                with FileLock(self.lock_file):
+                with profile_ownership.ownership_lock(self.backup_dir), FileLock(self.lock_file):
                     store_now, store_unreadable = (
                         self._read_account_credentials_ex(account_num, email)
                     )
@@ -3335,6 +3342,8 @@ class ClaudeAccountSwitcher:
                 f"{session_dir / 'sessions'} and remove or repair them, then "
                 f"retry {action}."
             )
+        with profile_ownership.ownership_lock(self.backup_dir):
+            self._ensure_profile_idle_locked(account_num, email)
 
     def _invalidate_session_credentials(self, account_num: str, email: str) -> None:
         """Drop a session profile's credential material, keeping its history.
@@ -3344,20 +3353,22 @@ class ClaudeAccountSwitcher:
         projects/history survive. Used when backup credentials change under
         an existing profile (e.g. --import --force).
         """
-        from claude_swap.session import (
-            clear_session_stale,
-            delete_macos_keychain_entry,
-        )
+        with profile_ownership.ownership_lock(self.backup_dir):
+            from claude_swap.session import (
+                clear_session_stale,
+                delete_macos_keychain_entry,
+            )
 
-        session_dir = self._session_dir(account_num, email)
-        if not session_dir.exists():
-            return
-        delete_macos_keychain_entry(session_dir)
-        (session_dir / ".credentials.json").unlink(missing_ok=True)
-        clear_session_stale(session_dir)
-        self._logger.info(
-            f"Invalidated session credentials for account {account_num}"
-        )
+            session_dir = self._session_dir(account_num, email)
+            profile_ownership.invalidate_generation_locked(self.backup_dir, session_dir)
+            if not session_dir.exists():
+                return
+            delete_macos_keychain_entry(session_dir)
+            (session_dir / ".credentials.json").unlink(missing_ok=True)
+            clear_session_stale(session_dir)
+            self._logger.info(
+                f"Invalidated session credentials for account {account_num}"
+            )
 
     def _session_profile_ahead(
         self, account_num: str, email: str, org_uuid: str
@@ -3453,7 +3464,7 @@ class ClaudeAccountSwitcher:
           Checked after the generation test, so a profile provably on the
           backup's generation still answers False with its identity gone.
         """
-        with FileLock(self.lock_file):
+        with profile_ownership.ownership_lock(self.backup_dir), FileLock(self.lock_file):
             return self._adopt_session_credential_locked(account_num, email, org_uuid)
 
     def _adopt_session_credential_locked(
@@ -3527,46 +3538,48 @@ class ClaudeAccountSwitcher:
         it: clear it explicitly, or the next profile created for this same
         slot+email inherits a re-bootstrap flag nothing set for it.
         """
-        from claude_swap.session import (
-            clear_session_stale,
-            delete_macos_keychain_entry,
-        )
-
-        session_dir = self._session_dir(account_num, email)
-        # NOT under an `exists()` guard. swap and move relocate the profile
-        # with `os.replace` and only then prune the old slot key, so by the
-        # time this runs the old dir is exactly what no longer exists -- and
-        # the keychain entry does not follow a relocated dir, because its
-        # service name hashes the path. Guarding the delete on the dir left
-        # that entry, holding the account's rotated tokens, at a name no
-        # command names again: `purge` builds its list from the profile dirs
-        # that still exist, so it never reaches it either.
-        delete_macos_keychain_entry(session_dir)
-        if session_dir.exists():
-            shutil.rmtree(session_dir, ignore_errors=True)
-        # NOT under that `if`. The marker lives OUTSIDE the dir, so it
-        # outlives it: `purge` removes profile dirs (`iterdir()` + `is_dir()`)
-        # and leaves the dot-file beside them by design. Early-returning on
-        # the missing dir left that marker for the next profile in this slot,
-        # which then re-bootstraps on a flag nothing set for it.
-        cleared = clear_session_stale(session_dir)
-        if session_dir.exists() or not cleared:
-            # Both removals tolerate a denied dir, which is right -- the
-            # caller has already deleted the credentials and must reach the
-            # roster write. But it arrives there with the profile still on
-            # disk, so an INFO saying it was removed is the only record, and
-            # it is wrong. The surviving stale marker also makes the next
-            # run's stale arm re-fire on this slot forever.
-            self._logger.warning(
-                "Could not fully remove account %s's session profile at %s; "
-                "credentials are gone but the profile dir and/or its stale "
-                "marker survive (check permissions on it and its parent).",
-                account_num, session_dir,
+        with profile_ownership.ownership_lock(self.backup_dir):
+            from claude_swap.session import (
+                clear_session_stale,
+                delete_macos_keychain_entry,
             )
-            return
-        self._logger.info(
-            f"Removed session profile for account {account_num} at {session_dir}"
-        )
+
+            session_dir = self._session_dir(account_num, email)
+            profile_ownership.invalidate_generation_locked(self.backup_dir, session_dir)
+            # NOT under an `exists()` guard. swap and move relocate the profile
+            # with `os.replace` and only then prune the old slot key, so by the
+            # time this runs the old dir is exactly what no longer exists -- and
+            # the keychain entry does not follow a relocated dir, because its
+            # service name hashes the path. Guarding the delete on the dir left
+            # that entry, holding the account's rotated tokens, at a name no
+            # command names again: `purge` builds its list from the profile dirs
+            # that still exist, so it never reaches it either.
+            delete_macos_keychain_entry(session_dir)
+            if session_dir.exists():
+                shutil.rmtree(session_dir, ignore_errors=True)
+            # NOT under that `if`. The marker lives OUTSIDE the dir, so it
+            # outlives it: `purge` removes profile dirs (`iterdir()` + `is_dir()`)
+            # and leaves the dot-file beside them by design. Early-returning on
+            # the missing dir left that marker for the next profile in this slot,
+            # which then re-bootstraps on a flag nothing set for it.
+            cleared = clear_session_stale(session_dir)
+            if session_dir.exists() or not cleared:
+                # Both removals tolerate a denied dir, which is right -- the
+                # caller has already deleted the credentials and must reach the
+                # roster write. But it arrives there with the profile still on
+                # disk, so an INFO saying it was removed is the only record, and
+                # it is wrong. The surviving stale marker also makes the next
+                # run's stale arm re-fire on this slot forever.
+                self._logger.warning(
+                    "Could not fully remove account %s's session profile at %s; "
+                    "credentials are gone but the profile dir and/or its stale "
+                    "marker survive (check permissions on it and its parent).",
+                    account_num, session_dir,
+                )
+                return
+            self._logger.info(
+                f"Removed session profile for account {account_num} at {session_dir}"
+            )
 
     def _init_sequence_file(self) -> None:
         """Initialize sequence.json if it doesn't exist."""
@@ -5039,6 +5052,7 @@ class ClaudeAccountSwitcher:
             # below (the one step that can touch ~/.claude.json).
             with (
                 FileLock(self.credentials_dir / f".consume-{account_num}.lock"),
+                profile_ownership.ownership_lock(self.backup_dir),
                 FileLock(self.lock_file),
                 claude_credentials_lock(),
             ):
@@ -5519,6 +5533,7 @@ class ClaudeAccountSwitcher:
                     return
                 self._provenance_warned.discard((account_num, email, "resync"))
             with (
+                profile_ownership.ownership_lock(self.backup_dir),
                 FileLock(self.lock_file),
                 claude_credentials_lock(),
             ):
@@ -8407,9 +8422,11 @@ class ClaudeAccountSwitcher:
         - Any stale legacy ~/.claude-swap-backup directory left around from
           before the XDG migration
 
-        One file is left on purpose: ``session.MIGRATION_LOCK`` in ``~/.claude``,
-        an empty lock file. Deleting a lock another launch may be holding lets
-        a third one take a fresh copy of it at the same time.
+        Ownership records and generation tombstones remain under
+        ``profile-ownership/``. The account lock and
+        ``session.MIGRATION_LOCK`` in ``~/.claude`` remain too: deleting a
+        lock another launch may hold lets a third launch lock a different
+        inode at the same time.
         """
         self._refuse_session_shell()
         legacy = get_legacy_backup_root()
@@ -8498,79 +8515,97 @@ class ClaudeAccountSwitcher:
             print(dimmed("Cancelled"))
             return
 
-        removed_items = []
+        with profile_ownership.ownership_lock(self.backup_dir), FileLock(self.lock_file):
+            # Recheck after confirmation, including reservations whose profile
+            # directory has not been created yet. Generation tombstones survive.
+            profile_ownership.invalidate_all_generations_locked(self.backup_dir)
+            sessions_root = self.backup_dir / "sessions"
+            session_dirs = [d for d in sessions_root.iterdir() if d.is_dir()] if sessions_root.is_dir() else []
+            for profile in session_dirs:
+                live, unreadable = scan_live_sessions(profile)
+                if live or unreadable:
+                    raise SessionError("A profile is busy or ownership is unknown; purge refused")
+                profile_ownership.invalidate_generation_locked(self.backup_dir, profile)
+            removed_items = []
 
-        # Remove credentials. On macOS backups may be in the Keychain and/or .enc
-        # files (auto-fallback), so clean both; Linux/WSL/Windows are file-only.
-        data = self._get_sequence_data()
-        if data:
-            for account_num, account_info in data.get("accounts", {}).items():
-                email = account_info.get("email", "")
-                nums = [account_num]
-                if str(account_num) != "None":
-                    nums.append("None")
-                usernames = [f"account-{num}-{email}" for num in nums]
+            # Remove credentials. On macOS backups may be in the Keychain and/or .enc
+            # files (auto-fallback), so clean both; Linux/WSL/Windows are file-only.
+            data = self._get_sequence_data()
+            if data:
+                for account_num, account_info in data.get("accounts", {}).items():
+                    email = account_info.get("email", "")
+                    nums = [account_num]
+                    if str(account_num) != "None":
+                        nums.append("None")
+                    usernames = [f"account-{num}-{email}" for num in nums]
 
-                # .enc files (Linux/WSL/Windows always; macOS fallback copies).
-                for num in nums:
-                    cred_file = self.credentials_dir / f".creds-{num}-{email}.enc"
-                    try:
-                        if cred_file.exists():
-                            cred_file.unlink()
-                            removed_items.append(f"Credential file: {cred_file.name}")
-                    except Exception:
-                        pass  # Ignore errors during purge
-
-                # macOS Keychain items via `security` (current macOS backend).
-                if self.platform == Platform.MACOS:
-                    for username in usernames:
+                    # .enc files (Linux/WSL/Windows always; macOS fallback copies).
+                    for num in nums:
+                        cred_file = self.credentials_dir / f".creds-{num}-{email}.enc"
                         try:
-                            macos_keychain.delete_password(SECURITY_SERVICE, username)
-                            removed_items.append(f"Credential: {username}")
+                            if cred_file.exists():
+                                cred_file.unlink()
+                                removed_items.append(f"Credential file: {cred_file.name}")
                         except Exception:
                             pass  # Ignore errors during purge
 
-                # Items the legacy ``keyring`` library stored (service
-                # ``claude-code``) that the keyring → security migration left
-                # behind: its keyring-less fallback in 0.23–0.30 copied without
-                # deleting, a delete can fail, and an ambiguous account-None is
-                # never attributed. Best-effort through ``security`` (deleting
-                # another app's item never prompts). Checked attribute-only first
-                # so the summary lists only items that were there. Windows
-                # Credential Manager entries from before 0.11 are out of reach
-                # without the keyring library; Linux/WSL never used one.
-                if self.platform == Platform.MACOS:
-                    for username in usernames:
-                        try:
-                            if macos_keychain.item_exists(KEYRING_SERVICE, username):
-                                macos_keychain.delete_password(KEYRING_SERVICE, username)
-                                removed_items.append(
-                                    f"Legacy keyring credential: {username}"
-                                )
-                        except Exception:
-                            pass  # Ignore errors during purge
+                    # macOS Keychain items via `security` (current macOS backend).
+                    if self.platform == Platform.MACOS:
+                        for username in usernames:
+                            try:
+                                macos_keychain.delete_password(SECURITY_SERVICE, username)
+                                removed_items.append(f"Credential: {username}")
+                            except Exception:
+                                pass  # Ignore errors during purge
 
-        # Session-profile keychain entries must go BEFORE the backup dir:
-        # the hashed service names are derived from the dir paths and can't
-        # be recomputed once the directories are deleted.
-        if session_dirs:
-            from claude_swap.session import delete_macos_keychain_entry
+                    # Items the legacy ``keyring`` library stored (service
+                    # ``claude-code``) that the keyring → security migration left
+                    # behind: its keyring-less fallback in 0.23–0.30 copied without
+                    # deleting, a delete can fail, and an ambiguous account-None is
+                    # never attributed. Best-effort through ``security`` (deleting
+                    # another app's item never prompts). Checked attribute-only first
+                    # so the summary lists only items that were there. Windows
+                    # Credential Manager entries from before 0.11 are out of reach
+                    # without the keyring library; Linux/WSL never used one.
+                    if self.platform == Platform.MACOS:
+                        for username in usernames:
+                            try:
+                                if macos_keychain.item_exists(KEYRING_SERVICE, username):
+                                    macos_keychain.delete_password(KEYRING_SERVICE, username)
+                                    removed_items.append(
+                                        f"Legacy keyring credential: {username}"
+                                    )
+                            except Exception:
+                                pass  # Ignore errors during purge
 
-            for d in session_dirs:
-                delete_macos_keychain_entry(d)
-            removed_items.append(
-                f"Session profiles: {', '.join(d.name for d in session_dirs)}"
-            )
+            # Session-profile keychain entries must go BEFORE the backup dir:
+            # the hashed service names are derived from the dir paths and can't
+            # be recomputed once the directories are deleted.
+            if session_dirs:
+                from claude_swap.session import delete_macos_keychain_entry
 
-        # Remove backup directory
-        if self.backup_dir.exists():
-            # Close log handlers before deleting (required on Windows)
-            for handler in self._logger.handlers[:]:
-                handler.close()
-                self._logger.removeHandler(handler)
+                for d in session_dirs:
+                    delete_macos_keychain_entry(d)
+                removed_items.append(
+                    f"Session profiles: {', '.join(d.name for d in session_dirs)}"
+                )
 
-            shutil.rmtree(self.backup_dir)
-            removed_items.append(f"Directory: {self.backup_dir}")
+            # Remove backup directory
+            if self.backup_dir.exists():
+                # Close log handlers before deleting (required on Windows)
+                for handler in self._logger.handlers[:]:
+                    handler.close()
+                    self._logger.removeHandler(handler)
+
+                # Ownership and generations survive profile deletion and purge.
+                for child in self.backup_dir.iterdir():
+                    if child.name in ("profile-ownership", self.lock_file.name):
+                        continue
+                    if child.is_dir() and not child.is_symlink():
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink()
+                removed_items.append(f"Data directory contents: {self.backup_dir}")
 
         # Also clean a stale legacy directory if it somehow still exists
         # (e.g. a partial pre-migration state, or files re-created after init).

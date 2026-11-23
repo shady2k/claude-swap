@@ -255,6 +255,8 @@ def test_f8_cold_profile_pins_auth_probe_and_launch(route, monkeypatch):
     monkeypatch.setenv("NO_PROXY", "*")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
     monkeypatch.setattr(real_claude, "resolve", lambda **_: binary)
+    monkeypatch.setattr(session.spawn, "require_supervision", lambda: None)
+    monkeypatch.setattr(session.spawn, "supervise", lambda callback: callback())
     assert not profile.exists()
     with pytest.raises(Finished):
         manager.run("1", ["-p", "synthetic prompt"])

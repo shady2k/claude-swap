@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from claude_swap import __version__, claude_forms, fsguard, launch_policy, paths, profile_ownership, real_claude, test_mode
+from claude_swap import __version__, claude_forms, fsguard, launch_policy, paths, profile_ownership, real_claude, spawn, test_mode
 from claude_swap.exceptions import ClaudeSwitchError, ConfigError
 from claude_swap.fsutil import atomic_write_bytes, make_dir_link
 from claude_swap.locking import FileLock
@@ -454,10 +454,11 @@ def _prepare_launch(
             return _Launch(real, child_args, child_env, recipient, profile, reservation=record)
         except _UnpreparedProfile as exc:
             failures.append(f"{label}: {exc}; resets unknown")
-        finally:
-            if record is not None and sys.exc_info()[0] is not None:
+        except BaseException:
+            if record is not None:
                 with profile_ownership.ownership_lock(root):
                     profile_ownership.release_locked(root, record["launchId"])
+            raise
         if record is not None:
             with profile_ownership.ownership_lock(root):
                 profile_ownership.release_locked(root, record["launchId"])
@@ -496,6 +497,12 @@ def _publish_launch(root: Path, directory: Path, policy: dict, prepared: _Launch
                 return False
             if not os.path.lexists(profile / "projects"):
                 make_dir_link(history, profile / "projects")
+        if prepared.reservation:
+            spawn.require_supervision()
+            profile_ownership.mark_running_locked(
+                root, prepared.reservation["launchId"], os.getpid(),
+                expected_profile_gen=prepared.reservation["profileGen"],
+            )
         _journal(directory, _OUTSIDE if prepared.outside_reason else "launch")
         return True
 
@@ -525,24 +532,16 @@ def _launch(marker: str, args: list[str], root: Path) -> None:
         raise ConfigError("Transparent policy kept changing; retry the launch")
     if prepared.outside_reason:
         print(f"claude-swap: {_OUTSIDE}: {prepared.outside_reason}", file=sys.stderr)
-    try:
-        if prepared.reservation:
-            with profile_ownership.ownership_lock(root), FileLock(paths.account_lock_path(root)), settings_lock(root):
-                current = launch_policy.read(root)
-                if current != policy or _recipient(
-                    prepared.recipient.slot, launch_policy.accounts(root),
-                    launch_policy.consent(current),
-                ) != prepared.recipient:
-                    raise ConfigError("Launch policy or recipient changed before handoff")
-                profile_ownership.mark_running_locked(
-                    root, prepared.reservation["launchId"], os.getpid(),
-                    expected_profile_gen=prepared.reservation["profileGen"],
-                )
-        prepared.real.handoff(prepared.args, prepared.env, job=True)
-    finally:
-        # POSIX exec keeps the same PID and never returns. Windows waits for
-        # the contained child, so its reservation survives until child exit.
-        _release_launch(root, prepared)
+    if prepared.reservation:
+        result = spawn.supervise(
+            lambda: prepared.real.handoff(prepared.args, prepared.env, job=True)
+        )
+        with profile_ownership.ownership_lock(root):
+            profile_ownership.release_locked(
+                root, prepared.reservation["launchId"], confirmed_complete=True,
+            )
+        raise SystemExit(result)
+    prepared.real.handoff(prepared.args, prepared.env, job=True)
 
 
 def _release_launch(root: Path, prepared: _Launch) -> None:

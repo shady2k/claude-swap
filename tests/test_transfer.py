@@ -2324,3 +2324,53 @@ class TestImportProfileOwnershipGuard:
             import_accounts(switcher, str(source), force=True)
         assert switcher.sequence_file.read_bytes() == before
         assert switcher._read_account_credentials("1", "alice@example.com") == creds_before
+
+
+def test_force_import_checks_ownership_under_state_then_account_lock(temp_home, monkeypatch):
+    from contextlib import contextmanager
+    from claude_swap import profile_ownership, locking
+
+    manager = _linux_switcher(temp_home)
+    _seed_account(manager, 1, "synthetic@example.com")
+    source = temp_home / "synthetic-export.json"
+    export_accounts(manager, str(source))
+    real_state = profile_ownership.ownership_lock
+    real_account = locking.FileLock
+    held = []
+    checks = []
+
+    @contextmanager
+    def state(*args):
+        with real_state(*args):
+            held.append("state")
+            try:
+                yield
+            finally:
+                held.pop()
+
+    @contextmanager
+    def account(path, *args, **kwargs):
+        if path == manager.lock_file:
+            assert held and held[0] == "state"
+            held.append("account")
+            try:
+                with real_account(path, *args, **kwargs):
+                    yield
+            finally:
+                held.pop()
+        else:
+            with real_account(path, *args, **kwargs):
+                yield
+
+    original_check = manager._ensure_profile_idle_locked
+
+    def check(*args):
+        assert held == ["state", "account"]
+        checks.append(args)
+        original_check(*args)
+
+    monkeypatch.setattr(profile_ownership, "ownership_lock", state)
+    monkeypatch.setattr(locking, "FileLock", account)
+    monkeypatch.setattr(manager, "_ensure_profile_idle_locked", check)
+    import_accounts(manager, str(source), force=True)
+    assert checks == [("1", "synthetic@example.com")]

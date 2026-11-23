@@ -11,8 +11,9 @@ and Windows; an unknown identity never authorizes handoff.
 Callers take ``ownership_lock`` before the switcher lock. The ``*_locked``
 functions do local I/O only and never acquire either lock. Network preparation
 runs with a logical reservation but without either physical lock. Profile
-generations live outside the profile and change only through
-``advance_generation_locked`` after a guarded rebuild.
+generations live outside the profile. A backup mutation invalidates the
+external generation without touching a busy profile; a guarded rebuild
+advances the reserved generation.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -34,8 +36,41 @@ def _root(backup_dir: Path) -> Path:
     return backup_dir / "profile-ownership"
 
 
+_ownership_locks = threading.local()
+
+
+class _OwnershipLock(FileLock):
+    """One thread's nested uses share a single OS lock and descriptor."""
+
+    def __init__(self, path: Path):
+        super().__init__(path)
+        self.depth = 0
+
+    def acquire(self, timeout: float | None = None) -> bool:
+        if self.depth:
+            self.depth += 1
+            return True
+        if not super().acquire(timeout):
+            return False
+        self.depth = 1
+        return True
+
+    def release(self) -> None:
+        if self.depth:
+            self.depth -= 1
+            if not self.depth:
+                super().release()
+
+
 def ownership_lock(backup_dir: Path) -> FileLock:
-    return FileLock(_root(backup_dir) / "state.lock")
+    """State lock, reentrant only in the calling thread and process."""
+    key = (os.getpid(), str((_root(backup_dir) / "state.lock").resolve()))
+    locks = getattr(_ownership_locks, "locks", None)
+    if locks is None:
+        locks = _ownership_locks.locks = {}
+    if key not in locks:
+        locks[key] = _OwnershipLock(Path(key[1]))
+    return locks[key]
 
 
 def _pid_alive(pid: int) -> bool | None:
@@ -234,10 +269,77 @@ def mark_running_locked(
     _write(_record_path(backup_dir, launch_id), data)
 
 
+def acknowledge_generation_locked(
+    backup_dir: Path, launch_id: str, expected_previous_gen: str,
+) -> str:
+    """Adopt the generation produced by a reservation's own warming refresh.
+
+    Before calling, the caller holds state then account lock and verifies
+    that the current backup identity and credential equal its refresh result.
+    That comparison, not this metadata operation, excludes unrelated writes.
+    """
+    try:
+        path = _record_path(backup_dir, launch_id)
+        data = _read(path)
+        _validate(data)
+        ticks = process_start_ticks(os.getpid())
+        if (
+            data["ownerPid"] != os.getpid()
+            or data["ownerTicks"] is None or ticks is None
+            or data["ownerTicks"] != ticks
+            or data["state"] != "reserved" or not data["warming"]
+            or data["profileGen"] != expected_previous_gen
+        ):
+            raise ValueError("Warming ownership changed")
+        generation = _generation(backup_dir, Path(data["profile"]))
+        data["profileGen"] = generation
+        _write(path, data)
+        return generation
+    except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
+        raise SessionError("Warming generation cannot be acknowledged") from exc
+
+
 def set_warming_locked(backup_dir: Path, launch_id: str, warming: bool) -> None:
     data = verify_reservation_locked(backup_dir, launch_id)
     data["warming"] = bool(warming)
     _write(_record_path(backup_dir, launch_id), data)
+
+
+def invalidate_generation_locked(backup_dir: Path, profile: Path) -> str:
+    """Mark a profile stale after a backup mutation, including while busy.
+
+    This changes external metadata only; it never writes a running profile.
+    The caller holds the ownership state lock before the account lock.
+    """
+    generation = uuid.uuid4().hex
+    _write(_generation_path(backup_dir, profile), {"profileGen": generation})
+    return generation
+
+
+def invalidate_all_generations_locked(backup_dir: Path) -> None:
+    """Reject busy/unknown ownership, then invalidate every known profile.
+
+    Caller holds the state lock across this check and the destructive purge.
+    All records and generations are read before any generation is changed.
+    """
+    try:
+        records = _records(backup_dir)
+        for data in records:
+            if profile_busy_locked(backup_dir, data["accountNum"], Path(data["profile"])):
+                raise SessionError("Cannot purge while a profile is busy or ownership is unknown")
+        directory = _root(backup_dir) / "generations"
+        try:
+            generations = list(directory.iterdir())
+        except FileNotFoundError:
+            generations = []
+        for path in generations:
+            generation = _read(path)["profileGen"]
+            if not isinstance(generation, str) or not generation:
+                raise ValueError("Invalid profile generation")
+        for path in generations:
+            _write(path, {"profileGen": uuid.uuid4().hex})
+    except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
+        raise SessionError("Profile ownership cannot be verified for purge") from exc
 
 
 def advance_generation_locked(backup_dir: Path, launch_id: str) -> str:

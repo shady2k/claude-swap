@@ -219,3 +219,90 @@ def test_running_publication_is_one_way(tmp_path, processes):
         ownership.mark_running_locked(tmp_path, record["launchId"], 4242)
         with pytest.raises(ownership.SessionError, match="reserved"):
             ownership.mark_running_locked(tmp_path, record["launchId"], 4343)
+
+
+def test_generation_invalidation_is_external(tmp_path, processes):
+    profile = tmp_path / "profile"
+    with ownership.ownership_lock(tmp_path):
+        record = ownership.reserve_locked(tmp_path, "1", profile)
+        generation = ownership.invalidate_generation_locked(tmp_path, profile)
+        assert generation != record["profileGen"]
+        assert not profile.exists()
+        with pytest.raises(ownership.SessionError, match="verified"):
+            ownership.verify_reservation_locked(tmp_path, record["launchId"])
+
+
+def test_ownership_lock_reentrant_for_same_thread(tmp_path):
+    outer = ownership.ownership_lock(tmp_path)
+    with outer:
+        with ownership.ownership_lock(tmp_path) as inner:
+            assert inner is outer
+
+
+@pytest.mark.skipif(__import__("sys").platform != "linux", reason="Linux subreaper")
+def test_real_supervision_frees_profile_after_descendant_completion(tmp_path):
+    import subprocess
+    import sys
+
+    code = r"""
+import os, sys, time
+from pathlib import Path
+from claude_swap import spawn, profile_ownership as ownership
+root = Path(sys.argv[1])
+profile = root / "synthetic-profile"
+with ownership.ownership_lock(root):
+    record = ownership.reserve_locked(root, "1", profile)
+    ownership.mark_running_locked(root, record["launchId"], os.getpid())
+def launch():
+    if os.fork() == 0:
+        os.setsid()
+        with ownership.ownership_lock(root):
+            assert ownership.profile_busy_locked(root, "1", profile)
+        time.sleep(0.05)
+        os._exit(0)
+    os._exit(0)
+assert spawn.supervise(launch) == 0
+with ownership.ownership_lock(root):
+    ownership.release_locked(root, record["launchId"], confirmed_complete=True)
+    assert not ownership.profile_busy_locked(root, "1", profile)
+"""
+    result = subprocess.run([sys.executable, "-c", code, str(tmp_path)],
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+def test_invalidate_all_rejects_busy_before_rotating(tmp_path, processes):
+    with ownership.ownership_lock(tmp_path):
+        first = ownership.reserve_locked(tmp_path, "1", tmp_path / "one")
+        ownership.release_locked(tmp_path, first["launchId"])
+        ownership.reserve_locked(tmp_path, "2", tmp_path / "two")
+        with pytest.raises(ownership.SessionError, match="busy"):
+            ownership.invalidate_all_generations_locked(tmp_path)
+        assert ownership._generation(tmp_path, tmp_path / "one") == first["profileGen"]
+
+
+def test_invalidate_all_rotates_idle_and_rejects_corruption(tmp_path, processes):
+    with ownership.ownership_lock(tmp_path):
+        record = ownership.reserve_locked(tmp_path, "1", tmp_path / "one")
+        ownership.release_locked(tmp_path, record["launchId"])
+        ownership.invalidate_all_generations_locked(tmp_path)
+        assert ownership._generation(tmp_path, tmp_path / "one") != record["profileGen"]
+        directory = tmp_path / "profile-ownership" / "launches"
+        (directory / "corrupt.json").write_text("{")
+        with pytest.raises(ownership.SessionError):
+            ownership.invalidate_all_generations_locked(tmp_path)
+
+
+def test_warming_acknowledgement_requires_reserved_owner_and_previous_generation(tmp_path, processes):
+    with ownership.ownership_lock(tmp_path):
+        record = ownership.reserve_locked(tmp_path, "1", tmp_path / "one", warming=True)
+        current = ownership.invalidate_generation_locked(tmp_path, tmp_path / "one")
+        with pytest.raises(ownership.SessionError):
+            ownership.acknowledge_generation_locked(tmp_path, record["launchId"], "wrong")
+        assert ownership.acknowledge_generation_locked(
+            tmp_path, record["launchId"], record["profileGen"],
+        ) == current
+        assert ownership.verify_reservation_locked(tmp_path, record["launchId"])["profileGen"] == current
+        ownership.set_warming_locked(tmp_path, record["launchId"], False)
+        with pytest.raises(ownership.SessionError):
+            ownership.acknowledge_generation_locked(tmp_path, record["launchId"], current)

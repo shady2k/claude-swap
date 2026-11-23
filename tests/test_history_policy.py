@@ -325,6 +325,8 @@ def test_archive_checks_are_outside_locks_except_publication(shim, monkeypatch):
     monkeypatch.setattr(transparent, "sys", SimpleNamespace(
         platform=sys.platform, flags=SimpleNamespace(isolated=True), stderr=sys.stderr,
     ))
+    monkeypatch.setattr(transparent.spawn, "require_supervision", lambda: None)
+    monkeypatch.setattr(transparent.spawn, "supervise", lambda callback: (callback(), 0)[1])
     real = test_mode.claude_binary(backup_root=root)
     monkeypatch.setattr(test_mode, "claude_binary", lambda **_: real)
     monkeypatch.setattr(real, "handoff", lambda *args, **kwargs: _assert_lock_free(root))
@@ -342,7 +344,9 @@ def test_archive_checks_are_outside_locks_except_publication(shim, monkeypatch):
 
     monkeypatch.setattr(launch_policy, "archive", observe_archive)
     transparent.enable(root, accept_shared_history=True)
-    transparent._launch(marker, ["-p", "hello"], root)
+    with pytest.raises(SystemExit) as done:
+        transparent._launch(marker, ["-p", "hello"], root)
+    assert done.value.code == 0
     assert len(checked) == 3
 
 
@@ -398,6 +402,8 @@ def test_policy_is_rechecked_at_publication_not_handoff(shim, monkeypatch, chang
     monkeypatch.setattr(transparent, "sys", SimpleNamespace(
         platform=sys.platform, flags=SimpleNamespace(isolated=True), stderr=sys.stderr,
     ))
+    monkeypatch.setattr(transparent.spawn, "require_supervision", lambda: None)
+    monkeypatch.setattr(transparent.spawn, "supervise", lambda callback: (callback(), 0)[1])
     selected = []
     real = test_mode.claude_binary(backup_root=root)
     monkeypatch.setattr(test_mode, "claude_binary", lambda **_: real)
@@ -431,7 +437,9 @@ def test_policy_is_rechecked_at_publication_not_handoff(shim, monkeypatch, chang
             transparent._launch(marker, ["--resume", SESSION_ID], root)
         assert not selected and not journal.exists()
     else:
-        transparent._launch(marker, ["--resume", SESSION_ID], root)
+        with pytest.raises(SystemExit) as done:
+            transparent._launch(marker, ["--resume", SESSION_ID], root)
+        assert done.value.code == 0
         assert selected == [profiles["1" if when == "before" else "2"]]
         assert SESSION_ID not in journal.read_text(encoding="utf-8")
 

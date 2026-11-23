@@ -175,7 +175,7 @@ def _trace(module: str, args: list[str]) -> int:
     result = subprocess.run([
         _tool("strace"), "-ff", "--kill-on-exit", "-yy", "-s", "256",
         "-o", str(run_dir / "trace"),
-        "-e", "trace=%network,%process,io_uring_setup,unshare,setns",
+        "-e", "trace=%network,%process,prctl,io_uring_setup,unshare,setns",
         "-e", "abbrev=!sendmsg,sendmmsg",
         "-e", "inject=io_uring_setup,unshare,setns:error=EPERM",
         *worker_argv(module, *args),
@@ -407,20 +407,35 @@ def _audit(
             return ("shim-claude",)
         return None
 
-    def visit(pid: int, role: Role) -> None:
+    def visit(pid: int, role: Role, *, supervised_child: bool = False) -> None:
+        subreaper = False
+        split = False
+        child_handoff = False
         for line in by_pid[pid][1 if pid == root else 0:]:
             syscall = _SYSCALL.match(line)
             if not syscall:
                 continue
             call = syscall[1]
             if call in {"clone", "clone3", "fork", "vfork"}:
+                result = _RESULT.search(line)
+                successful = bool(result and result[1].isdigit() and parents.get(int(result[1])) == pid)
+                supervisor_split = False
                 if role in {("path-shim",), ("shim-python",)} and "CLONE_THREAD" not in line:
-                    violations.append(f"pid {pid}: shim spawned a process instead of handing off")
+                    supervisor_split = bool(
+                        role in {("shim-python",)} and subreaper and not split
+                        and not supervised_child and successful and call in {"fork", "clone"}
+                        and "CLONE_VM" not in line and "CLONE_VFORK" not in line
+                    )
+                    if not supervisor_split:
+                        violations.append(f"pid {pid}: shim spawned a process without supervisor provenance")
+                    split = True
                 if "CLONE_NEW" in line or "CLONE_UNTRACED" in line:
                     violations.append(f"pid {pid}: unexpected process isolation flags in {call}")
-                result = _RESULT.search(line)
-                if result and result[1].isdigit() and parents.get(int(result[1])) == pid:
-                    visit(int(result[1]), role)
+                if successful:
+                    visit(int(result[1]), role, supervised_child=supervisor_split)
+            elif call == "prctl":
+                if re.fullmatch(r"prctl\(PR_SET_CHILD_SUBREAPER, 1\)\s+= 0", line) and role in {("shim-python",)} and not split:
+                    subreaper = True
             elif call in {"execve", "execveat"}:
                 argv = _exec_argv(line) or []
                 if role == root_role and tuple(argv) in child_commands:
@@ -429,7 +444,10 @@ def _audit(
                     new_role = ("openssl",)
                 elif transition := shim_transition(role, line):
                     new_role = transition
+                    if new_role == ("shim-claude",) and (not supervised_child or split):
+                        violations.append(f"pid {pid}: pinned handoff did not come from the supervisor child")
                     if line.endswith(" = 0"):
+                        child_handoff = new_role == ("shim-claude",)
                         shim_execs.append(new_role[0])
                 else:
                     violations.append(f"pid {pid}: non-allowlisted {call}")
@@ -439,6 +457,8 @@ def _audit(
             elif call in {"unshare", "setns", "io_uring_setup"}:
                 violations.append(f"pid {pid}: unexpected {call}")
             elif call in {"connect", "sendto", "sendmsg", "sendmmsg"}:
+                if role in {("path-shim",), ("shim-python",)}:
+                    violations.append(f"pid {pid}: network before pinned handoff")
                 result = _RESULT.search(line)
                 if not result or "<unfinished ...>" in line:
                     raise StandError(f"cannot audit {call} for pid {pid}")
@@ -456,6 +476,9 @@ def _audit(
                         violations.append(
                             f"pid {pid} {role!r} {call}: {label} {target!r} ({attempt.result})"
                         )
+
+        if supervised_child and not child_handoff:
+            violations.append(f"pid {pid}: supervisor child did not perform the pinned handoff")
 
     visit(root, root_role)
     return tuple(attempts), tuple(violations), tuple(shim_execs)
