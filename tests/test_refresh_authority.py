@@ -173,3 +173,144 @@ def test_stash_identity_uuid_is_optional_but_conflicts_refuse(
         result = s._adopt_stashed_successor("1", email, credential("old"))
     assert result == (credential("successor") if adopts else None)
     assert s._read_account_credentials("1", email) == credential("successor" if adopts else "old")
+
+
+@pytest.mark.parametrize("source", ["backup", "profile"])
+def test_session_checker_rejects_consumed_fp_across_guards(
+    temp_home, sample_sequence_data, source,
+):
+    s, email = seeded(sample_sequence_data)
+    old = credential("old")
+    s._store._write_unclaimed_credential(credential("successor"), {
+        "reason": "consume-gate-superseded", "configSlot": "99",
+        "identity": {"email": "other@example.invalid"}, "loginGen": 999,
+        "consumedFp": oauth.credential_fingerprint(old),
+    })
+    assert s._session_credential_stash_status(old, profile=source == "profile") == "consumed"
+
+
+def test_session_checker_skips_setup_token_and_flags_unknown_rows(
+    temp_home, sample_sequence_data,
+):
+    s, email = seeded(sample_sequence_data)
+    s._store._write_stash_manifest({"bad": None})
+    assert s._session_credential_stash_status(credential("old")) == "unverifiable"
+    setup = json.dumps({"claudeAiOauth": {"accessToken": "synthetic-setup"}})
+    with patch.object(s._store, "_stash_snapshot") as scan:
+        assert s._session_credential_stash_status(setup) is None
+    scan.assert_not_called()
+
+
+def test_stash_publication_and_removal_hold_manifest_lock(
+    temp_home, sample_sequence_data,
+):
+    from claude_swap.locking import FileLock
+    s, email = seeded(sample_sequence_data)
+    store = s._store
+    original_write = store._atomic_b64_write
+    original_unlink = type(store._stash_entry_path("unused")).unlink
+
+    def assert_locked():
+        probe = FileLock(store._stash_manifest_path().with_suffix(".lock"), timeout=0)
+        assert not probe.acquire(timeout=0)
+
+    def write(path, value):
+        assert_locked()
+        original_write(path, value)
+
+    def unlink(path, *args, **kwargs):
+        if path.name.startswith(".unclaimed-"):
+            assert_locked()
+        return original_unlink(path, *args, **kwargs)
+
+    with patch.object(store, "_atomic_b64_write", side_effect=write):
+        entry = store._write_unclaimed_credential(credential("successor"), {})
+    with patch("pathlib.Path.unlink", new=unlink):
+        store._remove_unclaimed_credential(entry)
+    assert store._stash_snapshot() == ({}, "ok")
+
+
+def test_stash_lock_failure_preserves_successor_without_publication(
+    temp_home, sample_sequence_data,
+):
+    from claude_swap.exceptions import LockError
+    s, email = seeded(sample_sequence_data)
+    with patch("claude_swap.locking.FileLock.acquire", return_value=False):
+        with pytest.raises(LockError):
+            s._store._write_unclaimed_credential(credential("successor"), {})
+    entries = s._store._list_unclaimed_credentials()
+    assert len(entries) == 1
+    assert s._store._read_unclaimed_credential(next(iter(entries)))[0] == credential("successor")
+    assert s._store._stash_snapshot()[1] == "orphaned"
+
+
+def test_stash_snapshot_distinguishes_contention_and_lock_storage_failure(
+    temp_home, sample_sequence_data,
+):
+    s, email = seeded(sample_sequence_data)
+    with patch("claude_swap.locking.FileLock.acquire", return_value=False):
+        assert s._store._stash_snapshot() == ({}, "busy")
+    with patch("claude_swap.locking.FileLock.acquire", side_effect=OSError("synthetic I/O")):
+        assert s._store._stash_snapshot() == ({}, "unreadable")
+
+
+def test_stash_snapshot_never_scans_during_publication(
+    temp_home, sample_sequence_data,
+):
+    from threading import Event, Thread
+    s, email = seeded(sample_sequence_data)
+    entered = Event()
+    resume = Event()
+    scanned = Event()
+    original_write = s._store._atomic_b64_write
+    original_scan = s._store._read_stash_manifest_ex
+    errors = []
+    snapshots = []
+
+    def write(path, value):
+        original_write(path, value)
+        entered.set()
+        assert resume.wait(2)
+
+    def scan():
+        scanned.set()
+        return original_scan()
+
+    def publish():
+        try:
+            s._store._write_unclaimed_credential(credential("successor"), {})
+        except Exception as exc:
+            errors.append(exc)
+
+    with patch.object(s._store, "_atomic_b64_write", side_effect=write):
+        writer = Thread(target=publish)
+        writer.start()
+        assert entered.wait(2)
+        with patch.object(s._store, "_read_stash_manifest_ex", side_effect=scan):
+            reader = Thread(target=lambda: snapshots.append(s._store._stash_snapshot()))
+            reader.start()
+            # The writer owns the lock across both bytes and manifest. A
+            # snapshot may finish only after publication is released.
+            assert not scanned.is_set()
+            resume.set()
+            writer.join(3)
+            reader.join(3)
+    assert not errors
+    assert len(snapshots) == 1
+    assert snapshots[0][1] == "ok"
+    assert len(snapshots[0][0]) == 1
+
+
+@pytest.mark.parametrize("verdict,error", [("busy", "transient"), ("unreadable", "stash-unreadable")])
+def test_backup_gate_defers_on_manifest_lock_failure_without_post(
+    temp_home, sample_sequence_data, verdict, error,
+):
+    s, email = seeded(sample_sequence_data)
+    snapshot = s.credential_snapshot("1", email)
+    with patch.object(s._store, "_stash_snapshot", return_value=({}, verdict)), patch(
+        "claude_swap.oauth.try_refresh_oauth_credentials"
+    ) as post:
+        result = s.consume_backup_grant("1", email, snapshot)
+    assert result.error == error
+    post.assert_not_called()
+    assert s._read_account_credentials("1", email) == credential("old")

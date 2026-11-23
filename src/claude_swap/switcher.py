@@ -257,6 +257,13 @@ _DEMOTING_STASH_REASONS = (
     "consume-gate-store-unreadable",
 )
 
+RECOVERY_ERRORS = frozenset({"stash-unreadable", "profile-busy", "credential-unproven"})
+
+_STASH_SAFETY_REASONS = frozenset({
+    "displaced-live-login", "foreign", "alien", "known-foreign",
+    "setup-token-mismatch", "api-key-mismatch",
+})
+
 ERROR_NOTES = {
     "active-refresh-deferred": (
         "active credential recovery is deferred until refresh authority is "
@@ -372,8 +379,8 @@ def _usage_entry_lines(
     login_line = muted(_pad_row(*login_row, len(login_row[0]) + 1)) if login_row else None
     if entry.sentinel is not None:
         note = (
-            ERROR_NOTES[entry.last_error]
-            if entry.last_error in {"stash-unreadable", "profile-busy", "credential-unproven"}
+            ERROR_NOTES[entry.recovery_error]
+            if entry.recovery_error is not None
             else SENTINEL_NOTES.get(entry.sentinel, entry.sentinel)
         )
         out = [dimmed(note)]
@@ -399,15 +406,18 @@ def _usage_entry_lines(
             and entry.fetched_at is not None
         ):
             lines[usage_count - 1] += f" · {format_age(int(entry.fetched_at * 1000))}"
-        if entry.last_error in {"stash-unreadable", "profile-busy", "credential-unproven"}:
-            lines.append(ERROR_NOTES[entry.last_error])
+        if entry.recovery_error is not None:
+            lines.append(ERROR_NOTES[entry.recovery_error])
         return [
             f"{dimmed('└' if j == len(lines) - 1 else '├')} {muted(line)}"
             for j, line in enumerate(lines)
         ]
     detail = "usage unavailable"
-    if entry.last_error:
-        detail += f" ({ERROR_NOTES.get(entry.last_error, entry.last_error)})"
+    display_error = entry.recovery_error or (
+        entry.last_error if entry.last_error not in RECOVERY_ERRORS else None
+    )
+    if display_error:
+        detail += f" ({ERROR_NOTES.get(display_error, display_error)})"
     out = [dimmed(detail)]
     if login_line is not None:
         out.append(f"{dimmed('└')} {login_line}")
@@ -2990,8 +3000,8 @@ class ClaudeAccountSwitcher:
                 stashed_reason = "consume-gate-unpersisted"
                 self._logger.error(
                     "Account %s's consumed successor could not be fully published. "
-                    "Inspect `cswap unclaimed` and fix storage; recover the login "
-                    "before `cswap unclaimed --purge ID`.", account_num, exc_info=True,
+                    "Fix credential storage before retrying recovery.",
+                    account_num, exc_info=True,
                 )
         if stashed_reason in _DEMOTING_STASH_REASONS:
             # The successor is parked, not persisted: the slot still holds the
@@ -3088,10 +3098,11 @@ class ClaudeAccountSwitcher:
         them intact and out of adoption. Unknown metadata cannot establish
         that distinction and must defer, even for another slot.
         """
-        manifest, verdict = self._store._read_stash_manifest_ex()
-        if (verdict == "unreadable"
-                or self._store._stash_entry_files_exist(excluding=manifest)):
-            entries = self._store._list_unclaimed_credentials()
+        manifest, verdict = self._store._stash_snapshot()
+        if verdict == "busy":
+            raise LockError("stash publication is busy; retry later")
+        if verdict not in {"ok", "corrupt"} or (verdict == "corrupt" and manifest):
+            entries = manifest
             self._logger.warning(
                 "Account %s stash publication unproven, entries %s; "
                 "inspect with `cswap unclaimed` before retrying.",
@@ -3099,14 +3110,10 @@ class ClaudeAccountSwitcher:
             )
             raise CredentialReadError("stash publication unavailable or incomplete")
         rotations = {}
-        safety_reasons = {
-            "displaced-live-login", "foreign", "alien", "known-foreign",
-            "setup-token-mismatch", "api-key-mismatch",
-        }
         for entry_id, meta in manifest.items():
             if not isinstance(meta, dict):
                 valid = False
-            elif (meta.get("reason") in safety_reasons
+            elif (meta.get("reason") in _STASH_SAFETY_REASONS
                     and meta.get("fingerprint")
                     and meta.get("configSlot")
                     and "consumedFp" not in meta):
@@ -3126,6 +3133,52 @@ class ClaudeAccountSwitcher:
                 raise CredentialReadError("stash entry has unproven provenance")
             rotations[entry_id] = meta
         return rotations
+
+    @staticmethod
+    def recovery_error_note(code: str) -> str | None:
+        return ERROR_NOTES.get(code)
+
+    def _session_credential_stash_status(
+        self, credentials: str, *, profile: bool = False,
+    ) -> str | None:
+        """Check a refresh-bearing session credential under the account lock.
+
+        Identity and slot guards cannot make a spent generation safe to seed:
+        any row's consumed fingerprint excludes that credential. A pending
+        row also asks the caller to inspect a reusable profile, lazily. Unknown
+        publication blocks bootstrap; a ready profile may still be independent
+        of the backup, which the session caller checks before reuse.
+        """
+        data = oauth.extract_oauth_data(credentials) or {}
+        if not data.get("refreshToken"):
+            return None
+        manifest, verdict = self._store._stash_snapshot()
+        fp = oauth.credential_fingerprint(credentials)
+        if fp and any(
+            isinstance(meta, dict) and meta.get("consumedFp") == fp
+            for meta in manifest.values()
+        ):
+            return "consumed"
+        if verdict == "busy":
+            return "busy"
+        if verdict != "ok":
+            return "unverifiable"
+        pending = False
+        for meta in manifest.values():
+            if not isinstance(meta, dict):
+                return "unverifiable"
+            if (meta.get("reason") in _STASH_SAFETY_REASONS
+                    and meta.get("fingerprint") and meta.get("configSlot")
+                    and "consumedFp" not in meta):
+                continue
+            if not (
+                isinstance(meta.get("consumedFp"), str) and meta["consumedFp"]
+                and (isinstance(meta.get("identity"), dict)
+                     or (meta.get("identity") is None and meta.get("configSlot")))
+            ):
+                return "unverifiable"
+            pending = True
+        return "pending" if pending and not profile else None
 
     def _adopt_stashed_successor(
         self, account_num: str, email: str, current: str, *, persist=None,
@@ -5217,6 +5270,11 @@ class ClaudeAccountSwitcher:
                                     "fingerprint": oauth.credential_fingerprint(successor),
                                 })
                             except Exception:
+                                self._logger.error(
+                                    "Account %s's consumed successor could not be fully published; "
+                                    "fix credential storage before retrying recovery.",
+                                    account_num, exc_info=True,
+                                )
                                 return FetchRecord(error="stash-unreadable")
                             return FetchRecord(error="transient")
             finally:
@@ -5726,6 +5784,7 @@ class ClaudeAccountSwitcher:
         # (e.g. Fable) resets, matching the poll planner's window view.
         _threshold, _weekly_threshold, models = self._poll_policy_inputs()
         sentinels: dict[str, str] = {}
+        expiry_pauses: set[str] = set()
         for num, info in info_by_num.items():
             static = self._static_usage_sentinel(info)
             if static is not None:
@@ -5800,6 +5859,7 @@ class ClaudeAccountSwitcher:
                 active_oauth.get("expiresAt")
             ):
                 sentinels[num] = USAGE_TOKEN_EXPIRED
+                expiry_pauses.add(num)
 
         if claims:
             pre = entries
@@ -5826,10 +5886,23 @@ class ClaudeAccountSwitcher:
                 ):
                     sentinels[num] = USAGE_RELOGIN_REQUIRED
 
-        return {
-            num: with_sentinel(entries[num], sentinels.get(num))
-            for num in info_by_num
-        }
+        result = {}
+        for num, info in info_by_num.items():
+            entry = entries[num]
+            recovery_error = None
+            # A current credential state wins over a stored fetch error. The
+            # active expiry pause only means this pass could not fetch, so it
+            # must not hide the recovery blocker that keeps the row in backoff.
+            if (num not in sentinels or num in expiry_pauses) and entry.last_error in RECOVERY_ERRORS:
+                if self._live_session_pids(num, info[1]):
+                    recovery_error = "profile-busy"
+                elif entry.last_error != "credential-unproven" or info[4]:
+                    recovery_error = entry.last_error
+            result[num] = dataclasses.replace(
+                with_sentinel(entry, sentinels.get(num)),
+                recovery_error=recovery_error,
+            )
+        return result
 
     def _slot_token_dead(self, num: str, email: str) -> bool:
         """Is this slot quarantined as refresh-token-dead, right now?
