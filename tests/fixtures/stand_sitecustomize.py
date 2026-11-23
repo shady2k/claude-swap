@@ -119,7 +119,8 @@ def install():
             return False
         module = sys.modules.get("claude_swap.spawn")
         caller = sys._getframe(2)
-        function = getattr(module, "supervise", None)
+        scope = getattr(module, "_Supervision", None)
+        function = getattr(scope, "wait", None)
         if not (function and caller.f_code is function.__code__
                 and Path(caller.f_code.co_filename).resolve() == Path(policy["source"]) / "claude_swap" / "spawn.py"):
             return False

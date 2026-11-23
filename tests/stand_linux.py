@@ -231,7 +231,7 @@ def _worker(module: str, args: list[str]) -> None:
             running = [entry for entry in records if entry.get("state") == "running"
                        and entry.get("pid") == supervisor_pid and entry.get("ownerPid") == supervisor_pid
                        and entry.get("profile") == str(profile) and entry.get("accountNum") == "1"]
-            if (os.getpid() == supervisor_pid and frame.f_code is spawn.supervise.__code__
+            if (os.getpid() == supervisor_pid and frame.f_code is spawn._Supervision.wait.__code__
                     and Path(frame.f_code.co_filename).resolve() == PROJECT / "src" / "claude_swap" / "spawn.py"
                     and len(running) == 1):
                 supervision_used = True
