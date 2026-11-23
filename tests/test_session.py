@@ -5555,8 +5555,8 @@ class TestStashSessionAdmission:
         self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch,
     ):
         self._ready(seeded_switcher)
-        monkeypatch.setattr(seeded_switcher, "_session_credential_stash_status",
-                            lambda *args, **kwargs: "busy")
+        monkeypatch.setattr(seeded_switcher._store, "_stash_snapshot",
+                            lambda: ({}, set(), "busy"))
         with pytest.raises(SessionError, match="Retry shortly") as exc:
             manager.setup_session(ACCOUNT_NUM, share=False)
         assert "purge" not in str(exc.value)

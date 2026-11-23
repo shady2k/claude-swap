@@ -831,7 +831,13 @@ def test_shared_stash_guard_preserves_local_state(active, monkeypatch, path, sta
     elif state == "unreadable-manifest":
         monkeypatch.setattr(store, "_read_stash_manifest_ex", lambda: ({}, "unreadable"))
     else:
-        monkeypatch.setattr(store, "_stash_entry_files_exist", lambda **kw: True)
+        from pathlib import Path
+        original_iterdir = Path.iterdir
+        def fail_stash_scan(directory):
+            if directory == switcher.credentials_dir:
+                raise OSError("synthetic directory read failure")
+            return original_iterdir(directory)
+        monkeypatch.setattr(Path, "iterdir", fail_stash_scan)
     paths = list(switcher.credentials_dir.glob(".unclaimed-*"))
     before = {p: p.read_bytes() for p in paths}
     if path == "active":

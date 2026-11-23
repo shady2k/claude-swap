@@ -227,7 +227,7 @@ def test_stash_publication_and_removal_hold_manifest_lock(
         entry = store._write_unclaimed_credential(credential("successor"), {})
     with patch("pathlib.Path.unlink", new=unlink):
         store._remove_unclaimed_credential(entry)
-    assert store._stash_snapshot() == ({}, "ok")
+    assert store._stash_snapshot() == ({}, set(), "ok")
 
 
 def test_stash_lock_failure_preserves_successor_without_publication(
@@ -241,7 +241,7 @@ def test_stash_lock_failure_preserves_successor_without_publication(
     entries = s._store._list_unclaimed_credentials()
     assert len(entries) == 1
     assert s._store._read_unclaimed_credential(next(iter(entries)))[0] == credential("successor")
-    assert s._store._stash_snapshot()[1] == "orphaned"
+    assert s._store._stash_snapshot() == ({}, set(entries), "ok")
 
 
 def test_stash_snapshot_distinguishes_contention_and_lock_storage_failure(
@@ -249,9 +249,37 @@ def test_stash_snapshot_distinguishes_contention_and_lock_storage_failure(
 ):
     s, email = seeded(sample_sequence_data)
     with patch("claude_swap.locking.FileLock.acquire", return_value=False):
-        assert s._store._stash_snapshot() == ({}, "busy")
+        assert s._store._stash_snapshot() == ({}, set(), "busy")
     with patch("claude_swap.locking.FileLock.acquire", side_effect=OSError("synthetic I/O")):
-        assert s._store._stash_snapshot() == ({}, "unreadable")
+        assert s._store._stash_snapshot() == ({}, set(), "unreadable")
+
+
+@pytest.mark.parametrize("manifest,verdict", [("{", "corrupt"), (None, "ok")])
+def test_stash_snapshot_keeps_orphan_ids_separate_from_manifest_verdict(
+    temp_home, sample_sequence_data, manifest, verdict,
+):
+    s, email = seeded(sample_sequence_data)
+    store = s._store
+    store._atomic_b64_write(store._stash_entry_path("orphan"), credential("successor"))
+    if manifest is not None:
+        store._stash_manifest_path().write_text(manifest)
+    assert store._stash_snapshot() == ({}, {"orphan"}, verdict)
+
+
+def test_stash_snapshot_directory_error_is_unreadable_under_manifest_lock(
+    temp_home, sample_sequence_data,
+):
+    from claude_swap.locking import FileLock
+    s, email = seeded(sample_sequence_data)
+    store = s._store
+
+    def scan(path):
+        probe = FileLock(store._stash_manifest_path().with_suffix(".lock"), timeout=0)
+        assert not probe.acquire(timeout=0)
+        raise PermissionError("synthetic directory read failure")
+
+    with patch("pathlib.Path.iterdir", new=scan):
+        assert store._stash_snapshot() == ({}, set(), "unreadable")
 
 
 def test_stash_snapshot_never_scans_during_publication(
@@ -311,7 +339,7 @@ def test_stash_snapshot_never_scans_during_publication(
             reader.join(3)
     assert not errors
     assert len(snapshots) == 1
-    assert snapshots[0][1] == "ok"
+    assert snapshots[0][1:] == (set(), "ok")
     assert len(snapshots[0][0]) == 1
 
 
@@ -321,10 +349,32 @@ def test_backup_gate_defers_on_manifest_lock_failure_without_post(
 ):
     s, email = seeded(sample_sequence_data)
     snapshot = s.credential_snapshot("1", email)
-    with patch.object(s._store, "_stash_snapshot", return_value=({}, verdict)), patch(
+    with patch.object(s._store, "_stash_snapshot", return_value=({}, set(), verdict)), patch(
         "claude_swap.oauth.try_refresh_oauth_credentials"
     ) as post:
         result = s.consume_backup_grant("1", email, snapshot)
     assert result.error == error
     post.assert_not_called()
     assert s._read_account_credentials("1", email) == credential("old")
+
+
+def test_stash_refusal_logs_only_blocking_orphan_id(
+    temp_home, sample_sequence_data, caplog,
+):
+    from claude_swap.exceptions import CredentialReadError
+    from claude_swap.locking import FileLock
+
+    s, email = seeded(sample_sequence_data)
+    row_id = s._store._write_unclaimed_credential(credential("successor"), {
+        "reason": "consume-gate-store-unreadable", "configSlot": "1",
+        "consumedFp": oauth.credential_fingerprint(credential("old")),
+    })
+    s._store._atomic_b64_write(
+        s._store._stash_entry_path("blocking-orphan"), credential("orphan"),
+    )
+    with FileLock(s.lock_file), pytest.raises(CredentialReadError):
+        s._checked_refresh_stash("1")
+    assert "Account 1" in caplog.text
+    assert "blocking-orphan" in caplog.text
+    assert row_id not in caplog.text
+    assert "synthetic-refresh" not in caplog.text

@@ -334,7 +334,7 @@ class PollEvent(AutoSwitchEvent):
         recovery = "".join(
             f" | Account-{number}: {ERROR_NOTES[error]}"
             for number, error in self.fetch_errors.items()
-            if error in ("stash-unreadable", "profile-busy", "credential-unproven")
+            if error in RECOVERY_ERRORS
         )
         return (
             f"Account-{num} ({self.active.get('email')}): {used} "

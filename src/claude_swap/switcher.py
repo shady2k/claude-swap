@@ -3089,50 +3089,54 @@ class ClaudeAccountSwitcher:
                 account_num, entry_id, exc_info=True,
             )
 
-    def _checked_refresh_stash(self, account_num: str) -> dict:
-        """Check publication before either refresh path can spend a grant.
+    def _refresh_stash_state(self) -> dict:
+        """Interpret one local snapshot for refresh and session admission.
 
-        Unmapped bytes or an uncertain scan may hide a pending successor.
-        Known switch safety copies have a fingerprint and a displacement
-        reason, but no consumed grant; they are not pending rotations. Keep
-        them intact and out of adoption. Unknown metadata cannot establish
-        that distinction and must defer, even for another slot.
+        Preserve every consumed fingerprint even when another entry makes
+        publication unverifiable. Safety copies do not represent rotations.
+        A corrupt manifest with no entry files has nothing to recover.
+        Callers hold the account lock; the snapshot releases its own lock
+        before any adoption or profile mutation.
         """
-        manifest, verdict = self._store._stash_snapshot()
-        if verdict == "busy":
+        manifest, orphan_ids, verdict = self._store._stash_snapshot()
+        status = "busy" if verdict == "busy" else "ok"
+        if verdict not in {"ok", "corrupt", "busy"} or orphan_ids:
+            status = "unverifiable"
+        blocking_ids = set(orphan_ids)
+        consumed_fps = set()
+        rotations = {}
+        for entry_id, meta in manifest.items():
+            if isinstance(meta, dict):
+                consumed = meta.get("consumedFp")
+                if isinstance(consumed, str) and consumed:
+                    consumed_fps.add(consumed)
+                if (meta.get("reason") in _STASH_SAFETY_REASONS
+                        and meta.get("fingerprint") and meta.get("configSlot")
+                        and "consumedFp" not in meta):
+                    continue
+                if (isinstance(consumed, str) and consumed
+                        and (isinstance(meta.get("identity"), dict)
+                             or (meta.get("identity") is None and meta.get("configSlot")))):
+                    rotations[entry_id] = meta
+                    continue
+            blocking_ids.add(entry_id)
+            status = "unverifiable"
+        return dict(status=status, consumed_fps=consumed_fps,
+                    blocking_ids=blocking_ids, rotations=rotations)
+
+    def _checked_refresh_stash(self, account_num: str) -> dict:
+        """Require proven publication before either refresh path spends a grant."""
+        state = self._refresh_stash_state()
+        if state["status"] == "busy":
             raise LockError("stash publication is busy; retry later")
-        if verdict not in {"ok", "corrupt"} or (verdict == "corrupt" and manifest):
-            entries = manifest
+        if state["status"] != "ok":
             self._logger.warning(
                 "Account %s stash publication unproven, entries %s; "
                 "inspect with `cswap unclaimed` before retrying.",
-                account_num, ", ".join(sorted(entries)) or "unknown (scan unavailable)",
+                account_num, ", ".join(sorted(state["blocking_ids"])) or "unknown (scan unavailable)",
             )
             raise CredentialReadError("stash publication unavailable or incomplete")
-        rotations = {}
-        for entry_id, meta in manifest.items():
-            if not isinstance(meta, dict):
-                valid = False
-            elif (meta.get("reason") in _STASH_SAFETY_REASONS
-                    and meta.get("fingerprint")
-                    and meta.get("configSlot")
-                    and "consumedFp" not in meta):
-                continue
-            else:
-                valid = bool(
-                    isinstance(meta.get("consumedFp"), str)
-                    and meta["consumedFp"]
-                    and (isinstance(meta.get("identity"), dict)
-                         or (meta.get("identity") is None and meta.get("configSlot")))
-                )
-            if not valid:
-                self._logger.warning(
-                    "Account %s stash entry %s is unattributed; deferring refresh.",
-                    account_num, entry_id,
-                )
-                raise CredentialReadError("stash entry has unproven provenance")
-            rotations[entry_id] = meta
-        return rotations
+        return state["rotations"]
 
     @staticmethod
     def recovery_error_note(code: str) -> str | None:
@@ -3141,44 +3145,16 @@ class ClaudeAccountSwitcher:
     def _session_credential_stash_status(
         self, credentials: str, *, profile: bool = False,
     ) -> str | None:
-        """Check a refresh-bearing session credential under the account lock.
-
-        Identity and slot guards cannot make a spent generation safe to seed:
-        any row's consumed fingerprint excludes that credential. A pending
-        row also asks the caller to inspect a reusable profile, lazily. Unknown
-        publication blocks bootstrap; a ready profile may still be independent
-        of the backup, which the session caller checks before reuse.
-        """
+        """Check the exact refresh-bearing bytes about to seed a profile."""
         data = oauth.extract_oauth_data(credentials) or {}
         if not data.get("refreshToken"):
             return None
-        manifest, verdict = self._store._stash_snapshot()
-        fp = oauth.credential_fingerprint(credentials)
-        if fp and any(
-            isinstance(meta, dict) and meta.get("consumedFp") == fp
-            for meta in manifest.values()
-        ):
+        state = self._refresh_stash_state()
+        if oauth.credential_fingerprint(credentials) in state["consumed_fps"]:
             return "consumed"
-        if verdict == "busy":
-            return "busy"
-        if verdict != "ok":
-            return "unverifiable"
-        pending = False
-        for meta in manifest.values():
-            if not isinstance(meta, dict):
-                return "unverifiable"
-            if (meta.get("reason") in _STASH_SAFETY_REASONS
-                    and meta.get("fingerprint") and meta.get("configSlot")
-                    and "consumedFp" not in meta):
-                continue
-            if not (
-                isinstance(meta.get("consumedFp"), str) and meta["consumedFp"]
-                and (isinstance(meta.get("identity"), dict)
-                     or (meta.get("identity") is None and meta.get("configSlot")))
-            ):
-                return "unverifiable"
-            pending = True
-        return "pending" if pending and not profile else None
+        if state["status"] != "ok":
+            return state["status"]
+        return "pending" if state["rotations"] and not profile else None
 
     def _adopt_stashed_successor(
         self, account_num: str, email: str, current: str, *, persist=None,

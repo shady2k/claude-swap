@@ -1882,7 +1882,7 @@ class CredentialStore:
           repair is ``_write_stash_manifest`` renaming the bad file aside, and
           that runs only on a manifest WRITE, which deferring prevents. The
           adopt scan therefore decides by whether any entry bytes are actually
-          at risk (see ``_stash_entry_files_exist``), and the mutator proceeds
+          at risk (see ``_stash_snapshot``), and the mutator proceeds
           so the set-aside can happen at all.
         - ``"ok"`` — includes a genuinely absent manifest; no rows and nothing
           to protect read the same to every caller.
@@ -1924,43 +1924,6 @@ class CredentialStore:
             return {}, "corrupt"
         return entries, "ok"
 
-    def _stash_entry_files_exist(self, *, excluding=()) -> bool:
-        """Are there stash entry files outside the supplied manifest entry IDs?
-
-        With no exclusions this checks whether a corrupt manifest could hide
-        a consumed generation's only successor. Excluding mapped entries
-        detects unpublished successors even with a readable manifest. Entry
-        files are named independently of the manifest, so they answer even
-        when publication failed.
-
-        Unknowable answers TRUE: a directory we cannot list is not evidence
-        that nothing is at risk, and the caller uses this to decide whether to
-        spend a grant.
-
-        ``iterdir``, NOT ``glob``. ``Path.glob`` SUPPRESSES directory-scan
-        ``OSError``s, so the guard's except arm never ran: measured on 3.14.6,
-        a searchable-but-unlistable credentials dir (mode 0o311) returned
-        ``[]`` with a real orphan sitting right there — the manifest and the
-        entry bytes stay readable through the searchable dir, so corrupt+
-        orphans read as corrupt+empty and the gate POSTed the spent grant.
-        ``iterdir`` raises on the same state. The same interpreter-suppression
-        trap as ``Path.exists()``, third appearance in this file.
-
-        A MISSING directory is the one ``OSError`` that answers False: no
-        credentials dir means provably nothing was ever stashed.
-        """
-        try:
-            for entry in self._host.credentials_dir.iterdir():
-                name = entry.name
-                if (name.startswith(".unclaimed-") and name.endswith(".enc")
-                        and name[len(".unclaimed-"):-len(".enc")] not in excluding):
-                    return True
-        except FileNotFoundError:
-            return False
-        except OSError:
-            return True
-        return False
-
     def _read_stash_manifest(self) -> dict:
         return self._read_stash_manifest_ex()[0]
 
@@ -1992,15 +1955,21 @@ class CredentialStore:
                     )
         atomic_write_json(path, {"schemaVersion": 1, "entries": entries})
 
-    def _stash_manifest_lock(self):
-        """The final lock in the credential lock order, bounded to two seconds."""
+    def _stash_manifest_lock(self, *, timeout: float = 10.0):
+        """The final lock in the credential lock order.
+
+        Writers and removals wait up to ten seconds to avoid unpublished
+        successors; read-only snapshots use a shorter two-second budget.
+        """
         from claude_swap.locking import FileLock
 
-        return FileLock(self._stash_manifest_path().with_suffix(".lock"), timeout=2.0)
+        return FileLock(self._stash_manifest_path().with_suffix(".lock"), timeout=timeout)
 
-    def _stash_snapshot(self) -> tuple[dict, str]:
-        """Read manifest and directory together, without observing publication gaps.
+    def _stash_snapshot(self) -> tuple[dict, set[str], str]:
+        """Read manifest and orphan IDs without observing publication gaps.
 
+        The verdict describes the manifest or a failed directory read; orphan
+        IDs are separate so unpublished files do not hide corrupt metadata.
         The lock is released before adoption or any other account mutation.
         Contention is distinct from failed storage: a busy writer only needs
         another pass, while an unreadable snapshot cannot establish lineage.
@@ -2008,15 +1977,24 @@ class CredentialStore:
         from claude_swap.exceptions import LockError
 
         try:
-            with self._stash_manifest_lock():
+            with self._stash_manifest_lock(timeout=2.0):
                 entries, verdict = self._read_stash_manifest_ex()
-                if self._stash_entry_files_exist(excluding=entries):
-                    return entries, "orphaned"
-                return entries, verdict
+                try:
+                    entry_ids = {
+                        entry.name[len(".unclaimed-"):-len(".enc")]
+                        for entry in self._host.credentials_dir.iterdir()
+                        if entry.name.startswith(".unclaimed-")
+                        and entry.name.endswith(".enc")
+                    }
+                except FileNotFoundError:
+                    entry_ids = set()
+                except OSError:
+                    return entries, set(), "unreadable"
+                return entries, entry_ids.difference(entries), verdict
         except LockError:
-            return {}, "busy"
+            return {}, set(), "busy"
         except OSError:
-            return {}, "unreadable"
+            return {}, set(), "unreadable"
 
     def _mutate_stash_manifest(self, mutate) -> None:
         """Apply ``mutate(entries)`` to the manifest as one atomic step.
@@ -2089,11 +2067,15 @@ class CredentialStore:
         lock = self._stash_manifest_lock()
         try:
             lock.__enter__()
-        except Exception:
-            # A consumed successor must survive even when lock storage or a
-            # competing writer prevents publication. Leave recoverable bytes
-            # and report failure; never claim the manifest was published.
+        except BaseException:
+            # A consumed successor must survive even when lock storage,
+            # contention or interruption prevents publication.
             self._atomic_b64_write(self._stash_entry_path(entry_id), credentials)
+            self._host._logger.warning(
+                "Stash publication failed for account %s, entry %s; "
+                "credential bytes preserved.", context.get("configSlot", "unknown"),
+                entry_id,
+            )
             raise
         try:
             self._atomic_b64_write(self._stash_entry_path(entry_id), credentials)

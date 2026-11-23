@@ -1327,12 +1327,9 @@ class SessionManager:
                 raise SessionError("Account identity changed during profile preparation")
             stash_status = self._profile_stash_status(session_dir, account_num, email)
             if stash_status == "consumed":
-                backup = self.switcher.read_account_credentials(account_num, email)
-                backup_status = self.switcher._session_credential_stash_status(backup or "")
-                if backup_status in (None, "pending"):
-                    self._bootstrap(session_dir, account_num, email, org_uuid)
-                    clear_session_stale(session_dir)
-                    stash_status = None
+                self._bootstrap(session_dir, account_num, email, org_uuid)
+                clear_session_stale(session_dir)
+                stash_status = None
             if stash_status:
                 raise self._stash_admission_error(account_num, status=stash_status)
             # A backup refresh can mark the reserved profile stale. Re-check
@@ -1402,21 +1399,20 @@ class SessionManager:
         """
         from claude_swap import oauth
 
-        backup = self.switcher.read_account_credentials(account_num, email)
-        status = self.switcher._session_credential_stash_status(backup or "")
-        if not status:
+        state = self.switcher._refresh_stash_state()
+        if state["status"] == "ok" and not state["consumed_fps"]:
             return None
         profile = read_session_credentials(session_dir)
-        if status in ("pending", "consumed"):
-            if not profile:
-                return status if status == "consumed" else None
-            profile_status = self.switcher._session_credential_stash_status(profile, profile=True)
-            if not profile_status or profile_status == "consumed":
-                return profile_status
-            status = profile_status
-        if profile and backup and oauth.credential_fingerprint(profile) != oauth.credential_fingerprint(backup):
+        if profile and not self._has_refresh_token(profile):
             return None
-        return status
+        if profile and oauth.credential_fingerprint(profile) in state["consumed_fps"]:
+            return "consumed"
+        if state["status"] in ("busy", "unverifiable"):
+            backup, unreadable = self.switcher._read_account_credentials_ex(account_num, email)
+            if (not profile or not backup or unreadable
+                    or oauth.credential_fingerprint(profile) == oauth.credential_fingerprint(backup)):
+                return state["status"]
+        return None
 
     def _stash_admission_error(self, account_num: str, *, status: str | None = None) -> SessionError:
         if status == "busy":
@@ -1459,44 +1455,30 @@ class SessionManager:
         self, session_dir: Path, account_num: str, email: str, org_uuid: str
     ) -> None:
         """Seed the session profile from backup storage. Caller holds the lock."""
-        # Checked here, on the login about to be copied, and before anything
-        # of the profile is touched. The consume gate's own check does not
-        # cover every way in: it reports success without reaching it when the
-        # backup moved after the caller's snapshot. Only a certain match
-        # refuses: a live store that cannot be read is no reason to fail a
-        # launch the stored credentials can serve.
-        if self.switcher._live_login_holds(
-            self.switcher.read_account_credentials(account_num, email) or ""
-        ):
-            raise self._live_login_error(account_num)
-
-        credentials = self.switcher.read_account_credentials(account_num, email)
-        stash_status = self.switcher._session_credential_stash_status(credentials or "")
-        if stash_status and stash_status != "pending":
-            raise self._stash_admission_error(account_num, status=stash_status)
-
-        self._guard_profile_rebuild(session_dir)
-
-        # Claude reads the keychain before the plaintext file — a stale hashed
-        # entry from an earlier profile at this path would shadow the seed.
-        delete_macos_keychain_entry(session_dir)
-
-        creds, unreadable = self.switcher._read_account_credentials_ex(
-            account_num, email
-        )
-        if not creds:
+        # Validate the same bytes that will be written, before touching the
+        # profile or removing its Keychain entry.
+        creds, unreadable = self.switcher._read_account_credentials_ex(account_num, email)
+        if not creds or unreadable:
             if unreadable:
-                # Third copy of the switch path's message; same reason not to
-                # send the user to a re-add over a locked Keychain.
                 raise SessionError(
-                    f"Account-{account_num}'s backup is in the macOS Keychain "
-                    f"but it is unreadable right now (locked or no GUI "
-                    f"session). Retry from a GUI terminal; do not re-add."
+                    f"Account-{account_num}'s backup is unreadable right now "
+                    "(locked Keychain or credential file read failure). "
+                    "Retry when storage is available; do not re-add."
                 )
             raise SessionError(
                 f"Account-{account_num} has no stored credentials. "
                 f"Re-add with: cswap --add-account --slot {account_num}"
             )
+        if self.switcher._live_login_holds(creds):
+            raise self._live_login_error(account_num)
+        stash_status = self.switcher._session_credential_stash_status(creds)
+        if stash_status and stash_status != "pending":
+            raise self._stash_admission_error(account_num, status=stash_status)
+
+        self._guard_profile_rebuild(session_dir)
+
+        # Claude reads the keychain before the plaintext file.
+        delete_macos_keychain_entry(session_dir)
 
         # The pre-lock refresh (see run(): the consume gate must not run
         # under this lock — its POST is network and the FileLock is

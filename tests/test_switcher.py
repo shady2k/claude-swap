@@ -8140,7 +8140,7 @@ class TestActiveRefreshProvenance:
             result = switcher._fetch_active_usage("1", "test@example.com", snapshot)
 
         eligible = backup_refresh == "rt-live"
-        expected_error = "transient" if eligible else "ownership-lost"
+        expected_error = "transient" if eligible else "credential-unproven"
         assert result.error == expected_error
         assert result.sentinel is None
         assert result.struck_fp is None
@@ -10333,7 +10333,7 @@ class TestConsumeGate:
             s._store._remove_unclaimed_credential(entry_id)
 
         # 3. after which nothing is at risk and the slot moves again
-        assert s._store._stash_entry_files_exist() is False
+        assert s._store._stash_snapshot()[1:] == (set(), "corrupt")
         posted = []
 
         def mock_refresh(credentials, **kw):
@@ -10356,7 +10356,7 @@ class TestConsumeGate:
     ):
         """The corrupt policy asks "is anything at risk"; not knowing is YES.
 
-        `_stash_entry_files_exist` is what lets a corrupt manifest proceed, so
+        `_stash_snapshot` is what lets a corrupt manifest proceed, so
         a scan that FAILS must not read as "nothing on disk" — that is the
         empty-means-safe conflation this whole PR removes, one level down. The
         caller spends a grant on this answer.
@@ -10371,12 +10371,12 @@ class TestConsumeGate:
         """
         s = self._switcher(sample_sequence_data)
         self._stash_successor_of(s, self._NEW, self._OLD)
-        assert s._store._stash_entry_files_exist() is True, "test premise"
+        assert s._store._stash_snapshot()[0], "test premise"
 
         cred_dir = s._store._host.credentials_dir
         os.chmod(cred_dir, 0o311)  # searchable (files reachable), unlistable
         try:
-            assert s._store._stash_entry_files_exist() is True
+            assert s._store._stash_snapshot()[2] == "unreadable"
         finally:
             os.chmod(cred_dir, 0o700)
 
@@ -10394,7 +10394,7 @@ class TestConsumeGate:
 
             _shutil.rmtree(cred_dir)
 
-        assert s._store._stash_entry_files_exist() is False
+        assert s._store._stash_snapshot()[1:] == (set(), "ok")
 
     def test_a_manifest_without_a_dict_entries_member_is_corrupt(
         self, temp_home: Path, sample_sequence_data: dict
