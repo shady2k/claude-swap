@@ -53,6 +53,8 @@ uv run pytest tests/test_usage_store.py -n 0 --pdb   # no parallelism, stop in t
 ```
 
 The tests never touch your real accounts: they run in a temporary home with a fake Keychain.
+The native Windows policy control also needs the pre-pytest preparation and
+always-run cleanup in `.github/workflows/ci.yml`; see `tests/win_profile_home.py`.
 
 A bug fix should come with a test that fails without it. CI runs on Linux, macOS and Windows; if you could only try one of them, say so in the pull request and that is fine.
 

@@ -39,7 +39,7 @@ def test_check_dacl_distinguishes_inherit_only_modify_from_add_subdirectory(
         if add_subdirectory:
             with pytest.raises(fsguard.GuardError, match="Writable by another user or group"):
                 _observe_dacl(security._check_dacl, tmp_path, dacl, trusted, rejection)
-            assert rejection == ["allow/explicit/authenticated-users rights=append-data-or-add-subdirectory"]
+            assert rejection == ["allow/explicit/authenticated-users mask=0x00000004 rights=append-data-or-add-subdirectory"]
         else:
             _observe_dacl(security._check_dacl, tmp_path, dacl, trusted, rejection)
             assert not rejection
