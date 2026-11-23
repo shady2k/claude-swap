@@ -1246,8 +1246,12 @@ class SessionManager:
                     raise SessionError("Account identity changed before profile reuse")
                 if self.switcher._get_current_account() == (email, org_uuid) and not self._default_login_signed_out() and self._slot_has_default_refresh_grant(account_num, email):
                     raise SessionError("Selected account became the default login before profile reuse")
-                self._sync_sharing(session_dir, share, share_history)
-            return session_dir, account_num, email
+                stash_status = self._profile_stash_status(session_dir, account_num, email)
+                if stash_status != "consumed":
+                    if stash_status:
+                        raise self._stash_admission_error(account_num, status=stash_status)
+                    self._sync_sharing(session_dir, share, share_history)
+                    return session_dir, account_num, email
 
         # One refresh so the profile starts with a fresh access token —
         # BEFORE the bootstrap lock (the gate takes the same non-reentrant
@@ -1280,53 +1284,13 @@ class SessionManager:
                     f"Account-{account_num}'s stored login changed during refresh; "
                     "retry to prepare a profile from the current login."
                 )
+            if outcome.error == "stash-unreadable":
+                raise self._stash_admission_error(account_num)
             if outcome.error is not None and outcome.credentials:
-                # `error is None` is the gate's own "the slot is freshened
-                # and safe to activate" signal, and it is NOT implied by
-                # credentials being present: a failed persist returns the
-                # successor AND `transient`, with the backup still holding
-                # the generation whose grant was just spent.
-                #
-                # WARNING ABOUT IT IS NOT ENOUGH. `_bootstrap` re-reads the
-                # backup, so continuing seeds the profile from that spent
-                # generation and claude's first refresh gets invalid_grant —
-                # the warning scrolls past and the session is broken anyway.
-                #
-                # Refuse — but the two demoted shapes need OPPOSITE advice,
-                # and `error`/`credentials` cannot tell them apart, which is
-                # why the gate carries `stashed`.
-                #
-                # Stashed: retrying is right. The next run's gate adopts the
-                # successor without consuming anything and bootstraps
-                # normally, so the recovery machinery already built here does
-                # the rest.
-                #
-                # NOT stashed (`consume-gate-unpersisted`, where the persist
-                # AND the stash both failed): retrying POSTs the spent
-                # predecessor and earns a strike. The successor survived only
-                # in this return value, which the raise discards — saying
-                # "nothing was lost" there would be false on both counts. The
-                # remedy is the storage failure, which is what the gate's own
-                # ERROR log at that site already says.
-                #
-                # This shape is distinguishable at the call site: a genuine
-                # network-transient carries `credentials=None` and falls to
-                # the warning below, where continuing on the stored
-                # credentials is correct because nothing was spent.
-                if outcome.stashed:
-                    raise SessionError(
-                        f"Account-{account_num}'s refreshed credential could "
-                        f"not be stored, so the backup still holds a spent "
-                        f"grant. The successor is stashed — please retry, and "
-                        f"the next run adopts it automatically."
-                    )
                 raise SessionError(
-                    f"Account-{account_num}'s refreshed credential could "
-                    f"neither be stored nor stashed, so the backup holds a "
-                    f"spent grant and the successor is gone. Fix the storage "
-                    f"failure first; retrying before that spends nothing but "
-                    f"earns a strike. If the slot strikes, log in again and "
-                    f"re-add it: cswap --add-account --slot {account_num}"
+                    f"Account-{account_num}'s refreshed credential could not be "
+                    "stored. Credential preparation is deferred; fix the storage "
+                    "failure, then retry so recovery can adopt the successor."
                 )
             if outcome.error == "live-login":
                 # The gate declined because the live login holds this same
@@ -1336,8 +1300,8 @@ class SessionManager:
                 raise self._live_login_error(account_num)
             if outcome.error is not None:
                 warning(
-                    f"Could not refresh the token for Account-{account_num}; "
-                    "continuing with the stored credentials."
+                    f"Token refresh for Account-{account_num} is deferred; "
+                    "checking the stored login before profile preparation."
                 )
 
         with profile_ownership.ownership_lock(self.switcher.backup_dir), FileLock(
@@ -1361,6 +1325,16 @@ class SessionManager:
             self._verify_profile_recipient(record)
             if self.switcher.resolve_account(identifier) != (account_num, email, org_uuid):
                 raise SessionError("Account identity changed during profile preparation")
+            stash_status = self._profile_stash_status(session_dir, account_num, email)
+            if stash_status == "consumed":
+                backup = self.switcher.read_account_credentials(account_num, email)
+                backup_status = self.switcher._session_credential_stash_status(backup or "")
+                if backup_status in (None, "pending"):
+                    self._bootstrap(session_dir, account_num, email, org_uuid)
+                    clear_session_stale(session_dir)
+                    stash_status = None
+            if stash_status:
+                raise self._stash_admission_error(account_num, status=stash_status)
             # A backup refresh can mark the reserved profile stale. Re-check
             # under both locks before rebuilding its credentials.
             if is_session_stale(session_dir) and profile_is_quiescent(session_dir):
@@ -1417,6 +1391,47 @@ class SessionManager:
 
         return session_dir, account_num, email
 
+    def _profile_stash_status(
+        self, session_dir: Path, account_num: str, email: str,
+    ) -> str | None:
+        """Check admission under the account lock, reading profiles only on doubt.
+
+        An unverifiable stash prevents copying the backup, but an existing
+        profile with an independent, readable generation can still run.
+        A known consumed backup must go through the recovery gate first.
+        """
+        from claude_swap import oauth
+
+        backup = self.switcher.read_account_credentials(account_num, email)
+        status = self.switcher._session_credential_stash_status(backup or "")
+        if not status:
+            return None
+        profile = read_session_credentials(session_dir)
+        if status in ("pending", "consumed"):
+            if not profile:
+                return status if status == "consumed" else None
+            profile_status = self.switcher._session_credential_stash_status(profile, profile=True)
+            if not profile_status or profile_status == "consumed":
+                return profile_status
+            status = profile_status
+        if profile and backup and oauth.credential_fingerprint(profile) != oauth.credential_fingerprint(backup):
+            return None
+        return status
+
+    def _stash_admission_error(self, account_num: str, *, status: str | None = None) -> SessionError:
+        if status == "busy":
+            return SessionError(
+                f"Account-{account_num}'s stash recovery is busy; preparation is deferred. Retry shortly."
+            )
+        if status == "consumed":
+            return SessionError(
+                f"Account-{account_num}'s stored refresh grant was already consumed; "
+                "credential preparation is deferred. Retry after successor recovery."
+            )
+        return SessionError(
+            f"Account-{account_num}: {self.switcher.recovery_error_note('stash-unreadable')}"
+        )
+
     def _profile_matches_backup(
         self, session_dir: Path, account_num: str, email: str
     ) -> bool:
@@ -1454,6 +1469,11 @@ class SessionManager:
             self.switcher.read_account_credentials(account_num, email) or ""
         ):
             raise self._live_login_error(account_num)
+
+        credentials = self.switcher.read_account_credentials(account_num, email)
+        stash_status = self.switcher._session_credential_stash_status(credentials or "")
+        if stash_status and stash_status != "pending":
+            raise self._stash_admission_error(account_num, status=stash_status)
 
         self._guard_profile_rebuild(session_dir)
 
