@@ -647,6 +647,12 @@ def _change_policy(root, change):
         transparent.revoke_history(root)
     elif change == "share-history":
         set_setting(root, "run.shareHistory", "false")
+    elif change == "account-disabled":
+        with FileLock(paths.account_lock_path(root)):
+            sequence = root / "sequence.json"
+            data = json.loads(sequence.read_text())
+            data["accounts"]["2"]["disabled"] = True
+            sequence.write_text(json.dumps(data))
     else:
         transparent.disable(root)
 
@@ -763,7 +769,7 @@ def test_summary_escapes_controls_and_bounds_label(shim):
     assert reason == "not a member of the current history zone; resets unknown"
 
 
-@pytest.mark.parametrize("change", ["pool", "members", "scope", "revoke", "share-history", "disable"])
+@pytest.mark.parametrize("change", ["pool", "members", "scope", "revoke", "share-history", "disable", "account-disabled"])
 @pytest.mark.parametrize("when", ["before", "after"])
 def test_policy_is_rechecked_at_publication_not_handoff(shim, monkeypatch, change, when):
     root, profiles = shim
@@ -775,7 +781,11 @@ def test_policy_is_rechecked_at_publication_not_handoff(shim, monkeypatch, chang
     ))
     monkeypatch.setattr(transparent.spawn, "require_supervision", lambda: None)
     def owned_launch(callback, *, publish, release, abort):
-        publish()
+        try:
+            publish()
+        except BaseException:
+            abort()
+            raise
         callback()
         release()
         return 0
@@ -787,12 +797,33 @@ def test_policy_is_rechecked_at_publication_not_handoff(shim, monkeypatch, chang
     def handoff(args, env, **_):
         _assert_lock_free(root)
         assert len(json.loads(journal.read_text(encoding="utf-8"))) == 1
-        if when == "after":
-            _change_policy(root, change)
         assert tuple(args[-2:]) == ("--resume", SESSION_ID)
         selected.append(Path(env["CLAUDE_CONFIG_DIR"]))
 
     monkeypatch.setattr(real, "handoff", handoff)
+    if when == "after":
+        journal_write = transparent._journal
+
+        def change_after_running(*args):
+            records = list((root / "profile-ownership" / "launches").glob("*.json"))
+            assert len(records) == 1
+            assert json.loads(records[0].read_text())["state"] == "running"
+            return journal_write(*args)
+
+        monkeypatch.setattr(transparent, "_journal", change_after_running)
+        # Policy writers run outside publication locks, after the saved
+        # running record but before handoff.
+        def owned_launch(callback, *, publish, release, abort):
+            try:
+                publish()
+            except BaseException:
+                abort()
+                raise
+            _change_policy(root, change)
+            callback()
+            release()
+            return 0
+        monkeypatch.setattr(transparent.spawn, "owned_launch", owned_launch)
     if when == "before":
         prepare = transparent._prepare_launch
         changed = False
@@ -808,7 +839,7 @@ def test_policy_is_rechecked_at_publication_not_handoff(shim, monkeypatch, chang
             return prepared
 
         monkeypatch.setattr(transparent, "_prepare_launch", prepare_then_change)
-    if when == "before" and change not in {"pool", "members"}:
+    if when == "before" and change not in {"pool", "members", "account-disabled"}:
         with pytest.raises(transparent.ConfigError):
             transparent._launch(marker, ["--resume", SESSION_ID], root)
         assert not selected and not journal.exists()
@@ -818,6 +849,9 @@ def test_policy_is_rechecked_at_publication_not_handoff(shim, monkeypatch, chang
         assert done.value.code == 0
         assert selected == [profiles["1" if when == "before" else "2"]]
         assert SESSION_ID not in journal.read_text(encoding="utf-8")
+    ownership = [json.loads(path.read_text(encoding="utf-8"))
+                 for path in (root / "profile-ownership" / "launches").glob("*.json")]
+    assert not ownership, [(record["state"], record.get("pid")) for record in ownership]
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="direct routing is Linux-only")
@@ -848,3 +882,188 @@ def test_share_history_disabled_refuses_without_reading_or_changing_setting(shim
     assert not (tmp_path / "handoff").exists()
     assert transcript.read_text(encoding="utf-8") == PREVIOUS + "\n"
     assert json.loads((root / "settings.json").read_text(encoding="utf-8"))["run"]["shareHistory"] is False
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="running publication requires Linux supervision")
+def test_running_is_committed_before_launch_journal(shim, monkeypatch):
+    root, _ = shim
+    directory = paths.get_shim_dir(root)
+    policy = launch_policy.read(root)
+    monkeypatch.setattr(transparent, "sys", SimpleNamespace(
+        platform=sys.platform, flags=SimpleNamespace(isolated=True), stderr=sys.stderr,
+    ))
+    prepared = transparent._prepare_launch(
+        root, directory, transparent._invocation_marker(directory, False),
+        ["-p", "hello"], policy, launch_policy.accounts(root), test=True,
+    )
+    original = transparent._journal
+    observed = []
+
+    def journal_after_running(*args):
+        records = list((root / "profile-ownership" / "launches").glob("*.json"))
+        assert len(records) == 1
+        assert json.loads(records[0].read_text())["state"] == "running"
+        observed.append("running")
+        return original(*args)
+
+    monkeypatch.setattr(transparent, "_journal", journal_after_running)
+    try:
+        assert transparent._publish_launch(root, directory, policy, prepared)
+        assert observed == ["running"]
+    finally:
+        with transparent.profile_ownership.ownership_lock(root):
+            transparent.profile_ownership.release_locked(root, prepared.reservation["launchId"], confirmed_complete=True)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="running publication requires Linux supervision")
+@pytest.mark.parametrize("order", ["running-first", "false-first"])
+@pytest.mark.parametrize("key", ["run.shareHistory", "ui.theme"])
+def test_f37_settings_write_serializes_with_running(shim, monkeypatch, order, key):
+    """Events establish order; timeouts only diagnose a stuck child."""
+    import multiprocessing
+
+    root, _ = shim
+    ctx = multiprocessing.get_context("fork")
+    read_true, allow_read, attempted, written, running_saved = (ctx.Event() for _ in range(5))
+    trace = ctx.Queue()
+    results = ctx.Queue()
+    directory = paths.get_shim_dir(root)
+    marker = transparent._invocation_marker(directory, False)
+    monkeypatch.setattr(transparent, "sys", SimpleNamespace(
+        platform=sys.platform, flags=SimpleNamespace(isolated=True), stderr=sys.stderr,
+    ))
+    original_check = transparent.check_transparent_history
+    original_running = transparent.profile_ownership.mark_running_locked
+    checks = 0
+
+    def check(root):
+        nonlocal checks
+        checks += 1
+        original_check(root)
+        if checks == 2 and order == "running-first":
+            read_true.set()
+            assert allow_read.wait(10), "publisher was not released"
+
+    def running(*args, **kwargs):
+        original_running(*args, **kwargs)
+        assert not written.is_set()
+        running_saved.set()
+        trace.put("running")
+
+    def owned_launch(callback, *, publish, release, abort):
+        try:
+            publish()
+            callback()
+            release()
+            return 0
+        except BaseException:
+            abort()
+            raise
+
+    def publisher():
+        transparent.check_transparent_history = check
+        transparent.profile_ownership.mark_running_locked = running
+        transparent.spawn.owned_launch = owned_launch
+        real = test_mode.claude_binary(backup_root=root)
+        test_mode.claude_binary = lambda **_: real
+        def handoff(*args, **kwargs):
+            _assert_lock_free(root)
+            trace.put("handoff")
+        real.handoff = handoff
+        try:
+            transparent._launch(marker, ["-p", "hello"], root)
+        except SystemExit as exc:
+            results.put(exc.code)
+        except transparent.ConfigError:
+            results.put(4)
+
+    def writer():
+        assert read_true.wait(10), "publisher did not reach settings read"
+        lock_path = root / "settings.lock"
+        lock = FileLock(lock_path, timeout=0)
+        acquired = lock.acquire()
+        if acquired:
+            lock.release()
+        results.put(("probe", acquired))
+        attempted.set()
+        if key == "ui.theme":
+            set_setting(root, key, "light")
+        set_setting(root, "run.shareHistory", "false")
+        assert running_saved.is_set() is (order == "running-first")
+        trace.put("false")
+        written.set()
+
+    # In the reverse order the writer must finish outside the publication
+    # locks, not from a hook already inside them.
+    if order == "false-first":
+        original_prepare = transparent._prepare_launch
+        def prepare(*args, **kwargs):
+            result = original_prepare(*args, **kwargs)
+            read_true.set()
+            assert written.wait(10), "writer did not finish before publication"
+            return result
+        monkeypatch.setattr(transparent, "_prepare_launch", prepare)
+
+    children = [ctx.Process(target=publisher), ctx.Process(target=writer)]
+    try:
+        for child in children:
+            child.start()
+        assert attempted.wait(10), "writer did not probe the publication lock"
+        allow_read.set()
+        for child in children:
+            child.join(15)
+            assert child.exitcode == 0, "child failed or hung"
+        outcomes = [results.get(timeout=2) for _ in range(2)]
+        assert ("probe", order == "false-first") in outcomes
+        expected_code = 0 if order == "running-first" else 4
+        assert expected_code in outcomes
+        count = 3 if order == "running-first" else 1
+        entries = [trace.get(timeout=2) for _ in range(count)]
+        setting = "false"
+        if order == "running-first":
+            assert entries.count("running") == entries.count("handoff") == 1
+            assert running_saved.is_set() and written.is_set()
+        else:
+            assert entries == [setting]
+            assert trace.empty()
+            assert not (directory / "launches.json").exists()
+        assert not list((root / "profile-ownership" / "launches").glob("*.json"))
+    finally:
+        for child in children:
+            if child.is_alive():
+                child.terminate()
+            child.join(5)
+
+
+@pytest.mark.parametrize("value", ["{", "[]", '{"run": null}', '{"run": {"shareHistory": "true"}}'])
+def test_corrupt_settings_at_publication_refuses(shim, monkeypatch, value):
+    root, _ = shim
+    monkeypatch.setattr(transparent, "sys", SimpleNamespace(
+        platform=sys.platform, flags=SimpleNamespace(isolated=True), stderr=sys.stderr,
+    ))
+    prepare = transparent._prepare_launch
+    def corrupt_after_prepare(*args, **kwargs):
+        result = prepare(*args, **kwargs)
+        (root / "settings.json").write_text(value)
+        return result
+    monkeypatch.setattr(transparent, "_prepare_launch", corrupt_after_prepare)
+    # This wrapper keeps the real abort path but never hands off a process.
+    def owned_launch(callback, *, publish, release, abort):
+        try:
+            publish()
+            pytest.fail("corrupt settings allowed publication")
+        finally:
+            abort()
+    monkeypatch.setattr(transparent.spawn, "owned_launch", owned_launch)
+    with pytest.raises(transparent.ConfigError):
+        transparent._launch(transparent._invocation_marker(paths.get_shim_dir(root), False), ["-p", "hello"], root)
+    assert not (paths.get_shim_dir(root) / "launches.json").exists()
+    assert not list((root / "profile-ownership" / "launches").glob("*.json"))
+
+
+@pytest.mark.parametrize("value", ["{}", '{"run": {}}'])
+def test_absent_share_history_key_uses_default(shim, value):
+    root, _ = shim
+    (root / "settings.json").write_text(value)
+    result = _invoke("-p", "hello")
+    assert result.returncode == 0, result.stderr

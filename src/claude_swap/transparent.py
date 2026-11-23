@@ -474,7 +474,11 @@ def _prepare_launch(
 
 
 def _publish_launch(root: Path, directory: Path, policy: dict, prepared: _Launch) -> bool:
-    """Commit the selected launch while consent and the identity still match."""
+    """Save running under state → account → settings locks, then journal it.
+
+    Settings writers cannot revoke sharing between the final consent read and
+    the running save. Handoff is the caller's job after these locks are free.
+    """
     with profile_ownership.ownership_lock(root), FileLock(paths.account_lock_path(root)), settings_lock(root):
         if prepared.reservation:
             profile_ownership.verify_reservation_locked(
@@ -505,12 +509,12 @@ def _publish_launch(root: Path, directory: Path, policy: dict, prepared: _Launch
                 return False
             if not os.path.lexists(profile / "projects"):
                 make_dir_link(history, profile / "projects")
-        _journal(directory, _OUTSIDE if prepared.outside_reason else "launch")
         if prepared.reservation:
             profile_ownership.mark_running_locked(
                 root, prepared.reservation["launchId"], os.getpid(),
                 expected_profile_gen=prepared.reservation["profileGen"],
             )
+        _journal(directory, _OUTSIDE if prepared.outside_reason else "launch")
         return True
 
 
