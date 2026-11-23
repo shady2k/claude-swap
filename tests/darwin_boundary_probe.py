@@ -12,7 +12,6 @@ import json
 import os
 import platform
 import plistlib
-import resource
 import socket
 import subprocess
 import sys
@@ -23,7 +22,9 @@ from pathlib import Path
 
 
 def target(directory: Path, detached: bool) -> None:
-    # No imports, credentials, network clients or product launch path involved.
+    import resource
+
+    # No credentials, network clients or product launch path involved.
     if detached:
         if os.fork():
             os._exit(0)
