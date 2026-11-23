@@ -5421,8 +5421,9 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
             "just spent — claude's first refresh gets invalid_grant"
         )
 
+    @pytest.mark.parametrize("credentials", [ROTATED_CREDS, None])
     def test_an_unpersisted_successor_is_not_reported_as_stashed(
-        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, credentials
     ):
         """A failed persist cannot prove the successor was lost."""
         session_dir = session_dir_for(
@@ -5434,7 +5435,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
             ClaudeAccountSwitcher,
             "consume_backup_grant",
             lambda self, num, email, snap, **kwargs: oauth.RefreshOutcome(
-                ROTATED_CREDS, "transient", stashed=False
+                credentials, "stash-unreadable", stashed=False
             ),
         )
 
@@ -5442,8 +5443,9 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
             manager.setup_session("2", share=False)
 
         msg = str(exc.value)
-        assert "preparation is deferred" in msg
-        assert "fix the storage failure" in msg
+        assert seeded_switcher.recovery_error_note("stash-unreadable") in msg
+        assert "only after recovering the login" in msg
+        assert "--purge ID" in msg
         assert "successor is gone" not in msg
         assert "strike" not in msg
 
@@ -5505,6 +5507,39 @@ class TestStashSessionAdmission:
             manager.setup_session(ACCOUNT_NUM, share=False)
         assert not profile.exists()
         assert seeded_switcher._store._list_unclaimed_credentials()
+
+    def test_persist_and_manifest_failure_preserve_orphan_and_block_retry(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch,
+    ):
+        profile = session_dir_for(seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+        posts = []
+        def refresh(*args, **kwargs):
+            posts.append(True)
+            return oauth.RefreshOutcome(ROTATED_CREDS, None)
+        def fail_write(*args, **kwargs):
+            raise OSError("storage unavailable")
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", refresh)
+        monkeypatch.setattr(seeded_switcher._store, "_write_account_credentials", fail_write)
+        monkeypatch.setattr(seeded_switcher._store, "_write_stash_manifest", fail_write)
+        outcomes = []
+        gate = seeded_switcher.consume_backup_grant
+        def record_gate(*args, **kwargs):
+            outcome = gate(*args, **kwargs)
+            outcomes.append(outcome)
+            return outcome
+        monkeypatch.setattr(seeded_switcher, "consume_backup_grant", record_gate)
+        for _ in range(2):
+            with pytest.raises(SessionError, match="stash recovery is blocked"):
+                manager.setup_session(ACCOUNT_NUM, share=False)
+            assert not profile.exists()
+        assert len(posts) == 1
+        assert outcomes[0].error == outcomes[1].error == "stash-unreadable"
+        assert outcomes[0].credentials == ROTATED_CREDS
+        assert outcomes[1].credentials is None
+        entries = seeded_switcher._store._list_unclaimed_credentials()
+        assert len(entries) == 1
+        entry_id = next(iter(entries))
+        assert seeded_switcher._store._read_unclaimed_credential(entry_id) == (ROTATED_CREDS, False)
 
     def test_consumed_backup_allows_independent_ready_profile(
         self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch,
