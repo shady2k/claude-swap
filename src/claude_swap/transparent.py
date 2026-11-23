@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from claude_swap import __version__, claude_forms, fsguard, launch_policy, paths, profile_ownership, real_claude, spawn, test_mode
-from claude_swap.exceptions import ClaudeSwitchError, ConfigError
+from claude_swap.exceptions import ClaudeSwitchError, ConfigError, SessionError
 from claude_swap.fsutil import atomic_write_bytes, make_dir_link
 from claude_swap.locking import FileLock
 from claude_swap.python_chain import LOADER_VARS, check_python_chain
@@ -385,6 +385,12 @@ def _recipient(slot: str, accounts: dict, members: dict) -> _Recipient:
     return _Recipient(slot, identity)
 
 
+def _is_default_login(recipient: _Recipient) -> bool:
+    from claude_swap.session import SessionManager
+
+    return SessionManager._default_login_identity() == recipient.identity[:2]
+
+
 def _prepare_launch(
     root: Path, directory: Path, marker: str, args: list[str], policy: dict,
     accounts: dict, *, test: bool,
@@ -444,6 +450,8 @@ def _prepare_launch(
                 current = launch_policy.accounts(root)
                 if _recipient(slot, current, members) != recipient:
                     raise ConfigError("Recipient changed before reservation")
+                if _is_default_login(recipient):
+                    raise _UnpreparedProfile("account is the active default login")
                 record = profile_ownership.reserve_locked(root, slot, profile)
             profile = _profile_dir(root, recipient, history)
             test_mode.check_launch(args, profile, backup_root=root, binary=real)
@@ -452,7 +460,7 @@ def _prepare_launch(
             if not history.exists():
                 launch_policy.archive(create=True)
             return _Launch(real, child_args, child_env, recipient, profile, reservation=record)
-        except _UnpreparedProfile as exc:
+        except (_UnpreparedProfile, SessionError) as exc:
             failures.append(f"{label}: {exc}; resets unknown")
         except BaseException:
             if record is not None:
@@ -487,7 +495,7 @@ def _publish_launch(root: Path, directory: Path, policy: dict, prepared: _Launch
                 current_recipient = _recipient(recipient.slot, accounts, members)
             except ConfigError:
                 return False
-            if current_recipient != recipient:
+            if current_recipient != recipient or _is_default_login(recipient):
                 return False
             try:
                 profile = _profile_dir(root, recipient, history)
@@ -497,13 +505,13 @@ def _publish_launch(root: Path, directory: Path, policy: dict, prepared: _Launch
                 return False
             if not os.path.lexists(profile / "projects"):
                 make_dir_link(history, profile / "projects")
+        _journal(directory, _OUTSIDE if prepared.outside_reason else "launch")
         if prepared.reservation:
             spawn.require_supervision()
             profile_ownership.mark_running_locked(
                 root, prepared.reservation["launchId"], os.getpid(),
                 expected_profile_gen=prepared.reservation["profileGen"],
             )
-        _journal(directory, _OUTSIDE if prepared.outside_reason else "launch")
         return True
 
 
@@ -536,10 +544,7 @@ def _launch(marker: str, args: list[str], root: Path) -> None:
         result = spawn.supervise(
             lambda: prepared.real.handoff(prepared.args, prepared.env, job=True)
         )
-        with profile_ownership.ownership_lock(root):
-            profile_ownership.release_locked(
-                root, prepared.reservation["launchId"], confirmed_complete=True,
-            )
+        profile_ownership.release_completed(root, prepared.reservation["launchId"])
         raise SystemExit(result)
     prepared.real.handoff(prepared.args, prepared.env, job=True)
 
@@ -547,9 +552,7 @@ def _launch(marker: str, args: list[str], root: Path) -> None:
 def _release_launch(root: Path, prepared: _Launch) -> None:
     if prepared.reservation:
         with profile_ownership.ownership_lock(root):
-            current = profile_ownership.verify_reservation_locked(root, prepared.reservation["launchId"])
-            if current["state"] == "reserved":
-                profile_ownership.release_locked(root, prepared.reservation["launchId"])
+            profile_ownership.release_locked(root, prepared.reservation["launchId"])
 
 
 def main() -> None:

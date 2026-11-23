@@ -22,7 +22,7 @@ class Child:
         self.reader, self.writer = reader, command_writer
         env = stand.env | {'ADMISSION_LOG': str(self.log), 'ADMISSION_EVENTS': str(writer),
                            'ADMISSION_COMMANDS': str(commands), 'ADMISSION_BARRIER': str(int(barrier)),
-                           'ADMISSION_SCAN_PID': str(scan_pid or '')}
+                           'ADMISSION_SCAN_PID': str(scan_pid or ''), 'ADMISSION_MODE': mode}
         self.process = subprocess.Popen([sys.executable, '-I', '-c',
             f"import sys; sys.path.insert(0, {str(PROJECT)!r}); from tests.profile_admission_stand import worker; worker()",
             mode, stand.route], env=env, cwd=stand.directory,
@@ -43,7 +43,7 @@ class Child:
     def finish(self):
         output, errors = self.process.communicate(timeout=20)
         self.output, self.errors = output, errors
-        assert self.process.returncode in (0, 4), (output, errors, self.log.read_text())
+        assert self.process.returncode in (0, 3, 4, 7), (output, errors, self.log.read_text())
         return self.process.returncode
     def counts(self):
         lines = self.log.read_text().splitlines()
@@ -122,7 +122,7 @@ def synthetic():
     sys.addaudithook(deny)
     emit('launch')
     # The direct exec exits, leaving its detached child supervised.
-    if os.fork(): os._exit(0)
+    if os.fork(): os._exit(7 if os.environ['ADMISSION_MODE'] == 'release-contention' else 0)
     os.setsid()
     emit('live')
     command('exit')
@@ -173,7 +173,9 @@ def worker():
         paths.get_global_config_path().write_text(switcher.read_account_config('2','target@example.test'))
         return
     if mode == 'free':
-        with own.ownership_lock(root): assert not own.profile_busy_locked(root, '2', profile)
+        with own.ownership_lock(root):
+            if own.profile_busy_locked(root, '2', profile):
+                raise SystemExit(4)
         return
     if mode == 'switch':
         try: switcher.switch_to('2')
@@ -194,6 +196,33 @@ def worker():
                 emit('pid-read-resumed')
             return original_alive(pid)
         process_detection.is_pid_alive = alive
+    if mode in ('journal-error', 'journal-lock-error'):
+        from claude_swap.exceptions import LockError
+        def journal(*args):
+            if mode == 'journal-lock-error':
+                raise LockError('synthetic journal lock contention')
+            raise OSError('synthetic journal write failure')
+        transparent._journal = journal
+    if mode == 'release-contention':
+        original_completed = own.release_completed
+        def release_completed(root, launch_id):
+            lock = own.ownership_lock(root)
+            acquire = lock.acquire
+            attempted = False
+            def contend(timeout=None):
+                nonlocal attempted
+                if not attempted:
+                    attempted = True
+                    emit('release-wait')
+                    command('release')
+                    return False
+                return acquire(timeout)
+            lock.acquire = contend
+            try:
+                return original_completed(root, launch_id)
+            finally:
+                lock.acquire = acquire
+        own.release_completed = release_completed
     original = own.reserve_locked
     def reserve(*args, **kwargs):
         record = original(*args, **kwargs)
@@ -227,6 +256,6 @@ def worker():
         else:
             directory = paths.get_shim_dir(root)
             transparent._launch(transparent._invocation_marker(directory, False), ['-p','synthetic prompt'], root)
-    except ClaudeSwitchError as exc:
+    except (ClaudeSwitchError, OSError) as exc:
         print(type(exc).__name__ + ': ' + str(exc), file=sys.stderr)
         raise SystemExit(4)

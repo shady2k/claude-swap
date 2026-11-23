@@ -208,7 +208,7 @@ def test_disable_does_not_delete_replaced_launcher(installed):
     assert launcher.read_bytes() == b"someone else's file"
 
 
-def test_busy_profile_rejects_second_transparent_launch(installed):
+def test_running_valid_profile_allows_second_transparent_launch(installed):
     import select
 
     root, _, _ = installed
@@ -218,8 +218,27 @@ def test_busy_profile_rejects_second_transparent_launch(installed):
             assert select.select([child.stdout], [], [], 10)[0]
             assert child.stdout.readline() == b"ready\n"
             result = invoke("-p", "second launch")
-            assert result.returncode in (3, 4)
-            assert b"busy" in result.stderr.lower() or b"reserved" in result.stderr.lower()
+            assert result.returncode == 27
         finally:
             child.send_signal(signal.SIGTERM)
             child.communicate(timeout=10)
+
+
+def test_default_login_candidate_refusal_continues_pool(installed):
+    from claude_swap.session import session_dir_for
+
+    root, _, _ = installed
+    sequence = json.loads((root / "sequence.json").read_text())
+    sequence["accounts"]["2"] = {"email": "second@example.test", "uuid": "second-uuid"}
+    (root / "sequence.json").write_text(json.dumps(sequence))
+    profile = session_dir_for(root, "2", "second@example.test")
+    profile.mkdir(parents=True, mode=0o700)
+    (profile / ".claude.json").write_text(json.dumps({"oauthAccount": {
+        "emailAddress": "second@example.test", "accountUuid": "second-uuid",
+    }}))
+    paths.get_default_global_config_path().parent.mkdir(parents=True, exist_ok=True)
+    paths.get_default_global_config_path().write_text(json.dumps({"oauthAccount": {
+        "emailAddress": "profile@example.test", "accountUuid": "fake-profile",
+    }}))
+    transparent.enable(root, accept_shared_history=True, pool=["1", "2"])
+    assert invoke("-p", "second candidate").returncode == 27

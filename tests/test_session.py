@@ -729,13 +729,13 @@ class TestBootstrap:
         self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates,
         legacy_location: bool,
     ):
-        """A refused second launch leaves the live credential and stale marker alone."""
+        """Unknown legacy ownership leaves credentials and the stale marker alone."""
         session_dir, _, _ = manager.setup_session("2", share=False)
         (session_dir / ".credentials.json").write_text("live lineage")
         _mark_stale(session_dir, legacy_location)
         make_live(session_dir)
 
-        with pytest.raises(SessionError, match="busy"):
+        with pytest.raises(SessionError, match="legacy ownership"):
             manager.setup_session("2", share=False)
 
         assert (session_dir / ".credentials.json").read_text() == "live lineage"
@@ -4437,7 +4437,7 @@ class TestShareHistoryIsTheDefault:
         make_live(session_dir)
         capsys.readouterr()
 
-        with pytest.raises(SessionError, match="busy"):
+        with pytest.raises(SessionError, match="legacy ownership"):
             manager.run("2", [])
         assert (
             session_dir / "projects" / "-home-user-app" / "bbb.jsonl"
@@ -5664,11 +5664,12 @@ def test_run_keeps_reservation_across_setup_to_exec(manager, monkeypatch):
     def handoff(*args, **kwargs):
         with profile_ownership.ownership_lock(manager.switcher.backup_dir):
             assert profile_ownership.profile_busy_locked(manager.switcher.backup_dir, ACCOUNT_NUM)
-            with pytest.raises(SessionError, match="busy"):
-                profile_ownership.reserve_locked(
-                    manager.switcher.backup_dir, ACCOUNT_NUM,
-                    session_dir_for(manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL),
-                )
+            peer = profile_ownership.reserve_locked(
+                manager.switcher.backup_dir, ACCOUNT_NUM,
+                session_dir_for(manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL),
+            )
+            assert peer["launchId"] != manager._launch_reservation["launchId"]
+            profile_ownership.release_locked(manager.switcher.backup_dir, peer["launchId"])
         raise OSError("handoff failed")
 
     monkeypatch.setattr(manager, "setup_session", prepared)

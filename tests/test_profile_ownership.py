@@ -89,12 +89,18 @@ def test_generation_survives_launch_release(tmp_path, processes):
         assert second["profileGen"] == first["profileGen"]
 
 
-def test_reserved_slot_rejects_second_admission(tmp_path, processes):
+def test_reserved_slot_allows_independent_reservations(tmp_path, processes):
     profile = tmp_path / "profile"
     with ownership.ownership_lock(tmp_path):
-        ownership.reserve_locked(tmp_path, "1", profile, warming=True)
-        with pytest.raises(ownership.SessionError, match="busy"):
-            ownership.reserve_locked(tmp_path, "1", profile)
+        first = ownership.reserve_locked(tmp_path, "1", profile, warming=True)
+        second = ownership.reserve_locked(tmp_path, "1", profile)
+        assert first["launchId"] != second["launchId"]
+        assert not ownership.profile_running_locked(tmp_path, "1", profile)
+        ownership.mark_running_locked(tmp_path, first["launchId"], 4242)
+        assert ownership.profile_running_locked(tmp_path, "1", profile)
+        third = ownership.reserve_locked(tmp_path, "1", profile)
+        assert third["launchId"] not in {first["launchId"], second["launchId"]}
+        assert ownership.profile_busy_locked(tmp_path, "1", profile)
 
 
 def test_generation_change_rejects_prepared_launch(tmp_path, processes):
@@ -228,7 +234,7 @@ def test_generation_invalidation_is_external(tmp_path, processes):
         generation = ownership.invalidate_generation_locked(tmp_path, profile)
         assert generation != record["profileGen"]
         assert not profile.exists()
-        with pytest.raises(ownership.SessionError, match="verified"):
+        with pytest.raises(ownership.ProfileGenerationChanged):
             ownership.verify_reservation_locked(tmp_path, record["launchId"])
 
 
@@ -306,3 +312,159 @@ def test_warming_acknowledgement_requires_reserved_owner_and_previous_generation
         ownership.set_warming_locked(tmp_path, record["launchId"], False)
         with pytest.raises(ownership.SessionError):
             ownership.acknowledge_generation_locked(tmp_path, record["launchId"], current)
+
+
+@pytest.mark.parametrize("old,current,expected", [
+    (("machine", "old"), ("machine", "new"), False),
+    (("machine", "same"), ("machine", "same"), True),
+    (("machine", "old"), None, True),
+    (None, ("machine", "new"), True),
+    (("foreign", "old"), ("machine", "new"), True),
+])
+def test_running_completion_requires_proven_same_machine_reboot(
+    tmp_path, processes, monkeypatch, old, current, expected,
+):
+    tags = {"old": "11111111-1111-1111-1111-111111111111",
+            "new": "22222222-2222-2222-2222-222222222222",
+            "same": "33333333-3333-3333-3333-333333333333"}
+    old = (old[0], tags[old[1]]) if old else None
+    current = (current[0], tags[current[1]]) if current else None
+    monkeypatch.setattr(ownership, "_boot_identity", lambda: old)
+    with ownership.ownership_lock(tmp_path):
+        record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
+        ownership.mark_running_locked(tmp_path, record["launchId"], 4242)
+        monkeypatch.setattr(ownership, "_boot_identity", lambda: current)
+        assert ownership.profile_busy_locked(tmp_path, "1") is expected
+
+
+def test_abandoned_atomic_temp_does_not_block_any_profile(tmp_path):
+    directory = tmp_path / "profile-ownership" / "launches"
+    directory.mkdir(parents=True)
+    (directory / "record.json.random.tmp").write_text("{")
+    with ownership.ownership_lock(tmp_path):
+        assert not ownership.profile_busy_locked(tmp_path, "1")
+
+
+@pytest.mark.parametrize("current,expected", [("123", True), ("456", False), (None, True)])
+def test_reserved_pid_reuse_is_not_running_tree_completion(tmp_path, processes, monkeypatch, current, expected):
+    with ownership.ownership_lock(tmp_path):
+        ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
+        monkeypatch.setattr(ownership, "process_start_ticks", lambda pid: current)
+        assert ownership.profile_busy_locked(tmp_path, "1") is expected
+
+
+def test_completed_release_retries_after_lock_timeout(tmp_path, processes, monkeypatch):
+    import threading
+    from claude_swap.locking import FileLock
+    ready = threading.Event()
+    timed_out = threading.Event()
+    errors = []
+    with ownership.ownership_lock(tmp_path):
+        record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
+        ownership.mark_running_locked(tmp_path, record["launchId"], 4242)
+
+    def competitor():
+        try:
+            with FileLock(ownership._root(tmp_path) / "state.lock"):
+                ready.set()
+                assert timed_out.wait(5)
+        except BaseException as exc:
+            errors.append(exc)
+    thread = threading.Thread(target=competitor)
+    thread.start()
+    try:
+        assert ready.wait(5)
+        lock = ownership.ownership_lock(tmp_path)
+        acquire = lock.acquire
+        def acquire_short(timeout=None):
+            result = acquire(timeout=0.02)
+            if not result:
+                timed_out.set()
+            return result
+        monkeypatch.setattr(lock, "acquire", acquire_short)
+        ownership.release_completed(tmp_path, record["launchId"])
+    finally:
+        timed_out.set()
+        thread.join(5)
+    assert not thread.is_alive() and not errors
+    assert timed_out.is_set()
+    assert not ownership._record_path(tmp_path, record["launchId"]).exists()
+
+
+@pytest.mark.parametrize("failure", ["read", "unlink", "lock"])
+def test_completed_release_reports_permanent_io_errors(tmp_path, processes, monkeypatch, failure):
+    with ownership.ownership_lock(tmp_path):
+        record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
+        ownership.mark_running_locked(tmp_path, record["launchId"], 4242)
+    def denied(*args, **kwargs):
+        raise PermissionError("synthetic storage error")
+    if failure == "read":
+        monkeypatch.setattr(ownership, "_read", denied)
+    elif failure == "unlink":
+        monkeypatch.setattr(ownership.Path, "unlink", denied)
+    else:
+        monkeypatch.setattr(ownership.ownership_lock(tmp_path), "acquire", denied)
+    with pytest.raises(ownership.SessionError, match="Completed launch"):
+        ownership.release_completed(tmp_path, record["launchId"])
+    assert ownership._record_path(tmp_path, record["launchId"]).exists()
+
+
+def test_malformed_boot_tag_does_not_prove_completion(tmp_path, processes, monkeypatch):
+    monkeypatch.setattr(ownership, "_boot_identity", lambda: ("a" * 32, "11111111-1111-1111-1111-111111111111"))
+    with ownership.ownership_lock(tmp_path):
+        record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
+        ownership.mark_running_locked(tmp_path, record["launchId"], 4242)
+        path = ownership._record_path(tmp_path, record["launchId"])
+        data = ownership._read(path)
+        data["bootId"] = "not-a-boot-id"
+        ownership._write(path, data)
+        assert ownership.profile_busy_locked(tmp_path, "1")
+
+
+@pytest.mark.parametrize("machine,boot,available", [
+    ("a" * 32, "11111111-1111-1111-1111-111111111111", True),
+    ("", "11111111-1111-1111-1111-111111111111", False),
+    ("0" * 32, "11111111-1111-1111-1111-111111111111", False),
+    ("a" * 32, "not-a-boot", False),
+])
+def test_boot_identity_requires_os_identifiers(monkeypatch, machine, boot, available):
+    monkeypatch.setattr(ownership.sys, "platform", "linux")
+    def read(path, **kwargs):
+        return machine if str(path) == "/etc/machine-id" else boot
+    monkeypatch.setattr(ownership.Path, "read_text", read)
+    assert (ownership._boot_identity() is not None) is available
+
+
+def test_completed_release_does_not_hide_record_stat_error(tmp_path, processes, monkeypatch):
+    with ownership.ownership_lock(tmp_path):
+        record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
+        ownership.mark_running_locked(tmp_path, record["launchId"], 4242)
+    path = ownership._record_path(tmp_path, record["launchId"])
+    original = ownership.Path.stat
+    def denied(target, *args, **kwargs):
+        if target == path:
+            raise PermissionError("synthetic unreadable metadata")
+        return original(target, *args, **kwargs)
+    monkeypatch.setattr(ownership.Path, "stat", denied)
+    with pytest.raises(ownership.SessionError, match="Completed launch"):
+        ownership.release_completed(tmp_path, record["launchId"])
+
+
+@pytest.mark.parametrize("supervised,unreadable,allowed", [
+    (False, 0, False), (True, 0, True), (True, 1, False),
+])
+def test_reservation_distinguishes_supervised_reuse_from_unknown_legacy(
+    tmp_path, processes, monkeypatch, supervised, unreadable, allowed,
+):
+    profile = tmp_path / "profile"
+    with ownership.ownership_lock(tmp_path):
+        if supervised:
+            owner = ownership.reserve_locked(tmp_path, "1", profile)
+            ownership.mark_running_locked(tmp_path, owner["launchId"], 4242)
+        monkeypatch.setattr(ownership, "scan_sessions", lambda _: ([object()], unreadable))
+        if allowed:
+            peer = ownership.reserve_locked(tmp_path, "1", profile)
+            assert peer["state"] == "reserved"
+        else:
+            with pytest.raises(ownership.SessionError, match="legacy ownership"):
+                ownership.reserve_locked(tmp_path, "1", profile)

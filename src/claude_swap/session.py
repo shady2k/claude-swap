@@ -780,11 +780,9 @@ class SessionManager:
                     expected_profile_gen=record["profileGen"],
                 )
                 self._verify_profile_recipient(record)
-                if profile_ownership.profile_busy_locked(
+                profile_ownership.check_admission_locked(
                     self.switcher.backup_dir, record["accountNum"], Path(record["profile"]),
-                    ignore_launch_id=record["launchId"],
-                ):
-                    raise SessionError("Profile is busy or ownership is unknown")
+                )
             yield record
             return
         root = self.switcher.backup_dir
@@ -797,6 +795,7 @@ class SessionManager:
             record = profile_ownership.reserve_locked(root, num, profile, warming=True)
             record["recipientIdentity"] = recipient_identity
         self._launch_reservation = record
+        self._launch_published = False
         succeeded = False
         try:
             yield record
@@ -805,7 +804,7 @@ class SessionManager:
             if not (retain and succeeded) and self._launch_reservation is not None:
                 self._launch_reservation = None
                 with profile_ownership.ownership_lock(root):
-                    if record["state"] == "reserved":
+                    if not self._launch_published:
                         profile_ownership.release_locked(root, record["launchId"])
 
     def _run_reserved(
@@ -1107,18 +1106,12 @@ class SessionManager:
                     self.switcher.backup_dir, record["launchId"], os.getpid(),
                     expected_profile_gen=record["profileGen"],
                 )
-                record.update(profile_ownership.verify_reservation_locked(
-                    self.switcher.backup_dir, record["launchId"],
-                    expected_profile_gen=record["profileGen"],
-                ))
+                self._launch_published = True
         try:
             if record is None:
                 claude_bin.handoff(claude_args, env)
             result = spawn.supervise(lambda: claude_bin.handoff(claude_args, env))
-            with profile_ownership.ownership_lock(self.switcher.backup_dir):
-                profile_ownership.release_locked(
-                    self.switcher.backup_dir, record["launchId"], confirmed_complete=True,
-                )
+            profile_ownership.release_completed(self.switcher.backup_dir, record["launchId"])
             self._launch_reservation = None
             raise SystemExit(result)
         except OSError as exc:
@@ -1196,8 +1189,8 @@ class SessionManager:
         # only after both ownership and Claude session checks permit reuse.
         stale = is_session_stale(session_dir) and profile_is_quiescent(session_dir)
 
-        # The logical reservation excludes peers while the local auth probe
-        # runs without a physical account lock.
+        # Peers may prepare concurrently. The generation is checked again
+        # under both locks after the local auth probe.
         if not stale and self._is_session_valid(session_dir, email, org_uuid, binary=binary):
             with profile_ownership.ownership_lock(self.switcher.backup_dir), FileLock(self.switcher.lock_file):
                 record = self._launch_reservation
@@ -1322,30 +1315,22 @@ class SessionManager:
             # A backup refresh can mark the reserved profile stale. Re-check
             # under both locks before rebuilding its credentials.
             if is_session_stale(session_dir) and profile_is_quiescent(session_dir):
-                record["profileGen"] = profile_ownership.advance_generation_locked(
-                    self.switcher.backup_dir, record["launchId"]
-                )
+                self._guard_profile_rebuild(session_dir)
                 delete_macos_keychain_entry(session_dir)
                 (session_dir / ".credentials.json").unlink(missing_ok=True)
                 clear_session_stale(session_dir)
             if self._is_session_valid(session_dir, email, org_uuid, binary=binary):
                 # Local validity proves identity, not credential lineage.
                 # Re-seed a quiescent profile that predates the backup refresh;
-                # the reservation excludes another launch during this work.
+                # the state and account locks serialize this rebuild.
                 if not self._profile_matches_backup(
                     session_dir, account_num, email
                 ) and profile_is_quiescent(session_dir):
                     self._bootstrap(session_dir, account_num, email, org_uuid)
-                    record["profileGen"] = profile_ownership.advance_generation_locked(
-                        self.switcher.backup_dir, record["launchId"]
-                    )
                 self._sync_sharing(session_dir, share, share_history)
                 return session_dir, account_num, email
 
             self._bootstrap(session_dir, account_num, email, org_uuid)
-            record["profileGen"] = profile_ownership.advance_generation_locked(
-                self.switcher.backup_dir, record["launchId"]
-            )
             self._sync_sharing(session_dir, share, share_history)
 
             verdict = self._session_validity(session_dir, email, org_uuid, binary=binary)
@@ -1420,6 +1405,8 @@ class SessionManager:
             self.switcher.read_account_credentials(account_num, email) or ""
         ):
             raise self._live_login_error(account_num)
+
+        self._guard_profile_rebuild(session_dir)
 
         # Claude reads the keychain before the plaintext file — a stale hashed
         # entry from an earlier profile at this path would shadow the seed.
@@ -1504,7 +1491,21 @@ class SessionManager:
         except (json.JSONDecodeError, AttributeError):
             return True  # unknown shape — let the refresh attempt decide
 
+    def _guard_profile_rebuild(self, session_dir: Path) -> None:
+        """Protect running credentials and invalidate peers before replacement."""
+        record = self._launch_reservation
+        if profile_ownership.profile_running_locked(
+            self.switcher.backup_dir, record["accountNum"], session_dir,
+            ignore_launch_id=record["launchId"],
+        ):
+            raise SessionError("Cannot rebuild a running profile")
+        if session_dir.exists():
+            record["profileGen"] = profile_ownership.advance_generation_locked(
+                self.switcher.backup_dir, record["launchId"]
+            )
+
     def _cleanup_failed_session(self, session_dir: Path) -> None:
+        self._guard_profile_rebuild(session_dir)
         # Keychain first: claude may have partially migrated the seed, and the
         # hashed service name can't be recomputed once the dir is gone. The
         # stale marker is a sibling, so rmtree does not take it.

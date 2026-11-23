@@ -2,9 +2,13 @@
 
 Each launch owns a separate record outside the profile, so removing a profile
 cannot remove its lease. A reserved record spans preparation and a running
-record spans process handoff. Neither has a timeout: elapsed time proves
-nothing about a process. Unreadable records and unknown process identity block
-mutation. Linux identity uses process start ticks, unchanged across exec.
+record spans process handoff. Concurrent reservations may prepare the same
+profile; generation checks detect changes, while running readers block profile
+mutation. Neither record has a timeout: elapsed time proves nothing about a
+process. Unreadable records and unknown process identity block mutation.
+Linux identity uses process start ticks, unchanged across exec. A trustworthy
+machine identity and different boot ID prove an old tree ended; missing or
+foreign boot metadata never authorizes clearing running ownership.
 Publication is unsupported where those ticks are unavailable, including macOS
 and Windows; an unknown identity never authorizes handoff.
 
@@ -34,6 +38,10 @@ from claude_swap.process_detection import process_start_ticks, scan_sessions
 
 def _root(backup_dir: Path) -> Path:
     return backup_dir / "profile-ownership"
+
+
+class ProfileGenerationChanged(SessionError):
+    """The reservation's profile was rebuilt or invalidated by a peer."""
 
 
 _ownership_locks = threading.local()
@@ -71,6 +79,37 @@ def ownership_lock(backup_dir: Path) -> FileLock:
     if key not in locks:
         locks[key] = _OwnershipLock(Path(key[1]))
     return locks[key]
+
+
+def _boot_identity() -> tuple[str, str] | None:
+    """Identify a Linux boot on this machine, never infer it from PID ticks.
+
+    Both identifiers come from OS files, not the profile or environment. A
+    different machine ID cannot prove completion of a copied ownership store.
+    """
+    if sys.platform != "linux":
+        return None
+    try:
+        machine = Path("/etc/machine-id").read_text(encoding="ascii").strip()
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        if len(machine) != 32 or uuid.UUID(hex=machine).hex != machine.lower():
+            return None
+        if not int(machine, 16):
+            return None
+        return machine.lower(), str(uuid.UUID(boot))
+    except (OSError, ValueError, UnicodeError):
+        return None
+
+
+def _previous_boot(data: dict) -> bool:
+    current = _boot_identity()
+    if not current or data.get("machineId") != current[0]:
+        return False
+    try:
+        recorded = str(uuid.UUID(data["bootId"]))
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return False
+    return recorded != current[1]
 
 
 def _pid_alive(pid: int) -> bool | None:
@@ -145,6 +184,8 @@ def _records(backup_dir: Path) -> list[dict]:
         return []
     records = []
     for path in paths:
+        if path.name.endswith(".tmp"):
+            continue
         record = _read(path)
         _validate(record)
         if path != _record_path(backup_dir, record["launchId"]):
@@ -170,6 +211,8 @@ def profile_busy_locked(
     try:
         records = _records(backup_dir)
         for data in records:
+            if _previous_boot(data):
+                continue
             if data["launchId"] == ignore_launch_id:
                 continue
             if data["accountNum"] != str(account_num) and (
@@ -210,11 +253,57 @@ def _generation(backup_dir: Path, profile: Path) -> str:
     return generation
 
 
+def profile_running_locked(
+    backup_dir: Path, account_num: str, session_dir: Path | None = None,
+    *, ignore_launch_id: str | None = None,
+) -> bool:
+    """Protect profile contents, without treating preparations as readers.
+
+    Reserved/warming peers can invalidate each other's prepared generation.
+    A running or unknown owner forbids overwriting or deleting the profile.
+    """
+    try:
+        for data in _records(backup_dir):
+            if _previous_boot(data) or data["launchId"] == ignore_launch_id:
+                continue
+            if data["accountNum"] != str(account_num) and (
+                session_dir is None or data["profile"] != _profile_key(session_dir)
+            ):
+                continue
+            if data["state"] == "running":
+                return True
+        if session_dir is not None:
+            live, unreadable = scan_sessions(session_dir)
+            return bool(live or unreadable)
+        return False
+    except (OSError, ValueError, TypeError, KeyError, RecursionError, OverflowError):
+        return True
+
+
+def check_admission_locked(backup_dir: Path, account_num: str, session_dir: Path) -> None:
+    """Refuse uncertain legacy ownership before preparation or reuse."""
+    # Known supervised peers permit reuse; legacy processes have no external
+    # completion authority. Unknown or unreadable legacy ownership refuses
+    # admission before any probe or credential preparation.
+    try:
+        records = _records(backup_dir)
+        live, unreadable = scan_sessions(session_dir)
+        supervised = any(
+            data["state"] == "running" and not _previous_boot(data)
+            and data["accountNum"] == str(account_num)
+            and data["profile"] == _profile_key(session_dir)
+            for data in records
+        )
+        if unreadable or (live and not supervised):
+            raise SessionError("Profile has live or unknown legacy ownership")
+    except (OSError, ValueError, TypeError, KeyError, RecursionError, OverflowError) as exc:
+        raise SessionError("Profile ownership cannot be read") from exc
+
+
 def reserve_locked(
     backup_dir: Path, account_num: str, session_dir: Path, *, warming: bool = False,
 ) -> dict:
-    if profile_busy_locked(backup_dir, account_num, session_dir):
-        raise SessionError(f"Account-{account_num} profile is busy or ownership is unknown")
+    check_admission_locked(backup_dir, account_num, session_dir)
     launch_id = uuid.uuid4().hex
     data = {
         "launchId": launch_id, "accountNum": str(account_num),
@@ -223,6 +312,8 @@ def reserve_locked(
         "state": "reserved", "warming": warming,
         "ownerPid": os.getpid(), "ownerTicks": process_start_ticks(os.getpid()),
     }
+    if boot := _boot_identity():
+        data.update(machineId=boot[0], bootId=boot[1])
     _write(_record_path(backup_dir, launch_id), data)
     return data
 
@@ -243,7 +334,7 @@ def verify_reservation_locked(
         if data["profileGen"] != generation or (
             expected_profile_gen is not None and expected_profile_gen != generation
         ):
-            raise ValueError("Profile generation changed")
+            raise ProfileGenerationChanged("Profile generation changed")
         return data
     except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
         raise SessionError("Profile reservation cannot be verified") from exc
@@ -359,7 +450,9 @@ def release_locked(
 ) -> None:
     """Remove an own record; running work requires proven tree completion."""
     path = _record_path(backup_dir, launch_id)
-    if not path.exists():
+    try:
+        path.stat()
+    except FileNotFoundError:
         return
     try:
         data = _read(path)
@@ -374,6 +467,27 @@ def release_locked(
     if data["state"] == "running" and not confirmed_complete:
         raise SessionError("Running profile requires confirmed completion")
     path.unlink()
+
+
+def release_completed(backup_dir: Path, launch_id: str) -> None:
+    """Release this launch after supervision proved the whole tree empty.
+
+    Lock contention cannot undo completion. Retry each bounded acquisition
+    outside all other locks without an overall deadline. I/O errors are not
+    contention and are reported rather than retried forever.
+    """
+    lock = ownership_lock(backup_dir)
+    try:
+        while not lock.acquire():
+            continue
+    except OSError as exc:
+        raise SessionError("Completed launch state lock cannot be opened") from exc
+    try:
+        release_locked(backup_dir, launch_id, confirmed_complete=True)
+    except (OSError, SessionError) as exc:
+        raise SessionError("Completed launch record cannot be read or removed") from exc
+    finally:
+        lock.release()
 
 
 @contextmanager
