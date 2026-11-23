@@ -76,7 +76,7 @@ def _observe_dacl(check_dacl, path, dacl, trusted, rejection):
                 sid = security._sid_string(ace_pointer.value + security._ACE.sid_start.offset)
                 category = _SID_CATEGORIES.get(sid, "other-foreign")
                 rights = ",".join(label for mask, label in _WRITE_RIGHTS if mask & ace.mask)
-                rejection.append(f"allow/{origin}/{category} rights={rights or 'none'}")
+                rejection.append(f"allow/{origin}/{category} mask=0x{ace.mask:08x} rights={rights or 'none'}")
             elif str(exc).startswith("Unsupported access control entry:"):
                 rejection.append(f"unsupported/{origin} rights=unknown")
         raise

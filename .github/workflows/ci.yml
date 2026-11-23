@@ -72,10 +72,17 @@ jobs:
       - name: Diagnose policy lookup in an isolated Windows profile
         run: uv run python -m tests.win_config_diagnostic
 
+      - name: Prepare inherited token-profile control HOME
+        run: uv run python -m tests.win_profile_home prepare
+
       - name: Run tests
         # Includes the TUI tests: the Textual TUI (unlike the old curses one)
         # runs on stock Windows, and this job is the proof.
         run: uv run pytest -rs
+
+      - name: Remove token-profile control HOME
+        if: always()
+        run: uv run python -m tests.win_profile_home cleanup
 
   # The id stays `macos-keychain` although the job now runs everything: it is
   # the name branch protection matches on, and renaming it silently drops the

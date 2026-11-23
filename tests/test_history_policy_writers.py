@@ -2,14 +2,12 @@
 
 import ast
 import json
-import shutil
 import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from uuid import uuid4
 
 import pytest
 
@@ -18,61 +16,62 @@ from claude_swap.locking import FileLock
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="native Windows profile inheritance")
-def test_policy_update_in_inherited_profile_home(monkeypatch):
-    import ctypes as c
-    from ctypes import wintypes as w
+def test_policy_update_in_inherited_profile_home(monkeypatch, tmp_path_factory, request):
+    import os
 
     from claude_swap import _win_file_security as security
     from tests.win_config_diagnostic import _observe_dacl
+    from tests.win_profile_home import ENV, validate
 
-    # Do not repair the ACL: this controls the product's ordinary mkdir path,
-    # not pytest's temp-directory ACL or the private-root fixture.
-    # CSIDL_LOCAL_APPDATA resolves the account profile independently of pytest's
-    # HOME redirection, including in xdist workers. CSIDL_FLAG_CREATE lets the
-    # shell create LocalAppData if the runner profile has not populated it yet.
-    # The fresh child inherits the profile ACL without any repair.
-    shell = c.WinDLL("shell32", use_last_error=True)
-    locate = security._function(shell, "SHGetFolderPathW", c.c_long,
-                                w.HWND, c.c_int, w.HANDLE, w.DWORD, w.LPWSTR)
-    buffer = c.create_unicode_buffer(32768)
-    csidl_local_appdata = 0x1C
-    csidl_flag_create = 0x8000
-    result = locate(None, csidl_local_appdata | csidl_flag_create, None, 0, buffer)
-    assert result == 0, f"SHGetFolderPathW failed: HRESULT=0x{result & 0xFFFFFFFF:08X}"
-    home = Path(buffer.value) / f"cswap-policy-control-{uuid4().hex}"
-    home.mkdir()
+    # CI creates this empty direct child of the token profile before pytest.
+    # Never repair its ACL or fall back to a directory in pytest's temp tree.
     try:
-        monkeypatch.setenv("HOME", str(home))
-        monkeypatch.setenv("USERPROFILE", str(home))
-        monkeypatch.setattr(Path, "home", lambda: home)
-        root = paths.get_backup_root()
-        assert not root.exists()
-        check_dacl = security._check_dacl
-        rejection = []
+        basetemp = tmp_path_factory.getbasetemp()
+        if hasattr(request.config, "workerinput"):
+            # Local xdist workers use <controller basetemp>/popen-gwN.
+            basetemp = basetemp.parent
+        home = validate(Path(os.environ[ENV]), basetemp=basetemp, empty=True)
+    except Exception:
+        pytest.fail("profile control precondition failed; use the pre-pytest preparation "
+                    "and cleanup recipe in tests/win_profile_home.py", pytrace=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setattr(Path, "home", lambda: home)
+    root = paths.get_backup_root()
+    assert root.is_relative_to(home)
+    assert not root.exists()
+    check_dacl = security._check_dacl
+    rejection = []
 
-        def observe(path, dacl, trusted):
+    def observe(path, dacl, trusted):
+        first = len(rejection)
+        try:
             return _observe_dacl(check_dacl, path, dacl, trusted, rejection)
+        finally:
+            if len(rejection) > first:
+                # Relative synthetic object only; never print the profile path.
+                obj = path.relative_to(home).as_posix() if path.is_relative_to(home) else "outside-control"
+                rejection[first] = f"object={obj} {rejection[first]}"
 
-        monkeypatch.setattr(security, "_check_dacl", observe)
-        for revision in (1, 2):
-            changed = []
+    monkeypatch.setattr(security, "_check_dacl", observe)
+    for revision in (1, 2):
+        changed = []
 
-            def change(data):
-                changed.append(True)
-                assert data == ({} if revision == 1 else {"synthetic": 1, "rev": 1})
-                data["synthetic"] = revision
-                return True
+        def change(data):
+            changed.append(True)
+            assert data == ({} if revision == 1 else {"synthetic": 1, "rev": 1})
+            data["synthetic"] = revision
+            return True
 
-            try:
-                assert launch_policy.update(root, change) is True
-                expected = {"synthetic": revision, "rev": revision}
-                assert launch_policy.read(root) == expected
-            except fsguard.GuardError as exc:
-                pytest.fail(f"ordinary profile revision={revision}: {exc}; rejected ACE={rejection}")
-            assert changed == [True]
-            assert json.loads((root / "transparent.json").read_text(encoding="utf-8")) == expected
-    finally:
-        shutil.rmtree(home)
+        try:
+            assert launch_policy.update(root, change) is True
+            expected = {"synthetic": revision, "rev": revision}
+            assert launch_policy.read(root) == expected
+        except fsguard.GuardError:
+            pytest.fail(f"confirmed token-profile control revision={revision}: GuardError; "
+                        f"first rejected ACE={rejection}", pytrace=False)
+        assert changed == [True]
+        assert json.loads((root / "transparent.json").read_text(encoding="utf-8")) == expected
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="native Windows ACL APIs")
