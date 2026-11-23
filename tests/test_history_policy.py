@@ -168,6 +168,34 @@ def test_archive_permissions_checked_before_read_or_handoff(shim, archive, tmp_p
         assert result.returncode == 4 and not result.stdout
 
 
+def test_archive_allows_link_above_home(shim, tmp_path, monkeypatch):
+    _, profiles = shim
+    home = Path.home()
+    link = tmp_path / "linked-parent"
+    link.symlink_to(home.parent, target_is_directory=True)
+    monkeypatch.setenv("HOME", str(link / home.name))
+    enabled = subprocess.run(
+        [sys.executable, "-m", "claude_swap", "transparent", "enable", "--accept-shared-history"],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10,
+    )
+    assert enabled.returncode == 0, enabled.stderr
+
+    result = _invoke("--resume", SESSION_ID)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"profile": profiles["2"].name, "previous": [PREVIOUS]}
+
+
+def test_launch_outside_route_does_not_require_private_archive(shim, archive, monkeypatch):
+    projects, _ = archive
+    projects.chmod(0o755)
+    monkeypatch.delenv(test_mode.MODE)
+
+    result = _invoke("--version")
+    assert result.returncode == 0, result.stderr
+    assert "outside the profile route" in result.stderr
+    assert json.loads(result.stdout) == {"profile": "default"}
+
+
 @pytest.mark.parametrize("component", ["projects", ".claude"])
 @pytest.mark.parametrize("location", ["inside", "outside"])
 def test_archive_path_rejects_links_before_handoff(shim, archive, tmp_path, component, location):

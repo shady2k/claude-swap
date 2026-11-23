@@ -106,29 +106,30 @@ def consent(data: dict) -> dict:
 
 def _owned_directory(path: Path) -> int:
     info = path.lstat()
-    if not stat.S_ISDIR(info.st_mode):
-        raise ConfigError("Shared history must be a directory")
+    if (not stat.S_ISDIR(info.st_mode)
+            or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+        raise ConfigError("Shared history must be a directory, not a link or junction")
     if sys.platform == "win32" or info.st_uid != os.geteuid():
         raise ConfigError("Shared history must be owned by the current user")
+    fsguard.check_leaf(path, info)
     return info.st_mode
 
 
 def archive(*, create: bool = False) -> Path:
     """Check the archive path, never its contents; create it privately if requested."""
-    home = Path.home()
-    target = paths.get_default_claude_config_home() / "projects"
+    config_home = paths.get_default_claude_config_home()
     try:
-        fsguard.check_path(home, follow_links=False)
+        home = fsguard.check_path(config_home.parent)
         _owned_directory(home)
+        target = home / config_home.name / "projects"
         for directory in (target.parent, target):
             try:
-                directory.lstat()
+                mode = _owned_directory(directory)
             except FileNotFoundError:
                 if not create:
                     break
                 directory.mkdir(mode=0o700, exist_ok=True)
-            fsguard.check_path(directory, follow_links=False)
-            mode = _owned_directory(directory)
+                mode = _owned_directory(directory)
             if directory == target and mode & (stat.S_IRWXG | stat.S_IRWXO):
                 raise ConfigError("Shared projects/ must not be accessible to group or others")
         return target

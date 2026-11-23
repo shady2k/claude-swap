@@ -386,7 +386,7 @@ def _recipient(slot: str, accounts: dict, members: dict) -> _Recipient:
 
 def _prepare_launch(
     root: Path, directory: Path, marker: str, args: list[str], policy: dict,
-    accounts: dict, history: Path, *, test: bool,
+    accounts: dict, *, test: bool,
 ) -> _Launch:
     options = load_transparent_settings(root, policy=policy)
     if (
@@ -422,6 +422,7 @@ def _prepare_launch(
     members = launch_policy.consent(policy)
     real = test_mode.check_launch(args, backup_root=root)
     failures = []
+    history = None
     for slot in launch_policy.slots(policy.get("pool", [])):
         identity = launch_policy.identity(accounts.get(slot))
         label = _safe_label(f"Account-{slot} ({identity[0]})" if identity else f"Account-{slot}")
@@ -430,6 +431,8 @@ def _prepare_launch(
         except ConfigError as exc:
             failures.append(f"{label}: {exc}; resets unknown")
             continue
+        if history is None:
+            history = launch_policy.archive()
         # Unsafe history links are a configuration error, not a reason to
         # continue on a profile whose history would be different.
         try:
@@ -440,6 +443,8 @@ def _prepare_launch(
         test_mode.check_launch(args, profile, backup_root=root, binary=real)
         args, env = _test_layer(directory, args, env)
         env["CLAUDE_CONFIG_DIR"] = env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(profile)
+        if not history.exists():
+            launch_policy.archive(create=True)
         return _Launch(real, args, env, recipient, profile)
     raise NoAvailableProfile("\n".join(failures) if failures else "No accounts in the transparent pool")
 
@@ -452,8 +457,8 @@ def _publish_launch(root: Path, directory: Path, policy: dict, prepared: _Launch
         check_transparent_history(root)
         if current != policy:
             return False
-        history = launch_policy.archive()
         if recipient := prepared.recipient:
+            history = launch_policy.archive()
             if not history.is_dir():
                 raise ConfigError("Shared projects/ disappeared before publication; retry the launch")
             accounts = launch_policy.accounts(root)
@@ -488,10 +493,7 @@ def _launch(marker: str, args: list[str], root: Path) -> None:
             launch_policy.consent(policy)
             check_transparent_history(root)
             accounts = launch_policy.accounts(root) if test else {}
-        history = launch_policy.archive()
-        prepared = _prepare_launch(root, directory, marker, args, policy, accounts, history, test=test)
-        if prepared.recipient and not history.exists():
-            launch_policy.archive(create=True)
+        prepared = _prepare_launch(root, directory, marker, args, policy, accounts, test=test)
         if _publish_launch(root, directory, policy, prepared):
             break
     else:
