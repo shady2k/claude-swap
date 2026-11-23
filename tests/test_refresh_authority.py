@@ -257,11 +257,19 @@ def test_stash_snapshot_distinguishes_contention_and_lock_storage_failure(
 def test_stash_snapshot_never_scans_during_publication(
     temp_home, sample_sequence_data,
 ):
-    from threading import Event, Thread
+    from threading import Event, Thread, current_thread
+    from claude_swap.locking import FileLock
     s, email = seeded(sample_sequence_data)
     entered = Event()
     resume = Event()
+    reader_attempting = Event()
     scanned = Event()
+    original_acquire = FileLock.acquire
+
+    def acquire(lock, *args, **kwargs):
+        if current_thread().name == "stash-reader":
+            reader_attempting.set()
+        return original_acquire(lock, *args, **kwargs)
     original_write = s._store._atomic_b64_write
     original_scan = s._store._read_stash_manifest_ex
     errors = []
@@ -286,9 +294,15 @@ def test_stash_snapshot_never_scans_during_publication(
         writer = Thread(target=publish)
         writer.start()
         assert entered.wait(2)
-        with patch.object(s._store, "_read_stash_manifest_ex", side_effect=scan):
-            reader = Thread(target=lambda: snapshots.append(s._store._stash_snapshot()))
+        with patch.object(s._store, "_read_stash_manifest_ex", side_effect=scan), patch.object(
+            FileLock, "acquire", new=acquire,
+        ):
+            reader = Thread(
+                target=lambda: snapshots.append(s._store._stash_snapshot()),
+                name="stash-reader",
+            )
             reader.start()
+            assert reader_attempting.wait(2)
             # The writer owns the lock across both bytes and manifest. A
             # snapshot may finish only after publication is released.
             assert not scanned.is_set()
