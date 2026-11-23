@@ -33,8 +33,10 @@ TIMEOUT = 30  # seconds, including setup, tracing and test execution
 
 Role = tuple[str, ...]  # Fixed module and arguments, identified by execve.
 Target = tuple[str, int]
+DIRECT_SCENARIOS = ("direct_success", "direct_refused")
 MOCK_SCENARIOS = (
     "positive", "cli_positive", "direct", "denied_connect", "shim_positive", "shim_direct",
+    *DIRECT_SCENARIOS,
 )
 MOCK_CLI_CONTROLS = ("missing_endpoint", "malformed_endpoint")
 SHIM_REFUSALS = (
@@ -42,7 +44,7 @@ SHIM_REFUSALS = (
     "unlisted_claude", "project_env", "user_env", "client_settings", "auth", "update", "unknown", "bypass",
 )
 _SHIM_SPAWN_ROLES = {
-    *(("stand_mock", "client", name) for name in ("shim_positive", "shim_direct")),
+    *(("stand_mock", "client", name) for name in ("shim_positive", "shim_direct", *DIRECT_SCENARIOS)),
     *(("stand_shim", name) for name in (*SHIM_REFUSALS, "escape")),
 }
 ROOT_ROLES = {
@@ -56,11 +58,14 @@ def _child_roles(role: Role) -> set[Role]:
     if role == ("stand_linux_control", "dns"):
         return {("stand_linux_control", "query")}
     if len(role) == 2 and role[0] == "stand_mock" and role[1] in MOCK_SCENARIOS:
-        return {("stand_mock", "serve"), ("stand_mock", "client", role[1])}
+        scenario = role[1]
+        server = ("stand_mock", "serve", scenario) if scenario in DIRECT_SCENARIOS else ("stand_mock", "serve")
+        return {server, ("stand_mock", "client", scenario)}
     return set()
 
 
 WORKER_ROLES = ROOT_ROLES.union(*(_child_roles(role) for role in ROOT_ROLES))
+MOCK_SERVER_ROLES = {role for role in WORKER_ROLES if role[:2] == ("stand_mock", "serve")}
 
 
 class StandError(RuntimeError):
@@ -197,7 +202,7 @@ def _worker(module: str, args: list[str]) -> None:
     if role not in WORKER_ROLES:
         raise StandError("stand worker is not allowlisted")
     commands = {tuple(worker_argv(*child)) for child in _child_roles(role)}
-    openssl = openssl_path() if role == ("stand_mock", "serve") else None
+    openssl = openssl_path() if role in MOCK_SERVER_ROLES else None
     destinations = next(
         ({tuple(target) for target in targets} for name, targets in
          json.loads(os.environ["CSWAP_STAND_DESTINATIONS"]) if tuple(name) == role),
@@ -420,7 +425,7 @@ def _audit(
                 argv = _exec_argv(line) or []
                 if role == root_role and tuple(argv) in child_commands:
                     new_role = child_commands[tuple(argv)]
-                elif role == ("stand_mock", "serve") and argv and argv[0] == openssl:
+                elif role in MOCK_SERVER_ROLES and argv and argv[0] == openssl:
                     new_role = ("openssl",)
                 elif transition := shim_transition(role, line):
                     new_role = transition

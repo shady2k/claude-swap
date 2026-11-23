@@ -1,8 +1,8 @@
 """Fail-closed routing for the synthetic test mode, not a network sandbox.
 
 The stand must enforce isolation independently. This module rejects unsafe
-configuration before dispatch and supplies an explicit CONNECT route for cswap
-and the same pinned settings for Claude launches and internal auth probes.
+configuration before dispatch and pins either loopback CONNECT or an explicit
+direct TLS route for cswap, Claude launches and internal auth probes.
 """
 
 from __future__ import annotations
@@ -33,9 +33,10 @@ CLAUDE_BASE = "ANTHROPIC_BASE_URL"
 ALLOW = "CLAUDE_SWAP_TEST_CLAUDE_ALLOW"
 CA = "CLAUDE_SWAP_TEST_CA"
 PROXY = "HTTPS_PROXY"
+DIRECT = "CLAUDE_SWAP_TEST_DIRECT"
 _PROXY_KEYS = {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"}
 _ROUTE_KEYS = _PROXY_KEYS | {
-    CLAUDE_BASE, "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "NODE_EXTRA_CA_CERTS",
+    CLAUDE_BASE, DIRECT, "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "NODE_EXTRA_CA_CERTS",
     "NODE_TLS_REJECT_UNAUTHORIZED", "NODE_OPTIONS", "SSL_CERT_FILE", "SSL_CERT_DIR",
     "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
     "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR", "CLAUDE_CODE_USE_BEDROCK",
@@ -89,11 +90,39 @@ def _proxy(key: str, value: str) -> None:
         raise TestModeConfigError(f"{key}: expected a loopback-literal HTTP CONNECT proxy") from None
 
 
-def _route() -> None:
+def _direct_address(endpoint: str, claude_base: str) -> tuple[str, int]:
+    if sys.platform != "linux":
+        raise TestModeConfigError(f"{DIRECT}: direct test routing requires the isolated Linux stand")
+    # Keep the HTTPS authority for Host/SNI separate from the numeric dial
+    # address. All three settings must designate the same synthetic service.
+    try:
+        address = urlsplit(f"http://{os.environ[DIRECT]}")
+        ip = ipaddress.ip_address(address.hostname or "")
+        port = address.port
+        canonical = f"[{ip}]:{port}" if ip.version == 6 else f"{ip}:{port}"
+        base = urlsplit(endpoint)
+        claude = urlsplit(claude_base)
+        if (
+            not ip.is_loopback or not port or os.environ[DIRECT] != canonical
+            or base.port != port or claude.port != port or base.hostname != claude.hostname
+        ):
+            raise ValueError
+    except ValueError:
+        raise TestModeConfigError(
+            f"{DIRECT}: expected a loopback literal and port matching both test HTTPS origins"
+        ) from None
+    return str(ip), port
+
+
+def _route() -> tuple[str, int] | None:
     if "CLAUDE_SWAP_BYPASS" in os.environ:
         raise TestModeConfigError("CLAUDE_SWAP_BYPASS: forbidden in test mode")
-    _base(ENDPOINT)
-    _base(CLAUDE_BASE)
+    endpoint = _base(ENDPOINT)
+    claude_base = _base(CLAUDE_BASE)
+    if DIRECT in os.environ:
+        address = _direct_address(endpoint, claude_base)
+        _ca_file()
+        return address
     for key, value in os.environ.items():
         if value and key.upper() in _PROXY_KEYS - {"NO_PROXY"}:
             _proxy(key, value)
@@ -201,9 +230,19 @@ def preflight(argv: list[str]) -> RealClaude | None:
             raise TestModeConfigError("cswap run invocation form: explicit account required")
         _check_form(tail)
         return claude_binary()
+    if argv[:2] == ["transparent", "enable"]:
+        options = iter(argv[2:])
+        accepted = False
+        for option in options:
+            if option == "--accept-shared-history" and not accepted:
+                accepted = True
+            elif option != "--account" or not re.fullmatch(r"[1-9][0-9]*", next(options, "")):
+                break
+        else:
+            return None
     if argv not in (
         ["help"], ["--help"], ["-h"], ["--version"],
-        ["transparent", "enable"], ["transparent", "status"], ["transparent", "disable"],
+        ["transparent", "status"], ["transparent", "disable"],
     ):
         # Do not dispatch unrelated surfaces (update, service helpers, etc.).
         verb = argv[0] if argv and argv[0] in {"auth", "update", "upgrade", "install", "mcp"} else "unsupported"
@@ -221,9 +260,21 @@ def _ca_file() -> str:
 def pinned_launch(args: list[str], env: dict[str, str]) -> tuple[list[str], dict[str, str]]:
     """Supply one settings layer, without inherited auth or proxy overrides."""
     child = {key: value for key, value in env.items() if key.upper() not in _ROUTE_KEYS}
-    pinned = {CLAUDE_BASE: _base(CLAUDE_BASE), PROXY: os.environ[PROXY]}
-    if os.environ.get(CA):
+    pinned = {CLAUDE_BASE: _base(CLAUDE_BASE)}
+    if DIRECT in os.environ:
+        _direct_address(_base(ENDPOINT), pinned[CLAUDE_BASE])
+        pinned[DIRECT] = os.environ[DIRECT]
         pinned["NODE_EXTRA_CA_CERTS"] = _ca_file()
+    else:
+        proxy = os.environ[PROXY]
+        # Preflight forbids lower proxy settings. An authenticated test proxy
+        # can use the child environment without exposing userinfo in argv.
+        if urlsplit(proxy).username is None:
+            pinned[PROXY] = proxy
+        else:
+            child[PROXY] = proxy
+        if os.environ.get(CA):
+            pinned["NODE_EXTRA_CA_CERTS"] = _ca_file()
     child.update(pinned)
     return ["--settings", json.dumps({"env": pinned}), *args], child
 
@@ -232,11 +283,11 @@ def service_url(url: str) -> str:
     return _base(ENDPOINT) + urlsplit(url).path if active() else url
 
 
-class _Tunnel(http.client.HTTPSConnection):
-    """Dial only the proxy literal; do not ask the system resolver."""
+class _LiteralHTTPSConnection(http.client.HTTPSConnection):
+    """Use a fixed numeric address without changing the TLS authority."""
 
     @staticmethod
-    def _dial(address, timeout, source_address):
+    def _dial(address, timeout):
         ip = ipaddress.ip_address(address[0])
         family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
         sock = socket.socket(family, socket.SOCK_STREAM)
@@ -248,37 +299,44 @@ class _Tunnel(http.client.HTTPSConnection):
             raise
         return sock
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # HTTPConnection assigns its own connector on initialisation.
-        self._create_connection = self._dial
+    def __init__(self, host, port, *, address, timeout, context):
+        super().__init__(host, port, timeout=timeout, context=context)
+        self._create_connection = lambda _host, timeout, _source: self._dial(address, timeout)
 
 
 def open_service(request: Request, *, timeout: float):
-    """Open an API request through the explicit tunnel, with no redirects."""
+    """Open a pinned API request, with no proxy discovery or redirects."""
     if not active():
         from urllib.request import urlopen
 
         return urlopen(request, timeout=timeout)
     from urllib.error import HTTPError, URLError
 
-    _route()
+    direct = _route()
     origin = urlsplit(request.full_url)
     base = urlsplit(_base(ENDPOINT))
     if origin.scheme != base.scheme or origin.netloc != base.netloc:
         raise TestModeConfigError(f"{ENDPOINT}: unexpected request origin")
-    proxy = urlsplit(os.environ[PROXY])
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     try:
         context.load_verify_locations(cafile=_ca_file())
     except OSError:
         raise TestModeConfigError(f"{CA}: cannot load the explicit test CA") from None
-    conn = _Tunnel(proxy.hostname, proxy.port, timeout=timeout, context=context)
-    headers = {}
-    if proxy.username is not None:
-        userinfo = f"{unquote(proxy.username)}:{unquote(proxy.password or '')}"
-        headers["Proxy-Authorization"] = "Basic " + base64.b64encode(userinfo.encode()).decode("ascii")
-    conn.set_tunnel(origin.hostname, origin.port or 443, headers=headers)
+    if direct is not None:
+        conn = _LiteralHTTPSConnection(
+            origin.hostname, origin.port, address=direct, timeout=timeout, context=context,
+        )
+    else:
+        proxy = urlsplit(os.environ[PROXY])
+        conn = _LiteralHTTPSConnection(
+            proxy.hostname, proxy.port, address=(proxy.hostname, proxy.port),
+            timeout=timeout, context=context,
+        )
+        headers = {}
+        if proxy.username is not None:
+            userinfo = f"{unquote(proxy.username)}:{unquote(proxy.password or '')}"
+            headers["Proxy-Authorization"] = "Basic " + base64.b64encode(userinfo.encode()).decode("ascii")
+        conn.set_tunnel(origin.hostname, origin.port or 443, headers=headers)
     request_headers = dict(request.header_items())
     request_headers.setdefault("Connection", "close")
     try:

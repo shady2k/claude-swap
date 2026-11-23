@@ -1,7 +1,11 @@
-"""Portable, non-network checks of the stand hosts-file preflight."""
+"""Portable, non-network checks of the stand preflight."""
+
+import os
+from unittest.mock import patch
 
 import pytest
 
+from claude_swap import test_mode
 from tests import stand_mock as mock
 
 
@@ -35,3 +39,20 @@ def test_hosts_preflight_ignores_comments_and_other_hosts(tmp_path):
 def test_hosts_preflight_requires_readable_file(tmp_path):
     with pytest.raises(mock.HostsPreflightError, match="Cannot read hosts file"):
         mock.preflight_hosts(tmp_path / "missing-hosts")
+
+
+def test_direct_preflight_requires_the_provisioned_pair(monkeypatch, tmp_path):
+    # A different loopback port agreed on by all variables still must not
+    # qualify. Isolation is exercised separately by the Linux stand.
+    monkeypatch.setattr(mock, "_check_stand", lambda: None)
+    with patch.dict(os.environ):
+        mock._configure_direct(tmp_path / "test-ca.pem")
+        assert mock.require_direct_target() == mock.DIRECT_ORIGIN
+        other_port = mock.DIRECT_ORIGIN[1] + 1
+        os.environ.update({
+            test_mode.DIRECT: f"{mock.LOOPBACK}:{other_port}",
+            test_mode.ENDPOINT: f"{mock.BASE}:{other_port}",
+            test_mode.CLAUDE_BASE: f"{mock.BASE}:{other_port}",
+        })
+        with pytest.raises(ValueError, match="does not match the stand endpoint"):
+            mock.require_direct_target()

@@ -127,6 +127,7 @@ class StandAudit:
     ) -> subprocess.CompletedProcess[str]:
         """Install and run a trusted synthetic Claude under the audit hook."""
         from claude_swap import paths, test_mode
+        from claude_swap.session import session_dir_for
 
         # The fixture sets CLAUDE_CONFIG_DIR and isolates all homes. Compute
         # the shim directory with that fixture's XDG data/home, not pytest's.
@@ -135,6 +136,11 @@ class StandAudit:
         else:
             backup = Path(self._env["HOME"]) / paths.LEGACY_BACKUP_DIRNAME
         shim_dir = paths.get_shim_dir(backup)
+        email, uuid = "audit@example.test", "audit-profile"
+        profile = session_dir_for(backup, "1", email)
+        profile.mkdir(mode=0o700, parents=True)
+        (backup / "sequence.json").write_text(json.dumps({"accounts": {"1": {"email": email, "uuid": uuid}}}))
+        (profile / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": email, "accountUuid": uuid}}))
         fake = self.root / "bin" / "claude"
         # No interpreter path-length or quoting assumptions: the kernel runs
         # /bin/sh, which immediately execs the designated isolated Python.
@@ -160,6 +166,7 @@ class StandAudit:
         # including to the designated synthetic proxy.
         child_env = self.env
         del child_env["NO_PROXY"]
+        child_env.update(CLAUDE_CONFIG_DIR=str(profile), CLAUDE_SECURESTORAGE_CONFIG_DIR=str(profile))
         self._shim = {
             "argv": list(args),
             "dir": str(shim_dir),

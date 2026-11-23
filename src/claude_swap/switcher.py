@@ -85,6 +85,7 @@ from claude_swap.printer import (
     yellowed,
 )
 from claude_swap.paths import (
+    account_lock_path,
     get_backup_root,
     get_credentials_path,
     get_default_claude_config_home,
@@ -453,7 +454,7 @@ class ClaudeAccountSwitcher:
         self.sequence_file = self.backup_dir / "sequence.json"
         self.configs_dir = self.backup_dir / "configs"
         self.credentials_dir = self.backup_dir / "credentials"
-        self.lock_file = self.backup_dir / ".lock"
+        self.lock_file = account_lock_path(self.backup_dir)
         self._logger = setup_logging(self.backup_dir, debug=debug)
         self._usage_store = UsageStore(self.backup_dir / "cache")
         # (settings mtime, (threshold, weekly_threshold, models)) — see

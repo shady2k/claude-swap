@@ -25,6 +25,8 @@ _REQUIRED_CONTROLS = {
     "tests/test_stand_shim_linux.py::test_path_shim_hosts_control_stops_before_launch",
     "tests/test_stand_shim_linux.py::test_path_shim_route[shim_positive]",
     "tests/test_stand_shim_linux.py::test_path_shim_route[shim_direct]",
+    "tests/test_stand_shim_linux.py::test_f34_explicit_direct_routes[direct_success]",
+    "tests/test_stand_shim_linux.py::test_f34_explicit_direct_routes[direct_refused]",
     "tests/test_stand_shim_linux.py::test_path_shim_trace_detects_external_attempt",
 }
 

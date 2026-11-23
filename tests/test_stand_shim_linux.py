@@ -9,7 +9,7 @@ import pytest
 from claude_swap import test_mode
 from tests import stand_mock as mock
 from tests.stand_linux import LinuxStand, OPT_IN, SHIM_REFUSALS
-from tests.stand_shim import ESCAPE
+from tests.stand_shim import ESCAPE, PRIOR, SESSION_ID
 
 if sys.platform != "linux" or os.environ.get(OPT_IN) != "1":
     pytest.skip(f"network stand: set {OPT_IN}=1 on Linux", allow_module_level=True)
@@ -46,8 +46,8 @@ def test_path_shim_refuses_before_launch(stand, scenario):
     assert result.attempts == ()
     assert result.returncode == 4, result.stderr
     assert result.stdout == ""
-    assert result.stderr.startswith("claude-swap:")
-    assert _ERRORS[scenario] in result.stderr
+    diagnostic, = (line for line in result.stderr.splitlines() if line.startswith("claude-swap:"))
+    assert _ERRORS[scenario] in diagnostic
 
 
 def test_path_shim_hosts_control_stops_before_launch(stand):
@@ -86,6 +86,42 @@ def test_path_shim_route(stand, scenario):
             "denied_connect": 0,
         },
         "response": None if direct else {"stand": "synthetic"},
+    }
+
+
+@pytest.mark.parametrize("scenario", ["direct_success", "direct_refused"])
+def test_f34_explicit_direct_routes(stand, scenario):
+    refused = scenario == "direct_refused"
+    client = ("stand_mock", "client", scenario)
+    server = ("stand_mock", "serve", scenario)
+    result = stand.run(
+        "stand_mock", scenario,
+        children={client: {mock.DIRECT_ORIGIN}, ("shim-claude",): {mock.DIRECT_ORIGIN}},
+        listeners={server: {mock.DIRECT_ORIGIN, mock.PROXY}},
+    )
+    result.require_clean()
+    assert result.returncode == 0, result.stderr
+    assert result.shim_execs == ("path-shim", "shim-python", "shim-claude")
+    connects = [attempt for attempt in result.attempts if attempt.syscall == "connect"]
+    assert [(a.role, a.target) for a in connects] == [
+        (client, mock.DIRECT_ORIGIN), (client, mock.DIRECT_ORIGIN),
+        (("shim-claude",), mock.DIRECT_ORIGIN),
+    ]
+    data = json.loads(result.stdout)
+    assert data["records"] == {
+        "proxy_connections": 0,
+        "https": [] if refused else [
+            ["GET", mock.USAGE], ["POST", mock.REFRESH], ["POST", mock.MESSAGES],
+        ],
+        "messages": [] if refused else [{
+            "profile": "2", "session": SESSION_ID,
+            "messages": [{"role": "assistant", "content": PRIOR}],
+        }],
+    }
+    assert data["response"] == {
+        "usage": None if refused else {"five_hour": {"utilization": 21}},
+        "refresh": "transient" if refused else "rotated",
+        "claude": None if refused else {"profile": "2", "session": SESSION_ID, "reply": "synthetic reply"},
     }
 
 

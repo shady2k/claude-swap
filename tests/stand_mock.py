@@ -1,8 +1,7 @@
-"""Synthetic HTTPS origin, reachable only through this stand's CONNECT proxy.
+"""Synthetic HTTPS origins for the isolated CONNECT and explicit-direct cases.
 
-The authority is never resolved. The proxy maps it to one numeric loopback
-listener and sends a run-specific preamble before relaying any TLS bytes.
-The HTTPS listener records and closes connections without the preamble.
+CONNECT uses a run-specific preamble, without which its origin refuses TLS.
+Direct uses a separate numeric listener and a recording proxy trap.
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ import runpy
 import secrets
 import select
 import socket
-from socketserver import TCPServer
+from socketserver import BaseRequestHandler, TCPServer
 import ssl
 import subprocess
 import sys
@@ -34,6 +33,11 @@ AUTHORITY = f"{HOST}:443"
 LOOPBACK = "127.0.0.1"
 PROXY = (LOOPBACK, 18080)
 ORIGIN = (LOOPBACK, 18443)
+DIRECT_ORIGIN = (LOOPBACK, 19443)
+DIRECT_BASE = f"{BASE}:{DIRECT_ORIGIN[1]}"
+USAGE = "/api/oauth/usage"
+REFRESH = "/v1/oauth/token"
+MESSAGES = "/v1/messages"
 TIMEOUT = 5
 PROBE = "/stand-probe"
 
@@ -104,9 +108,9 @@ def _relay(client: socket.socket, origin: socket.socket) -> None:
             peers[sock].sendall(data)
 
 
-def _send_json(handler: BaseHTTPRequestHandler) -> None:
-    body = b'{"stand": "synthetic"}'
-    handler.send_response(200)
+def _send_json(handler: BaseHTTPRequestHandler, data=None, *, status=200) -> None:
+    body = json.dumps({"stand": "synthetic"} if data is None else data).encode()
+    handler.send_response(status)
     handler.send_header("Content-Type", "application/json")
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
@@ -207,6 +211,91 @@ def _serve():
             yield ca, records
 
 
+def require_direct_target() -> tuple[str, int]:
+    """Check the stand's provisioned pair after checking the namespace."""
+    from claude_swap import test_mode
+
+    _check_stand()
+    if (
+        os.environ.get(test_mode.DIRECT) != f"{DIRECT_ORIGIN[0]}:{DIRECT_ORIGIN[1]}"
+        or os.environ.get(test_mode.ENDPOINT) != DIRECT_BASE
+        or os.environ.get(test_mode.CLAUDE_BASE) != DIRECT_BASE
+    ):
+        raise ValueError("direct test configuration does not match the stand endpoint")
+    return DIRECT_ORIGIN
+
+
+@contextmanager
+def _serve_direct(*, refused: bool):
+    from tests.stand_linux import openssl_path
+
+    _check_stand()
+    records = {"proxy_connections": 0, "https": [], "messages": []}
+
+    class OriginHandler(_QuietHandler):
+        def do_GET(self):
+            path = self.path.partition("?")[0]
+            records["https"].append([self.command, path])
+            if (
+                path != USAGE or self.headers.get("Host") != f"{HOST}:{DIRECT_ORIGIN[1]}"
+                or self.headers.get("Authorization") != "Bearer synthetic-access"
+            ):
+                return self.send_error(400)
+            _send_json(self, {"five_hour": {"utilization": 21}})
+
+        def do_POST(self):
+            path = self.path.partition("?")[0]
+            records["https"].append([self.command, path])
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if path == REFRESH and payload.get("refresh_token") == "synthetic-refresh":
+                _send_json(self, {
+                    "access_token": "synthetic-rotated", "expires_in": 3600,
+                    "refresh_token": "synthetic-successor",
+                })
+            elif path == MESSAGES:
+                from tests.stand_shim import PRIOR, SESSION_ID
+
+                expected = {"profile": "2", "session": SESSION_ID, "messages": [
+                    {"role": "assistant", "content": PRIOR},
+                ]}
+                if payload != expected:
+                    return self.send_error(400)
+                records["messages"].append(expected)
+                _send_json(self, {"reply": "synthetic reply"})
+            else:
+                self.send_error(400)
+
+    class ProxyTrap(BaseRequestHandler):
+        def handle(self):
+            records["proxy_connections"] += 1
+
+    class OriginServer(TCPServer):
+        def get_request(self):
+            sock, address = super().get_request()
+            sock.settimeout(TIMEOUT)
+            try:
+                return tls.wrap_socket(sock, server_side=True), address
+            except OSError:
+                sock.close()
+                raise
+
+    with tempfile.TemporaryDirectory(prefix="stand-ca-") as directory:
+        ca, cert, key = _test_certificates(Path(directory), openssl_path())
+        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls.load_cert_chain(cert, key)
+        _configure_direct(ca)
+        with OriginServer(require_direct_target(), OriginHandler, bind_and_activate=False) as origin:
+            # Keep the refused endpoint bound for this run, but do not listen.
+            origin.server_bind()
+            with _running(TCPServer(PROXY, ProxyTrap)):
+                if refused:
+                    yield ca, records
+                else:
+                    origin.server_activate()
+                    with _running(origin):
+                        yield ca, records
+
+
 def _https_probe() -> dict:
     from claude_swap import test_mode
 
@@ -225,6 +314,21 @@ def _configure_route(ca: Path | None = None) -> None:
     })
     if ca is not None:
         os.environ[test_mode.CA] = str(ca)
+
+
+def _configure_direct(ca: Path) -> None:
+    from claude_swap import test_mode
+
+    _configure_route(ca)
+    proxy = os.environ[test_mode.PROXY]
+    os.environ.update({
+        test_mode.ENDPOINT: DIRECT_BASE,
+        test_mode.CLAUDE_BASE: DIRECT_BASE,
+        test_mode.DIRECT: f"{DIRECT_ORIGIN[0]}:{DIRECT_ORIGIN[1]}",
+        # Both canonical and lowercase forms point at the recording trap.
+        **{key: proxy for key in ("HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy")},
+        "no_proxy": "unrelated.test",
+    })
 
 
 def _fake_claude_path() -> str:
@@ -363,15 +467,52 @@ def _attempt_denied_connect() -> None:
                 raise AssertionError("Proxy did not reject an unlisted CONNECT authority")
 
 
-def _serve_worker() -> int:
-    with _serve() as (ca, records):
+def _serve_worker(scenario: str | None = None) -> int:
+    server = _serve() if scenario is None else _serve_direct(refused=scenario == "direct_refused")
+    with server as (ca, records):
         print(ca, flush=True)
         sys.stdin.readline()
     print(json.dumps(records))
-    return int(bool(records["direct"] or records["denied_connect"]))
+    return int(bool(records["direct"] or records["denied_connect"])) if scenario is None else 0
+
+
+def _run_direct(scenario: str, ca: Path) -> dict:
+    from urllib.error import URLError
+    from claude_swap import oauth
+    from tests.stand_shim import launch
+
+    _configure_direct(ca)
+    require_direct_target()
+    refused = scenario == "direct_refused"
+    # Linux has no stdlib OS proxy source. Supply a synthetic system proxy at
+    # the discovery boundary alongside the conflicting environment settings.
+    proxy = f"http://{PROXY[0]}:{PROXY[1]}"
+    with patch("urllib.request.getproxies", return_value={"https": proxy}) as discover_proxies:
+        try:
+            usage = oauth.request_usage_data("synthetic-access")
+        except URLError as exc:
+            assert refused and isinstance(exc.reason, ConnectionRefusedError)
+            usage = None
+        else:
+            assert not refused
+        credentials = json.dumps({"claudeAiOauth": {"refreshToken": "synthetic-refresh"}})
+        refreshed = oauth.try_refresh_oauth_credentials(credentials)
+    discover_proxies.assert_not_called()
+    if refused:
+        assert refreshed.error == "transient" and refreshed.credentials is None
+    else:
+        assert refreshed.error is None
+        assert oauth.extract_oauth_data(refreshed.credentials)["refreshToken"] == "synthetic-successor"
+
+    result = launch(scenario, ca)
+    assert result.returncode == (17 if refused else 0), (result.returncode, result.stderr)
+    assert not result.stderr, result.stderr
+    return {"usage": usage, "refresh": refreshed.error or "rotated", "claude": json.loads(result.stdout)}
 
 
 def _client_worker(scenario: str) -> int:
+    from tests.stand_linux import DIRECT_SCENARIOS
+
     _check_stand()
     ca = Path(sys.stdin.readline().strip())
     response = None
@@ -389,6 +530,8 @@ def _client_worker(scenario: str) -> int:
         if result.stderr:
             raise RuntimeError(f"PATH shim emitted stderr: {result.stderr}")
         response = json.loads(result.stdout)
+    elif scenario in DIRECT_SCENARIOS:
+        response = _run_direct(scenario, ca)
     elif scenario == "direct":
         _attempt_direct(ca)
     elif scenario == "denied_connect":
@@ -403,10 +546,11 @@ def main(scenario: str) -> int:
     # Check before either the mock or the client is launched. Each child
     # also checks the same mounted hosts file and the namespace on entry.
     _check_stand()
-    from tests.stand_linux import worker_argv
+    from tests.stand_linux import DIRECT_SCENARIOS, worker_argv
 
+    server_args = (scenario,) if scenario in DIRECT_SCENARIOS else ()
     with subprocess.Popen(
-        worker_argv("stand_mock", "serve"),
+        worker_argv("stand_mock", "serve", *server_args),
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
     ) as server:
         try:
@@ -426,8 +570,8 @@ def main(scenario: str) -> int:
 
 if __name__ == "__main__":
     try:
-        if sys.argv[1:] == ["serve"]:
-            sys.exit(_serve_worker())
+        if sys.argv[1:2] == ["serve"]:
+            sys.exit(_serve_worker(*sys.argv[2:]))
         if sys.argv[1:2] == ["client"]:
             sys.exit(_client_worker(sys.argv[2]))
         from tests.stand_linux import MOCK_CLI_CONTROLS

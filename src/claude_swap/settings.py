@@ -22,11 +22,14 @@ import logging
 import math
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from claude_swap import launch_policy
 from claude_swap.exceptions import ConfigError
 from claude_swap.fsutil import atomic_write_text, publish_target
+from claude_swap.locking import FileLock
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
@@ -561,19 +564,33 @@ def load_usage_settings(backup_root: Path) -> UsageSettings:
     return UsageSettings(**values)
 
 
+def settings_lock(backup_root: Path) -> FileLock:
+    return FileLock(backup_root / "settings.lock")
+
+
+def _update_settings(backup_root: Path, change: Callable[[dict], bool]) -> bool:
+    path = settings_path(backup_root)
+    with settings_lock(backup_root):
+        raw = _read_raw_for_write(path)
+        if not change(raw):
+            return False
+        raw.setdefault("schemaVersion", SETTINGS_SCHEMA_VERSION)
+        atomic_write_json(path, raw)
+        return True
+
+
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
     """Write the autoswitch section, preserving unknown keys and sections."""
-    path = settings_path(backup_root)
-    raw = _read_raw(path)
-    raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
-    section = raw.get("autoswitch")
-    if not isinstance(section, dict):
-        section = {}
-    for field, json_key in _AUTOSWITCH_KEYS.items():
-        section[json_key] = getattr(settings, field)
-    raw["autoswitch"] = section
-    atomic_write_json(path, raw)
+    def change(raw: dict) -> bool:
+        section = raw.get("autoswitch")
+        if not isinstance(section, dict):
+            section = {}
+        for field, json_key in _AUTOSWITCH_KEYS.items():
+            section[json_key] = getattr(settings, field)
+        raw["autoswitch"] = section
+        return True
 
+    _update_settings(backup_root, change)
 
 def setting_spec(dotted_key: str) -> SettingSpec:
     """Look up a spec by dotted key; unknown keys raise with the valid list."""
@@ -685,8 +702,7 @@ def _read_raw_for_write(path: Path) -> dict:
     return raw
 
 
-def _transparent(raw: dict) -> TransparentSettings:
-    section = raw.get("transparent", {})
+def _transparent(section: object) -> TransparentSettings:
     if not isinstance(section, dict):
         raise ConfigError("transparent: expected a settings object")
     claude_path = section.get("claudePath")
@@ -703,50 +719,76 @@ def _transparent(raw: dict) -> TransparentSettings:
     return TransparentSettings(claude_path, require_proxy, allow_unverified)
 
 
-def load_transparent_settings(backup_root: Path) -> TransparentSettings:
-    """Do not silently downgrade a malformed launch policy to optional."""
-    return _transparent(_read_raw_for_write(settings_path(backup_root)))
+def _transparent_section(legacy: dict, policy: dict) -> dict:
+    section = policy.get("options", legacy.get("transparent", {}))
+    if not isinstance(section, dict):
+        raise ConfigError("transparent: expected a settings object")
+    return section
+
+
+def load_transparent_settings(backup_root: Path, *, policy: dict | None = None) -> TransparentSettings:
+    """Read launch options; malformed policy never downgrades to optional."""
+    if policy is None:
+        policy = launch_policy.read(backup_root)
+    legacy = {} if "options" in policy else _read_raw_for_write(settings_path(backup_root))
+    return _transparent(_transparent_section(legacy, policy))
+
+
+def check_transparent_history(backup_root: Path) -> None:
+    """Fail closed on unreadable history preferences; caller holds settings.lock."""
+    run = _read_raw_for_write(settings_path(backup_root)).get("run", {})
+    if not isinstance(run, dict) or run.get("shareHistory", True) is not True:
+        raise ConfigError("Transparent mode needs run.shareHistory=true; history was not changed")
+
+
+def _update_setting(backup_root: Path, spec: SettingSpec, *, value=None, unset: bool = False) -> bool:
+    def change_section(section: dict) -> bool:
+        if unset:
+            if spec.json_key not in section:
+                return False
+            del section[spec.json_key]
+        else:
+            section[spec.json_key] = value
+        return True
+
+    if spec.section == "transparent":
+        def change_policy(policy: dict) -> bool:
+            legacy = {} if "options" in policy else _read_raw_for_write(settings_path(backup_root))
+            section = dict(_transparent_section(legacy, policy))
+            if not change_section(section):
+                return False
+            _transparent(section)
+            policy["options"] = section
+            return True
+
+        return launch_policy.update(backup_root, change_policy)
+
+    def change_settings(raw: dict) -> bool:
+        section = raw.get(spec.section)
+        if not isinstance(section, dict):
+            section = {}
+        if not change_section(section):
+            return False
+        if section:
+            raw[spec.section] = section
+        else:
+            del raw[spec.section]
+        return True
+
+    return _update_settings(backup_root, change_settings)
 
 
 def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
-    """Validate and persist one key for `cswap config set`; returns the value.
-
-    Writes only the given key (plus schemaVersion) — deliberately not
-    ``save_settings``, which writes every known key and would freeze the
-    current defaults into the file, pinning users to them if a later version
-    changes a default. Unknown keys and sections in the file survive.
-    """
+    """Validate and persist only the requested setting, preserving unknown keys."""
     spec = setting_spec(dotted_key)
     value = parse_setting_value(spec, raw_value)
-    path = settings_path(backup_root)
-    raw = _read_raw_for_write(path)
-    raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
-    section = raw.get(spec.section)
-    if not isinstance(section, dict):
-        section = {}
-    section[spec.json_key] = value
-    raw[spec.section] = section
-    if spec.section == "transparent":
-        _transparent(raw)
-    atomic_write_json(path, raw)
+    _update_setting(backup_root, spec, value=value)
     return value
 
 
 def unset_setting(backup_root: Path, dotted_key: str) -> bool:
-    """Remove one key from settings.json; False if it wasn't set (no write)."""
-    spec = setting_spec(dotted_key)
-    path = settings_path(backup_root)
-    raw = _read_raw_for_write(path)
-    section = raw.get(spec.section)
-    if not isinstance(section, dict) or spec.json_key not in section:
-        return False
-    raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
-    del section[spec.json_key]
-    if not section:
-        del raw[spec.section]
-    atomic_write_json(path, raw)
-    return True
-
+    """Remove one key from its settings file; False if it wasn't set (no write)."""
+    return _update_setting(backup_root, setting_spec(dotted_key), unset=True)
 
 def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, bool]]:
     """(spec, effective value, explicitly set?) per key, in registry order.
@@ -756,17 +798,18 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     reflects the file, not value equality.
     """
     raw = _read_raw(settings_path(backup_root))
+    transparent = _transparent_section(raw, launch_policy.read(backup_root))
     loaded = {
         "autoswitch": load_settings(backup_root),
         "ui": load_ui_settings(backup_root),
         "run": load_run_settings(backup_root),
         "updates": load_update_settings(backup_root),
         "usage": load_usage_settings(backup_root),
-        "transparent": _transparent(raw),
+        "transparent": _transparent(transparent),
     }
     rows = []
     for spec in SETTING_SPECS.values():
-        section = raw.get(spec.section)
+        section = transparent if spec.section == "transparent" else raw.get(spec.section)
         is_set = isinstance(section, dict) and spec.json_key in section
         rows.append((spec, getattr(loaded[spec.section], spec.field), is_set))
     return rows

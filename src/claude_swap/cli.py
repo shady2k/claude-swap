@@ -1462,17 +1462,32 @@ def _transparent_command(argv: list[str]) -> None:
     from claude_swap import transparent
 
     parser = argparse.ArgumentParser(prog="cswap transparent")
-    parser.add_argument("action", choices=("enable", "status", "disable"))
+    actions = parser.add_subparsers(dest="action", required=True)
+    enable = actions.add_parser("enable")
+    enable.add_argument("--accept-shared-history", action="store_true")
+    enable.add_argument("--account", action="append", metavar="SLOT")
+    pool = actions.add_parser("pool", help="remove or reorder approved recipients")
+    pool.add_argument("--account", action="append", metavar="SLOT", default=[])
+    actions.add_parser("revoke-shared-history")
+    actions.add_parser("status")
+    actions.add_parser("disable")
     args = parser.parse_args(argv)
     root = paths.get_backup_root()
     try:
         if args.action == "enable":
-            directory = transparent.enable(root)
+            directory = transparent.enable(root, accept_shared_history=args.accept_shared_history, pool=args.account)
             export = f'export PATH={shlex.quote(str(directory))}:"$PATH"'
+            print(transparent.launch_policy.CONSENT_TEXT)
             print(f"Prepend the shim for clients that should use it: {export}")
         elif args.action == "disable":
             transparent.disable(root)
             print("Shim disabled. You can remove its directory from your PATH.")
+        elif args.action == "pool":
+            transparent.set_pool(root, args.account)
+            print("Transparent pool updated.")
+        elif args.action == "revoke-shared-history":
+            transparent.revoke_history(root)
+            print("Shared history consent revoked.")
         else:
             print("\n".join(transparent.status(root)))
     except (ClaudeSwitchError, OSError) as exc:

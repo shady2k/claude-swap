@@ -234,6 +234,76 @@ def test_f8_cold_profile_pins_auth_probe_and_launch(route, monkeypatch):
     assert calls == [["auth", "status", "--json"], ["-p", "synthetic prompt"]]
 
 
+def test_proxy_userinfo_is_only_in_child_environment(route, monkeypatch):
+    proxy = "http://stand-user:stand%2Dpassword@127.0.0.1:18080"
+    monkeypatch.setenv(test_mode.PROXY, proxy)
+    args, env = test_mode.pinned_launch(["--print", "synthetic prompt"], {})
+    assert env[test_mode.PROXY] == proxy
+    assert json.loads(args[1]) == {"env": {test_mode.CLAUDE_BASE: route[2][test_mode.CLAUDE_BASE]}}
+    assert "stand-user" not in " ".join(args)
+    assert "stand%2Dpassword" not in " ".join(args)
+    if sys.platform == "linux":
+        # Split the marker so the assertion itself does not put it in argv.
+        script = (
+            "from pathlib import Path; argv = Path('/proc/self/cmdline').read_bytes(); "
+            "assert b'stand-' b'user' not in argv and b'stand%2D' b'password' not in argv"
+        )
+        proc = subprocess.run([sys.executable, "-c", script, *args], env=env, capture_output=True)
+        assert proc.returncode == 0, proc.stderr
+
+
+@pytest.fixture
+def direct_route(route, monkeypatch, tmp_path):
+    endpoint = "https://api.mock.example:19443"
+    ca = tmp_path / "stand-ca.pem"
+    ca.touch()
+    for key, value in {
+        test_mode.ENDPOINT: endpoint, test_mode.CLAUDE_BASE: endpoint,
+        test_mode.DIRECT: "127.0.0.1:19443", test_mode.CA: str(ca),
+    }.items():
+        monkeypatch.setenv(key, value)
+    return endpoint
+
+
+@pytest.mark.parametrize("address", ["127.0.0.1:19444", "192.0.2.1:19443"])
+def test_f34_direct_rejects_off_route_address_before_dial(direct_route, no_attempts, monkeypatch, address):
+    from urllib.request import Request
+
+    monkeypatch.setenv(test_mode.DIRECT, address)
+    with pytest.raises(test_mode.TestModeConfigError, match=test_mode.DIRECT):
+        test_mode.open_service(Request(direct_route + "/probe"), timeout=1)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="direct test routing is Linux-only")
+def test_f34_direct_discards_inherited_proxies(direct_route, no_attempts, monkeypatch):
+    proxy = "http://unusable.invalid:18080"
+    monkeypatch.setenv(test_mode.PROXY, proxy)
+    assert test_mode.check_launch(["-p", "synthetic prompt"])
+    args, env = test_mode.pinned_launch([], {
+        "HTTPS_PROXY": proxy, "http_proxy": proxy, "ALL_proxy": proxy, "No_Proxy": "*",
+    })
+    assert env == {
+        test_mode.CLAUDE_BASE: direct_route,
+        test_mode.DIRECT: "127.0.0.1:19443",
+        "NODE_EXTRA_CA_CERTS": os.environ[test_mode.CA],
+    }
+    assert json.loads(args[1])["env"] == env
+
+
+def test_f34_direct_refuses_other_platforms(direct_route, no_attempts, monkeypatch):
+    monkeypatch.setattr(test_mode.sys, "platform", "darwin")
+    with pytest.raises(test_mode.TestModeConfigError, match="Linux stand"):
+        test_mode.preflight(["--version"])
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="direct test routing is Linux-only")
+def test_f34_direct_refuses_managed_proxy_override(direct_route, no_attempts, route):
+    managed = route[1]
+    managed.write_text(json.dumps({"env": {"https_proxy": "http://127.0.0.1:18080"}}))
+    with pytest.raises(test_mode.TestModeConfigError, match=r"env\.https_proxy"):
+        test_mode.check_launch(["-p", "synthetic prompt"])
+
+
 def test_f8_transport_refuses_missing_test_ca_before_dial(route, no_attempts):
     from urllib.request import Request
 

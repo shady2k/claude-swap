@@ -10,16 +10,20 @@ import hashlib
 import json
 import os
 import shlex
+import stat
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
-from claude_swap import __version__, claude_forms, fsguard, paths, real_claude, test_mode
+from claude_swap import __version__, claude_forms, fsguard, launch_policy, paths, real_claude, test_mode
 from claude_swap.exceptions import ClaudeSwitchError, ConfigError
-from claude_swap.fsutil import atomic_write_bytes
+from claude_swap.fsutil import atomic_write_bytes, make_dir_link
 from claude_swap.locking import FileLock
 from claude_swap.python_chain import LOADER_VARS, check_python_chain
-from claude_swap.settings import load_transparent_settings
+from claude_swap.settings import (
+    check_transparent_history, load_transparent_settings, settings_lock,
+)
 
 _BYPASS = "CLAUDE_SWAP_BYPASS"
 _OUTSIDE = "launch outside the profile route"
@@ -84,49 +88,129 @@ def _make_dir(directory: Path) -> None:
     fsguard.check_path(directory)
 
 
-def enable(backup_root: Path) -> Path:
+def _install(directory: Path, strict: bool) -> None:
+    interpreter = check_python_chain()
+    script = _script(interpreter, directory, strict)
+    _make_dir(directory)
+    previous = _metadata(directory)
+    target = _launcher(directory)
+    original = target.read_bytes() if _owned(directory, previous) else None
+    metadata = {
+        "sha256": hashlib.sha256(script).hexdigest(),
+        "interpreter": str(interpreter),
+        "version": __version__,
+        "requireProxy": strict,
+    }
+    atomic_write_bytes(target, script, mode=0o700, follow_symlinks=False)
+    try:
+        atomic_write_bytes(directory / real_claude.SHIM_METADATA, json.dumps(metadata).encode(),
+                           follow_symlinks=False)
+    except OSError:
+        if original is None:
+            target.unlink()
+        else:
+            atomic_write_bytes(target, original, mode=0o700, follow_symlinks=False)
+        raise
+
+
+def enable(
+    backup_root: Path, *, accept_shared_history: bool = False, pool: list[str] | None = None,
+) -> Path:
     if sys.platform == "win32":
         raise ConfigError("No isolated, cancellable Windows shim launcher has been verified (PR1)")
-    settings = load_transparent_settings(backup_root)
-    interpreter = check_python_chain()
+    def pool_members(data: dict) -> tuple[tuple[str, ...], dict[str, list[str]]]:
+        selected = launch_policy.slots(data.get("pool", []) if pool is None else pool)
+        accounts = launch_policy.accounts(backup_root)
+        members = {}
+        for slot in selected:
+            identity = launch_policy.identity(accounts.get(slot))
+            if identity is None or identity[3] != "oauth":
+                raise ConfigError(f"Account-{slot} needs a verified OAuth identity before joining the pool")
+            members[slot] = list(identity)
+        return selected, members
+
+    reviewed = None
+    if not accept_shared_history:
+        if not sys.stdin.isatty() or not sys.stderr.isatty():
+            raise ConfigError(f"{launch_policy.CONSENT_TEXT} Use --accept-shared-history to approve without a terminal.")
+        with FileLock(paths.account_lock_path(backup_root)):
+            reviewed = pool_members(launch_policy.read(backup_root))
+        print(launch_policy.CONSENT_TEXT, file=sys.stderr)
+        members = reviewed[1]
+        label = ", ".join(f"Account-{slot} ({identity[0]!r}, organization {identity[1]!r})"
+                          for slot, identity in members.items())
+        print(f"Approve shared history for {label or 'an empty pool'}? [y/N] ",
+              end="", file=sys.stderr, flush=True)
+        if sys.stdin.readline().strip().lower() not in {"y", "yes"}:
+            raise ConfigError("Shared history was not approved")
     directory = paths.get_shim_dir(backup_root)
-    script = _script(interpreter, directory, settings.require_proxy)
-    _make_dir(directory)
-    with FileLock(directory / "install.lock"):
-        previous = _metadata(directory)
-        target = _launcher(directory)
-        original = target.read_bytes() if _owned(directory, previous) else None
-        metadata = {
-            "sha256": hashlib.sha256(script).hexdigest(),
-            "interpreter": str(interpreter),
-            "version": __version__,
-            "requireProxy": settings.require_proxy,
-        }
-        atomic_write_bytes(target, script, mode=0o700, follow_symlinks=False)
-        try:
-            atomic_write_bytes(directory / real_claude.SHIM_METADATA, json.dumps(metadata).encode(),
-                               follow_symlinks=False)
-        except OSError:
-            if original is None:
-                target.unlink()
-            else:
-                atomic_write_bytes(target, original, mode=0o700, follow_symlinks=False)
-            raise
+
+    def change(data: dict) -> bool:
+        selected, members = pool_members(data)
+        if reviewed is not None and reviewed != (selected, members):
+            raise ConfigError("The recipient identities changed; run cswap transparent enable again")
+        with settings_lock(backup_root):
+            check_transparent_history(backup_root)
+            launch_policy.archive()
+            settings = load_transparent_settings(backup_root, policy=data)
+            _install(directory, settings.require_proxy)
+        data.update(enabled=True, pool=list(selected), historyZone={
+            "scope": launch_policy.HISTORY_SCOPE, "members": members,
+        })
+        return True
+
+    launch_policy.update(backup_root, change)
     return directory
+
+
+def set_pool(backup_root: Path, pool: list[str]) -> None:
+    """Remove or reorder pool entries without extending history consent."""
+    selected = launch_policy.slots(pool)
+
+    def change(data: dict) -> bool:
+        if not set(selected).issubset(launch_policy.slots(data.get("pool", []))):
+            raise ConfigError("To add accounts, approve shared history again with cswap transparent enable")
+        data["pool"] = list(selected)
+        zone = data.get("historyZone")
+        if isinstance(zone, dict) and isinstance(zone.get("members"), dict):
+            zone["members"] = {slot: zone["members"][slot] for slot in selected if slot in zone["members"]}
+        return True
+
+    launch_policy.update(backup_root, change)
+
+
+def revoke_history(backup_root: Path) -> None:
+    def change(data: dict) -> bool:
+        if "historyZone" not in data:
+            return False
+        del data["historyZone"]
+        return True
+
+    launch_policy.update(backup_root, change)
 
 
 def disable(backup_root: Path) -> None:
     directory = paths.get_shim_dir(backup_root)
-    if not os.path.lexists(directory):
-        return
-    fsguard.check_path(directory)
-    with FileLock(directory / "install.lock"):
+
+    def change(data: dict) -> bool:
+        if not data and not os.path.lexists(directory):
+            return False
+        data["enabled"] = False
+        return True
+
+    # Commit the revocation even if the installed launcher was replaced and
+    # cannot safely be removed. In-flight publications already hold consent.
+    launch_policy.update(backup_root, change)
+
+    with FileLock(paths.account_lock_path(backup_root)):
+        if launch_policy.read(backup_root).get("enabled") is not False or not os.path.lexists(directory):
+            return
+        fsguard.check_path(directory)
         metadata = _metadata(directory)
         if _owned(directory, metadata):
             _launcher(directory).unlink()
         if metadata:
             (directory / real_claude.SHIM_METADATA).unlink()
-
 
 def _installed(directory: Path, strict: bool) -> bool:
     fsguard.check_path(directory)
@@ -173,8 +257,9 @@ def status(backup_root: Path) -> list[str]:
     command = real_claude.path_command()
     lines = [f"Claude for this PATH: {command or '(not found)'}"]
     try:
-        policy = load_transparent_settings(backup_root)
-        installed = _installed(directory, policy.require_proxy) if os.path.lexists(directory) else False
+        policy = launch_policy.read(backup_root)
+        options = load_transparent_settings(backup_root, policy=policy)
+        installed = policy.get("enabled") is True and _installed(directory, options.require_proxy)
         active = installed and command is not None and command.resolve() == _launcher(directory).resolve()
         lines.append(f"Shim: {'first on PATH' if active else 'installed, not first on PATH' if installed else 'disabled'}")
     except (ClaudeSwitchError, OSError) as exc:
@@ -200,8 +285,12 @@ def status(backup_root: Path) -> list[str]:
 
 def refresh_install(backup_root: Path) -> None:
     """Rewrite the shell's loader policy when an installed shim changes mode."""
-    if os.path.lexists(_launcher(paths.get_shim_dir(backup_root))):
-        enable(backup_root)
+    directory = paths.get_shim_dir(backup_root)
+    with FileLock(paths.account_lock_path(backup_root)):
+        policy = launch_policy.read(backup_root)
+        if policy.get("enabled") is True and os.path.lexists(_launcher(directory)):
+            settings = load_transparent_settings(backup_root, policy=policy)
+            _install(directory, settings.require_proxy)
 
 
 def _test_layer(directory: Path, args: list[str], env: dict[str, str]):
@@ -215,21 +304,84 @@ def _test_layer(directory: Path, args: list[str], env: dict[str, str]):
     return ["--settings", str(layer), *args], child
 
 
-def _launch(marker: str, args: list[str], root: Path) -> None:
-    test = test_mode.active()
-    real = test_mode.check_launch(args, backup_root=root) if test else None
-    settings = load_transparent_settings(root)
-    directory = paths.get_shim_dir(root)
+class NoAvailableProfile(ClaudeSwitchError):
+    """Current policy permits launch, but has no eligible recipient."""
+
+
+class _UnpreparedProfile(ConfigError):
+    """This selected identity has no matching warm profile."""
+
+
+@dataclass(frozen=True)
+class _Recipient:
+    slot: str
+    identity: launch_policy.Identity
+
+
+@dataclass(frozen=True)
+class _Launch:
+    real: real_claude.RealClaude
+    args: list[str]
+    env: dict[str, str]
+    recipient: _Recipient | None = None
+    profile: Path | None = None
+    outside_reason: str | None = None
+
+
+def _profile_dir(root: Path, recipient: _Recipient, history: Path) -> Path:
+    from claude_swap.session import session_dir_for
+
+    email, org, uuid, _ = recipient.identity
+    profile = session_dir_for(root, recipient.slot, email)
+    try:
+        if not os.path.lexists(profile):
+            raise _UnpreparedProfile("profile has not been prepared")
+        if fsguard.check_path(profile) != root.resolve() / profile.relative_to(root):
+            raise ConfigError("Transparent profile must stay in its own slot")
+        info = profile.stat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+            raise ConfigError("Transparent profile must be a directory owned by the current user")
+        config = profile / ".claude.json"
+        config_info = config.lstat()
+        if not stat.S_ISREG(config_info.st_mode) or config_info.st_uid != os.geteuid():
+            raise ConfigError("Transparent profile identity file is not safe")
+        fsguard.check_leaf(config, config_info)
+        oauth = json.loads(config.read_bytes())["oauthAccount"]
+        if (oauth.get("emailAddress"), oauth.get("organizationUuid") or "", oauth.get("accountUuid")) != (email, org, uuid):
+            raise ValueError
+        projects = profile / "projects"
+        if os.path.lexists(projects) and (not projects.is_symlink() or projects.resolve() != history):
+            raise ConfigError("profile projects/ does not point to the approved shared archive")
+    except (FileNotFoundError, ValueError, KeyError, AttributeError, TypeError) as exc:
+        raise _UnpreparedProfile("profile is not prepared for the approved identity") from exc
+    return profile
+
+
+def _recipient(slot: str, accounts: dict, members: dict) -> _Recipient:
+    record = accounts.get(slot)
+    identity = launch_policy.identity(record)
+    if identity is None or members.get(slot) != list(identity):
+        raise ConfigError("not a member of the current history zone")
+    if identity[3] != "oauth" or record.get("disabled"):
+        raise ConfigError("profile is disabled or not OAuth")
+    return _Recipient(slot, identity)
+
+
+def _prepare_launch(
+    root: Path, directory: Path, marker: str, args: list[str], policy: dict,
+    accounts: dict, history: Path, *, test: bool,
+) -> _Launch:
+    options = load_transparent_settings(root, policy=policy)
     if (
-        marker != _invocation_marker(directory, settings.require_proxy)
-        or not sys.flags.isolated or not _installed(directory, settings.require_proxy)
+        marker != _invocation_marker(directory, options.require_proxy)
+        or not sys.flags.isolated or not _installed(directory, options.require_proxy)
     ):
         raise ConfigError("Shim is not installed, isolated or current; run cswap transparent enable")
-    if settings.require_proxy and any(key in os.environ for key in LOADER_VARS):
+    if options.require_proxy and any(key in os.environ for key in LOADER_VARS):
         raise ConfigError("loader environment is forbidden in strict mode")
     env = os.environ.copy()
     bypass = env.pop(_BYPASS, None)
-    if bypass is not None and settings.require_proxy:
+    if bypass is not None and options.require_proxy:
         raise ConfigError(f"{_BYPASS}: forbidden in strict mode")
     reason = _BYPASS if bypass == "1" else None
     if reason is None:
@@ -237,22 +389,96 @@ def _launch(marker: str, args: list[str], root: Path) -> None:
         if form.error:
             raise ConfigError(form.error)
         reason = form.bypass_reason
-        if reason and settings.require_proxy:
+        if reason and options.require_proxy:
             raise ConfigError(f"{reason}; see cswap transparent status for the absolute path")
-    if test:
-        args, env = _test_layer(directory, args, env)
-        event = "launch"
-    else:
+    env["CLAUDE_SWAP_LAUNCHED"] = str(os.getpid())
+    if not test:
         if not reason:
-            if settings.require_proxy or not settings.allow_unverified:
+            if options.require_proxy or not options.allow_unverified:
                 raise ConfigError("No Claude build admitted for profile routing (PR3); see cswap transparent status")
             reason = "unverified Claude build"
-        real = real_claude.resolve(backup_root=root)
-        print(f"claude-swap: {_OUTSIDE}: {reason}", file=sys.stderr)
-        event = _OUTSIDE
-    env["CLAUDE_SWAP_LAUNCHED"] = str(os.getpid())
-    _journal(directory, event)
-    real.handoff(args, env, job=True)
+        real = real_claude.resolve(backup_root=root, configured_path=options.claude_path)
+        return _Launch(real, args, env, outside_reason=reason)
+
+    if options.require_proxy and test_mode.DIRECT in env:
+        raise ConfigError(f"{test_mode.DIRECT}: direct routing is forbidden in strict mode")
+    members = launch_policy.consent(policy)
+    real = test_mode.check_launch(args, backup_root=root)
+    failures = []
+    for slot in launch_policy.slots(policy.get("pool", [])):
+        identity = launch_policy.identity(accounts.get(slot))
+        label = f"Account-{slot} ({' '.join(identity[0].split())})" if identity else f"Account-{slot}"
+        try:
+            recipient = _recipient(slot, accounts, members)
+        except ConfigError as exc:
+            failures.append(f"{label}: {exc}; resets unknown")
+            continue
+        # Unsafe history links are a configuration error, not a reason to
+        # continue on a profile whose history would be different.
+        try:
+            profile = _profile_dir(root, recipient, history)
+        except _UnpreparedProfile as exc:
+            failures.append(f"{label}: {exc}; resets unknown")
+            continue
+        test_mode.check_launch(args, profile, backup_root=root, binary=real)
+        args, env = _test_layer(directory, args, env)
+        env["CLAUDE_CONFIG_DIR"] = env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(profile)
+        return _Launch(real, args, env, recipient, profile)
+    raise NoAvailableProfile("\n".join(failures) if failures else "No accounts in the transparent pool")
+
+
+def _publish_launch(root: Path, directory: Path, policy: dict, prepared: _Launch) -> bool:
+    """Commit the selected launch while consent and the identity still match."""
+    with FileLock(paths.account_lock_path(root)), settings_lock(root):
+        current = launch_policy.read(root)
+        members = launch_policy.consent(current)
+        check_transparent_history(root)
+        if current != policy:
+            return False
+        history = launch_policy.archive(inspect_contents=True)
+        if recipient := prepared.recipient:
+            accounts = launch_policy.accounts(root)
+            try:
+                current_recipient = _recipient(recipient.slot, accounts, members)
+            except ConfigError:
+                return False
+            if current_recipient != recipient:
+                return False
+            try:
+                profile = _profile_dir(root, recipient, history)
+            except _UnpreparedProfile:
+                return False
+            if profile != prepared.profile:
+                return False
+            if not os.path.lexists(profile / "projects"):
+                history = launch_policy.archive(create=True)
+                make_dir_link(history, profile / "projects")
+        _journal(directory, _OUTSIDE if prepared.outside_reason else "launch")
+        return True
+
+
+def _launch(marker: str, args: list[str], root: Path) -> None:
+    test = test_mode.active()
+    if test:
+        test_mode.check_launch(args, backup_root=root)
+    directory = paths.get_shim_dir(root)
+    # A concurrent policy edit restarts selection without giving a stale
+    # candidate history or launching it. Bound retries under constant edits.
+    for _ in range(3):
+        with FileLock(paths.account_lock_path(root)), settings_lock(root):
+            policy = launch_policy.read(root)
+            launch_policy.consent(policy)
+            check_transparent_history(root)
+            history = launch_policy.archive()
+            accounts = launch_policy.accounts(root) if test else {}
+        prepared = _prepare_launch(root, directory, marker, args, policy, accounts, history, test=test)
+        if _publish_launch(root, directory, policy, prepared):
+            break
+    else:
+        raise ConfigError("Transparent policy kept changing; retry the launch")
+    if prepared.outside_reason:
+        print(f"claude-swap: {_OUTSIDE}: {prepared.outside_reason}", file=sys.stderr)
+    prepared.real.handoff(prepared.args, prepared.env, job=True)
 
 
 def main() -> None:
@@ -260,6 +486,9 @@ def main() -> None:
         invocation = sys.argv[1:]
         marker = invocation.pop(0) if invocation else ""
         _launch(marker, invocation, paths.get_backup_root())
+    except NoAvailableProfile as exc:
+        print(exc, file=sys.stderr)
+        raise SystemExit(3) from None
     except (ClaudeSwitchError, OSError) as exc:
         print(f"claude-swap: {exc}", file=sys.stderr)
         raise SystemExit(4) from None

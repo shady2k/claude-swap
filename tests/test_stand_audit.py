@@ -130,7 +130,7 @@ def test_f20_audits_plain_claude_through_the_installed_shim(tmp_path, call, even
         import runpy
         import sys
 
-        sys.argv[:] = ["cswap", "transparent", "enable"]
+        sys.argv[:] = ["cswap", "transparent", "enable", "--accept-shared-history", "--account", "1"]
         runpy.run_module("claude_swap", run_name="__main__", alter_sys=True)
     """)
     result = stand.run_shim(installer, "import socket, subprocess\n" + call, "--", "prompt")

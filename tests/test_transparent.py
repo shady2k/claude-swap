@@ -45,6 +45,13 @@ def installed(tmp_path, monkeypatch):
     monkeypatch.setenv(test_mode.ALLOW, str(fake))
     for key in ("ALL_PROXY", "HTTP_PROXY", "all_proxy", "http_proxy", "https_proxy"):
         monkeypatch.delenv(key, raising=False)
+    from claude_swap.session import session_dir_for
+
+    email, uuid = "profile@example.test", "fake-profile"
+    profile = session_dir_for(root, "1", email)
+    profile.mkdir(parents=True, mode=0o700)
+    (root / "sequence.json").write_text(json.dumps({"accounts": {"1": {"email": email, "uuid": uuid}}}))
+    (profile / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": email, "accountUuid": uuid}}))
     shim = paths.get_shim_dir(root)
     monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{programs}")
     return root, shim, fake
@@ -60,7 +67,7 @@ def test_f9_lifecycle_argv_streams_exit_and_launch_count(installed):
     args = ["--model", "auth", "-p", "--", 'quoted \"text\"', "", "--settings=prompt text"]
     baseline = invoke(*args)
     assert baseline.returncode == 27
-    assert transparent.enable(root) == shim
+    assert transparent.enable(root, accept_shared_history=True, pool=["1"]) == shim
     assert any("first on PATH" in line for line in transparent.status(root))
     result = invoke(*args)
     assert result.returncode == baseline.returncode
@@ -85,13 +92,13 @@ def test_enable_refuses_group_writable_shim_directory(installed):
     shim.mkdir(parents=True)
     shim.chmod(0o770)
     with pytest.raises(transparent.fsguard.GuardError, match="Writable"):
-        transparent.enable(root)
+        transparent.enable(root, accept_shared_history=True, pool=["1"])
     assert not (shim / "claude").exists()
 
 
 def test_f9_sigterm_reaches_same_pid(installed):
     root, _, _ = installed
-    transparent.enable(root)
+    transparent.enable(root, accept_shared_history=True, pool=["1"])
     with subprocess.Popen(["claude", "-p", "wait for signal"], stdout=subprocess.PIPE) as child:
         try:
             import select
@@ -108,7 +115,7 @@ def test_f9_sigterm_reaches_same_pid(installed):
 
 def test_f4_only_shim_and_explicit_shim_refuse_without_recursion(installed, monkeypatch):
     root, shim, _ = installed
-    transparent.enable(root)
+    transparent.enable(root, accept_shared_history=True, pool=["1"])
     monkeypatch.setenv("PATH", os.pathsep.join((str(shim), str(shim))))
     # Measure separately from the parallel suite so scheduler delays from
     # other tests do not count against the launch budget.
@@ -129,7 +136,7 @@ def test_f4_only_shim_and_explicit_shim_refuse_without_recursion(installed, monk
 
 def test_f28_cwd_pythonpath_and_loader_controls(installed, monkeypatch, tmp_path):
     root, _, _ = installed
-    transparent.enable(root)
+    transparent.enable(root, accept_shared_history=True, pool=["1"])
     for name in ("json.py", "claude_swap.py"):
         (tmp_path / name).write_text("raise RuntimeError('client code imported')\n")
     monkeypatch.setenv("PYTHONPATH", str(tmp_path))
@@ -153,7 +160,7 @@ def test_f22_optional_bypass_and_strict_refusal(installed, monkeypatch, args):
     monkeypatch.delenv(test_mode.MODE)
     set_setting(root, "transparent.claudePath", str(fake))
     baseline = subprocess.run([str(fake), *args], capture_output=True, input=b"\x00\xff\r\n")
-    transparent.enable(root)
+    transparent.enable(root, accept_shared_history=True, pool=["1"])
     result = invoke(*args)
     assert result.returncode == baseline.returncode == 27
     assert result.stdout == baseline.stdout
@@ -176,7 +183,7 @@ def test_f22_explicit_bypass_precedes_form_validation(installed, monkeypatch, ar
     root, _, fake = installed
     monkeypatch.delenv(test_mode.MODE)
     set_setting(root, "transparent.claudePath", str(fake))
-    transparent.enable(root)
+    transparent.enable(root, accept_shared_history=True, pool=["1"])
 
     refusal = invoke(*args)
     assert refusal.returncode == 4
@@ -193,7 +200,7 @@ def test_f22_explicit_bypass_precedes_form_validation(installed, monkeypatch, ar
 
 def test_disable_does_not_delete_replaced_launcher(installed):
     root, shim, _ = installed
-    transparent.enable(root)
+    transparent.enable(root, accept_shared_history=True, pool=["1"])
     launcher = shim / "claude"
     launcher.write_bytes(b"someone else's file")
     with pytest.raises(transparent.ConfigError, match="installed shim"):

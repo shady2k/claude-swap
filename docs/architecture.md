@@ -33,7 +33,7 @@ It works on the same files and Keychain items Claude Code uses, and takes Claude
 - `paths.py`: resolves Claude Code's config and credential paths the way Claude Code does, and the backup root.
 - `claude_locks.py`: Claude Code's lock protocol. `locking.py`: cswap's own `FileLock`.
 - `process_detection.py`: finds running Claude Code instances. `spawn.py`: owns subprocess creation and terminal handoff.
-- `transparent.py`: installs the PATH shim and applies launch policy without running CLI migrations. `claude_forms.py` classifies arguments. `real_claude.py` resolves the original Claude Code for the shim and session launches, including auth probes. `fsguard.py` and `python_chain.py` check the executable chains.
+- `transparent.py`: installs the PATH shim and applies launch policy without running CLI migrations. `launch_policy.py` owns the shared-history consent and recipient pool. `claude_forms.py` classifies arguments. `real_claude.py` resolves the original Claude Code for the shim and session launches, including auth probes. `fsguard.py` and `python_chain.py` check the executable chains.
 - `fsutil.py`: atomic writes and link helpers. It imports nothing from the package.
 
 ## Finding things in `switcher.py`
@@ -106,6 +106,10 @@ Read next: the docstrings of `consume_backup_grant` and `_fetch_active_usage`.
 If the account is already the active default login, it starts plain `claude` instead, because two copies of one credential drift apart.
 
 Read next: the module docstring of `session.py`.
+
+### Transparent launch
+
+The PATH shim checks the shared-history policy, prepares a candidate without holding the account lock, then confirms the current policy and recipient under the account lock before recording the launch. Network and process handoff are outside that lock. See [the PATH shim reference](transparent.md) for consent and revocation.
 
 ### Auto-switch
 

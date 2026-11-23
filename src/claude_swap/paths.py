@@ -137,6 +137,11 @@ def get_backup_root() -> Path:
     return get_legacy_backup_root()
 
 
+def account_lock_path(backup_root: Path) -> Path:
+    """The lock shared by slot changes and transparent launch publication."""
+    return backup_root / ".lock"
+
+
 def get_shim_dir(backup_root: Path | None = None) -> Path:
     """The private PATH shim directory (not the Claude installation)."""
     return (get_backup_root() if backup_root is None else backup_root) / "shim"
