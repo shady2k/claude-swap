@@ -1362,7 +1362,7 @@ def fetch_usage(access_token: str) -> dict | None:
 # a grant the live login also holds; the retry would be declined the same way.
 _DETERMINISTIC_REFRESH_ERRORS = (
     "store-unmirrored", "invalid_client", "consume-busy", "stash-unreadable",
-    "live-login",
+    "live-login", "ownership-lost", "superseded", "unreadable",
 )
 
 

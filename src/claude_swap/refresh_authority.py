@@ -19,6 +19,15 @@ def identity_key(email: str, org_uuid: str = "") -> str:
     return hashlib.sha256(value.encode()).hexdigest()[:16]
 
 
+def same_identity(left: dict, right: dict) -> bool:
+    """Match email/org, rejecting UUID disagreement only when both are known."""
+    return (
+        left.get("email") == right.get("email")
+        and (left.get("organizationUuid") or "") == (right.get("organizationUuid") or "")
+        and not (left.get("uuid") and right.get("uuid") and left["uuid"] != right["uuid"])
+    )
+
+
 def _directory(backup_dir: Path, email: str, org_uuid: str) -> Path:
     return backup_dir / "launch" / identity_key(email, org_uuid)
 

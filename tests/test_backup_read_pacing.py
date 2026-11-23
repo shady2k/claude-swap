@@ -512,8 +512,76 @@ class TestRefreshSnapshotBypassesDisplayCache:
             block_real_keychain.data[_backup_key(2)] = _cred("replacement")
         assert s.sequence_file.read_bytes() == registry_before
         before = keychain.backup_calls(2)
-        entries = s._build_accounts_info()
-        credential = next(info[5] for info in entries if str(info[0]) == "2")
+        credential = s.credential_snapshot("2", _email(2))
         assert credential == _cred("replacement")
         assert credential.login_gen == generation
         assert keychain.backup_calls(2) == before + 1
+
+
+class TestLazyDisplayAuthority:
+    def test_default_build_reuses_idle_backup_cache(
+        self, temp_home, block_real_keychain, keychain
+    ):
+        s = _switcher(temp_home, block_real_keychain, 3)
+        s._build_accounts_info()
+        s._build_accounts_info()
+        assert keychain.backup_calls(2) == 1
+        assert keychain.backup_calls(3) == 1
+
+    def test_display_does_not_read_login_generation(
+        self, temp_home, block_real_keychain, monkeypatch
+    ):
+        s = _switcher(temp_home, block_real_keychain, 3)
+        def denied(*args):
+            raise OSError("synthetic generation read failure")
+        monkeypatch.setattr("claude_swap.refresh_authority.login_generation", denied)
+        assert len(s.accounts_snapshot(fetch=set()).accounts) == 3
+
+    def test_refresh_snapshot_failure_is_local_to_fetch(
+        self, temp_home, block_real_keychain, monkeypatch
+    ):
+        s = _switcher(temp_home, block_real_keychain, 3)
+        infos = s._build_accounts_info(cached=True)
+        def denied(*args):
+            raise OSError("synthetic snapshot read failure")
+        monkeypatch.setattr(s, "credential_snapshot", denied)
+        monkeypatch.setattr(s, "_live_session_pids", lambda *_: [])
+        monkeypatch.setattr(s, "_is_default_login_from_another_profile", lambda *_: False)
+        def fetch(num, email, creds, **kwargs):
+            if num == "2":
+                result = kwargs["refresh_via"](num, email, creds)
+                return oauth.UsageOutcome(None, error=result.error)
+            return oauth.UsageOutcome({"five_hour": {"utilization": 10}})
+        monkeypatch.setattr(oauth, "try_fetch_usage_for_account", fetch)
+        records = s._run_usage_fetches(infos[1:])
+        assert records["2"].error == "unreadable"
+        assert records["3"].usage is not None
+
+    def test_active_generation_failure_is_local_to_collection(
+        self, temp_home, block_real_keychain, monkeypatch
+    ):
+        s = _switcher(temp_home, block_real_keychain, 2)
+        expired = json.loads(_cred("expired"))
+        expired["claudeAiOauth"]["expiresAt"] = 1
+        info = (1, _email(1), "Org", "org-1", True, json.dumps(expired), "")
+        def denied(*args):
+            raise OSError("synthetic generation read failure")
+        monkeypatch.setattr("claude_swap.refresh_authority.login_generation", denied)
+        assert s._fetch_account_usage(info).error == "unreadable"
+
+    def test_plain_display_bytes_cannot_supply_missing_locked_sources(
+        self, temp_home, block_real_keychain, monkeypatch
+    ):
+        s = _switcher(temp_home, block_real_keychain, 2)
+        expired = json.loads(_cred("expired"))
+        expired["claudeAiOauth"]["expiresAt"] = 1
+        info = (1, _email(1), "Org", "org-1", True, json.dumps(expired), "")
+        block_real_keychain.data.pop(_backup_key(1))
+        block_real_keychain.data.pop(
+            (CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name())
+        )
+        calls = []
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", lambda *a, **kw: calls.append(a))
+        result = s._fetch_account_usage(info)
+        assert not calls
+        assert result.error == "no_refresh_token"

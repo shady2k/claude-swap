@@ -7512,3 +7512,10 @@ def test_refresh_passes_bound_credential_snapshot(harness):
     assert isinstance(seen[0], CredentialSnapshot)
     assert seen[0].identity["email"] == "b@example.com"
     assert seen[0].login_gen == 0
+
+
+def test_freshen_snapshot_failure_is_local(harness, monkeypatch):
+    def denied(*args):
+        raise OSError("synthetic generation read failure")
+    monkeypatch.setattr(harness.switcher, "credential_snapshot", denied)
+    assert harness.engine._freshen_target("2", "b@example.com") == "transient"

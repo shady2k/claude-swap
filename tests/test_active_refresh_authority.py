@@ -41,6 +41,57 @@ def active(temp_home, monkeypatch):
     return switcher, calls
 
 
+@pytest.mark.parametrize("unreadable", [True, False])
+def test_active_pending_successor_without_readable_bytes_defers(active, monkeypatch, unreadable):
+    switcher, calls = active
+    original = Snapshot(credential("own"))
+    switcher._write_account_credentials("1", EMAIL, original)
+    switcher._write_credentials(original)
+    switcher._store._write_unclaimed_credential(credential("successor"), {
+        "reason": "active-refresh-persist-failed", "configSlot": "1",
+        "identity": original.identity, "loginGen": original.login_gen,
+        "consumedFp": oauth.credential_fingerprint(original),
+    })
+    monkeypatch.setattr(switcher._store, "_read_unclaimed_credential", lambda *a: ("", unreadable))
+    result = switcher._fetch_active_usage("1", EMAIL, original)
+    assert calls == []
+    assert result.error == "stash-unreadable"
+    assert switcher._read_credentials() == original
+
+
+def test_active_legacy_stash_without_authority_defers(active):
+    switcher, calls = active
+    original = Snapshot(credential("own"))
+    switcher._write_account_credentials("1", EMAIL, original)
+    switcher._write_credentials(original)
+    switcher._store._write_unclaimed_credential(credential("unproven-successor"), {
+        "reason": "active-refresh-persist-failed", "configSlot": "1",
+        "consumedFp": oauth.credential_fingerprint(original),
+    })
+    result = switcher._fetch_active_usage("1", EMAIL, original)
+    assert calls == []
+    assert result.error == "stash-unreadable"
+    assert switcher._read_credentials() == original
+    assert switcher._read_account_credentials("1", EMAIL) == original
+
+
+def test_active_retry_after_live_persist_failure(active, monkeypatch):
+    switcher, calls = active
+    original = Snapshot(credential("own"))
+    switcher._write_account_credentials("1", EMAIL, original)
+    switcher._write_credentials(original)
+    with monkeypatch.context() as failure:
+        def fail(*args):
+            raise OSError("synthetic live persist failure")
+        failure.setattr(switcher, "_write_credentials", fail)
+        result = switcher._fetch_active_usage("1", EMAIL, original)
+    assert result.error == "transient"
+    result = switcher._fetch_active_usage("1", EMAIL, original)
+    assert result.usage == {"ok": True}
+    assert len(calls) == 1
+    assert switcher._read_credentials() == credential("successor")
+
+
 @pytest.mark.parametrize("source", ["live", "backup", "snapshot", "stale-live"])
 def test_active_refresh_uses_locked_source(active, source):
     switcher, calls = active
@@ -96,13 +147,22 @@ def test_failed_persist_stashes_successor(active, monkeypatch):
     original = Snapshot(credential("own"))
     switcher._write_account_credentials("1", EMAIL, original)
     switcher._write_credentials(original)
-    def fail(*args):
-        raise OSError("synthetic failure")
-    monkeypatch.setattr(switcher._store, "_write_account_credentials", fail)
-    result = switcher._fetch_active_usage("1", EMAIL, original)
+    with monkeypatch.context() as persist_failure:
+        def fail(*args):
+            raise OSError("synthetic failure")
+        persist_failure.setattr(switcher._store, "_write_account_credentials", fail)
+        result = switcher._fetch_active_usage("1", EMAIL, original)
     assert len(calls) == 1
     assert result.error == "transient"
     assert switcher.list_unclaimed_credentials()
+    data = switcher._get_sequence_data()
+    data["accounts"]["1"]["uuid"] = "discovered-uuid"
+    switcher._write_json(switcher.sequence_file, data)
+    result = switcher._fetch_active_usage("1", EMAIL, original)
+    assert result.usage == {"ok": True}
+    assert len(calls) == 1
+    assert switcher._read_credentials() == credential("successor")
+    assert switcher._read_account_credentials("1", EMAIL) == credential("successor")
 
 
 def test_same_identity_relogin_between_snapshot_and_locks(active, monkeypatch):
@@ -243,7 +303,7 @@ def test_unbound_snapshot_never_posts(active):
     assert calls == []
 
 
-def test_empty_uuid_backfill_invalidates_snapshot(active):
+def test_empty_uuid_backfill_preserves_refresh_identity(active):
     switcher, calls = active
     old = Snapshot(credential("old"))
     switcher._write_credentials(old)
@@ -252,8 +312,8 @@ def test_empty_uuid_backfill_invalidates_snapshot(active):
     data["accounts"]["1"]["uuid"] = "newly-bound"
     switcher._write_json(switcher.sequence_file, data)
     result = switcher._fetch_active_usage("1", EMAIL, old)
-    assert result.error == "ownership-lost"
-    assert calls == []
+    assert result.usage == {"ok": True}
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("state", ["running", "reserved"])

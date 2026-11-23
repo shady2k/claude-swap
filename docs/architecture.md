@@ -96,7 +96,7 @@ Read next: the module docstring of `claude_locks.py`, and the docstring of `_cla
 
 A refresh token works once: after it is used, only its successor is valid. Refreshing a stored credential therefore goes through one gate, `consume_backup_grant`, which serializes refreshes per slot, re-reads the freshest copy before it posts, and always persists or stashes the successor. The auto engine uses it before activating a target, and session mode before seeding a profile.
 
-Both refresh paths share an identity-scoped OS consume lock in `refresh_authority.py`. Credential snapshots bind bytes to the slot identity and `loginGen` under the account lock. Replacement logins advance `loginGen`; rotation and stash adoption preserve it. Mutations and launch reservation probe the right without waiting under the account lock and refuse while refresh is in flight.
+Both refresh paths share an identity-scoped OS consume lock in `refresh_authority.py`. Credential snapshots bind bytes to the slot identity and `loginGen` under the account lock. Replacement logins advance `loginGen`; rotation and stash adoption preserve it. Mutations probe the right without waiting under the account lock and refuse while refresh is in flight. Explicit session launches wait for the right before taking the account lock, then reserve the profile while holding both.
 
 The backup gate posts outside the account lock and holds its right through CAS or stash. Active recovery in `_fetch_active_usage` re-reads both stores under the account and Claude credential locks. Its bounded POST is the sole network-under-account-lock exception, needed to serialize with Claude's default-store rotation. Both paths persist without taking ownership state under the account lock, then invalidate profiles after releasing the refresh right.
 
@@ -122,7 +122,7 @@ Read next: the module docstring of `autoswitch.py`. The rules as users see them 
 
 ## Rules that hold everywhere
 
-- **Lock order.** Profile ownership state lock, then cswap's lock, then Claude Code's credential lock, then its config lock. Ownership checks at mutation and publication require state before cswap. Never the other way round.
+- **Lock order.** Profile ownership state lock → identity-scoped refresh consume right → `switcher.lock_file` → Claude Code's credential lock → its config lock. Ownership checks at mutation and publication require state before cswap. Never wait for a consume right under `switcher.lock_file`; account-locked callers may only probe it without waiting.
 - **No network under ownership locks.** A switch does only local I/O under its locks, and the usage store never holds its lock across a fetch. Backup-token refresh posts outside the ownership and account locks. Only active recovery holds account and Claude credential locks across a bounded POST to serialize default-store rotation with Claude. Both paths hold the same identity-scoped consume right through persistence or stash; account-locked callers may only probe that right without waiting.
 - **A used refresh token's successor is never dropped.** Once the refresh is posted, the new credential is persisted or stashed, whatever else fails.
 - **A live credential enters a slot only when it is known to belong there.** Writing another account's credential into a slot destroys that slot's only refresh token.

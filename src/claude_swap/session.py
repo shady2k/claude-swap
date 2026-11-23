@@ -62,7 +62,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from claude_swap import claude_forms, launch_policy, macos_keychain, profile_ownership, real_claude, spawn, test_mode
+from claude_swap import claude_forms, launch_policy, macos_keychain, profile_ownership, real_claude, refresh_authority, spawn, test_mode
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
@@ -772,6 +772,7 @@ class SessionManager:
 
     @contextmanager
     def _reserve_profile(self, identifier: str, *, retain: bool = False):
+        """Wait up to 30 seconds for refresh before locking account state."""
         if getattr(self, "_launch_reservation", None) is not None:
             record = self._launch_reservation
             with profile_ownership.ownership_lock(self.switcher.backup_dir), FileLock(self.switcher.lock_file):
@@ -788,11 +789,17 @@ class SessionManager:
         root = self.switcher.backup_dir
         num, email, org = self.switcher.resolve_account(identifier)
         profile = session_dir_for(root, num, email)
-        with profile_ownership.ownership_lock(root), FileLock(self.switcher.lock_file):
+        # Wait outside the account lock so an in-flight refresh can persist
+        # its successor. Keep the right until reservation is recorded.
+        with profile_ownership.ownership_lock(root), refresh_authority.consume_lock(
+            root, email, org, timeout=_BOOTSTRAP_LOCK_TIMEOUT,
+        ), FileLock(self.switcher.lock_file):
             if self.switcher.resolve_account(identifier) != (num, email, org):
                 raise SessionError("Account identity changed before profile reservation")
             recipient_identity = self._profile_recipient_identity(num)
-            record = profile_ownership.reserve_locked(root, num, profile, warming=True)
+            record = profile_ownership.reserve_locked(
+                root, num, profile, warming=True, refresh_right_held=True,
+            )
             record["recipientIdentity"] = recipient_identity
         self._launch_reservation = record
         self._launch_published = False
@@ -910,6 +917,14 @@ class SessionManager:
             # Run on the default login, not on the preset profile.
             env.pop("CLAUDE_CONFIG_DIR", None)
             self._exec(binary, claude_args, env=env)
+        if current is not None and not any(
+            (account.get("email"), account.get("organizationUuid") or "") == current
+            for account in self.switcher._get_sequence_data().get("accounts", {}).values()
+        ):
+            print(dimmed(
+                "The active default login is unmanaged by cswap; "
+                "it remains unchanged while this account runs in a session profile."
+            ))
         if config_dir_preset:
             warning(
                 f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
@@ -1245,6 +1260,11 @@ class SessionManager:
                 account_num, email, pre_creds, timeout=30.0,
                 launch_id=self._launch_reservation["launchId"],
             )
+            if outcome.error == "superseded":
+                raise SessionError(
+                    f"Account-{account_num}'s stored login changed during refresh; "
+                    "retry to prepare a profile from the current login."
+                )
             if outcome.error is not None and outcome.credentials:
                 # `error is None` is the gate's own "the slot is freshened
                 # and safe to activate" signal, and it is NOT implied by

@@ -824,7 +824,10 @@ class AutoSwitchEngine:
             # is already being consumed by that session anyway. Manual
             # switch_to keeps its warn-and-proceed behavior; auto skips.
             return "skip-live-session"
-        creds = self.switcher.credential_snapshot(number, email)
+        try:
+            creds = self.switcher.credential_snapshot(number, email)
+        except Exception:
+            return "transient"
         if not creds:
             return "transient"
         data = oauth.extract_oauth_data(creds)

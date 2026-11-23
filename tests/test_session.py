@@ -5678,6 +5678,147 @@ def test_run_keeps_reservation_across_setup_to_exec(manager, monkeypatch):
         assert not profile_ownership.profile_busy_locked(manager.switcher.backup_dir, ACCOUNT_NUM)
 
 
+class TestRefreshReservationWait:
+    def test_refresh_timeout_does_not_reserve_or_take_account_lock(
+        self, manager, monkeypatch,
+    ):
+        from claude_swap import refresh_authority
+
+        class BusyRight:
+            def __enter__(self):
+                raise LockError("refresh still running")
+
+            def __exit__(self, *args):
+                pass
+
+        def busy_right(root, email, org_uuid, timeout):
+            assert timeout == 30.0
+            return BusyRight()
+
+        monkeypatch.setattr(refresh_authority, "consume_lock", busy_right)
+        monkeypatch.setattr(session_mod, "FileLock",
+                            lambda *a, **k: pytest.fail("account lock before refresh right"))
+        with pytest.raises(LockError, match="refresh still running"):
+            with manager._reserve_profile(ACCOUNT_NUM):
+                pytest.fail("reservation admitted during refresh")
+        assert not (manager.switcher.backup_dir / "profile-ownership" / "launches").exists()
+
+    def test_real_inflight_refresh_can_persist_then_admit_run(
+        self, manager, capture_exec, auth_status_tracks_seed, monkeypatch,
+    ):
+        from claude_swap import refresh_authority
+
+        root = manager.switcher.backup_dir
+        posted = threading.Event()
+        waiting = threading.Event()
+        persisted = threading.Event()
+        errors = []
+        outcomes = []
+        original = refresh_authority.consume_lock
+
+        def post(credentials):
+            posted.set()
+            assert waiting.wait(5)
+            return oauth.RefreshOutcome(ROTATED_CREDS, None)
+
+        def refresher():
+            try:
+                snapshot = manager.switcher.credential_snapshot(ACCOUNT_NUM, ACCOUNT_EMAIL)
+                outcomes.append(manager.switcher.consume_backup_grant(
+                    ACCOUNT_NUM, ACCOUNT_EMAIL, snapshot,
+                ))
+                persisted.set()
+            except BaseException as exc:
+                errors.append(exc)
+                posted.set()
+
+        class ObservedRight(FileLock):
+            def acquire(self, timeout=None):
+                waiting.set()
+                return super().acquire(timeout)
+
+        def observed_right(backup_dir, email, org_uuid="", timeout=10.0):
+            lock = original(backup_dir, email, org_uuid, timeout)
+            return ObservedRight(lock.lock_path, timeout=timeout)
+
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", post)
+        monkeypatch.setattr(manager.switcher, "_get_current_account", lambda: None)
+        worker = threading.Thread(target=refresher)
+        worker.start()
+        assert posted.wait(5)
+        monkeypatch.setattr(refresh_authority, "consume_lock", observed_right)
+        # Reuse is enough here: the launch must first await the foreign POST.
+        monkeypatch.setattr(manager, "setup_session", lambda *a, **k: (
+            session_dir_for(root, ACCOUNT_NUM, ACCOUNT_EMAIL), ACCOUNT_NUM, ACCOUNT_EMAIL,
+        ))
+        try:
+            with pytest.raises(_ExecCalled):
+                manager.run(ACCOUNT_NUM, [])
+        finally:
+            waiting.set()
+            worker.join(5)
+        assert not worker.is_alive()
+        assert not errors
+        assert persisted.is_set()
+        assert outcomes[0].error is None
+        assert manager.switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL) == ROTATED_CREDS
+
+    def test_superseded_refresh_never_seeds_stored_spent_grant(
+        self, manager, monkeypatch,
+    ):
+        monkeypatch.setattr(manager.switcher, "consume_backup_grant",
+                            lambda *a, **k: oauth.RefreshOutcome(None, "superseded"))
+        monkeypatch.setattr(manager, "_bootstrap",
+                            lambda *a, **k: pytest.fail("spent credential seeded"))
+        with pytest.raises(SessionError, match="changed during refresh"):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+    def test_explicit_run_waits_for_refresh_before_account_lock(
+        self, manager, capture_exec, monkeypatch
+    ):
+        from claude_swap import refresh_authority
+
+        root = manager.switcher.backup_dir
+        held = refresh_authority.consume_lock(root, ACCOUNT_EMAIL, ORG_UUID)
+        assert held.acquire(timeout=0)
+        original = refresh_authority.consume_lock
+        waits = []
+
+        def waiting_right(backup_dir, email, org_uuid="", timeout=10.0):
+            assert (backup_dir, email, org_uuid) == (root, ACCOUNT_EMAIL, ORG_UUID)
+            assert timeout == 30.0
+            # The refresher must be able to persist while this launch waits.
+            account_lock = FileLock(manager.switcher.lock_file)
+            assert account_lock.acquire(timeout=0), "account lock held while waiting"
+            account_lock.release()
+            waits.append(timeout)
+            held.release()
+            return original(backup_dir, email, org_uuid, timeout)
+
+        monkeypatch.setattr(refresh_authority, "consume_lock", waiting_right)
+        monkeypatch.setattr(manager.switcher, "_get_current_account",
+                            lambda: (ACCOUNT_EMAIL, ORG_UUID))
+        try:
+            with pytest.raises(_ExecCalled):
+                manager.run(ACCOUNT_NUM, [])
+        finally:
+            held.release()
+        assert waits == [30.0]
+
+    def test_unmanaged_default_login_notice(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
+        monkeypatch, capsys,
+    ):
+        monkeypatch.setattr(manager.switcher, "_get_current_account",
+                            lambda: ("unmanaged@example.com", "unmanaged-org"))
+        with pytest.raises(_ExecCalled):
+            manager.run(ACCOUNT_NUM, [])
+        out = capsys.readouterr().out.lower()
+        assert "unmanaged" in out
+        assert "default login" in out
+        assert "unchanged" in out
+
+
 class TestLaunchReservation:
     def test_setup_keeps_reservation_until_external_handoff(
         self, manager, auth_status_tracks_seed, refresh_rotates

@@ -106,7 +106,7 @@ def test_cas_generation_change_stashes_successor(temp_home, sample_sequence_data
     assert s.list_unclaimed_credentials()
 
 
-def test_collector_reads_bytes_with_generation_under_same_lock(temp_home, sample_sequence_data):
+def test_snapshot_reads_bytes_with_generation_under_same_lock(temp_home, sample_sequence_data):
     from claude_swap import refresh_authority as authority
     from claude_swap.locking import FileLock
     s, email = seeded(sample_sequence_data)
@@ -115,9 +115,9 @@ def test_collector_reads_bytes_with_generation_under_same_lock(temp_home, sample
         assert not probe.acquire(timeout=0), "generation escaped account lock"
         return 7
     with patch("claude_swap.refresh_authority.login_generation", side_effect=generation):
-        entries = s._build_accounts_info()
-    assert entries[0][5].login_gen == 7
-    assert entries[0][5].identity == s.account_identity("1")
+        snapshot = s.credential_snapshot("1", email)
+    assert snapshot.login_gen == 7
+    assert snapshot.identity == s.account_identity("1")
 
 
 def test_reservation_refuses_while_identity_right_held(temp_home, sample_sequence_data):
@@ -146,3 +146,30 @@ def test_unbound_snapshot_cannot_authorize_post(temp_home, sample_sequence_data)
         result = s.consume_backup_grant("1", email, credential("old"))
     assert result.error == "superseded"
     post.assert_not_called()
+
+
+@pytest.mark.parametrize("stored_uuid,current_uuid,adopts", [
+    ("", "discovered", True),
+    ("known", "", True),
+    ("known", "different", False),
+])
+def test_stash_identity_uuid_is_optional_but_conflicts_refuse(
+    temp_home, sample_sequence_data, stored_uuid, current_uuid, adopts,
+):
+    from claude_swap import refresh_authority as authority
+    from claude_swap.locking import FileLock
+    s, email = seeded(sample_sequence_data)
+    identity = dict(s.account_identity("1"), uuid=stored_uuid)
+    s._store._write_unclaimed_credential(credential("successor"), {
+        "reason": "active-refresh-persist-failed", "configSlot": "1",
+        "identity": identity,
+        "loginGen": authority.login_generation(s.backup_dir, email, identity["organizationUuid"]),
+        "consumedFp": oauth.credential_fingerprint(credential("old")),
+    })
+    data = s._get_sequence_data()
+    data["accounts"]["1"]["uuid"] = current_uuid
+    s._write_json(s.sequence_file, data)
+    with FileLock(s.lock_file):
+        result = s._adopt_stashed_successor("1", email, credential("old"))
+    assert result == (credential("successor") if adopts else None)
+    assert s._read_account_credentials("1", email) == credential("successor" if adopts else "old")
