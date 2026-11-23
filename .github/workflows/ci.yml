@@ -66,6 +66,9 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
+      - name: Check legacy executable identity on the venv Python
+        run: uv run python -m tests.win_handoff_diagnostic
+
       - name: Run tests
         # Includes the TUI tests: the Textual TUI (unlike the old curses one)
         # runs on stock Windows, and this job is the proof.
