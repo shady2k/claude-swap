@@ -34,13 +34,58 @@ _SLOT = re.compile(r"[1-9][0-9]*", re.ASCII)
 Identity = tuple[str, str, str, str]
 
 
+def _windows_entry(path: Path, *, directory: bool) -> os.stat_result | None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    is_expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    if (not is_expected_type(info.st_mode)
+            or info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            or (not directory and info.st_nlink != 1)):
+        raise fsguard.GuardError(f"Not an ordinary policy {'directory' if directory else 'file'}: {path}")
+    return info
+
+
+def _windows_policy_root(root: Path) -> bool:
+    """Check the data store, not an executable trust chain.
+
+    Windows pool administration uses the current user's backup root. Reject
+    path redirections throughout, but require trusted owner and write access
+    only at the backup root and the policy files, not on OS-owned ancestors.
+    Windows cannot enable the shim.
+    """
+    if not root.is_absolute() or ".." in root.parts:
+        raise fsguard.GuardError(f"Expected an absolute policy directory with no parent traversal: {root}")
+    for parent in reversed(root.parents):
+        if _windows_entry(parent, directory=True) is None:
+            return False
+    info = _windows_entry(root, directory=True)
+    if info is None:
+        return False
+    fsguard.check_leaf(root, info)
+    return True
+
+
+def _windows_policy_file(path: Path) -> bool:
+    info = _windows_entry(path, directory=False)
+    if info is None:
+        return False
+    fsguard.check_leaf(path, info)
+    return True
+
+
 def _read(path: Path) -> dict:
     try:
-        if not os.path.lexists(path):
-            return {}
-        fsguard.check_path(path)
-        if path.is_symlink() or not path.is_file():
-            raise ValueError
+        if sys.platform == "win32":
+            if not _windows_policy_root(path.parent) or not _windows_policy_file(path):
+                return {}
+        else:
+            if not os.path.lexists(path):
+                return {}
+            fsguard.check_path(path)
+            if path.is_symlink() or not path.is_file():
+                raise ValueError
         value = json.loads(path.read_bytes())
         if not isinstance(value, dict):
             raise ValueError
@@ -55,9 +100,16 @@ def read(root: Path) -> dict:
 
 def update(root: Path, change: Callable[[dict], bool]) -> bool:
     """Read/modify/write under the slot lock. A true result adds one revision."""
-    if root.exists():
+    lock = paths.account_lock_path(root)
+    if sys.platform == "win32":
+        if not _windows_policy_root(root):
+            root.mkdir(parents=True, exist_ok=True)
+            if not _windows_policy_root(root):
+                raise ConfigError("Could not create the policy directory")
+        _windows_policy_file(lock)
+    elif root.exists():
         fsguard.check_path(root)
-    with FileLock(paths.account_lock_path(root)):
+    with FileLock(lock):
         data = read(root)
         if not change(data):
             return False
