@@ -352,6 +352,63 @@ class TestFormatting:
         ).plain
         assert "last seen" not in api_key
 
+    @pytest.mark.parametrize("error", ["stash-unreadable", "profile-busy"])
+    @pytest.mark.parametrize("has_history", [False, True])
+    @pytest.mark.parametrize("backoff", [False, True])
+    @pytest.mark.parametrize("expired_sentinel", [False, True])
+    def test_recovery_card_keeps_guidance_and_prior_usage(self, error, has_history, backoff, expired_sentinel):
+        from claude_swap.switcher import ERROR_NOTES
+        from claude_swap.tui.widgets import account_card_text, mini_account_text
+
+        entry = dataclasses.replace(
+            make_entry() if has_history else UsageEntry(), last_error=error,
+            recovery_error=error,
+            backoff_until=time.time() + 600 if backoff else None,
+            sentinel=USAGE_TOKEN_EXPIRED if expired_sentinel else None,
+        )
+        from claude_swap.switcher import _usage_entry_lines
+
+        account = make_account(1, entry=entry)
+        mini = mini_account_text(account, time.time()).plain
+        assert mini.endswith(error)
+        assert ERROR_NOTES[error] not in mini
+        for text in (
+            account_card_text(account, 100).plain,
+            "\n".join(_usage_entry_lines(entry)),
+        ):
+            assert ERROR_NOTES[error] in text
+            assert "retries automatically" not in text
+            if has_history:
+                assert "last seen" in text if expired_sentinel else "25%" in text
+            if error == "stash-unreadable":
+                assert "cswap unclaimed --purge ID" in text
+            else:
+                assert "log in again" not in text
+                assert "cswap add" not in text
+
+    def test_recovery_mini_fits_rendered_width_after_login_note(self):
+        from io import StringIO
+        from rich.console import Console
+        from rich.cells import cell_len
+        from claude_swap.tui.widgets import fit_login, mini_account_text
+
+        now = time.time()
+        acc = dataclasses.replace(
+            make_account(2, email="work@example.com", entry=dataclasses.replace(
+                make_entry(), recovery_error="stash-unreadable",
+            )),
+            login_expires_at=now + 2 * 86400 + 3600,
+        )
+        (row,) = fit_login(lambda form: [mini_account_text(acc, now, login=form)], 88)
+        output = StringIO()
+        Console(file=output, width=88, color_system=None).print(row)
+        rendered = output.getvalue().strip()
+        assert cell_len(rendered) <= 88
+        assert "5h 25%" in rendered
+        assert "7d 10%" in rendered
+        assert rendered.endswith("stash-unreadable")
+        assert rendered.index("re-login") < rendered.index("stash-unreadable")
+
     def test_account_card_uses_light_palette_when_passed(self):
         from claude_swap.tui.theme import ACCENT_LIGHT, CSWAP_LIGHT, Palette
         from claude_swap.tui.widgets import account_card_text

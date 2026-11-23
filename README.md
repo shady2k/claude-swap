@@ -207,6 +207,8 @@ cswap add
 
 This will update the stored credentials without creating a duplicate.
 
+If refresh reports unproven copies or stash uncertainty, cswap defers without rewriting live or backup credentials; list, TUI, and auto-switch keep recovery guidance beside prior usage. Follow the applicable steps in [credential recovery](docs/auto-switch.md#credential-recovery); unproven copies do not require purging a stash entry.
+
 If the refresh token itself has died (auto-switch quarantines and reports such an account), log in with it and re-run `cswap add --slot N`, or replace its stored credentials from a known-good export: a plain `cswap import backup.cswap` replaces dead-token slots on its own (a stale export can carry an already-superseded token).
 
 ### Other commands
@@ -235,7 +237,7 @@ cswap alias                     # List all aliases
 cswap move 2 1                  # Assign an account to a slot (relocates to an empty slot, swaps if taken)
 cswap swap 2 3                  # Exchange two accounts' slot numbers
 cswap unclaimed                 # List stashed credential entries (slot + why they were stashed)
-cswap unclaimed --purge ID      # Drop one (deletes its bytes; recover with /login + `cswap add`)
+cswap unclaimed --purge ID      # After inspection/recovery, delete a blocking entry and its bytes
 cswap tui                       # Interactive dashboard (also: bare `cswap`)
 cswap watch                     # Dashboard, opened on the live watch page
 cswap upgrade                   # Upgrade claude-swap to the latest version

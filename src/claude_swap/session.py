@@ -62,7 +62,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from claude_swap import claude_forms, launch_policy, macos_keychain, profile_ownership, real_claude, spawn, test_mode
+from claude_swap import claude_forms, launch_policy, macos_keychain, profile_ownership, real_claude, refresh_authority, spawn, test_mode
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
@@ -321,12 +321,14 @@ def _keychain_account_name() -> str:
     return macos_keychain.keychain_account_name()
 
 
-def delete_macos_keychain_entry(session_dir: Path) -> None:
+def delete_macos_keychain_entry(session_dir: Path, *, strict: bool = False) -> None:
     """Best-effort delete of a session profile's hashed keychain entry.
 
     No-op off macOS. Needed before seeding (Claude reads the keychain before
     the plaintext file, so a stale entry would shadow a fresh seed) and on
     profile removal (once the dir is gone the hashed name is unrecoverable).
+    Seeding and stale replacement use ``strict``: a deletion failure must not
+    leave a shadowing Keychain entry above a newly written plaintext seed.
     """
     if Platform.detect() != Platform.MACOS:
         return
@@ -334,8 +336,12 @@ def delete_macos_keychain_entry(session_dir: Path) -> None:
         macos_keychain.delete_password(
             keychain_service_name(session_dir), _keychain_account_name()
         )
-    except macos_keychain.KEYCHAIN_ERRORS:
-        pass  # best-effort; absent entry is already success (rc 44)
+    except macos_keychain.KEYCHAIN_ERRORS as exc:
+        if strict:
+            raise SessionError(
+                "Session profile input is unavailable right now; unlock storage and retry."
+            ) from exc
+        # Best-effort for other callers; absence (rc 44) is already success.
 
 
 def read_session_credentials(session_dir: Path) -> str | None:
@@ -352,6 +358,28 @@ def read_session_credentials(session_dir: Path) -> str | None:
     readable credential material.
     """
     return read_config_dir_credentials(str(session_dir))
+
+
+def _read_profile_admission_input(session_dir: Path) -> str | None:
+    """Read Claude's input, distinguishing absence from read failure.
+
+    Admission alone needs this strict file and Keychain view. Other readers
+    retain their best-effort fallback. Hash the exported directory string,
+    not a symlink target, exactly as the launch environment does.
+    """
+    if Platform.detect() == Platform.MACOS:
+        try:
+            credential = _keychain_entry(keychain_service_name(session_dir), True)
+        except macos_keychain.KEYCHAIN_ERRORS as exc:
+            raise CredentialReadError("Profile input is unavailable") from exc
+        if credential is not None:
+            return credential
+    try:
+        return (session_dir / ".credentials.json").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise CredentialReadError("Profile input is unavailable") from exc
 
 
 def _may_have_credential_material(session_dir: Path) -> bool:
@@ -771,7 +799,23 @@ class SessionManager:
             raise SessionError("Account identity changed during profile preparation")
 
     @contextmanager
+    def _reservation_refresh_right(self, root, email, org):
+        # Translate only admission failure, not errors from the reserved work.
+        right = refresh_authority.consume_lock(
+            root, email, org, timeout=_BOOTSTRAP_LOCK_TIMEOUT,
+        )
+        try:
+            right.__enter__()
+        except LockError as exc:
+            raise SessionError("Login refresh in progress; retry after it completes") from exc
+        try:
+            yield
+        finally:
+            right.__exit__(None, None, None)
+
+    @contextmanager
     def _reserve_profile(self, identifier: str, *, retain: bool = False):
+        """Wait up to 30 seconds for refresh before locking account state."""
         if getattr(self, "_launch_reservation", None) is not None:
             record = self._launch_reservation
             with profile_ownership.ownership_lock(self.switcher.backup_dir), FileLock(self.switcher.lock_file):
@@ -788,12 +832,18 @@ class SessionManager:
         root = self.switcher.backup_dir
         num, email, org = self.switcher.resolve_account(identifier)
         profile = session_dir_for(root, num, email)
-        with profile_ownership.ownership_lock(root), FileLock(self.switcher.lock_file):
-            if self.switcher.resolve_account(identifier) != (num, email, org):
-                raise SessionError("Account identity changed before profile reservation")
-            recipient_identity = self._profile_recipient_identity(num)
-            record = profile_ownership.reserve_locked(root, num, profile, warming=True)
-            record["recipientIdentity"] = recipient_identity
+        # Wait outside the account lock so an in-flight refresh can persist
+        # its successor. Keep the right until reservation is recorded.
+        with profile_ownership.ownership_lock(root):
+            with self._reservation_refresh_right(root, email, org):
+                with FileLock(self.switcher.lock_file):
+                    if self.switcher.resolve_account(identifier) != (num, email, org):
+                        raise SessionError("Account identity changed before profile reservation")
+                    recipient_identity = self._profile_recipient_identity(num)
+                    record = profile_ownership.reserve_locked(
+                        root, num, profile, warming=True, refresh_right_held=True,
+                    )
+                    record["recipientIdentity"] = recipient_identity
         self._launch_reservation = record
         self._launch_published = False
         succeeded = False
@@ -884,7 +934,8 @@ class SessionManager:
                     "the stored login in a session profile."
                 )
             )
-        if current is not None and current == (email, org_uuid) and not signed_out:
+        if (current is not None and current == (email, org_uuid) and not signed_out
+                and self._slot_has_default_refresh_grant(account_num, email)):
             if require_session:
                 raise SessionError(
                     f"Account-{account_num} ({email}) is the active default "
@@ -909,6 +960,14 @@ class SessionManager:
             # Run on the default login, not on the preset profile.
             env.pop("CLAUDE_CONFIG_DIR", None)
             self._exec(binary, claude_args, env=env)
+        if current is not None and not any(
+            (account.get("email"), account.get("organizationUuid") or "") == current
+            for account in self.switcher._get_sequence_data().get("accounts", {}).values()
+        ):
+            print(dimmed(
+                "The active default login is unmanaged by cswap; "
+                "it remains unchanged while this account runs in a session profile."
+            ))
         if config_dir_preset:
             warning(
                 f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
@@ -1102,7 +1161,7 @@ class SessionManager:
                 num, email, _ = self.switcher.resolve_account(record["accountNum"])
                 if profile_ownership.profile_key(session_dir_for(self.switcher.backup_dir, num, email)) != record["profile"]:
                     raise SessionError("Account identity changed before handoff")
-                if self.switcher._get_current_account() == self.switcher.resolve_account(num)[1:] and not self._default_login_signed_out():
+                if self.switcher._get_current_account() == self.switcher.resolve_account(num)[1:] and not self._default_login_signed_out() and self._slot_has_default_refresh_grant(num, email):
                     raise SessionError("Selected account became the default login before handoff")
                 profile_ownership.mark_running_locked(
                     self.switcher.backup_dir, record["launchId"], os.getpid(),
@@ -1213,10 +1272,14 @@ class SessionManager:
                 self._verify_profile_recipient(record)
                 if self.switcher.resolve_account(identifier) != (account_num, email, org_uuid):
                     raise SessionError("Account identity changed before profile reuse")
-                if self.switcher._get_current_account() == (email, org_uuid) and not self._default_login_signed_out():
+                if self.switcher._get_current_account() == (email, org_uuid) and not self._default_login_signed_out() and self._slot_has_default_refresh_grant(account_num, email):
                     raise SessionError("Selected account became the default login before profile reuse")
-                self._sync_sharing(session_dir, share, share_history)
-            return session_dir, account_num, email
+                stash_status = self._profile_stash_status(session_dir, account_num, email)
+                if stash_status not in ("consumed", "absent"):
+                    if stash_status:
+                        raise self._stash_admission_error(account_num, status=stash_status)
+                    self._sync_sharing(session_dir, share, share_history)
+                    return session_dir, account_num, email
 
         # One refresh so the profile starts with a fresh access token —
         # BEFORE the bootstrap lock (the gate takes the same non-reentrant
@@ -1236,60 +1299,26 @@ class SessionManager:
             self._verify_profile_recipient(record)
             if self.switcher.resolve_account(identifier) != (account_num, email, org_uuid):
                 raise SessionError("Account identity changed before credential preparation")
-            if self.switcher._get_current_account() == (email, org_uuid) and not self._default_login_signed_out():
+            if self.switcher._get_current_account() == (email, org_uuid) and not self._default_login_signed_out() and self._slot_has_default_refresh_grant(account_num, email):
                 raise self._live_login_error(account_num)
-        pre_creds = self.switcher.read_account_credentials(account_num, email)
+        pre_creds = self.switcher.credential_snapshot(account_num, email)
         if pre_creds and self._has_refresh_token(pre_creds):
             outcome = self.switcher.consume_backup_grant(
-                account_num, email, pre_creds
+                account_num, email, pre_creds, timeout=30.0,
+                launch_id=self._launch_reservation["launchId"],
             )
-            if outcome.error is not None and outcome.credentials:
-                # `error is None` is the gate's own "the slot is freshened
-                # and safe to activate" signal, and it is NOT implied by
-                # credentials being present: a failed persist returns the
-                # successor AND `transient`, with the backup still holding
-                # the generation whose grant was just spent.
-                #
-                # WARNING ABOUT IT IS NOT ENOUGH. `_bootstrap` re-reads the
-                # backup, so continuing seeds the profile from that spent
-                # generation and claude's first refresh gets invalid_grant —
-                # the warning scrolls past and the session is broken anyway.
-                #
-                # Refuse — but the two demoted shapes need OPPOSITE advice,
-                # and `error`/`credentials` cannot tell them apart, which is
-                # why the gate carries `stashed`.
-                #
-                # Stashed: retrying is right. The next run's gate adopts the
-                # successor without consuming anything and bootstraps
-                # normally, so the recovery machinery already built here does
-                # the rest.
-                #
-                # NOT stashed (`consume-gate-unpersisted`, where the persist
-                # AND the stash both failed): retrying POSTs the spent
-                # predecessor and earns a strike. The successor survived only
-                # in this return value, which the raise discards — saying
-                # "nothing was lost" there would be false on both counts. The
-                # remedy is the storage failure, which is what the gate's own
-                # ERROR log at that site already says.
-                #
-                # This shape is distinguishable at the call site: a genuine
-                # network-transient carries `credentials=None` and falls to
-                # the warning below, where continuing on the stored
-                # credentials is correct because nothing was spent.
-                if outcome.stashed:
-                    raise SessionError(
-                        f"Account-{account_num}'s refreshed credential could "
-                        f"not be stored, so the backup still holds a spent "
-                        f"grant. The successor is stashed — please retry, and "
-                        f"the next run adopts it automatically."
-                    )
+            if outcome.error == "superseded":
                 raise SessionError(
-                    f"Account-{account_num}'s refreshed credential could "
-                    f"neither be stored nor stashed, so the backup holds a "
-                    f"spent grant and the successor is gone. Fix the storage "
-                    f"failure first; retrying before that spends nothing but "
-                    f"earns a strike. If the slot strikes, log in again and "
-                    f"re-add it: cswap --add-account --slot {account_num}"
+                    f"Account-{account_num}'s stored login changed during refresh; "
+                    "retry to prepare a profile from the current login."
+                )
+            if outcome.error == "stash-unreadable":
+                raise self._stash_admission_error(account_num)
+            if outcome.error is not None and outcome.credentials:
+                raise SessionError(
+                    f"Account-{account_num}'s refreshed credential could not be "
+                    "stored. Credential preparation is deferred; fix the storage "
+                    "failure, then retry so recovery can adopt the successor."
                 )
             if outcome.error == "live-login":
                 # The gate declined because the live login holds this same
@@ -1299,8 +1328,8 @@ class SessionManager:
                 raise self._live_login_error(account_num)
             if outcome.error is not None:
                 warning(
-                    f"Could not refresh the token for Account-{account_num}; "
-                    "continuing with the stored credentials."
+                    f"Token refresh for Account-{account_num} is deferred; "
+                    "checking the stored login before profile preparation."
                 )
 
         with profile_ownership.ownership_lock(self.switcher.backup_dir), FileLock(
@@ -1324,11 +1353,18 @@ class SessionManager:
             self._verify_profile_recipient(record)
             if self.switcher.resolve_account(identifier) != (account_num, email, org_uuid):
                 raise SessionError("Account identity changed during profile preparation")
+            stash_status = self._profile_stash_status(session_dir, account_num, email)
+            if stash_status in ("consumed", "absent"):
+                self._bootstrap(session_dir, account_num, email, org_uuid)
+                clear_session_stale(session_dir)
+                stash_status = None
+            if stash_status:
+                raise self._stash_admission_error(account_num, status=stash_status)
             # A backup refresh can mark the reserved profile stale. Re-check
             # under both locks before rebuilding its credentials.
             if is_session_stale(session_dir) and profile_is_quiescent(session_dir):
                 self._guard_profile_rebuild(session_dir)
-                delete_macos_keychain_entry(session_dir)
+                delete_macos_keychain_entry(session_dir, strict=True)
                 (session_dir / ".credentials.json").unlink(missing_ok=True)
                 clear_session_stale(session_dir)
             if self._is_session_valid(session_dir, email, org_uuid, binary=binary):
@@ -1380,6 +1416,57 @@ class SessionManager:
 
         return session_dir, account_num, email
 
+    def _profile_stash_status(
+        self, session_dir: Path, account_num: str, email: str,
+    ) -> str | None:
+        """Check admission under the account lock, reading profiles only on doubt.
+
+        An unverifiable stash prevents copying the backup, but an existing
+        profile with an independent, readable generation can still run.
+        A consumed or absent profile input must be seeded from checked backup
+        bytes. An unreadable input must never be replaced.
+        """
+        from claude_swap import oauth
+
+        state = self.switcher._refresh_stash_state()
+        if state["status"] == "ok" and not state["consumed_fps"]:
+            return None
+        try:
+            profile = _read_profile_admission_input(session_dir)
+        except CredentialReadError:
+            return "profile-unreadable"
+        if profile is None:
+            return "absent"
+        if profile and not self._has_refresh_token(profile):
+            return None
+        if profile and oauth.credential_fingerprint(profile) in state["consumed_fps"]:
+            return "consumed"
+        if state["status"] in ("busy", "unverifiable"):
+            backup, unreadable = self.switcher._read_account_credentials_ex(account_num, email)
+            if (not profile or not backup or unreadable
+                    or oauth.credential_fingerprint(profile) == oauth.credential_fingerprint(backup)):
+                return state["status"]
+        return None
+
+    def _stash_admission_error(self, account_num: str, *, status: str | None = None) -> SessionError:
+        if status == "profile-unreadable":
+            return SessionError(
+                f"Account-{account_num}'s profile input is unavailable right now; "
+                "unlock storage and retry."
+            )
+        if status == "busy":
+            return SessionError(
+                f"Account-{account_num}'s stash recovery is busy; preparation is deferred. Retry shortly."
+            )
+        if status == "consumed":
+            return SessionError(
+                f"Account-{account_num}'s stored refresh grant was already consumed; "
+                "credential preparation is deferred. Retry after successor recovery."
+            )
+        return SessionError(
+            f"Account-{account_num}: {self.switcher.recovery_error_note('stash-unreadable')}"
+        )
+
     def _profile_matches_backup(
         self, session_dir: Path, account_num: str, email: str
     ) -> bool:
@@ -1407,39 +1494,32 @@ class SessionManager:
         self, session_dir: Path, account_num: str, email: str, org_uuid: str
     ) -> None:
         """Seed the session profile from backup storage. Caller holds the lock."""
-        # Checked here, on the login about to be copied, and before anything
-        # of the profile is touched. The consume gate's own check does not
-        # cover every way in: it reports success without reaching it when the
-        # backup moved after the caller's snapshot. Only a certain match
-        # refuses: a live store that cannot be read is no reason to fail a
-        # launch the stored credentials can serve.
-        if self.switcher._live_login_holds(
-            self.switcher.read_account_credentials(account_num, email) or ""
-        ):
-            raise self._live_login_error(account_num)
-
-        self._guard_profile_rebuild(session_dir)
-
-        # Claude reads the keychain before the plaintext file — a stale hashed
-        # entry from an earlier profile at this path would shadow the seed.
-        delete_macos_keychain_entry(session_dir)
-
-        creds, unreadable = self.switcher._read_account_credentials_ex(
-            account_num, email
-        )
-        if not creds:
+        # Validate the same bytes that will be written, before touching the
+        # profile or removing its Keychain entry.
+        creds, unreadable = self.switcher._read_account_credentials_ex(account_num, email)
+        if not creds or unreadable:
             if unreadable:
-                # Third copy of the switch path's message; same reason not to
-                # send the user to a re-add over a locked Keychain.
                 raise SessionError(
-                    f"Account-{account_num}'s backup is in the macOS Keychain "
-                    f"but it is unreadable right now (locked or no GUI "
-                    f"session). Retry from a GUI terminal; do not re-add."
+                    f"Account-{account_num}'s backup is unreadable right now "
+                    "(locked Keychain or credential file read failure). "
+                    "Retry when storage is available; do not re-add."
                 )
             raise SessionError(
                 f"Account-{account_num} has no stored credentials. "
                 f"Re-add with: cswap --add-account --slot {account_num}"
             )
+        # An unreadable live input is not proof that it holds this grant;
+        # _live_login_holds refuses only a positively matching generation.
+        if self.switcher._live_login_holds(creds):
+            raise self._live_login_error(account_num)
+        stash_status = self.switcher._session_credential_stash_status(creds)
+        if stash_status:
+            raise self._stash_admission_error(account_num, status=stash_status)
+
+        self._guard_profile_rebuild(session_dir)
+
+        # Claude reads the keychain before the plaintext file.
+        delete_macos_keychain_entry(session_dir, strict=True)
 
         # The pre-lock refresh (see run(): the consume gate must not run
         # under this lock — its POST is network and the FileLock is
@@ -1495,6 +1575,16 @@ class SessionManager:
             f"Run 'cswap --switch-to {account_num}' so cswap treats it as the "
             f"active account, then start claude normally."
         )
+
+    def _slot_has_default_refresh_grant(self, account_num: str, email: str) -> bool:
+        """Keep default-login exclusion unless the slot is a readable setup-token."""
+        credentials, unreadable = self.switcher._read_account_credentials_ex(account_num, email)
+        if unreadable:
+            return True
+        from claude_swap import oauth
+
+        token = oauth.extract_oauth_data(credentials or "") or {}
+        return not (token.get("accessToken") and not token.get("refreshToken"))
 
     @staticmethod
     def _has_refresh_token(creds: str) -> bool:

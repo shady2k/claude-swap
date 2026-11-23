@@ -38,6 +38,7 @@ HISTORY_SCENARIOS = ("history_success", "history_503")
 MOCK_SCENARIOS = (
     "positive", "cli_positive", "direct", "denied_connect", "shim_positive", "shim_direct",
     *DIRECT_SCENARIOS,
+    "f15_setup_default", "f15_setup_probe", "f15_oauth_gate",
 )
 MOCK_CLI_CONTROLS = ("missing_endpoint", "malformed_endpoint")
 SHIM_REFUSALS = (

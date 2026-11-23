@@ -459,6 +459,9 @@ def _unclaimed_command(argv: list[str]) -> None:
             print(dimmed("No unclaimed credential entries"))
             return
         for entry_id, meta in sorted(entries.items()):
+            if not isinstance(meta, dict):
+                print(f"{entry_id}  slot ?  invalid manifest row")
+                continue
             slot = meta.get("configSlot") or "?"
             reason = meta.get("reason") or "orphaned (no manifest row)"
             print(f"{entry_id}  slot {slot}  {reason}")

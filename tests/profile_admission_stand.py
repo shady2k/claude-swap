@@ -168,7 +168,7 @@ def worker():
                     for n,email in ((1,'default@example.test'),(2,'target@example.test'))}
         switcher._write_json(switcher.sequence_file, {'activeAccountNumber':1, 'sequence':[1,2], 'accounts':accounts})
         for n, account in accounts.items():
-            credentials = json.dumps({'claudeAiOauth':{'accessToken':'synthetic-'+n, 'expiresAt':9999999999999}})
+            credentials = json.dumps({'claudeAiOauth':{'accessToken':'synthetic-'+n, 'refreshToken':'synthetic-refresh-'+n, 'expiresAt':9999999999999}})
             config = json.dumps({'oauthAccount':{'emailAddress':account['email'], 'organizationUuid':account['organizationUuid'], 'accountUuid':account['uuid']}})
             switcher._write_account_credentials(n, account['email'], credentials)
             switcher._write_account_config(n, account['email'], config)
@@ -189,7 +189,12 @@ def worker():
         data['accounts']['2']['uuid'] = 'replacement-uuid'
         switcher._write_json(switcher.sequence_file, data)
         return
-    if mode == 'identity':
+    if mode in ('identity', 'setup-identity'):
+        if mode == 'setup-identity':
+            credentials = json.dumps({'claudeAiOauth': {'accessToken': 'synthetic-setup'}})
+            switcher._write_account_credentials('2', 'target@example.test', credentials)
+            if profile.exists():
+                (profile / '.credentials.json').write_text(credentials)
         paths.get_global_config_path().write_text(switcher.read_account_config('2','target@example.test'))
         return
     if mode == 'free':

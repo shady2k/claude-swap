@@ -263,7 +263,7 @@ def refresh_rotates(monkeypatch):
     real one does (bootstrap re-reads the backup afterwards)."""
     calls: list[str] = []
 
-    def fake_gate(self, account_num: str, email: str, snapshot: str):
+    def fake_gate(self, account_num: str, email: str, snapshot: str, **kwargs):
         from claude_swap import oauth as oauth_mod
         calls.append(snapshot)
         self._write_account_credentials(account_num, email, ROTATED_CREDS)
@@ -498,13 +498,13 @@ class TestBootstrap:
     ):
         monkeypatch.setattr(
             ClaudeAccountSwitcher, "consume_backup_grant",
-            lambda self, num, email, snap: oauth.RefreshOutcome(
+            lambda self, num, email, snap, **kwargs: oauth.RefreshOutcome(
                 None, "transient"
             ),
         )
         session_dir, _, _ = manager.setup_session("2", share=False)
         assert (session_dir / ".credentials.json").read_text() == CREDS
-        assert "Could not refresh" in capsys.readouterr().out
+        assert "refresh for Account-2 is deferred" in capsys.readouterr().out
 
     def test_a_session_is_not_seeded_from_the_live_login(
         self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
@@ -593,7 +593,7 @@ class TestBootstrap:
         refresh_calls = []
         monkeypatch.setattr(
             ClaudeAccountSwitcher, "consume_backup_grant",
-            lambda self, num, email, snap: refresh_calls.append(snap)
+            lambda self, num, email, snap, **kwargs: refresh_calls.append(snap)
             or oauth.RefreshOutcome(None, "transient"),
         )
 
@@ -5180,7 +5180,7 @@ class TestBootstrapRefreshRoutesThroughGate:
         })
         gate = {}
 
-        def mock_gate(num, email, snapshot):
+        def mock_gate(num, email, snapshot, **kwargs):
             gate["args"] = (num, email)
             return oauth_mod.RefreshOutcome(fresh, None)
 
@@ -5193,11 +5193,9 @@ class TestBootstrapRefreshRoutesThroughGate:
 
         # The bypass seam: session.py no longer imports any direct refresh
         # helper, so a regression would have to call oauth's POST directly.
+        assert not hasattr(oauth_mod, "refresh_oauth_credentials")
         monkeypatch.setattr(
             "claude_swap.oauth.try_refresh_oauth_credentials", direct_post
-        )
-        monkeypatch.setattr(
-            "claude_swap.oauth.refresh_oauth_credentials", direct_post
         )
         from claude_swap.session import SessionManager
         mgr = SessionManager(s)
@@ -5233,7 +5231,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         )
 
         # The gate rotates the backup, exactly as the real one does.
-        def fake_gate(self, num, email, snapshot):
+        def fake_gate(self, num, email, snapshot, **kwargs):
             self._write_account_credentials(num, email, ROTATED_CREDS)
             return oauth.RefreshOutcome(ROTATED_CREDS, None)
 
@@ -5285,7 +5283,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
 
-        def fake_gate(self, num, email, snapshot):
+        def fake_gate(self, num, email, snapshot, **kwargs):
             self._write_account_credentials(num, email, ROTATED_CREDS)
             return oauth.RefreshOutcome(ROTATED_CREDS, None)
 
@@ -5399,7 +5397,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         )
         session_dir.mkdir(parents=True, exist_ok=True)
 
-        def gate_consumes_then_fails_to_persist(self, num, email, snapshot):
+        def gate_consumes_then_fails_to_persist(self, num, email, snapshot, **kwargs):
             # Grant spent; successor NOT written to the backup, which still
             # holds CREDS, but it DID reach the stash. Exactly the shape
             # switcher.py returns when the persist fails and the successor is
@@ -5414,7 +5412,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
             gate_consumes_then_fails_to_persist,
         )
 
-        with pytest.raises(SessionError, match="stashed — please retry"):
+        with pytest.raises(SessionError, match="preparation is deferred"):
             manager.setup_session("2", share=False)
 
         assert seeded_switcher.read_account_credentials(
@@ -5429,18 +5427,11 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
             "just spent — claude's first refresh gets invalid_grant"
         )
 
+    @pytest.mark.parametrize("credentials", [ROTATED_CREDS, None])
     def test_an_unpersisted_successor_is_not_reported_as_stashed(
-        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, credentials
     ):
-        """The `consume-gate-unpersisted` corner needs the OPPOSITE advice.
-
-        There the persist AND the stash both failed, so the successor survived
-        only in the return value the raise discards, and retrying POSTs the
-        spent predecessor — earning a strike. `error` and `credentials` are
-        identical to the stashed shape, so without the gate carrying
-        `stashed` this message promises a stash that never happened and sends
-        the user to retry into a guaranteed invalid_grant.
-        """
+        """A failed persist cannot prove the successor was lost."""
         session_dir = session_dir_for(
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
@@ -5449,8 +5440,8 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         monkeypatch.setattr(
             ClaudeAccountSwitcher,
             "consume_backup_grant",
-            lambda self, num, email, snap: oauth.RefreshOutcome(
-                ROTATED_CREDS, "transient", stashed=False
+            lambda self, num, email, snap, **kwargs: oauth.RefreshOutcome(
+                credentials, "stash-unreadable", stashed=False
             ),
         )
 
@@ -5458,11 +5449,168 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
             manager.setup_session("2", share=False)
 
         msg = str(exc.value)
-        assert "neither be stored nor stashed" in msg
-        assert "Fix the storage failure" in msg
-        assert "the successor is stashed" not in msg, (
-            "promised a stash that never happened"
+        assert seeded_switcher.recovery_error_note("stash-unreadable") in msg
+        assert "only after recovering the login" in msg
+        assert "--purge ID" in msg
+        assert "successor is gone" not in msg
+        assert "strike" not in msg
+
+
+
+class TestStashSessionAdmission:
+    def _ready(self, switcher):
+        profile = session_dir_for(switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+        profile.mkdir(parents=True, exist_ok=True)
+        (profile / ".credentials.json").write_text(CREDS)
+        (profile / ".claude.json").write_text(CONFIG)
+        return profile
+
+    def _stash(self, switcher):
+        snapshot = switcher.credential_snapshot(ACCOUNT_NUM, ACCOUNT_EMAIL)
+        return switcher._store._write_unclaimed_credential(ROTATED_CREDS, {
+            "reason": "consume-gate-persist-failed",
+            "configSlot": ACCOUNT_NUM,
+            "identity": snapshot.identity,
+            "loginGen": snapshot.login_gen,
+            "consumedFp": oauth.credential_fingerprint(CREDS),
+            "fingerprint": oauth.credential_fingerprint(ROTATED_CREDS),
+        })
+
+    @pytest.mark.parametrize("ready", [False, True])
+    def test_recovers_prior_successor_without_post(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, ready,
+    ):
+        if ready:
+            self._ready(seeded_switcher)
+        self._stash(seeded_switcher)
+        def no_post(*args, **kwargs):
+            pytest.fail("spent grant was posted again")
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", no_post)
+        profile, _, _ = manager.setup_session(ACCOUNT_NUM, share=False)
+        assert (profile / ".credentials.json").read_text() == ROTATED_CREDS
+
+    def test_adoption_rebuilds_consumed_profile_when_row_retirement_is_deferred(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch,
+    ):
+        profile = self._ready(seeded_switcher)
+        self._stash(seeded_switcher)
+        monkeypatch.setattr(seeded_switcher, "_retire_stash_entry", lambda *args: None)
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials",
+                            lambda *args, **kwargs: pytest.fail("spent grant posted"))
+        assert manager.setup_session(ACCOUNT_NUM, share=False)[0] == profile
+        assert (profile / ".credentials.json").read_text() == ROTATED_CREDS
+
+    def test_current_persist_failure_preserves_cold_profile(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch,
+    ):
+        profile = session_dir_for(seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials",
+                            lambda *args, **kwargs: oauth.RefreshOutcome(ROTATED_CREDS, None))
+        def fail_persist(*args, **kwargs):
+            raise OSError("storage unavailable")
+        monkeypatch.setattr(seeded_switcher._store, "_write_account_credentials", fail_persist)
+        with pytest.raises(SessionError, match="preparation is deferred"):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+        assert not profile.exists()
+        assert seeded_switcher._store._list_unclaimed_credentials()
+
+    def test_persist_and_manifest_failure_preserve_orphan_and_block_retry(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch,
+    ):
+        profile = session_dir_for(seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+        posts = []
+        def refresh(*args, **kwargs):
+            posts.append(True)
+            return oauth.RefreshOutcome(ROTATED_CREDS, None)
+        def fail_write(*args, **kwargs):
+            raise OSError("storage unavailable")
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", refresh)
+        monkeypatch.setattr(seeded_switcher._store, "_write_account_credentials", fail_write)
+        monkeypatch.setattr(seeded_switcher._store, "_write_stash_manifest", fail_write)
+        outcomes = []
+        gate = seeded_switcher.consume_backup_grant
+        def record_gate(*args, **kwargs):
+            outcome = gate(*args, **kwargs)
+            outcomes.append(outcome)
+            return outcome
+        monkeypatch.setattr(seeded_switcher, "consume_backup_grant", record_gate)
+        for _ in range(2):
+            with pytest.raises(SessionError, match="stash recovery is blocked"):
+                manager.setup_session(ACCOUNT_NUM, share=False)
+            assert not profile.exists()
+        assert len(posts) == 1
+        assert outcomes[0].error == outcomes[1].error == "stash-unreadable"
+        assert outcomes[0].credentials == ROTATED_CREDS
+        assert outcomes[1].credentials is None
+        entries = seeded_switcher._store._list_unclaimed_credentials()
+        assert len(entries) == 1
+        entry_id = next(iter(entries))
+        assert seeded_switcher._store._read_unclaimed_credential(entry_id) == (ROTATED_CREDS, False)
+
+    def test_consumed_backup_allows_independent_ready_profile(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch,
+    ):
+        profile = self._ready(seeded_switcher)
+        (profile / ".credentials.json").write_text(ROTATED_CREDS)
+        self._stash(seeded_switcher)
+        monkeypatch.setattr(seeded_switcher, "consume_backup_grant",
+                            lambda *args, **kwargs: pytest.fail("independent profile need not refresh"))
+        assert manager.setup_session(ACCOUNT_NUM, share=False)[0] == profile
+
+    def test_busy_stash_uses_retry_only_advice(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch,
+    ):
+        self._ready(seeded_switcher)
+        monkeypatch.setattr(seeded_switcher._store, "_stash_snapshot",
+                            lambda: ({}, set(), "busy"))
+        with pytest.raises(SessionError, match="Retry shortly") as exc:
+            manager.setup_session(ACCOUNT_NUM, share=False)
+        assert "purge" not in str(exc.value)
+
+    def test_stash_unreadable_outcome_uses_recovery_note_even_with_credentials(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch,
+    ):
+        monkeypatch.setattr(seeded_switcher, "consume_backup_grant",
+                            lambda *args, **kwargs: oauth.RefreshOutcome(ROTATED_CREDS, "stash-unreadable"))
+        with pytest.raises(SessionError, match="stash recovery is blocked"):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+    @pytest.mark.parametrize("ready", [False, True])
+    @pytest.mark.parametrize("error", ["profile-busy", "consume-busy", "store-unmirrored"])
+    def test_early_gate_refusal_never_admits_consumed_backup(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, ready, error,
+    ):
+        profile = self._ready(seeded_switcher) if ready else session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL,
         )
+        self._stash(seeded_switcher)
+        monkeypatch.setattr(seeded_switcher, "consume_backup_grant",
+                            lambda *args, **kwargs: oauth.RefreshOutcome(None, error))
+        with pytest.raises(SessionError, match="already consumed"):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+        if ready:
+            assert (profile / ".credentials.json").read_text() == CREDS
+        else:
+            assert not profile.exists()
+
+    @pytest.mark.parametrize("independent", [False, True])
+    def test_orphan_blocks_same_lineage_but_allows_independent_profile(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, independent,
+    ):
+        profile = self._ready(seeded_switcher)
+        if independent:
+            (profile / ".credentials.json").write_text(ROTATED_CREDS)
+        seeded_switcher.credentials_dir.joinpath(".unclaimed-orphan.enc").write_text("opaque")
+        monkeypatch.setattr(seeded_switcher, "consume_backup_grant",
+                            lambda *args, **kwargs: pytest.fail("unverifiable stash bypassed"))
+        if independent:
+            assert manager.setup_session(ACCOUNT_NUM, share=False)[0] == profile
+        else:
+            with pytest.raises(SessionError, match="stash recovery is blocked"):
+                manager.setup_session(ACCOUNT_NUM, share=False)
+        assert (profile / ".credentials.json").read_bytes() == (
+            ROTATED_CREDS if independent else CREDS
+        ).encode()
 
 
 def test_manifest_interrupted_mid_write_leaves_no_temp(tmp_path: Path, monkeypatch):
@@ -5686,6 +5834,147 @@ def test_run_keeps_reservation_across_setup_to_exec(manager, monkeypatch):
         assert not profile_ownership.profile_busy_locked(manager.switcher.backup_dir, ACCOUNT_NUM)
 
 
+class TestRefreshReservationWait:
+    def test_refresh_timeout_does_not_reserve_or_take_account_lock(
+        self, manager, monkeypatch,
+    ):
+        from claude_swap import refresh_authority
+
+        class BusyRight:
+            def __enter__(self):
+                raise LockError("refresh still running")
+
+            def __exit__(self, *args):
+                pass
+
+        def busy_right(root, email, org_uuid, timeout):
+            assert timeout == 30.0
+            return BusyRight()
+
+        monkeypatch.setattr(refresh_authority, "consume_lock", busy_right)
+        monkeypatch.setattr(session_mod, "FileLock",
+                            lambda *a, **k: pytest.fail("account lock before refresh right"))
+        with pytest.raises(SessionError, match="Login refresh in progress"):
+            with manager._reserve_profile(ACCOUNT_NUM):
+                pytest.fail("reservation admitted during refresh")
+        assert not (manager.switcher.backup_dir / "profile-ownership" / "launches").exists()
+
+    def test_real_inflight_refresh_can_persist_then_admit_run(
+        self, manager, capture_exec, auth_status_tracks_seed, monkeypatch,
+    ):
+        from claude_swap import refresh_authority
+
+        root = manager.switcher.backup_dir
+        posted = threading.Event()
+        waiting = threading.Event()
+        persisted = threading.Event()
+        errors = []
+        outcomes = []
+        original = refresh_authority.consume_lock
+
+        def post(credentials):
+            posted.set()
+            assert waiting.wait(5)
+            return oauth.RefreshOutcome(ROTATED_CREDS, None)
+
+        def refresher():
+            try:
+                snapshot = manager.switcher.credential_snapshot(ACCOUNT_NUM, ACCOUNT_EMAIL)
+                outcomes.append(manager.switcher.consume_backup_grant(
+                    ACCOUNT_NUM, ACCOUNT_EMAIL, snapshot,
+                ))
+                persisted.set()
+            except BaseException as exc:
+                errors.append(exc)
+                posted.set()
+
+        class ObservedRight(FileLock):
+            def acquire(self, timeout=None):
+                waiting.set()
+                return super().acquire(timeout)
+
+        def observed_right(backup_dir, email, org_uuid="", timeout=10.0):
+            lock = original(backup_dir, email, org_uuid, timeout)
+            return ObservedRight(lock.lock_path, timeout=timeout)
+
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", post)
+        monkeypatch.setattr(manager.switcher, "_get_current_account", lambda: None)
+        worker = threading.Thread(target=refresher)
+        worker.start()
+        assert posted.wait(5)
+        monkeypatch.setattr(refresh_authority, "consume_lock", observed_right)
+        # Reuse is enough here: the launch must first await the foreign POST.
+        monkeypatch.setattr(manager, "setup_session", lambda *a, **k: (
+            session_dir_for(root, ACCOUNT_NUM, ACCOUNT_EMAIL), ACCOUNT_NUM, ACCOUNT_EMAIL,
+        ))
+        try:
+            with pytest.raises(_ExecCalled):
+                manager.run(ACCOUNT_NUM, [])
+        finally:
+            waiting.set()
+            worker.join(5)
+        assert not worker.is_alive()
+        assert not errors
+        assert persisted.is_set()
+        assert outcomes[0].error is None
+        assert manager.switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL) == ROTATED_CREDS
+
+    def test_superseded_refresh_never_seeds_stored_spent_grant(
+        self, manager, monkeypatch,
+    ):
+        monkeypatch.setattr(manager.switcher, "consume_backup_grant",
+                            lambda *a, **k: oauth.RefreshOutcome(None, "superseded"))
+        monkeypatch.setattr(manager, "_bootstrap",
+                            lambda *a, **k: pytest.fail("spent credential seeded"))
+        with pytest.raises(SessionError, match="changed during refresh"):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+    def test_explicit_run_waits_for_refresh_before_account_lock(
+        self, manager, capture_exec, monkeypatch
+    ):
+        from claude_swap import refresh_authority
+
+        root = manager.switcher.backup_dir
+        held = refresh_authority.consume_lock(root, ACCOUNT_EMAIL, ORG_UUID)
+        assert held.acquire(timeout=0)
+        original = refresh_authority.consume_lock
+        waits = []
+
+        def waiting_right(backup_dir, email, org_uuid="", timeout=10.0):
+            assert (backup_dir, email, org_uuid) == (root, ACCOUNT_EMAIL, ORG_UUID)
+            assert timeout == 30.0
+            # The refresher must be able to persist while this launch waits.
+            account_lock = FileLock(manager.switcher.lock_file)
+            assert account_lock.acquire(timeout=0), "account lock held while waiting"
+            account_lock.release()
+            waits.append(timeout)
+            held.release()
+            return original(backup_dir, email, org_uuid, timeout)
+
+        monkeypatch.setattr(refresh_authority, "consume_lock", waiting_right)
+        monkeypatch.setattr(manager.switcher, "_get_current_account",
+                            lambda: (ACCOUNT_EMAIL, ORG_UUID))
+        try:
+            with pytest.raises(_ExecCalled):
+                manager.run(ACCOUNT_NUM, [])
+        finally:
+            held.release()
+        assert waits == [30.0]
+
+    def test_unmanaged_default_login_notice(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
+        monkeypatch, capsys,
+    ):
+        monkeypatch.setattr(manager.switcher, "_get_current_account",
+                            lambda: ("unmanaged@example.com", "unmanaged-org"))
+        with pytest.raises(_ExecCalled):
+            manager.run(ACCOUNT_NUM, [])
+        out = capsys.readouterr().out.lower()
+        assert "unmanaged" in out
+        assert "default login" in out
+        assert "unchanged" in out
+
+
 class TestLaunchReservation:
     @pytest.mark.parametrize("windows_key", [False, True], ids=["native", "WindowsCase"])
     def test_setup_keeps_reservation_until_external_handoff(
@@ -5833,3 +6122,157 @@ def test_prepublication_cleanup_error_is_not_retried_by_reservation(manager, mon
                 "CLAUDE_CONFIG_DIR": record["profile"],
             })
     assert events == ["aborted"]
+
+
+def test_bootstrap_passes_snapshot_and_own_reservation(manager, auth_status_tracks_seed, monkeypatch):
+    from claude_swap.refresh_authority import CredentialSnapshot
+
+    seen = []
+    def gate(num, email, snapshot, **kwargs):
+        seen.append((snapshot, kwargs, manager._launch_reservation["launchId"]))
+        return oauth.RefreshOutcome(str(snapshot), None)
+    monkeypatch.setattr(manager.switcher, "consume_backup_grant", gate)
+    manager.setup_session("2", share=False)
+    snapshot, kwargs, launch_id = seen[0]
+    assert isinstance(snapshot, CredentialSnapshot)
+    assert snapshot.identity["email"] == ACCOUNT_EMAIL
+    assert snapshot.login_gen == 0
+    assert kwargs["launch_id"] == launch_id
+    assert kwargs["timeout"] == 30.0
+
+
+def test_f36_session_setup_token_same_default_login(manager, seeded_switcher, capture_exec, auth_status_tracks_seed, monkeypatch):
+    setup = json.dumps({"claudeAiOauth": {"accessToken": "setup-access"}})
+    seeded_switcher._write_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL, setup)
+    monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: (ACCOUNT_EMAIL, ORG_UUID))
+    monkeypatch.setattr(manager, "_default_login_signed_out", lambda: False)
+    monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", lambda *a, **k: pytest.fail("setup-token refreshed"))
+    monkeypatch.setattr(oauth, "fetch_usage", lambda *a, **k: pytest.fail("implicit usage request"))
+    with pytest.raises(_ExecCalled) as exc:
+        manager.run(ACCOUNT_NUM, [], require_session=True)
+    assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir_for(seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL))
+    assert seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL) == setup
+
+
+class TestProfileAdmissionInput:
+    _ready = TestStashSessionAdmission._ready
+    _stash = TestStashSessionAdmission._stash
+
+    @pytest.mark.parametrize("second_pass", [False, True])
+    @pytest.mark.parametrize("failure", ["keychain", "file", "directory"])
+    def test_unreadable_refuses_without_changes(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch,
+        second_pass, failure, block_real_keychain,
+    ):
+        profile = self._ready(seeded_switcher)
+        self._stash(seeded_switcher)
+        before = (profile / ".credentials.json").read_bytes()
+        backup = seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+        stash = seeded_switcher._store._stash_snapshot()
+        keychain = block_real_keychain.data.copy()
+        stash_bytes = {p.name: p.read_bytes() for p in seeded_switcher.credentials_dir.glob(".unclaimed*")}
+        calls = []
+        original_status = manager._profile_stash_status
+        def status(*args):
+            calls.append(True)
+            if second_pass and len(calls) == 1:
+                return "consumed"
+            return original_status(*args)
+        monkeypatch.setattr(manager, "_profile_stash_status", status)
+        monkeypatch.setattr(seeded_switcher, "consume_backup_grant",
+                            lambda *a, **k: oauth.RefreshOutcome(None, "deferred"))
+        original_get = macos_keychain.get_password
+        original_read = Path.read_text
+        if failure == "keychain":
+            def denied(service, *args, **kwargs):
+                if service == keychain_service_name(profile):
+                    raise OSError("locked")
+                return original_get(service, *args, **kwargs)
+            monkeypatch.setattr(macos_keychain, "get_password", denied)
+        else:
+            original_read = Path.read_text
+            def denied(path, *args, **kwargs):
+                if path == profile / ".credentials.json":
+                    if failure == "directory":
+                        raise NotADirectoryError("profile unavailable")
+                    raise PermissionError("profile unavailable")
+                return original_read(path, *args, **kwargs)
+            monkeypatch.setattr(Path, "read_text", denied)
+        with pytest.raises(SessionError, match="profile.*unavailable") as exc:
+            manager.setup_session(ACCOUNT_NUM, share=False)
+        assert all(word not in str(exc.value) for word in ("--purge", "--slot", "re-add", "Log in"))
+        assert (profile / ".credentials.json").read_bytes() == before
+        # Keep the in-memory Keychain fixture while removing read failures.
+        monkeypatch.setattr(macos_keychain, "get_password", original_get)
+        monkeypatch.setattr(Path, "read_text", original_read)
+        assert seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL) == backup
+        assert seeded_switcher._store._stash_snapshot() == stash
+        assert block_real_keychain.data == keychain
+        assert {p.name: p.read_bytes() for p in seeded_switcher.credentials_dir.glob(".unclaimed*")} == stash_bytes
+
+    def test_absent_input_never_reused_after_successful_auth(
+        self, manager, seeded_switcher, monkeypatch,
+    ):
+        profile = self._ready(seeded_switcher)
+        (profile / ".credentials.json").unlink()
+        self._stash(seeded_switcher)
+        monkeypatch.setattr(manager, "_is_session_valid", lambda *a, **k: True)
+        monkeypatch.setattr(seeded_switcher, "consume_backup_grant",
+                            lambda *a, **k: oauth.RefreshOutcome(None, "deferred"))
+        # Only the bootstrap's exact-byte gate can refuse this consumed seed.
+        with pytest.raises(SessionError, match="already consumed"):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+    def test_symlink_reads_exported_service_not_target(
+        self, manager, seeded_switcher, monkeypatch, tmp_path,
+    ):
+        target = self._ready(seeded_switcher)
+        alias = tmp_path / "alias"
+        alias.symlink_to(target, target_is_directory=True)
+        self._stash(seeded_switcher)
+        services = []
+        def get(service, account):
+            services.append(service)
+            return ROTATED_CREDS if service == keychain_service_name(target) else None
+        monkeypatch.setattr(macos_keychain, "get_password", get)
+        assert manager._profile_stash_status(alias, ACCOUNT_NUM, ACCOUNT_EMAIL) == "consumed"
+        assert services == [keychain_service_name(alias)]
+
+    @pytest.mark.parametrize("stale", [False, True])
+    def test_keychain_delete_failure_preserves_input(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, stale,
+        block_real_keychain,
+    ):
+        profile = self._ready(seeded_switcher)
+        if stale:
+            stale_marker_for(profile).parent.mkdir(parents=True, exist_ok=True)
+            stale_marker_for(profile).write_text("stale")
+        else:
+            self._stash(seeded_switcher)
+        # Simulate a safe successor already in the slot, but a spent profile.
+        seeded_switcher._write_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS)
+        profile = self._ready(seeded_switcher)
+        if stale:
+            stale_marker_for(profile).write_text("stale")
+        monkeypatch.setattr(seeded_switcher, "consume_backup_grant",
+                            lambda *a, **k: oauth.RefreshOutcome(None, "deferred"))
+        before = (profile / ".credentials.json").read_bytes()
+        keychain = block_real_keychain.data.copy()
+        seeded_switcher._store._stash_snapshot()
+        stash_bytes = {p.name: p.read_bytes() for p in seeded_switcher.credentials_dir.glob(".unclaimed*")}
+        def denied(*args):
+            raise OSError("locked")
+        monkeypatch.setattr(macos_keychain, "delete_password", denied)
+        with pytest.raises(SessionError, match="profile.*unavailable"):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+        assert (profile / ".credentials.json").read_bytes() == before
+        assert block_real_keychain.data == keychain
+        assert {p.name: p.read_bytes() for p in seeded_switcher.credentials_dir.glob(".unclaimed*")} == stash_bytes
+
+    def test_empty_stash_does_not_read_profile_or_backup(self, manager, monkeypatch):
+        monkeypatch.setattr(manager.switcher, "_refresh_stash_state",
+                            lambda: {"status": "ok", "consumed_fps": set()})
+        monkeypatch.setattr(Path, "read_text", lambda *a, **k: pytest.fail("unexpected read"))
+        monkeypatch.setattr(manager.switcher, "_read_account_credentials_ex",
+                            lambda *a: pytest.fail("unexpected backup read"))
+        assert manager._profile_stash_status(Path("unused"), ACCOUNT_NUM, ACCOUNT_EMAIL) is None

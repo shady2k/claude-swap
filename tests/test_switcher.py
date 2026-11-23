@@ -50,6 +50,56 @@ def _raise_locked(*args, **kwargs):
     raise KeychainError("locked")
 
 
+
+
+@pytest.mark.parametrize("active,live,static,expected", [
+    (True, False, None, "credential-unproven"),
+    (False, False, None, None),
+    (False, True, None, "profile-busy"),
+    (True, False, USAGE_FOREIGN_CREDENTIAL, None),
+    (True, True, "keychain_unavailable", None),
+])
+def test_collector_recovery_overlay_priority(temp_home, monkeypatch, active, live, static, expected):
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    creds = json.dumps({"claudeAiOauth": {"accessToken": "synthetic", "expiresAt": 1000}})
+    info = [(1, "user@example.com", "", "", active, creds, "")]
+    store = switcher._usage_store
+    identities = {"1": ("user@example.com", "")}
+    history = {"five_hour": {"pct": 25}}
+    store.record({"1": FetchRecord(usage=history)}, identities)
+    store.record({"1": FetchRecord(error="credential-unproven")}, identities)
+    monkeypatch.setattr(switcher, "_static_usage_sentinel", lambda info: static)
+    monkeypatch.setattr(switcher, "_live_session_pids", lambda *args: [123] if live else [])
+    entry = switcher._collect_usage_entries(info, fetch=set())["1"]
+    assert entry.recovery_error == expected
+    assert entry.last_error == "credential-unproven"
+    assert entry.last_good == history
+    assert store.entries(identities)["1"].recovery_error is None
+    if static:
+        assert entry.sentinel == static
+        assert "credential relationship is unproven" not in "\n".join(_usage_entry_lines(entry))
+
+
+def test_current_fetch_sentinel_clears_stored_recovery_guidance(temp_home, monkeypatch):
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    info = [(1, "user@example.com", "", "", False, "", "")]
+    identities = {"1": ("user@example.com", "")}
+    store = switcher._usage_store
+    store.record({"1": FetchRecord(error="stash-unreadable")}, identities)
+    monkeypatch.setattr(switcher, "_static_usage_sentinel", lambda info: None)
+    monkeypatch.setattr(store, "reserve", lambda *args, **kwargs: {"1": "synthetic-claim"})
+    monkeypatch.setattr(switcher, "_run_usage_fetches", lambda *args: {"1": FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)})
+    monkeypatch.setattr(switcher, "_plans_after_fetch", lambda *args: {})
+    # Simulate an accepted sentinel-only fetch retaining the last fetch error.
+    monkeypatch.setattr(store, "record", lambda *args: {"1"})
+    entry = switcher._collect_usage_entries(info)["1"]
+    assert entry.last_error == "stash-unreadable"
+    assert entry.sentinel == USAGE_TOKEN_EXPIRED
+    assert entry.recovery_error is None
+
+
 class TestEmailValidation:
     """Test email validation."""
 
@@ -908,7 +958,7 @@ class TestFetchAccountUsageSessionProfile:
         args, kwargs = mock_fetch.call_args
         assert args[2] == backup
         assert kwargs.get("is_active") is True
-        assert "refresh_via" not in kwargs
+        assert kwargs["refresh_via"] is None
 
     def test_live_session_without_profile_credentials_and_expired_backup_is_sentinel(
         self, temp_home: Path
@@ -1565,7 +1615,13 @@ class TestFetchAccountUsageFromAnotherProfile:
             )
 
         assert record.usage == {"five_hour": {"pct": 5}}
-        assert mock_fetch.call_args.kwargs["refresh_via"] == switcher.consume_backup_grant
+        refresh = mock_fetch.call_args.kwargs["refresh_via"]
+        snapshot = _oauth_creds("sk-current-idle", -3600)
+        with patch.object(switcher, "credential_snapshot", return_value=snapshot) as capture, \
+                patch.object(switcher, "consume_backup_grant") as consume:
+            refresh("3", "idle@example.com", expired)
+        capture.assert_called_once_with("3", "idle@example.com")
+        consume.assert_called_once_with("3", "idle@example.com", snapshot)
 
 
 class TestAdoptSessionCredential:
@@ -2796,15 +2852,19 @@ class TestActiveAccountRefresh:
         assert result.sentinel == USAGE_NO_CREDENTIALS
         mock_fetch.assert_not_called()
 
-    def test_expired_active_collection_records_deferral(
+    def test_expired_active_collection_records_refresh_failure(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
-        """The collect pass stores the deferral as a paced fetch failure."""
+        """The collect pass stores a failed authorized refresh as paced failure."""
         switcher = self._switcher(sample_sequence_data)
-        info = (1, "test@example.com", "", "", True, self._EXPIRED, "")
+        switcher._write_credentials(self._EXPIRED)
+        switcher._write_account_credentials("1", "test@example.com", self._EXPIRED)
+        snapshot = switcher.credential_snapshot("1", "test@example.com")
+        info = (1, "test@example.com", "", "", True, snapshot, "")
 
         with patch(
-            "claude_swap.oauth.try_refresh_oauth_credentials"
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "transient"),
         ) as refresh, patch(
             "claude_swap.oauth.try_fetch_usage_for_account"
         ) as fetch:
@@ -2812,12 +2872,13 @@ class TestActiveAccountRefresh:
 
         assert entry.sentinel is None
         assert entry.last_good is None
-        assert entry.last_error == "active-refresh-deferred"
+        assert entry.last_error == "transient"
         assert entry.consecutive_failures == 1
         assert entry.backoff_until is not None
         assert entry.auth_dead_strikes == 0
-        refresh.assert_not_called()
+        refresh.assert_called_once_with(self._EXPIRED, timeout_s=6.0)
         fetch.assert_not_called()
+
 
 
 class TestPerformSwitchPostDisplay:
@@ -2923,6 +2984,7 @@ class TestPerformSwitchPostDisplay:
                 switcher, "_read_account_credentials_ex", side_effect=read_creds_ex
             ),
             patch.object(switcher, "_write_account_credentials", side_effect=write_creds),
+            patch.object(switcher._store, "_write_account_credentials", side_effect=write_creds),
             patch.object(switcher, "_read_account_config", side_effect=read_cfg),
             patch.object(switcher, "_write_account_config", side_effect=write_cfg),
             patch.object(switcher, "_read_credentials", side_effect=read_live),
@@ -6582,6 +6644,30 @@ class TestProvenanceGuard:
         ):
             return switcher._perform_switch("2", emit_output=not quiet)
 
+    @pytest.mark.parametrize("resolved", [False, True])
+    def test_f36_switch_preserves_setup_token_slot(
+        self, temp_home, mock_claude_config, sample_sequence_data, resolved,
+    ):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        setup = json.dumps({"claudeAiOauth": {"accessToken": "setup-access"}})
+        creds_store[("1", "test@example.com")] = setup
+        live_state = {"creds": self._A1_BACKUP}
+        patches = self._install_store_patches(switcher, creds_store, configs_store, live_state)
+        profile = {"email": "test@example.com", "uuid": sample_sequence_data["accounts"]["1"].get("uuid"), "organizationUuid": ""} if resolved else None
+        try:
+            with patch("claude_swap.oauth.try_refresh_oauth_credentials") as refresh, patch("claude_swap.oauth.fetch_usage") as usage:
+                result = self._run_switch(switcher, resolver=profile)
+            assert any("setup-token" in message and "config" in message for message in result["warnings"])
+            refresh.assert_not_called()
+            usage.assert_not_called()
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == setup
+        assert live_state["creds"] == creds_store[("2", "account2@example.com")]
+
     # -- normal-operation timeline ---------------------------------------
 
     def test_byte_identical_live_skips_credential_backup(
@@ -8020,7 +8106,7 @@ class TestStashAndRetentionStore:
 
 
 class TestActiveRefreshProvenance:
-    """Deferring an expired active token preserves every stored generation."""
+    """Failed active refreshes preserve the locked live and backup sources."""
 
     @pytest.mark.parametrize("backup_refresh", ["rt-live", "rt-other", ""])
     @pytest.mark.parametrize("backup_expiry", [1000, 9999999999000])
@@ -8043,16 +8129,25 @@ class TestActiveRefreshProvenance:
         switcher._write_account_credentials("1", "test@example.com", backup)
 
         with patch(
-            "claude_swap.oauth.try_refresh_oauth_credentials"
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "transient"),
         ) as refresh, patch(
             "claude_swap.oauth.try_fetch_usage_for_account"
         ) as fetch:
-            result = switcher._fetch_active_usage("1", "test@example.com", live)
+            from claude_swap.refresh_authority import CredentialSnapshot
+            saved = switcher.credential_snapshot("1", "test@example.com")
+            snapshot = CredentialSnapshot(live, saved.identity, saved.login_gen)
+            result = switcher._fetch_active_usage("1", "test@example.com", snapshot)
 
-        assert result.error == "active-refresh-deferred"
+        eligible = backup_refresh == "rt-live"
+        expected_error = "transient" if eligible else "credential-unproven"
+        assert result.error == expected_error
         assert result.sentinel is None
         assert result.struck_fp is None
-        refresh.assert_not_called()
+        if eligible and backup_refresh:
+            refresh.assert_called_once_with(backup, timeout_s=6.0)
+        else:
+            refresh.assert_not_called()
         fetch.assert_not_called()
         assert switcher._read_credentials() == live
         assert switcher._read_account_credentials("1", "test@example.com") == backup
@@ -9766,6 +9861,19 @@ class TestSwitchUnreadableBackup:
         assert "add-account" not in msg   # the remedy must not be a re-add
 
 
+def _bound_gate_snapshot(switcher, value):
+    """Bind synthetic caller bytes to the generation before injecting a race."""
+    from claude_swap.locking import FileLock
+    from claude_swap.refresh_authority import CredentialSnapshot, login_generation
+
+    with FileLock(switcher.lock_file):
+        identity = switcher.account_identity("1")
+        generation = login_generation(
+            switcher.backup_dir, identity["email"], identity["organizationUuid"]
+        )
+        return CredentialSnapshot(value, identity, generation)
+
+
 class TestConsumeGate:
     """Every backup-refresh-token POST is serialized by the consume lock:
     locked re-read → unlocked POST → reacquire-and-CAS persist."""
@@ -9797,6 +9905,7 @@ class TestConsumeGate:
         caller's snapshot — a fresher backup written since the caller read
         means the caller's rt is the consumed predecessor."""
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         fresher = json.dumps({
             "claudeAiOauth": {
                 "accessToken": "sk-fresher", "refreshToken": "rt-fresher",
@@ -9813,7 +9922,7 @@ class TestConsumeGate:
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=mock_refresh):
             # caller holds a STALE snapshot (_OLD); gate must ignore it
-            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            result = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert posted["creds"] == fresher      # re-read bytes, not snapshot
         assert result.credentials == self._NEW
@@ -9826,6 +9935,7 @@ class TestConsumeGate:
         a writer won the race: the successor is stashed (never discarded),
         the store's newer lineage is adopted, nothing overwritten."""
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         racer = json.dumps({
             "claudeAiOauth": {
@@ -9843,7 +9953,7 @@ class TestConsumeGate:
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=mock_refresh):
-            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            result = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         # racer's write survives; our successor was stashed, not written over it
         assert s._read_account_credentials("1", "test@example.com") == racer
@@ -9866,12 +9976,13 @@ class TestConsumeGate:
         import logging
 
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    return_value=oauth.RefreshOutcome(self._NEW, None)), \
              caplog.at_level(logging.INFO, logger="claude-swap"):
-            s.consume_backup_grant("1", "test@example.com", self._OLD)
+            s.consume_backup_grant("1", "test@example.com", snapshot)
 
         old = oauth.credential_fingerprint(self._OLD)[:19]
         new = oauth.credential_fingerprint(self._NEW)[:19]
@@ -9887,12 +9998,13 @@ class TestConsumeGate:
         import logging
 
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    return_value=oauth.RefreshOutcome(None, "invalid_grant")), \
              caplog.at_level(logging.INFO, logger="claude-swap"):
-            s.consume_backup_grant("1", "test@example.com", self._OLD)
+            s.consume_backup_grant("1", "test@example.com", snapshot)
 
         old = oauth.credential_fingerprint(self._OLD)[:19]
         assert self._refresh_lines(caplog) == [
@@ -9908,13 +10020,14 @@ class TestConsumeGate:
         import logging
 
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=KeyboardInterrupt), \
              caplog.at_level(logging.INFO, logger="claude-swap"), \
              pytest.raises(KeyboardInterrupt):
-            s.consume_backup_grant("1", "test@example.com", self._OLD)
+            s.consume_backup_grant("1", "test@example.com", snapshot)
 
         old = oauth.credential_fingerprint(self._OLD)[:19]
         assert self._refresh_lines(caplog) == [
@@ -9929,12 +10042,13 @@ class TestConsumeGate:
         import logging
 
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         s._write_credentials(self._OLD)
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post, \
              caplog.at_level(logging.INFO, logger="claude-swap"):
-            s.consume_backup_grant("1", "test@example.com", self._OLD)
+            s.consume_backup_grant("1", "test@example.com", snapshot)
 
         post.assert_not_called()
         assert self._refresh_lines(caplog) == []
@@ -9946,6 +10060,7 @@ class TestConsumeGate:
         renews it. The gate saves a successor to the backup only, so a POST
         here would leave the live store on a spent grant (#590)."""
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         s._write_credentials(json.dumps({
             "claudeAiOauth": {
@@ -9955,7 +10070,7 @@ class TestConsumeGate:
         }))
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
-            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            result = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         post.assert_not_called()
         assert result.error == "live-login"
@@ -9968,6 +10083,7 @@ class TestConsumeGate:
     ):
         """Another account's live login is no reason to hold back."""
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         s._write_credentials(json.dumps({
             "claudeAiOauth": {
@@ -9978,7 +10094,7 @@ class TestConsumeGate:
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    return_value=oauth.RefreshOutcome(self._NEW, None)) as post:
-            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            result = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         post.assert_called_once()
         assert result.error is None
@@ -9991,13 +10107,14 @@ class TestConsumeGate:
         from claude_swap.credentials import ActiveCredentials
 
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
 
         with patch.object(s, "_read_active_credentials",
                           return_value=ActiveCredentials("", False)), \
              patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    return_value=oauth.RefreshOutcome(self._NEW, None)) as post:
-            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            result = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         post.assert_called_once()
         assert result.error is None
@@ -10023,13 +10140,14 @@ class TestConsumeGate:
         from claude_swap.credentials import ActiveCredentials
 
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
 
         with patch.object(
             s, "_read_active_credentials",
             return_value=ActiveCredentials(value, keychain_unavailable, degraded),
         ), patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
-            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            result = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         post.assert_not_called()
         assert result.error == "transient"
@@ -10045,6 +10163,7 @@ class TestConsumeGate:
         POST the profile's rt, never the backup's."""
         from claude_swap.session import session_dir_for
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         profile_newer = json.dumps({
             "claudeAiOauth": {
@@ -10064,7 +10183,7 @@ class TestConsumeGate:
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=mock_refresh), \
              patch.object(s, "_live_session_pids", return_value=[]):
-            s.consume_backup_grant("1", "test@example.com", self._OLD)
+            s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert posted["creds"] == profile_newer
 
@@ -10072,11 +10191,12 @@ class TestConsumeGate:
         self, temp_home: Path, sample_sequence_data: dict
     ):
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    return_value=oauth.RefreshOutcome(None, "invalid_grant")):
-            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            result = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert result.error == "invalid_grant"
         # the dead bytes stay put — no destructive write
@@ -10106,6 +10226,7 @@ class TestConsumeGate:
         stash exists because storage I/O already failed once.
         """
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         self._stash_successor_of(s, self._NEW, self._OLD)
 
@@ -10130,7 +10251,7 @@ class TestConsumeGate:
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=mock_refresh):
-            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            result = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert posted == [], (
             "POSTed the spent generation while its successor sat in a stash "
@@ -10198,20 +10319,28 @@ class TestConsumeGate:
         asserting the sentence.
         """
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         self._stash_successor_of(s, self._NEW, self._OLD)
-        s._store._stash_manifest_path().write_text("{not json at all")
+        manifest = s._store._stash_manifest_path()
+        corrupt_manifest = "{not json at all"
+        manifest.write_text(corrupt_manifest)
+        assert s._store._stash_snapshot()[2] == "corrupt"
 
         # 1. the operator can SEE the orphan, by glob, with no readable rows
         listed = s.list_unclaimed_credentials()
         assert listed, "corrupt manifest hid the orphan from `cswap unclaimed`"
+        assert manifest.read_text() == corrupt_manifest
 
         # 2. and can DROP it — the mutator does not refuse on corrupt
         for entry_id in list(listed):
             s._store._remove_unclaimed_credential(entry_id)
 
         # 3. after which nothing is at risk and the slot moves again
-        assert s._store._stash_entry_files_exist() is False
+        assert s._store._stash_snapshot() == ({}, set(), "ok")
+        preserved = list(s.credentials_dir.glob(".unclaimed-manifest.json.corrupt-*"))
+        assert len(preserved) == 1
+        assert preserved[0].read_text() == corrupt_manifest
         posted = []
 
         def mock_refresh(credentials, **kw):
@@ -10220,7 +10349,7 @@ class TestConsumeGate:
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=mock_refresh):
-            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            result = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert posted == [self._OLD], "the documented exit did not unblock it"
         assert result.error is None
@@ -10234,7 +10363,7 @@ class TestConsumeGate:
     ):
         """The corrupt policy asks "is anything at risk"; not knowing is YES.
 
-        `_stash_entry_files_exist` is what lets a corrupt manifest proceed, so
+        `_stash_snapshot` is what lets a corrupt manifest proceed, so
         a scan that FAILS must not read as "nothing on disk" — that is the
         empty-means-safe conflation this whole PR removes, one level down. The
         caller spends a grant on this answer.
@@ -10249,12 +10378,12 @@ class TestConsumeGate:
         """
         s = self._switcher(sample_sequence_data)
         self._stash_successor_of(s, self._NEW, self._OLD)
-        assert s._store._stash_entry_files_exist() is True, "test premise"
+        assert s._store._stash_snapshot()[0], "test premise"
 
         cred_dir = s._store._host.credentials_dir
         os.chmod(cred_dir, 0o311)  # searchable (files reachable), unlistable
         try:
-            assert s._store._stash_entry_files_exist() is True
+            assert s._store._stash_snapshot()[2] == "unreadable"
         finally:
             os.chmod(cred_dir, 0o700)
 
@@ -10272,7 +10401,7 @@ class TestConsumeGate:
 
             _shutil.rmtree(cred_dir)
 
-        assert s._store._stash_entry_files_exist() is False
+        assert s._store._stash_snapshot()[1:] == (set(), "ok")
 
     def test_a_manifest_without_a_dict_entries_member_is_corrupt(
         self, temp_home: Path, sample_sequence_data: dict
@@ -10305,6 +10434,7 @@ class TestConsumeGate:
         POST that strikes a live account.
         """
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         self._stash_successor_of(s, self._NEW, self._OLD)
         s._store._stash_manifest_path().write_text("{not json at all")
@@ -10316,7 +10446,7 @@ class TestConsumeGate:
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=mock_refresh):
-            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            result = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert posted == [], "POSTed a spent grant with a successor on disk"
         assert result.error == "stash-unreadable"
@@ -10339,6 +10469,7 @@ class TestConsumeGate:
         what made "self-heal at the cost of one POST" look true.
         """
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         s._store._stash_manifest_path().write_text("{not json at all")
         posted = []
@@ -10349,7 +10480,7 @@ class TestConsumeGate:
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=mock_refresh):
-            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            result = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert posted == [self._OLD], "a corrupt manifest froze the slot"
         assert result.error is None
@@ -10380,6 +10511,7 @@ class TestConsumeGate:
         """The control. Nothing stashed really does mean nothing to adopt —
         without this, the test above passes on a gate that never POSTs."""
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         posted = []
 
@@ -10389,7 +10521,7 @@ class TestConsumeGate:
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=mock_refresh):
-            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            result = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert posted == [self._OLD]
         assert result.error is None
@@ -10411,6 +10543,7 @@ class TestConsumeGate:
         store, so an absent re-read really does mean removed.
         """
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         # No stored credential for slot 1: `cswap remove` landed first.
         posted = []
 
@@ -10420,7 +10553,7 @@ class TestConsumeGate:
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=mock_refresh):
-            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            result = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert posted == [], "spent a grant for a slot that no longer exists"
         assert result.error == "transient"
@@ -10447,6 +10580,7 @@ class TestConsumeGate:
         """
         from claude_swap.session import session_dir_for
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         # No stored credential for slot 1 — but a profile that outlived it.
         profile_newer = json.dumps({
             "claudeAiOauth": {
@@ -10466,7 +10600,7 @@ class TestConsumeGate:
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=mock_refresh), \
              patch.object(s, "_live_session_pids", return_value=[]):
-            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            result = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert posted == [], "healed a removed slot from its surviving profile"
         assert result.error == "transient"
@@ -10550,11 +10684,12 @@ class TestInactiveRefreshRoutesThroughGate:
         })
         s._write_account_credentials("2", "b@example.com", expired)
         s._write_credentials(expired)
+        snapshot = s.credential_snapshot("2", "b@example.com")
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post, \
              patch.object(s, "_live_session_pids", return_value=[]), \
              patch("claude_swap.oauth.request_usage_data") as usage:
-            info = (2, "b@example.com", "", "", False, expired, "")
+            info = (2, "b@example.com", "", "", False, snapshot, "")
             record = s._fetch_account_usage(info)
 
         post.assert_not_called()
@@ -10623,9 +10758,10 @@ class TestStoreResolutionParity:
         creds = json.dumps({
             "claudeAiOauth": {"accessToken": "a", "refreshToken": "rt",
                               "expiresAt": 1000}})
+        snapshot = _bound_gate_snapshot(s, creds)
         s._write_account_credentials("1", "test@example.com", creds)
         with patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_post:
-            result = s.consume_backup_grant("1", "test@example.com", creds)
+            result = s.consume_backup_grant("1", "test@example.com", snapshot)
         mock_post.assert_not_called()
         assert result.error == "store-unmirrored"
 
@@ -10647,19 +10783,21 @@ class TestStoreResolutionParity:
         self, temp_home: Path, sample_sequence_data: dict, monkeypatch
     ):
         monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         s = ClaudeAccountSwitcher()
         s._setup_directories()
         s._write_json(s.sequence_file, sample_sequence_data)
         creds = json.dumps({
             "claudeAiOauth": {"accessToken": "a", "refreshToken": "rt",
                               "expiresAt": 1000}})
+        snapshot = _bound_gate_snapshot(s, creds)
         s._write_account_credentials("1", "test@example.com", creds)
         fresh = json.dumps({
             "claudeAiOauth": {"accessToken": "b", "refreshToken": "rt2",
                               "expiresAt": 9999999999000}})
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    return_value=oauth.RefreshOutcome(fresh, None)):
-            result = s.consume_backup_grant("1", "test@example.com", creds)
+            result = s.consume_backup_grant("1", "test@example.com", snapshot)
         assert result.credentials == fresh
 
     def test_a_secure_store_miss_does_not_capture_the_other_profiles_key(
@@ -10803,9 +10941,10 @@ class TestConsumeGateLockFailures:
             def __enter__(self): raise LE("held elsewhere")
             def __exit__(self, *a): return False
 
+        snapshot = s.credential_snapshot("1", "test@example.com")
         monkeypatch.setattr("claude_swap.switcher.FileLock", FailingLock)
         with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
-            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            out = s.consume_backup_grant("1", "test@example.com", snapshot)
         post.assert_not_called()          # nothing consumed
         assert out.error == "transient"   # clean defer, no raise
 
@@ -10835,10 +10974,11 @@ class TestConsumeGateLockFailures:
             def __exit__(self, *a):
                 return self._inner.__exit__(*a)
 
+        snapshot = s.credential_snapshot("1", "test@example.com")
         monkeypatch.setattr("claude_swap.switcher.FileLock", SecondLockFails)
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    return_value=oauth.RefreshOutcome(self._NEW, None)):
-            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            out = s.consume_backup_grant("1", "test@example.com", snapshot)
         # successor survives: returned to the caller AND stashed
         assert out.credentials == self._NEW
         assert s.list_unclaimed_credentials(), "successor must be stashed"
@@ -10879,10 +11019,11 @@ class TestConsumeGateLockFailures:
             def __exit__(self, *a):
                 return self._inner.__exit__(*a)
 
+        snapshot = s.credential_snapshot("1", "test@example.com")
         monkeypatch.setattr("claude_swap.switcher.FileLock", SecondLockFails)
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    return_value=oauth.RefreshOutcome(self._NEW, None)):
-            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            out = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         # The store still holds the spent generation — the premise of the bug.
         assert s.read_account_credentials("1", "test@example.com") == self._OLD
@@ -10931,6 +11072,7 @@ class TestPermanentlyUnreadableStashRow:
         self, temp_home: Path, sample_sequence_data: dict,
     ):
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         entry_id = s._store._write_unclaimed_credential(
             self._NEW,
@@ -10945,7 +11087,7 @@ class TestPermanentlyUnreadableStashRow:
             with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
                 errors = {
                     s.consume_backup_grant(
-                        "1", "test@example.com", self._OLD
+                        "1", "test@example.com", snapshot
                     ).error
                     for _ in range(10)
                 }
@@ -11056,6 +11198,7 @@ class TestGateUltraReviewFixes:
             "claudeAiOauth": {"accessToken": "sk-rac", "refreshToken": "rt-rac",
                               "expiresAt": 8888888888000}})
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
 
         def refresh_then_lose_the_race(credentials, **kw):
@@ -11064,7 +11207,7 @@ class TestGateUltraReviewFixes:
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=refresh_then_lose_the_race):
-            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            out = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert s._read_account_credentials("1", "test@example.com") == racer, (
             "premise: the store holds the racer's newer lineage"
@@ -11096,6 +11239,7 @@ class TestGateUltraReviewFixes:
             "claudeAiOauth": {"accessToken": "sk-3rd", "refreshToken": "rt-3rd",
                               "expiresAt": 9999999999000}})
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
 
         # Both gate store reads ask the strict reader (absent must stay
@@ -11112,7 +11256,7 @@ class TestGateUltraReviewFixes:
                           side_effect=read_ex), \
              patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    return_value=oauth.RefreshOutcome(self._NEW, None)):
-            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            out = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         # The gate adopts the newer store lineage, as designed.
         assert out.credentials == THIRD
@@ -11145,6 +11289,7 @@ class TestGateUltraReviewFixes:
         from the cause. Pin it.
         """
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
 
         order: list[str] = []
@@ -11161,7 +11306,7 @@ class TestGateUltraReviewFixes:
                 self._name = str(path)
                 self._inner = real_filelock(path, *a, **k)
             def acquire(self, *a, **k):
-                if ".consume-" in self._name:
+                if self._name.endswith("/consume.lock"):
                     order.append("consume-lock")
                 return self._inner.acquire(*a, **k)
             def release(self):
@@ -11171,11 +11316,11 @@ class TestGateUltraReviewFixes:
             def __exit__(self, *a):
                 return self._inner.__exit__(*a)
 
-        monkeypatch.setattr("claude_swap.switcher.FileLock", WatchedLock)
+        monkeypatch.setattr("claude_swap.refresh_authority.FileLock", WatchedLock)
         with patch.object(s, "_read_account_credentials", side_effect=watched_read), \
              patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    return_value=oauth.RefreshOutcome(self._NEW, None)):
-            s.consume_backup_grant("1", "test@example.com", self._OLD)
+            s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert "consume-lock" in order, "the consume lock must be taken"
         assert order.index("consume-lock") == 0, (
@@ -11195,13 +11340,14 @@ class TestGateUltraReviewFixes:
         overlap this is routine, not an edge.
         """
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
 
         from claude_swap.locking import FileLock as real_filelock
 
         class ConsumeLockBusy:
             def __init__(self, path, *a, **k):
-                self._busy = ".consume-" in str(path)
+                self._busy = str(path).endswith("/consume.lock")
                 self._inner = real_filelock(path, *a, **k)
             def acquire(self, *a, **k):
                 return False if self._busy else self._inner.acquire(*a, **k)
@@ -11213,8 +11359,8 @@ class TestGateUltraReviewFixes:
             def __exit__(self, *a):
                 return self._inner.__exit__(*a)
 
-        monkeypatch.setattr("claude_swap.switcher.FileLock", ConsumeLockBusy)
-        out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+        monkeypatch.setattr("claude_swap.refresh_authority.FileLock", ConsumeLockBusy)
+        out = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert out.error == "consume-busy", (
             f"got {out.error!r}: contention reads as a transient failure and "
@@ -11229,9 +11375,10 @@ class TestGateUltraReviewFixes:
         """An OSError from the CAS persist (disk full) after the POST must
         neither raise out of the gate nor discard the consumed successor."""
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
 
-        real_write = ClaudeAccountSwitcher._write_account_credentials
+        real_write = type(s._store)._write_account_credentials
         state = {"post_done": False}
 
         def failing_write(self_s, num, email, creds):
@@ -11244,11 +11391,11 @@ class TestGateUltraReviewFixes:
             return oauth.RefreshOutcome(self._NEW, None)
 
         monkeypatch.setattr(
-            ClaudeAccountSwitcher, "_write_account_credentials", failing_write
+            type(s._store), "_write_account_credentials", failing_write
         )
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=mock_refresh):
-            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            out = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         # Never raises, never discards the successor — the two things this
         # test exists for. It does NOT report success: the persist failed, so
@@ -11272,9 +11419,10 @@ class TestGateUltraReviewFixes:
         so a caller that only needs a live token for THIS request works.
         """
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         state = {"post_done": False}
-        real_write = ClaudeAccountSwitcher._write_account_credentials
+        real_write = type(s._store)._write_account_credentials
 
         def failing_write(self_s, num, email, creds):
             if state["post_done"]:
@@ -11289,15 +11437,15 @@ class TestGateUltraReviewFixes:
             return oauth.RefreshOutcome(self._NEW, None)
 
         monkeypatch.setattr(
-            ClaudeAccountSwitcher, "_write_account_credentials", failing_write
+            type(s._store), "_write_account_credentials", failing_write
         )
         monkeypatch.setattr(
             s._store, "_write_unclaimed_credential", failing_stash
         )
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=mock_refresh):
-            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
-        assert out.error == "transient", (
+            out = s.consume_backup_grant("1", "test@example.com", snapshot)
+        assert out.error == "stash-unreadable", (
             "reported success on a spent grant with nothing stashed"
         )
         assert out.credentials == self._NEW
@@ -11310,6 +11458,7 @@ class TestGateUltraReviewFixes:
         """invalid_grant after the gate substituted a fresher re-read must
         bind the strike to the POSTed bytes, not the caller's snapshot."""
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         fresher = json.dumps({
             "claudeAiOauth": {"accessToken": "sk-fresher",
                               "refreshToken": "rt-fresher",
@@ -11318,7 +11467,7 @@ class TestGateUltraReviewFixes:
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    return_value=oauth.RefreshOutcome(None, "invalid_grant")):
-            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            out = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert out.error == "invalid_grant"
         assert out.consumed_fp == oauth.credential_fingerprint(fresher)
@@ -11334,6 +11483,7 @@ class TestGateUltraReviewFixes:
         successor instead of re-consuming."""
         import threading
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         posted = []
         in_post = threading.Event()
@@ -11351,7 +11501,7 @@ class TestGateUltraReviewFixes:
             # each thread gets its own switcher (cross-process shape)
             s2 = ClaudeAccountSwitcher()
             results[tag] = s2.consume_backup_grant(
-                "1", "test@example.com", self._OLD
+                "1", "test@example.com", snapshot
             )
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
@@ -11381,6 +11531,7 @@ class TestGateUltraReviewFixes:
         by the next gate pass (the pending persist completes) without
         consuming another grant."""
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         # simulate the strand: stash holds the successor of _OLD
         s._store._write_unclaimed_credential(
@@ -11392,7 +11543,7 @@ class TestGateUltraReviewFixes:
         )
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
-            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            out = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         post.assert_not_called()               # no second grant consumed
         assert out.error is None
@@ -11410,6 +11561,7 @@ class TestGateUltraReviewFixes:
         """A slot emptied while the POST was in flight must not get its
         credential re-created; the successor parks in the stash."""
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
 
         def refresh_and_remove(credentials, **kw):
@@ -11418,7 +11570,7 @@ class TestGateUltraReviewFixes:
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=refresh_and_remove):
-            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            out = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert out.error is None               # grant did rotate
         assert s._read_account_credentials("1", "test@example.com") == "", (
@@ -11440,6 +11592,7 @@ class TestGateUltraReviewFixes:
             "claudeAiOauth": {"accessToken": "sk-readd",
                               "refreshToken": "rt-readd",
                               "expiresAt": 1000}})
+        snapshot = _bound_gate_snapshot(s, reimported)
         s._write_account_credentials("1", "test@example.com", reimported)
         stale_profile = json.dumps({
             "claudeAiOauth": {"accessToken": "sk-stale",
@@ -11458,7 +11611,7 @@ class TestGateUltraReviewFixes:
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=mock_refresh), \
              patch.object(s, "_live_session_pids", return_value=[]):
-            s.consume_backup_grant("1", "test@example.com", reimported)
+            s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert posted["creds"] == reimported, (
             "the re-added backup, not the presumed-stale profile"
@@ -11481,15 +11634,16 @@ class TestGateUltraReviewFixes:
         the only one that can see the guard.
         """
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=RuntimeError("boom")):
             with pytest.raises(RuntimeError):
-                s.consume_backup_grant("1", "test@example.com", self._OLD)
+                s.consume_backup_grant("1", "test@example.com", snapshot)
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    return_value=oauth.RefreshOutcome(self._NEW, None)):
-            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            out = s.consume_backup_grant("1", "test@example.com", snapshot)
         assert out.error != "consume-busy"
 
     # -- session-profile precedence: the other three conjuncts -----------
@@ -11515,6 +11669,7 @@ class TestGateUltraReviewFixes:
         backup = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-bk", "refreshToken": "rt-bk",
             "expiresAt": 1000}})
+        snapshot = _bound_gate_snapshot(s, backup)
         s._write_account_credentials("1", "test@example.com", backup)
         # A profile on a NEWER generation, but logged in as another account.
         foreign = json.dumps({"claudeAiOauth": {
@@ -11537,7 +11692,7 @@ class TestGateUltraReviewFixes:
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=mock_refresh), \
              patch.object(s, "_live_session_pids", return_value=[]):
-            s.consume_backup_grant("1", "test@example.com", backup)
+            s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert posted["creds"] == backup, (
             "the gate POSTed a profile logged in as another account"
@@ -11563,6 +11718,7 @@ class TestGateUltraReviewFixes:
         backup = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-bk", "refreshToken": "rt-bk",
             "expiresAt": 5000}})
+        snapshot = _bound_gate_snapshot(s, backup)
         s._write_account_credentials("1", "test@example.com", backup)
         older = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-pf", "refreshToken": "rt-pf-SPENT",
@@ -11579,7 +11735,7 @@ class TestGateUltraReviewFixes:
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=mock_refresh), \
              patch.object(s, "_live_session_pids", return_value=[]):
-            s.consume_backup_grant("1", "test@example.com", backup)
+            s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert posted["creds"] == backup, (
             "the gate POSTed the profile's older, already-superseded "
@@ -11594,12 +11750,13 @@ class TestGateUltraReviewFixes:
         """When the backup read is unreadable (keychain locked) — not
         absent — the gate must defer, never POST the caller's snapshot."""
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         monkeypatch.setattr(
             ClaudeAccountSwitcher, "_read_account_credentials_ex",
             lambda self_s, num, email: ("", True),
         )
         with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
-            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            out = s.consume_backup_grant("1", "test@example.com", snapshot)
         post.assert_not_called()
         assert out.error == "transient"
 
@@ -11611,9 +11768,10 @@ class TestGateUltraReviewFixes:
         """The store already holds a FRESH different generation (a racing
         gate rotated it): adopt it instead of consuming another grant."""
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._NEW)
         with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
-            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            out = s.consume_backup_grant("1", "test@example.com", snapshot)
         post.assert_not_called()
         assert out.error is None
         assert out.credentials == self._NEW
@@ -12286,6 +12444,7 @@ class TestUltraReviewCoverageGaps:
         old = json.dumps({
             "claudeAiOauth": {"accessToken": "a", "refreshToken": "rt",
                               "expiresAt": 1000}})
+        snapshot = _bound_gate_snapshot(s, old)
         new = json.dumps({
             "claudeAiOauth": {"accessToken": "b", "refreshToken": "rt2",
                               "expiresAt": 9999999999000}})
@@ -12293,7 +12452,7 @@ class TestUltraReviewCoverageGaps:
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    return_value=oauth.RefreshOutcome(new, None)), \
              patch.object(s, "_write_credentials") as write_live:
-            out = s.consume_backup_grant("1", "test@example.com", old)
+            out = s.consume_backup_grant("1", "test@example.com", snapshot)
         assert out.credentials == new
         write_live.assert_not_called()
         assert s._read_account_credentials("1", "test@example.com") == new
@@ -12344,6 +12503,7 @@ class TestUnreadableBackupIsNotAbsent:
         ``invalid_grant``.
         """
         s = self._macos_switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         assert s._read_account_credentials("1", "test@example.com") == self._OLD
 
@@ -12354,7 +12514,7 @@ class TestUnreadableBackupIsNotAbsent:
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=refresh_then_lock):
-            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            out = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         reasons = [
             m.get("reason") for m in s.list_unclaimed_credentials().values()
@@ -12663,13 +12823,14 @@ class TestStashReaderUnreadableVsAbsent:
         (locked Keychain, mid-unmount, transient EIO). Adoption must DEFER,
         not fall through to POSTing the store's already-spent generation."""
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         entry_path = s._store._stash_entry_path(self._stash_successor(s))
         entry_path.chmod(0o000)
         try:
             with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                        side_effect=self._post_rejects_spent) as post:
-                out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+                out = s.consume_backup_grant("1", "test@example.com", snapshot)
         finally:
             entry_path.chmod(0o600)
 
@@ -12693,11 +12854,12 @@ class TestStashReaderUnreadableVsAbsent:
         true before and after the fix -- the fix only touches the unreadable
         branch."""
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         self._stash_successor(s)
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
-            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            out = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert not post.called, "adopted successor must short-circuit the POST"
         assert out.error is None
@@ -12711,11 +12873,12 @@ class TestStashReaderUnreadableVsAbsent:
         adopt and must POST the snapshot. Must stay true before and after
         the fix."""
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=self._post_rejects_spent) as post:
-            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            out = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert post.called
         assert out.error == "invalid_grant"
@@ -12732,13 +12895,14 @@ class TestStashReaderUnreadableVsAbsent:
         inaccessible. It must keep POSTing the spent snapshot exactly as it
         does today -- the fix must not change this row at all."""
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         entry_path = s._store._stash_entry_path(self._stash_successor(s))
         entry_path.write_text("not-valid-base64!!!", encoding="utf-8")
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=self._post_rejects_spent) as post:
-            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            out = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert post.called, (
             "a corrupt (undecodable) entry must behave like ABSENT, not "
@@ -12760,13 +12924,14 @@ class TestStashReaderUnreadableVsAbsent:
         base64, and must reach the same terminal verdict instead of raising
         out of the reader on the caller's behalf."""
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         entry_path = s._store._stash_entry_path(self._stash_successor(s))
         entry_path.write_bytes(b"\xff\xfegarbled")
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=self._post_rejects_spent) as post:
-            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            out = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert post.called
         assert out.error == "invalid_grant"
@@ -12782,12 +12947,13 @@ class TestStashReaderUnreadableVsAbsent:
         (POST the spent snapshot and report invalid_grant), not defer
         forever the way an UNREADABLE entry correctly does."""
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         s._store._stash_entry_path(self._stash_successor(s)).unlink()
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=self._post_rejects_spent) as post:
-            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            out = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert post.called, (
             "an absent entry must not defer -- nothing can ever adopt bytes "
@@ -12805,12 +12971,13 @@ class TestStashReaderUnreadableVsAbsent:
         leaks in ``--json``'s ``unclaimedCredentials`` forever,
         indistinguishable from an entry still pending adoption."""
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         s._store._stash_entry_path(self._stash_successor(s)).unlink()
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=self._post_rejects_spent):
-            s.consume_backup_grant("1", "test@example.com", self._OLD)
+            s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert not s.list_unclaimed_credentials(), (
             "an absent-bytes stash entry must be retired once the gate "
@@ -12831,6 +12998,7 @@ class TestStashReaderUnreadableVsAbsent:
         later, readable, adoptable sibling on the same generation is
         tried."""
         s = self._switcher(sample_sequence_data)
+        snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         unreadable_id = self._stash_successor(s)
         entry_path = s._store._stash_entry_path(unreadable_id)
@@ -12846,7 +13014,7 @@ class TestStashReaderUnreadableVsAbsent:
                  "fingerprint": oauth.credential_fingerprint(self._NEW)},
             )
             with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
-                out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+                out = s.consume_backup_grant("1", "test@example.com", snapshot)
         finally:
             entry_path.chmod(0o600)
 

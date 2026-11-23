@@ -385,10 +385,25 @@ def _recipient(slot: str, accounts: dict, members: dict) -> _Recipient:
     return _Recipient(slot, identity)
 
 
-def _is_default_login(recipient: _Recipient) -> bool:
+def _is_default_login(root: Path, recipient: _Recipient) -> bool:
+    import logging
+    from types import SimpleNamespace
+
+    from claude_swap import oauth
+    from claude_swap.credentials import CredentialStore
+    from claude_swap.models import Platform
     from claude_swap.session import SessionManager
 
-    return SessionManager._default_login_identity() == recipient.identity[:2]
+    if SessionManager._default_login_identity() != recipient.identity[:2]:
+        return False
+    store = CredentialStore(SimpleNamespace(
+        platform=Platform.detect(), credentials_dir=root / "credentials",
+        sequence_file=root / "sequence.json", _logger=logging.getLogger("claude-swap"),
+    ))
+    credentials = store._read_account_credentials(recipient.slot, recipient.identity[0])
+    token = oauth.extract_oauth_data(credentials or "") or {}
+    # A setup-token cannot consume the default login's refresh grant.
+    return not (token.get("accessToken") and not token.get("refreshToken"))
 
 
 def _prepare_launch(
@@ -450,7 +465,7 @@ def _prepare_launch(
                 current = launch_policy.accounts(root)
                 if _recipient(slot, current, members) != recipient:
                     raise ConfigError("Recipient changed before reservation")
-                if _is_default_login(recipient):
+                if _is_default_login(root, recipient):
                     raise _UnpreparedProfile("account is the active default login")
                 record = profile_ownership.reserve_locked(root, slot, profile)
             profile = _profile_dir(root, recipient, history)
@@ -499,7 +514,7 @@ def _publish_launch(root: Path, directory: Path, policy: dict, prepared: _Launch
                 current_recipient = _recipient(recipient.slot, accounts, members)
             except ConfigError:
                 return False
-            if current_recipient != recipient or _is_default_login(recipient):
+            if current_recipient != recipient or _is_default_login(root, recipient):
                 return False
             try:
                 profile = _profile_dir(root, recipient, history)

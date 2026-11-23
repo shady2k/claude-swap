@@ -66,7 +66,7 @@ from claude_swap.settings import (
     log_unrecognized_keys,
     parse_model_names,
 )
-from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.switcher import ERROR_NOTES, RECOVERY_ERRORS, ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
@@ -79,19 +79,19 @@ _logger = logging.getLogger("claude-swap")
 # and the order decides which, because reporting the wrong one is how a cause
 # needing a human hides behind one that clears itself. store-unmirrored and
 # invalid_client stay until somebody unsets an env var or fixes a client
-# registration, and stash-unreadable until they unlock a keychain, fix a mode,
-# or purge the row; consume-busy is gone by the next pass. stash-unreadable is
-# the one that is per-SLOT rather than global, which costs nothing here: this
-# message is only ever emitted when NO candidate freshened, so naming the real
-# cause of the only slot that had one beats "(network?)".
+# registration, and stash-unreadable until they inspect and recover the login,
+# then purge the blocking entry; consume-busy is gone by the next pass.
+# Unknown stash ownership blocks every slot; a proven entry can block only
+# its own slot. This message is emitted when no candidate freshened, so it
+# names the actionable cause rather than guessing at a network failure.
 _SYSTEMIC_MESSAGES = {
     "store-unmirrored": "CLAUDE_SECURESTORAGE_CONFIG_DIR is set — unset it or "
                         "run cswap from a normal shell",
     "invalid_client": "cswap's OAuth client was rejected — systemic, not this "
                       "account",
-    "stash-unreadable": "a stashed successor is unreadable — unlock the "
-                        "keychain or fix the file, then retry; "
-                        "`cswap unclaimed` inspects it",
+    "stash-unreadable": ERROR_NOTES["stash-unreadable"],
+    "profile-busy": ERROR_NOTES["profile-busy"],
+    "credential-unproven": ERROR_NOTES["credential-unproven"],
     "consume-busy": "another cswap surface holds the slot — retries next pass",
 }
 # Insertion order IS the precedence order, so the remedy and its rank cannot
@@ -263,7 +263,8 @@ class PollEvent(AutoSwitchEvent):
     headroom: dict[str, float | None]  # account number → headroom pct (None=unknown)
     threshold: float
     # account number → last fetch-error cause ("http-429", "timeout", ...) for
-    # accounts whose usage is unknown this tick. Additive field.
+    # accounts whose usage is unknown this tick, plus stash recovery blockers
+    # even when a last-good reading is retained. Additive field.
     fetch_errors: dict[str, str] = field(default_factory=dict)
     # account number → ordered window label → utilization pct ("5h", "7d",
     # then scoped model display names). Additive field: the binding pct alone
@@ -330,9 +331,14 @@ class PollEvent(AutoSwitchEvent):
             if n != str(num)
         )
         tail = f" | others: {others}" if others else ""
+        recovery = "".join(
+            f" | Account-{number}: {ERROR_NOTES[error]}"
+            for number, error in self.fetch_errors.items()
+            if error in RECOVERY_ERRORS
+        )
         return (
             f"Account-{num} ({self.active.get('email')}): {used} "
-            f"(switch at {pct_label(line)}%){tail}"
+            f"(switch at {pct_label(line)}%){tail}{recovery}"
         )
 
 
@@ -824,7 +830,10 @@ class AutoSwitchEngine:
             # is already being consumed by that session anyway. Manual
             # switch_to keeps its warn-and-proceed behavior; auto skips.
             return "skip-live-session"
-        creds = self.switcher.read_account_credentials(number, email)
+        try:
+            creds = self.switcher.credential_snapshot(number, email)
+        except Exception:
+            return "transient"
         if not creds:
             return "transient"
         data = oauth.extract_oauth_data(creds)
@@ -840,7 +849,7 @@ class AutoSwitchEngine:
             return "ok"
         # The consume gate serializes every backup-rt POST (the recovery
         # branch in `_fetch_active_usage` is a second call site, under the
-        # same per-slot consume lock):
+        # same identity-scoped consume right):
         # it re-reads under the slot lock (our snapshot may be superseded),
         # consults the session profile for a newer generation, and persists
         # via fingerprint CAS — so a freshen racing the collector (or a
@@ -1153,9 +1162,13 @@ class AutoSwitchEngine:
                 threshold=thresholds[current],
                 weekly_threshold=settings.weekly_threshold,
                 fetch_errors={
-                    num: entry.last_error
+                    num: entry.recovery_error or entry.last_error
                     for num, entry in entries.items()
-                    if usage.get(num) is None and entry.last_error
+                    if entry.recovery_error is not None or (
+                        usage.get(num) is None
+                        and entry.last_error is not None
+                        and entry.last_error not in RECOVERY_ERRORS
+                    )
                 },
                 windows={
                     num: pcts
