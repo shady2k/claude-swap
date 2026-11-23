@@ -1,4 +1,5 @@
 """Real process admission stand; synthetic local auth, no endpoint traffic."""
+import stat
 import sys
 import pytest
 from tests.profile_admission_stand import AdmissionStand
@@ -115,19 +116,55 @@ def test_completed_release_retries_contention_and_preserves_exit(tmp_path, route
         assert stand.free()
 
 
+def _assert_f36_credentials_unchanged(before, after, route):
+    expected = before.copy()
+    lock = "credentials/.unclaimed-manifest.lock"
+    if route == "session" and after.keys() - before.keys() == {lock}:
+        _, mode, content = after[lock]
+        assert stat.S_ISREG(mode)
+        assert content == b""
+        expected[lock] = after[lock]
+    assert after == expected
+
+
 @pytest.mark.parametrize("route", ["session", "transparent"])
 def test_f36_setup_token_same_default_identity_is_admitted(tmp_path, route):
     with AdmissionStand(tmp_path, route) as stand:
         assert stand.launch("setup-identity", mode="setup-identity").finish() == 0
         before = {name: value for name, value in stand.snapshot().items() if name.startswith("credentials/")}
-        launch = stand.launch("setup-launch")
-        if route == "session":
-            launch.event("probe")
-        launch.event("launch")
-        launch.event("live")
-        launch.send("exit")
-        assert launch.finish() == 0
-        assert launch.counts()["post"] == 0
-        after = {name: value for name, value in stand.snapshot().items() if name.startswith("credentials/")}
-        assert after == before
-        assert stand.free()
+        for index in range(2):
+            launch = stand.launch(f"setup-launch-{index}")
+            if route == "session":
+                launch.event("probe")
+            launch.event("launch")
+            launch.event("live")
+            launch.send("exit")
+            assert launch.finish() == 0
+            assert launch.counts()["post"] == 0
+            after = {name: value for name, value in stand.snapshot().items() if name.startswith("credentials/")}
+            if index == 0:
+                _assert_f36_credentials_unchanged(before, after, route)
+            else:
+                assert after == before
+            assert stand.free()
+            before = after
+
+
+@pytest.mark.parametrize("change", ["extra-file", "slot-byte", "nonempty-lock", "transparent-lock"])
+def test_f36_credential_comparison_rejects_changes(change):
+    slot = "credentials/2-target@example.test.json"
+    regular = stat.S_IFREG | 0o600
+    before = {slot: (101, regular, b"synthetic-slot")}
+    after = before.copy()
+    route = "session"
+    if change == "extra-file":
+        after["credentials/unexpected"] = (102, regular, b"")
+    elif change == "slot-byte":
+        after[slot] = (101, regular, b"synthetic-sloT")
+    else:
+        content = b"not empty" if change == "nonempty-lock" else b""
+        after["credentials/.unclaimed-manifest.lock"] = (102, regular, content)
+        if change == "transparent-lock":
+            route = "transparent"
+    with pytest.raises(AssertionError):
+        _assert_f36_credentials_unchanged(before, after, route)

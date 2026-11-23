@@ -2082,7 +2082,7 @@ class CredentialStore:
             self._mutate_stash_manifest_locked(
                 lambda entries: entries.update({entry_id: row})
             )
-        except Exception:
+        except BaseException:
             self._host._logger.warning(
                 "Stash publication failed for account %s, entry %s; "
                 "credential bytes preserved.", context.get("configSlot", "unknown"),

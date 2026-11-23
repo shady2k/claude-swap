@@ -3143,7 +3143,7 @@ class ClaudeAccountSwitcher:
         return ERROR_NOTES.get(code)
 
     def _session_credential_stash_status(
-        self, credentials: str, *, profile: bool = False,
+        self, credentials: str,
     ) -> str | None:
         """Check the exact refresh-bearing bytes about to seed a profile."""
         data = oauth.extract_oauth_data(credentials) or {}
@@ -3154,7 +3154,7 @@ class ClaudeAccountSwitcher:
             return "consumed"
         if state["status"] != "ok":
             return state["status"]
-        return "pending" if state["rotations"] and not profile else None
+        return None
 
     def _adopt_stashed_successor(
         self, account_num: str, email: str, current: str, *, persist=None,

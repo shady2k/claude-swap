@@ -321,12 +321,14 @@ def _keychain_account_name() -> str:
     return macos_keychain.keychain_account_name()
 
 
-def delete_macos_keychain_entry(session_dir: Path) -> None:
+def delete_macos_keychain_entry(session_dir: Path, *, strict: bool = False) -> None:
     """Best-effort delete of a session profile's hashed keychain entry.
 
     No-op off macOS. Needed before seeding (Claude reads the keychain before
     the plaintext file, so a stale entry would shadow a fresh seed) and on
     profile removal (once the dir is gone the hashed name is unrecoverable).
+    Seeding and stale replacement use ``strict``: a deletion failure must not
+    leave a shadowing Keychain entry above a newly written plaintext seed.
     """
     if Platform.detect() != Platform.MACOS:
         return
@@ -334,8 +336,12 @@ def delete_macos_keychain_entry(session_dir: Path) -> None:
         macos_keychain.delete_password(
             keychain_service_name(session_dir), _keychain_account_name()
         )
-    except macos_keychain.KEYCHAIN_ERRORS:
-        pass  # best-effort; absent entry is already success (rc 44)
+    except macos_keychain.KEYCHAIN_ERRORS as exc:
+        if strict:
+            raise SessionError(
+                "Session profile input is unavailable right now; unlock storage and retry."
+            ) from exc
+        # Best-effort for other callers; absence (rc 44) is already success.
 
 
 def read_session_credentials(session_dir: Path) -> str | None:
@@ -352,6 +358,28 @@ def read_session_credentials(session_dir: Path) -> str | None:
     readable credential material.
     """
     return read_config_dir_credentials(str(session_dir))
+
+
+def _read_profile_admission_input(session_dir: Path) -> str | None:
+    """Read Claude's input, distinguishing absence from read failure.
+
+    Admission alone needs this strict file and Keychain view. Other readers
+    retain their best-effort fallback. Hash the exported directory string,
+    not a symlink target, exactly as the launch environment does.
+    """
+    if Platform.detect() == Platform.MACOS:
+        try:
+            credential = _keychain_entry(keychain_service_name(session_dir), True)
+        except macos_keychain.KEYCHAIN_ERRORS as exc:
+            raise CredentialReadError("Profile input is unavailable") from exc
+        if credential is not None:
+            return credential
+    try:
+        return (session_dir / ".credentials.json").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise CredentialReadError("Profile input is unavailable") from exc
 
 
 def _may_have_credential_material(session_dir: Path) -> bool:
@@ -1247,7 +1275,7 @@ class SessionManager:
                 if self.switcher._get_current_account() == (email, org_uuid) and not self._default_login_signed_out() and self._slot_has_default_refresh_grant(account_num, email):
                     raise SessionError("Selected account became the default login before profile reuse")
                 stash_status = self._profile_stash_status(session_dir, account_num, email)
-                if stash_status != "consumed":
+                if stash_status not in ("consumed", "absent"):
                     if stash_status:
                         raise self._stash_admission_error(account_num, status=stash_status)
                     self._sync_sharing(session_dir, share, share_history)
@@ -1326,7 +1354,7 @@ class SessionManager:
             if self.switcher.resolve_account(identifier) != (account_num, email, org_uuid):
                 raise SessionError("Account identity changed during profile preparation")
             stash_status = self._profile_stash_status(session_dir, account_num, email)
-            if stash_status == "consumed":
+            if stash_status in ("consumed", "absent"):
                 self._bootstrap(session_dir, account_num, email, org_uuid)
                 clear_session_stale(session_dir)
                 stash_status = None
@@ -1336,7 +1364,7 @@ class SessionManager:
             # under both locks before rebuilding its credentials.
             if is_session_stale(session_dir) and profile_is_quiescent(session_dir):
                 self._guard_profile_rebuild(session_dir)
-                delete_macos_keychain_entry(session_dir)
+                delete_macos_keychain_entry(session_dir, strict=True)
                 (session_dir / ".credentials.json").unlink(missing_ok=True)
                 clear_session_stale(session_dir)
             if self._is_session_valid(session_dir, email, org_uuid, binary=binary):
@@ -1395,14 +1423,20 @@ class SessionManager:
 
         An unverifiable stash prevents copying the backup, but an existing
         profile with an independent, readable generation can still run.
-        A known consumed backup must go through the recovery gate first.
+        A consumed or absent profile input must be seeded from checked backup
+        bytes. An unreadable input must never be replaced.
         """
         from claude_swap import oauth
 
         state = self.switcher._refresh_stash_state()
         if state["status"] == "ok" and not state["consumed_fps"]:
             return None
-        profile = read_session_credentials(session_dir)
+        try:
+            profile = _read_profile_admission_input(session_dir)
+        except CredentialReadError:
+            return "profile-unreadable"
+        if profile is None:
+            return "absent"
         if profile and not self._has_refresh_token(profile):
             return None
         if profile and oauth.credential_fingerprint(profile) in state["consumed_fps"]:
@@ -1415,6 +1449,11 @@ class SessionManager:
         return None
 
     def _stash_admission_error(self, account_num: str, *, status: str | None = None) -> SessionError:
+        if status == "profile-unreadable":
+            return SessionError(
+                f"Account-{account_num}'s profile input is unavailable right now; "
+                "unlock storage and retry."
+            )
         if status == "busy":
             return SessionError(
                 f"Account-{account_num}'s stash recovery is busy; preparation is deferred. Retry shortly."
@@ -1469,16 +1508,18 @@ class SessionManager:
                 f"Account-{account_num} has no stored credentials. "
                 f"Re-add with: cswap --add-account --slot {account_num}"
             )
+        # An unreadable live input is not proof that it holds this grant;
+        # _live_login_holds refuses only a positively matching generation.
         if self.switcher._live_login_holds(creds):
             raise self._live_login_error(account_num)
         stash_status = self.switcher._session_credential_stash_status(creds)
-        if stash_status and stash_status != "pending":
+        if stash_status:
             raise self._stash_admission_error(account_num, status=stash_status)
 
         self._guard_profile_rebuild(session_dir)
 
         # Claude reads the keychain before the plaintext file.
-        delete_macos_keychain_entry(session_dir)
+        delete_macos_keychain_entry(session_dir, strict=True)
 
         # The pre-lock refresh (see run(): the consume gate must not run
         # under this lock — its POST is network and the FileLock is

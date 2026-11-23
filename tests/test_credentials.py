@@ -754,3 +754,29 @@ class TestStashPublication:
         assert "account 4" in caplog.text
         assert "sk-target-slot" not in caplog.text
         assert "rt-target-slot" not in caplog.text
+
+    @pytest.mark.parametrize("failure", [KeyboardInterrupt, SystemExit, OSError])
+    def test_interrupted_manifest_update_preserves_successor_and_logs_id_and_slot(
+        self, tmp_path, monkeypatch, caplog, failure,
+    ):
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        interruption = failure("synthetic failure")
+
+        def interrupted(mutate):
+            raise interruption
+
+        monkeypatch.setattr(store, "_mutate_stash_manifest_locked", interrupted)
+        with pytest.raises(failure) as raised:
+            store._write_unclaimed_credential(TARGET_SLOT_CREDS, {"configSlot": "4"})
+        assert raised.value is interruption
+        entries = store._list_unclaimed_credentials()
+        assert len(entries) == 1
+        entry_id = next(iter(entries))
+        assert store._read_unclaimed_credential(entry_id) == (TARGET_SLOT_CREDS, False)
+        assert store._read_stash_manifest() == {}
+        assert entry_id in caplog.text
+        assert "account 4" in caplog.text
+        assert "sk-target-slot" not in caplog.text
+        assert "rt-target-slot" not in caplog.text
+        with store._stash_manifest_lock(timeout=0.1):
+            pass

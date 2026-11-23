@@ -10322,18 +10322,25 @@ class TestConsumeGate:
         snapshot = _bound_gate_snapshot(s, self._OLD)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         self._stash_successor_of(s, self._NEW, self._OLD)
-        s._store._stash_manifest_path().write_text("{not json at all")
+        manifest = s._store._stash_manifest_path()
+        corrupt_manifest = "{not json at all"
+        manifest.write_text(corrupt_manifest)
+        assert s._store._stash_snapshot()[2] == "corrupt"
 
         # 1. the operator can SEE the orphan, by glob, with no readable rows
         listed = s.list_unclaimed_credentials()
         assert listed, "corrupt manifest hid the orphan from `cswap unclaimed`"
+        assert manifest.read_text() == corrupt_manifest
 
         # 2. and can DROP it — the mutator does not refuse on corrupt
         for entry_id in list(listed):
             s._store._remove_unclaimed_credential(entry_id)
 
         # 3. after which nothing is at risk and the slot moves again
-        assert s._store._stash_snapshot()[1:] == (set(), "corrupt")
+        assert s._store._stash_snapshot() == ({}, set(), "ok")
+        preserved = list(s.credentials_dir.glob(".unclaimed-manifest.json.corrupt-*"))
+        assert len(preserved) == 1
+        assert preserved[0].read_text() == corrupt_manifest
         posted = []
 
         def mock_refresh(credentials, **kw):

@@ -67,7 +67,8 @@ def test_consumed_profile_refused_with_unavailable_backup(
         calls.append(True)
         return pass_number == 1 or len(calls) > 1
     monkeypatch.setattr(manager, "_is_session_valid", valid)
-    with pytest.raises(SessionError):
+    cause = "backup is unreadable" if unreadable else "no stored credentials"
+    with pytest.raises(SessionError, match=cause):
         manager.setup_session(ACCOUNT_NUM, share=False)
     assert {p.name: p.read_bytes() for p in profile.iterdir()} == before
 
@@ -85,7 +86,7 @@ def test_consumed_profile_refused_despite_orphan_and_independent_backup(
         calls.append(True)
         return pass_number == 1 or len(calls) > 1
     monkeypatch.setattr(manager, "_is_session_valid", valid)
-    with pytest.raises(SessionError):
+    with pytest.raises(SessionError, match="stash recovery is blocked"):
         manager.setup_session(ACCOUNT_NUM, share=False)
     assert (profile / ".credentials.json").read_text() == CREDS
 
@@ -225,3 +226,59 @@ def test_safe_launch_controls(manager, seeded_switcher, auth_status_tracks_seed,
     else:
         assert manager.setup_session(ACCOUNT_NUM, share=False)[0] == profile
     assert (profile / ".credentials.json").read_text() == credentials
+
+
+def credential_state(switcher, profile):
+    return (
+        {p.name: p.read_bytes() for p in profile.rglob("*") if p.is_file()}
+        if profile.exists() else None,
+        switcher._read_account_credentials_ex(ACCOUNT_NUM, ACCOUNT_EMAIL),
+        {p.name: p.read_bytes() for p in switcher.credentials_dir.glob(".unclaimed*")
+         if p.is_file() and p.suffix != ".lock"},
+    )
+
+
+@pytest.mark.parametrize("condition", ["orphan", "corrupt", "busy"])
+@pytest.mark.parametrize("setup_token", [False, True])
+def test_cold_stash_admission_checks_exact_seed_without_post(
+    manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, condition, setup_token,
+):
+    credentials = (json.dumps({"claudeAiOauth": {"accessToken": "synthetic-setup"}})
+                   if setup_token else CREDS)
+    seeded_switcher._store._write_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL, credentials)
+    profile = session_dir_for(seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+    orphan(seeded_switcher)
+    if condition == "corrupt":
+        seeded_switcher._store._stash_manifest_path().write_text("{broken")
+    elif condition == "busy":
+        monkeypatch.setattr(seeded_switcher._store, "_stash_snapshot",
+                            lambda: ({}, set(), "busy"))
+    before = credential_state(seeded_switcher, profile)
+    posts = []
+    def post(*a, **k):
+        posts.append(True)
+        pytest.fail("stash admission must not POST")
+    monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", post)
+    if setup_token:
+        assert manager.setup_session(ACCOUNT_NUM, share=False)[0] == profile
+        assert (profile / ".credentials.json").read_text() == credentials
+    else:
+        with pytest.raises(SessionError, match="busy" if condition == "busy" else "stash recovery is blocked"):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+        assert credential_state(seeded_switcher, profile) == before
+    assert not posts
+
+
+def test_active_default_login_ignores_busy_stash(
+    manager, seeded_switcher, capture_exec, monkeypatch,
+):
+    monkeypatch.setattr(seeded_switcher._store, "_stash_snapshot",
+                        lambda: ({}, set(), "busy"))
+    monkeypatch.setattr(seeded_switcher, "_get_current_account",
+                        lambda: (ACCOUNT_EMAIL, ORG_UUID))
+    profile = session_dir_for(seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+    before = credential_state(seeded_switcher, profile)
+    with pytest.raises(_ExecCalled) as exc:
+        manager.run(ACCOUNT_NUM, [])
+    assert exc.value.env is None or "CLAUDE_CONFIG_DIR" not in exc.value.env
+    assert credential_state(seeded_switcher, profile) == before

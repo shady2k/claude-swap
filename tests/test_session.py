@@ -5602,7 +5602,9 @@ class TestStashSessionAdmission:
         else:
             with pytest.raises(SessionError, match="stash recovery is blocked"):
                 manager.setup_session(ACCOUNT_NUM, share=False)
-        assert profile.exists()
+        assert (profile / ".credentials.json").read_bytes() == (
+            ROTATED_CREDS if independent else CREDS
+        ).encode()
 
 
 def test_manifest_interrupted_mid_write_leaves_no_temp(tmp_path: Path, monkeypatch):
@@ -6112,3 +6114,127 @@ def test_f36_session_setup_token_same_default_login(manager, seeded_switcher, ca
         manager.run(ACCOUNT_NUM, [], require_session=True)
     assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir_for(seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL))
     assert seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL) == setup
+
+
+class TestProfileAdmissionInput:
+    _ready = TestStashSessionAdmission._ready
+    _stash = TestStashSessionAdmission._stash
+
+    @pytest.mark.parametrize("second_pass", [False, True])
+    @pytest.mark.parametrize("failure", ["keychain", "file", "directory"])
+    def test_unreadable_refuses_without_changes(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch,
+        second_pass, failure, block_real_keychain,
+    ):
+        profile = self._ready(seeded_switcher)
+        self._stash(seeded_switcher)
+        before = (profile / ".credentials.json").read_bytes()
+        backup = seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+        stash = seeded_switcher._store._stash_snapshot()
+        keychain = block_real_keychain.data.copy()
+        stash_bytes = {p.name: p.read_bytes() for p in seeded_switcher.credentials_dir.glob(".unclaimed*")}
+        calls = []
+        original_status = manager._profile_stash_status
+        def status(*args):
+            calls.append(True)
+            if second_pass and len(calls) == 1:
+                return "consumed"
+            return original_status(*args)
+        monkeypatch.setattr(manager, "_profile_stash_status", status)
+        monkeypatch.setattr(seeded_switcher, "consume_backup_grant",
+                            lambda *a, **k: oauth.RefreshOutcome(None, "deferred"))
+        original_get = macos_keychain.get_password
+        original_read = Path.read_text
+        if failure == "keychain":
+            def denied(service, *args, **kwargs):
+                if service == keychain_service_name(profile):
+                    raise OSError("locked")
+                return original_get(service, *args, **kwargs)
+            monkeypatch.setattr(macos_keychain, "get_password", denied)
+        else:
+            original_read = Path.read_text
+            def denied(path, *args, **kwargs):
+                if path == profile / ".credentials.json":
+                    if failure == "directory":
+                        raise NotADirectoryError("profile unavailable")
+                    raise PermissionError("profile unavailable")
+                return original_read(path, *args, **kwargs)
+            monkeypatch.setattr(Path, "read_text", denied)
+        with pytest.raises(SessionError, match="profile.*unavailable") as exc:
+            manager.setup_session(ACCOUNT_NUM, share=False)
+        assert all(word not in str(exc.value) for word in ("--purge", "--slot", "re-add", "Log in"))
+        assert (profile / ".credentials.json").read_bytes() == before
+        # Keep the in-memory Keychain fixture while removing read failures.
+        monkeypatch.setattr(macos_keychain, "get_password", original_get)
+        monkeypatch.setattr(Path, "read_text", original_read)
+        assert seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL) == backup
+        assert seeded_switcher._store._stash_snapshot() == stash
+        assert block_real_keychain.data == keychain
+        assert {p.name: p.read_bytes() for p in seeded_switcher.credentials_dir.glob(".unclaimed*")} == stash_bytes
+
+    def test_absent_input_never_reused_after_successful_auth(
+        self, manager, seeded_switcher, monkeypatch,
+    ):
+        profile = self._ready(seeded_switcher)
+        (profile / ".credentials.json").unlink()
+        self._stash(seeded_switcher)
+        monkeypatch.setattr(manager, "_is_session_valid", lambda *a, **k: True)
+        monkeypatch.setattr(seeded_switcher, "consume_backup_grant",
+                            lambda *a, **k: oauth.RefreshOutcome(None, "deferred"))
+        # Only the bootstrap's exact-byte gate can refuse this consumed seed.
+        with pytest.raises(SessionError, match="already consumed"):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+    def test_symlink_reads_exported_service_not_target(
+        self, manager, seeded_switcher, monkeypatch, tmp_path,
+    ):
+        target = self._ready(seeded_switcher)
+        alias = tmp_path / "alias"
+        alias.symlink_to(target, target_is_directory=True)
+        self._stash(seeded_switcher)
+        services = []
+        def get(service, account):
+            services.append(service)
+            return ROTATED_CREDS if service == keychain_service_name(target) else None
+        monkeypatch.setattr(macos_keychain, "get_password", get)
+        assert manager._profile_stash_status(alias, ACCOUNT_NUM, ACCOUNT_EMAIL) == "consumed"
+        assert services == [keychain_service_name(alias)]
+
+    @pytest.mark.parametrize("stale", [False, True])
+    def test_keychain_delete_failure_preserves_input(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, stale,
+        block_real_keychain,
+    ):
+        profile = self._ready(seeded_switcher)
+        if stale:
+            stale_marker_for(profile).parent.mkdir(parents=True, exist_ok=True)
+            stale_marker_for(profile).write_text("stale")
+        else:
+            self._stash(seeded_switcher)
+        # Simulate a safe successor already in the slot, but a spent profile.
+        seeded_switcher._write_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS)
+        profile = self._ready(seeded_switcher)
+        if stale:
+            stale_marker_for(profile).write_text("stale")
+        monkeypatch.setattr(seeded_switcher, "consume_backup_grant",
+                            lambda *a, **k: oauth.RefreshOutcome(None, "deferred"))
+        before = (profile / ".credentials.json").read_bytes()
+        keychain = block_real_keychain.data.copy()
+        seeded_switcher._store._stash_snapshot()
+        stash_bytes = {p.name: p.read_bytes() for p in seeded_switcher.credentials_dir.glob(".unclaimed*")}
+        def denied(*args):
+            raise OSError("locked")
+        monkeypatch.setattr(macos_keychain, "delete_password", denied)
+        with pytest.raises(SessionError, match="profile.*unavailable"):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+        assert (profile / ".credentials.json").read_bytes() == before
+        assert block_real_keychain.data == keychain
+        assert {p.name: p.read_bytes() for p in seeded_switcher.credentials_dir.glob(".unclaimed*")} == stash_bytes
+
+    def test_empty_stash_does_not_read_profile_or_backup(self, manager, monkeypatch):
+        monkeypatch.setattr(manager.switcher, "_refresh_stash_state",
+                            lambda: {"status": "ok", "consumed_fps": set()})
+        monkeypatch.setattr(Path, "read_text", lambda *a, **k: pytest.fail("unexpected read"))
+        monkeypatch.setattr(manager.switcher, "_read_account_credentials_ex",
+                            lambda *a: pytest.fail("unexpected backup read"))
+        assert manager._profile_stash_status(Path("unused"), ACCOUNT_NUM, ACCOUNT_EMAIL) is None
