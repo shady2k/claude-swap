@@ -92,6 +92,13 @@ if options:
             # _launch, _publish_launch and both real storage locks.
             launch_policy.archive = lambda **kwargs: history
             transparent._profile_dir = lambda *args: profile
+            # Shim-local telemetry belongs to the unsupported POSIX install,
+            # not to profile ownership publication or tree supervision.
+            def journal(directory, event=None):
+                assert directory == transparent.paths.get_shim_dir(root)
+                assert event == "launch"
+                return 1
+            transparent._journal = journal
             def prepare(*unused, **kwargs):
                 with ownership.ownership_lock(root), transparent.FileLock(switcher.lock_file):
                     record = ownership.reserve_locked(root, "1", profile)
