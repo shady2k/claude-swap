@@ -2,16 +2,96 @@
 
 import ast
 import json
+import shutil
+import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
-from claude_swap import cli, launch_policy, menubar, settings, transparent
+from claude_swap import cli, fsguard, launch_policy, menubar, paths, settings, transparent
 from claude_swap.locking import FileLock
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="native Windows profile inheritance")
+def test_policy_update_in_inherited_profile_home(monkeypatch):
+    import ctypes as c
+    from ctypes import wintypes as w
+
+    from claude_swap import _win_file_security as security
+    from tests.win_config_diagnostic import _observe_dacl
+
+    # Do not repair the ACL: this controls the product's ordinary mkdir path,
+    # not pytest's temp-directory ACL or the private-root fixture.
+    # CSIDL_LOCAL_APPDATA resolves the account profile independently of pytest's
+    # HOME redirection, including in xdist workers. Its existing directory is
+    # outside the guarded real account store; only this fresh child is touched.
+    shell = c.WinDLL("shell32", use_last_error=True)
+    locate = security._function(shell, "SHGetFolderPathW", c.c_long,
+                                w.HWND, c.c_int, w.HANDLE, w.DWORD, w.LPWSTR)
+    buffer = c.create_unicode_buffer(32768)
+    assert locate(None, 0x1C, None, 0, buffer) == 0
+    home = Path(buffer.value) / f"cswap-policy-control-{uuid4().hex}"
+    home.mkdir()
+    try:
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.setattr(Path, "home", lambda: home)
+        root = paths.get_backup_root()
+        assert not root.exists()
+        check_dacl = security._check_dacl
+        rejection = []
+
+        def observe(path, dacl, trusted):
+            return _observe_dacl(check_dacl, path, dacl, trusted, rejection)
+
+        monkeypatch.setattr(security, "_check_dacl", observe)
+        for revision in (1, 2):
+            changed = []
+
+            def change(data):
+                changed.append(True)
+                assert data == ({} if revision == 1 else {"synthetic": 1, "rev": 1})
+                data["synthetic"] = revision
+                return True
+
+            try:
+                assert launch_policy.update(root, change) is True
+                expected = {"synthetic": revision, "rev": revision}
+                assert launch_policy.read(root) == expected
+            except fsguard.GuardError as exc:
+                pytest.fail(f"ordinary profile revision={revision}: {exc}; rejected ACE={rejection}")
+            assert changed == [True]
+            assert json.loads((root / "transparent.json").read_text(encoding="utf-8")) == expected
+    finally:
+        shutil.rmtree(home)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="native Windows ACL APIs")
+@pytest.mark.parametrize("existing_policy", [False, True], ids=["absent-policy", "existing-policy"])
+def test_policy_update_refuses_foreign_write_before_mutation(private_backup_root, existing_policy):
+    root = private_backup_root
+    policy = root / "transparent.json"
+    if existing_policy:
+        assert launch_policy.update(root, lambda data: (data.update(synthetic=True) or True))
+    before = {path.name: path.read_bytes() for path in root.iterdir()}
+    # Authenticated Users is outside the guard's current-user/SYSTEM/Admin set.
+    result = subprocess.run(
+        ["icacls", str(root), "/grant", "*S-1-5-11:(OI)(CI)(M)"],
+        capture_output=True, check=False,
+    )
+    assert result.returncode == 0, "could not install the synthetic foreign write grant"
+    changed = []
+    with pytest.raises(fsguard.GuardError, match="Writable by another user or group") as error:
+        launch_policy.update(root, lambda data: (changed.append(True) or True))
+    assert str(root) in str(error.value)
+    assert not changed
+    assert {path.name: path.read_bytes() for path in root.iterdir()} == before
+    assert policy.exists() is existing_policy
 
 
 @pytest.fixture
