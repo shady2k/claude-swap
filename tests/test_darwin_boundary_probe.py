@@ -34,6 +34,8 @@ def test_job_configuration_is_single_run_synthetic_and_isolated(tmp_path):
 
 @pytest.fixture
 def job_root():
+    if sys.platform == "win32":
+        pytest.skip("launchd job controls require POSIX AF_UNIX paths")
     with tempfile.TemporaryDirectory(prefix="cswap-test-", dir="/tmp") as directory:
         yield Path(directory)
 
