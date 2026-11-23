@@ -174,3 +174,37 @@ def test_active_orphan_guidance_survives_cached_usage_and_expiry_backoff(recover
     assert_recovery_guidance(switcher, capsys)
     assert calls == ["B-refresh"]
     assert preserved_orphan(switcher) == entry_id
+
+
+def test_401_publication_failure_is_visible_on_first_collection(recovery, monkeypatch):
+    switcher, calls, now = recovery
+    login(switcher, OTHER_EMAIL, credential("other", expired=False), "2")
+    # Locally valid B reaches the usage endpoint and receives a server 401.
+    original = credential("B", expired=False)
+    switcher._write_account_credentials("1", EMAIL, original)
+    usage_calls = []
+
+    def usage(access_token):
+        usage_calls.append(access_token)
+        if access_token == "B-access":
+            raise urllib.error.HTTPError(
+                "https://synthetic.invalid/usage", 401, "expired", {}, None,
+            )
+        return {"five_hour": {"utilization": 31}}
+
+    monkeypatch.setattr(oauth, "request_usage_data", usage)
+    with monkeypatch.context() as failure:
+        fail_persistence(failure, switcher)
+        first = collect(switcher)
+    assert first.last_error == "stash-unreadable"
+    assert first.last_good == HISTORY
+    assert first.struck_fingerprint is None
+    assert calls == ["B-refresh"]
+    assert usage_calls == ["B-access"]
+    entries = switcher.list_unclaimed_credentials()
+    assert len(entries) == 1
+    entry_id = next(iter(entries))
+    assert switcher._store._read_unclaimed_credential(entry_id) == (
+        credential("C", expired=False), False,
+    )
+    assert switcher._read_account_credentials("1", EMAIL) == original

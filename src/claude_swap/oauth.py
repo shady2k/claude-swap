@@ -1468,6 +1468,8 @@ def try_fetch_usage_for_account(
         # "refresh-failed") so the store can quarantine instead of retrying a
         # dead token forever.
         refresh = refresh_via(account_num, email, working_credentials)
+        if refresh.error == "stash-unreadable":
+            return UsageOutcome(None, error=refresh.error)
         if not refresh.credentials:
             _log_usage_failure(context, e, kind)
             dead = refresh.error in ("invalid_grant", "no_refresh_token")
