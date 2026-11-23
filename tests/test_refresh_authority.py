@@ -175,9 +175,8 @@ def test_stash_identity_uuid_is_optional_but_conflicts_refuse(
     assert s._read_account_credentials("1", email) == credential("successor" if adopts else "old")
 
 
-@pytest.mark.parametrize("source", ["backup", "profile"])
 def test_session_checker_rejects_consumed_fp_across_guards(
-    temp_home, sample_sequence_data, source,
+    temp_home, sample_sequence_data,
 ):
     s, email = seeded(sample_sequence_data)
     old = credential("old")
@@ -186,7 +185,7 @@ def test_session_checker_rejects_consumed_fp_across_guards(
         "identity": {"email": "other@example.invalid"}, "loginGen": 999,
         "consumedFp": oauth.credential_fingerprint(old),
     })
-    assert s._session_credential_stash_status(old, profile=source == "profile") == "consumed"
+    assert s._session_credential_stash_status(old) == "consumed"
 
 
 def test_session_checker_skips_setup_token_and_flags_unknown_rows(
