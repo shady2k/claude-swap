@@ -131,7 +131,11 @@ class Job:
         except Exception as exc:
             self.events.append({"stage": "ready barrier failed",
                                 "error": f"{type(exc).__name__}: {exc}"})
-            self.snapshot()
+            try:
+                self.snapshot()
+            except Exception:
+                # command() already recorded the diagnostic failure.
+                pass
             raise
         self.channel.settimeout(5)
         message = b""
@@ -190,8 +194,7 @@ def run(output: Path) -> None:
             for kind in ("gui", "user"):
                 result = launchctl("print", f"{kind}/{os.getuid()}")
                 report["domains"][kind] = {
-                    "returncode": result.returncode, "stderr": result.stderr,
-                    "stdout": result.stdout}
+                    "returncode": result.returncode, "stderr": result.stderr}
             home = root / "preflight-home"
             home.mkdir()
             preflight = subprocess.run(
