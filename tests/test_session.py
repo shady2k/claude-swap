@@ -220,7 +220,13 @@ def _admitted_unit_launch(request, monkeypatch):
 
 
 @pytest.fixture
-def manager(seeded_switcher) -> SessionManager:
+def manager(seeded_switcher, monkeypatch) -> SessionManager:
+    """Session semantics use known identity, not host process-reader support."""
+    from claude_swap import profile_ownership
+
+    monkeypatch.setattr(profile_ownership, "_process_identity", lambda pid:
+        profile_ownership._ProcessIdentity(
+            "present", profile_ownership._PosixStart(str(pid)), "linux"))
     return SessionManager(seeded_switcher)
 
 
@@ -5734,6 +5740,9 @@ class TestLaunchReservation:
         from claude_swap import profile_ownership
 
         events = []
+        monkeypatch.setattr(profile_ownership, "_process_identity", lambda pid:
+            profile_ownership._ProcessIdentity(
+                "present", profile_ownership._PosixStart(str(pid)), "linux"))
         monkeypatch.setattr(session_mod.spawn, "require_supervision", lambda: events.append("require"))
         def owned_launch(callback, *, publish, release, abort):
             session_mod.spawn.require_supervision()
@@ -5772,6 +5781,27 @@ class TestLaunchReservation:
             pass
         with pytest.raises(SessionError, match="profile.*handoff"):
             manager._exec(_ClaudeStub(), ["-p", "hello"], env={"CLAUDE_CONFIG_DIR": "/other"})
+
+
+def test_unsupported_supervision_preserves_profile_before_target(manager, monkeypatch):
+    from claude_swap import profile_ownership
+
+    profile = session_dir_for(manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+    profile.mkdir(parents=True)
+    marker = profile / "untouched"
+    marker.write_bytes(b"synthetic warm profile")
+    monkeypatch.setattr(session_mod.spawn, "sys", SimpleNamespace(platform="darwin", stderr=sys.stderr))
+    monkeypatch.setattr(profile_ownership, "_process_identity", lambda pid:
+        profile_ownership._ProcessIdentity(
+            "present", profile_ownership._PosixStart(str(pid)), "darwin"))
+    monkeypatch.setattr(_ClaudeStub, "handoff",
+                        lambda *a, **kw: pytest.fail("target started"), raising=False)
+    with pytest.raises(session_mod.real_claude.ResolveError, match="supervision is unsupported"):
+        with manager._reserve_profile(ACCOUNT_NUM):
+            manager._exec(_ClaudeStub(), ["-p", "hello"], env={"CLAUDE_CONFIG_DIR": str(profile)})
+    assert marker.read_bytes() == b"synthetic warm profile"
+    with profile_ownership.ownership_lock(manager.switcher.backup_dir):
+        assert not profile_ownership.profile_busy_locked(manager.switcher.backup_dir, ACCOUNT_NUM)
 
 
 def test_prepublication_cleanup_error_is_not_retried_by_reservation(manager, monkeypatch):

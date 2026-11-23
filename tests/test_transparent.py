@@ -61,6 +61,16 @@ def invoke(*args, **kwargs):
     return subprocess.run(["claude", *args], capture_output=True, input=b"\x00\xff\r\n", **kwargs)
 
 
+def assert_unsupported_refusal(result, root):
+    """Unsupported hosts must refuse before starting the synthetic target."""
+    assert result.returncode == 4
+    assert not result.stdout
+    assert b"supervision is unsupported" in result.stderr
+    assert not (paths.get_shim_dir(root) / "launches.json").exists()
+    profile = next((root / "sessions").iterdir())
+    assert json.loads((profile / ".claude.json").read_text())["oauthAccount"]["accountUuid"] == "fake-profile"
+
+
 def test_f9_lifecycle_argv_streams_exit_and_launch_count(installed):
     root, shim, fake = installed
     expected_hash = hashlib.sha256(fake.read_bytes()).digest()
@@ -70,6 +80,9 @@ def test_f9_lifecycle_argv_streams_exit_and_launch_count(installed):
     assert transparent.enable(root, accept_shared_history=True, pool=["1"]) == shim
     assert any("first on PATH" in line for line in transparent.status(root))
     result = invoke(*args)
+    if sys.platform != "linux":
+        assert_unsupported_refusal(result, root)
+        return
     assert result.returncode == baseline.returncode
     first, body = result.stdout.split(b"\n", 1)
     original, original_body = baseline.stdout.split(b"\n", 1)
@@ -87,6 +100,31 @@ def test_f9_lifecycle_argv_streams_exit_and_launch_count(installed):
     assert hashlib.sha256(fake.read_bytes()).digest() == expected_hash
 
 
+def test_unsupported_supervision_refuses_without_starting_or_changing_profile(installed, monkeypatch):
+    from types import SimpleNamespace
+    from claude_swap import profile_ownership, real_claude
+
+    root, directory, _ = installed
+    transparent.enable(root, accept_shared_history=True, pool=["1"])
+    profile = next((root / "sessions").iterdir())
+    before = {p.name: p.read_bytes() for p in profile.iterdir() if p.is_file()}
+    monkeypatch.setattr(transparent, "sys", SimpleNamespace(
+        platform="darwin", flags=SimpleNamespace(isolated=True), stderr=sys.stderr))
+    monkeypatch.setattr(transparent.spawn, "sys", SimpleNamespace(
+        platform="darwin", stderr=sys.stderr))
+    monkeypatch.setattr(profile_ownership, "_process_identity", lambda pid:
+        profile_ownership._ProcessIdentity(
+            "present", profile_ownership._PosixStart(str(pid)), "darwin"))
+    monkeypatch.setattr(real_claude.RealClaude, "handoff",
+                        lambda *a, **kw: pytest.fail("target started"))
+    with pytest.raises(OSError, match="supervision is unsupported"):
+        transparent._launch(transparent._invocation_marker(directory, False), ["-p", "hello"], root)
+    assert {p.name: p.read_bytes() for p in profile.iterdir() if p.is_file()} == before
+    assert not (directory / "launches.json").exists()
+    with profile_ownership.ownership_lock(root):
+        assert not profile_ownership.profile_busy_locked(root, "1")
+
+
 def test_enable_refuses_group_writable_shim_directory(installed):
     root, shim, _ = installed
     shim.mkdir(parents=True)
@@ -99,6 +137,9 @@ def test_enable_refuses_group_writable_shim_directory(installed):
 def test_f9_sigterm_reaches_same_pid(installed):
     root, _, _ = installed
     transparent.enable(root, accept_shared_history=True, pool=["1"])
+    if sys.platform != "linux":
+        assert_unsupported_refusal(invoke("-p", "test refusal"), root)
+        return
     with subprocess.Popen(["claude", "-p", "wait for signal"], stdout=subprocess.PIPE) as child:
         try:
             import select
@@ -140,7 +181,11 @@ def test_f28_cwd_pythonpath_and_loader_controls(installed, monkeypatch, tmp_path
     for name in ("json.py", "claude_swap.py"):
         (tmp_path / name).write_text("raise RuntimeError('client code imported')\n")
     monkeypatch.setenv("PYTHONPATH", str(tmp_path))
-    assert invoke("-p", "test this", cwd=tmp_path).returncode == 27
+    result = invoke("-p", "test this", cwd=tmp_path)
+    if sys.platform == "linux":
+        assert result.returncode == 27
+    else:
+        assert_unsupported_refusal(result, root)
     set_setting(root, "transparent.requireProxy", "true")
     assert invoke("-p", "test this").returncode == 4
     transparent.refresh_install(root)
@@ -213,6 +258,9 @@ def test_running_valid_profile_allows_second_transparent_launch(installed):
 
     root, _, _ = installed
     transparent.enable(root, accept_shared_history=True, pool=["1"])
+    if sys.platform != "linux":
+        assert_unsupported_refusal(invoke("-p", "test refusal"), root)
+        return
     with subprocess.Popen(["claude", "-p", "wait for signal"], stdout=subprocess.PIPE) as child:
         try:
             assert select.select([child.stdout], [], [], 10)[0]
@@ -241,4 +289,8 @@ def test_default_login_candidate_refusal_continues_pool(installed):
         "emailAddress": "profile@example.test", "accountUuid": "fake-profile",
     }}))
     transparent.enable(root, accept_shared_history=True, pool=["1", "2"])
-    assert invoke("-p", "second candidate").returncode == 27
+    result = invoke("-p", "second candidate")
+    if sys.platform == "linux":
+        assert result.returncode == 27
+    else:
+        assert_unsupported_refusal(result, root)

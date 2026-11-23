@@ -137,6 +137,75 @@ def _invoke(*args):
     return subprocess.run(["claude", *args], capture_output=True, text=True, timeout=10)
 
 
+@pytest.fixture(autouse=True)
+def launch_boundary(monkeypatch):
+    """Exercise history policy independently of host process supervision.
+
+    Identity is synthetic; publication still runs the real ownership and
+    policy checks. Only the terminal boundary runs the no-network fake.
+    """
+    from contextlib import redirect_stderr, redirect_stdout
+    from io import StringIO
+    from claude_swap import profile_ownership
+    from claude_swap.exceptions import ClaudeSwitchError
+
+    monkeypatch.setattr(profile_ownership, "_process_identity", lambda pid:
+        profile_ownership._ProcessIdentity(
+            "present", profile_ownership._PosixStart(str(pid)), "linux"))
+    monkeypatch.setattr(transparent, "sys", SimpleNamespace(
+        platform=sys.platform, flags=SimpleNamespace(isolated=True), stderr=sys.stderr,
+    ))
+
+    def owned_launch(callback, *, publish, release, abort):
+        try:
+            publish()
+        except BaseException:
+            abort()
+            raise
+        try:
+            callback()
+        except SystemExit as done:
+            result = done.code
+        else:
+            result = 0
+        release()
+        return result
+
+    def handoff(self, args, env, *, job=False):
+        result = subprocess.run([str(self.path), *args], env=env,
+                                capture_output=True, text=True, timeout=10)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        raise SystemExit(result.returncode)
+
+    def invoke(*args):
+        root = paths.get_backup_root()
+        output, errors = StringIO(), StringIO()
+        with redirect_stdout(output), redirect_stderr(errors):
+            transparent.sys.stderr = errors
+            try:
+                policy = launch_policy.read(root)
+                strict = transparent.load_transparent_settings(root, policy=policy).require_proxy
+                transparent._launch(transparent._invocation_marker(
+                    paths.get_shim_dir(root), strict), list(args), root)
+            except SystemExit as done:
+                code = done.code
+            except transparent.NoAvailableProfile as error:
+                print(error, file=sys.stderr)
+                code = 3
+            except (ClaudeSwitchError, OSError) as error:
+                print(error, file=sys.stderr)
+                code = 4
+            else:
+                code = 0
+        return subprocess.CompletedProcess(args, code, output.getvalue(), errors.getvalue())
+
+    monkeypatch.setattr(transparent.spawn, "owned_launch", owned_launch)
+    monkeypatch.setattr(real_claude.RealClaude, "handoff", handoff)
+    monkeypatch.setattr(sys.modules[__name__], "_invoke", invoke)
+    return handoff
+
+
 def _transcript_files(projects):
     return sorted(path.relative_to(projects).as_posix() for path in projects.rglob("*.jsonl"))
 
@@ -331,7 +400,7 @@ def test_excluded_member_history_continues_with_remaining_participant(shim, arch
     ))
 
 
-def test_run_created_outside_zone_history_resumes_under_b(shim, archive, monkeypatch):
+def test_run_created_outside_zone_history_resumes_under_b(shim, archive, monkeypatch, launch_boundary):
     root, profiles = shim
     projects, transcript = archive
     transcript.unlink()
@@ -373,6 +442,7 @@ def test_run_created_outside_zone_history_resumes_under_b(shim, archive, monkeyp
     ids_before = _transcript_files(projects)
 
     monkeypatch.setenv("HISTORY_TEST_EXPECTED_EMAIL", "profile2@example.test")
+    monkeypatch.setattr(real_claude.RealClaude, "handoff", launch_boundary)
     result = _invoke("--resume", sid, "-p", NEW_MESSAGE)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["profile"] == profiles["2"].name
@@ -413,6 +483,7 @@ def test_archive_allows_link_above_home(shim, tmp_path, monkeypatch):
         stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10,
     )
     assert enabled.returncode == 0, enabled.stderr
+    transparent.enable(paths.get_backup_root(), accept_shared_history=True)
 
     result = _invoke("--resume", SESSION_ID)
     assert result.returncode == 0, result.stderr
@@ -571,6 +642,7 @@ def _assert_lock_free(root):
 
 
 def test_policy_writer_uses_slot_lock_and_advances_revision(shim, monkeypatch):
+    monkeypatch.setenv("CONTAINER", "1")
     root, _ = shim
     original = launch_policy.atomic_write_text
     observed = []
