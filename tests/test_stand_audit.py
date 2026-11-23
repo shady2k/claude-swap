@@ -78,36 +78,48 @@ def test_startup_refusal_reports_only_fixed_categories(tmp_path, reason):
 
 
 @pytest.mark.parametrize("contaminate_descendant", [False, True], ids=["clean", "contaminated-descendant"])
-def test_startup_probe_tracks_reached_bodies(tmp_path, monkeypatch, contaminate_descendant):
-    if contaminate_descendant:
-        def make_stand(path):
-            stand = StandAudit(path)
-            # Change the environment after the parent approves the launch.
+def test_startup_probe_tracks_reached_bodies(tmp_path, monkeypatch, capsys, contaminate_descendant):
+    key = "__CF_USER_TEXT_ENCODING"
+    canary = "private-darwin-canary"
+    monkeypatch.setenv(key, canary)
+    darwin = sys.platform == "darwin"
+
+    def make_stand(path):
+        stand = StandAudit(path)
+        if darwin:
+            assert stand.env[key] == f"0x{os.getuid():X}:0:0"
+        else:
+            assert key not in stand.env
+        if contaminate_descendant:
+            # Modify the environment after the parent approves the launch.
             stand._policy.with_name("synthetic_darwin.pth").write_text(
                 "import os, sys; "
                 "sys.argv[0].endswith('descendant.py') and "
-                "os.environ.update(__CF_USER_TEXT_ENCODING='private-darwin-canary')\n",
+                f"os.environ.update({key}={canary!r})\n",
                 encoding="utf-8",
             )
-            return stand
+        return stand
 
-        monkeypatch.setattr(stand_startup_diagnostic, "StandAudit", make_stand)
+    monkeypatch.setattr(stand_startup_diagnostic, "StandAudit", make_stand)
+    if contaminate_descendant:
+        drift = {category: {"count": 0, "known": []} for category in ("added", "missing", "changed")}
+        drift["changed" if darwin else "added"] = {
+            "count": 1, "known": ["darwin-user-text-encoding"],
+        }
         expected = {
             "started": ["root"],
             "exit": 125,
             "refusal": {
                 "stage": "descendant",
                 "reason": "environment",
-                "environment": {
-                    "added": {"count": 1, "known": ["darwin-user-text-encoding"]},
-                    "missing": {"count": 0, "known": []},
-                    "changed": {"count": 0, "known": []},
-                },
+                "environment": drift,
             },
         }
     else:
         expected = {"started": ["root", "descendant"], "exit": 0}
-    assert stand_startup_diagnostic.probe(tmp_path) == expected
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    assert stand_startup_diagnostic.main() == expected["exit"]
+    assert json.loads(capsys.readouterr().out) == expected
 
 
 def test_f20_audited_python_process_tree_uses_only_temporary_state(tmp_path, monkeypatch):
