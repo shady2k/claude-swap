@@ -352,6 +352,34 @@ class TestFormatting:
         ).plain
         assert "last seen" not in api_key
 
+    @pytest.mark.parametrize("error", ["stash-unreadable", "profile-busy"])
+    @pytest.mark.parametrize("has_history", [False, True])
+    @pytest.mark.parametrize("backoff", [False, True])
+    def test_recovery_card_keeps_guidance_and_prior_usage(self, error, has_history, backoff):
+        from claude_swap.switcher import ERROR_NOTES
+        from claude_swap.tui.widgets import account_card_text, mini_account_text
+
+        entry = dataclasses.replace(
+            make_entry() if has_history else UsageEntry(), last_error=error,
+            backoff_until=time.time() + 600 if backoff else None,
+        )
+        from claude_swap.switcher import _usage_entry_lines
+
+        account = make_account(1, entry=entry)
+        for text in (
+            account_card_text(account, 100).plain,
+            mini_account_text(account, time.time()).plain,
+            "\n".join(_usage_entry_lines(entry)),
+        ):
+            assert ERROR_NOTES[error] in text
+            if has_history:
+                assert "25%" in text
+            if error == "stash-unreadable":
+                assert "cswap unclaimed --purge ID" in text
+            else:
+                assert "log in again" not in text
+                assert "cswap add" not in text
+
     def test_account_card_uses_light_palette_when_passed(self):
         from claude_swap.tui.theme import ACCENT_LIGHT, CSWAP_LIGHT, Palette
         from claude_swap.tui.widgets import account_card_text

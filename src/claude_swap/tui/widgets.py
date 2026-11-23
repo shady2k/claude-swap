@@ -341,6 +341,8 @@ def account_card_text(
                 palette=palette,
             )
         )
+    if acc.usage.last_error in ("stash-unreadable", "profile-busy"):
+        text.append("\n    ⚠ " + ERROR_NOTES[acc.usage.last_error], style=palette.sev_warn)
     return text
 
 
@@ -442,6 +444,8 @@ def mini_account_text(
         parts += 1
     if not parts:
         text.append("usage unknown", style=palette.muted)
+    if acc.usage.last_error in ("stash-unreadable", "profile-busy"):
+        text.append(" · " + ERROR_NOTES[acc.usage.last_error], style=palette.sev_warn)
     return _end_mini(text, acc, login, now, palette)
 
 

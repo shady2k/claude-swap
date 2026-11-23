@@ -57,6 +57,16 @@ It fails safe: if a usage check errors it keeps trusting the last-known numbers,
 
 An account whose refresh token has died is quarantined and reported until you either log in with it and re-run `cswap add --slot N`, or replace its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots on its own (`--force` is still required to replace other existing accounts; note a stale export can carry an already-superseded token). API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
 
+### Credential recovery
+
+`stash-unreadable` means a preserved successor credential is unreadable or cannot be proven to belong to the slot. cswap does not consume another refresh token while that entry blocks recovery. `cswap list`, the TUI, and auto-switch show the recovery guidance on the first failure and while retries back off, alongside any last-good usage reading.
+
+1. Run `cswap unclaimed` to inspect the preserved entries. Unlock the keychain or fix unreadable files first, then retry.
+2. If the credential cannot be recovered, log in again with Claude Code and run `cswap add --slot N` for the affected slot.
+3. After inspection and recovery, run `cswap unclaimed --purge ID` for the blocking entry. This deletes its preserved credential bytes; do not purge a credential you still need to recover.
+
+A busy session profile is different: let its Claude Code launch finish, then retry. It does not mean the stored login needs replacing.
+
 ## Running alongside Claude Code
 
 Runs safely alongside Claude Code: switches take the same credential locks Claude Code uses, so a swap never collides with a token refresh.

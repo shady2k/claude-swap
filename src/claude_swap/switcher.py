@@ -278,11 +278,13 @@ ERROR_NOTES = {
     ),
     "superseded": "login was replaced — retries with the current credential",
     "unreadable": "stored login is unreadable — unlock the keychain or fix the file",
+    "profile-busy": "profile is in use — wait for its launch to finish, then retry",
     "stash-unreadable": (
-        "this slot's stashed successor is unreadable or unproven — "
+        "stash recovery is blocked — inspect preserved entries with `cswap unclaimed`; "
+        "unlock the keychain or fix unreadable files first; if recovery is impossible, "
         "log in again with Claude Code, then run: cswap add --slot N; "
-        "unlock the keychain or fix unreadable files first; "
-        "`cswap unclaimed` inspects preserved entries"
+        "only after recovering the login, remove the blocking entry with "
+        "`cswap unclaimed --purge ID`"
     ),
     "live-login": (
         "the live login is this account's, so Claude Code renews it — "
@@ -391,6 +393,8 @@ def _usage_entry_lines(
             and entry.fetched_at is not None
         ):
             lines[usage_count - 1] += f" · {format_age(int(entry.fetched_at * 1000))}"
+        if entry.last_error in {"stash-unreadable", "profile-busy"}:
+            lines.append(ERROR_NOTES[entry.last_error])
         return [
             f"{dimmed('└' if j == len(lines) - 1 else '├')} {muted(line)}"
             for j, line in enumerate(lines)
@@ -2662,7 +2666,7 @@ class ClaudeAccountSwitcher:
                     self.backup_dir, account_num, self._session_dir(account_num, email),
                     ignore_launch_id=launch_id,
                 ):
-                    return oauth.RefreshOutcome(None, "ownership-lost")
+                    return oauth.RefreshOutcome(None, "profile-busy")
                 current, unreadable = self._read_account_credentials_ex(
                     account_num, email
                 )
@@ -3068,6 +3072,54 @@ class ClaudeAccountSwitcher:
                 account_num, entry_id, exc_info=True,
             )
 
+    def _checked_refresh_stash(self, account_num: str) -> dict:
+        """Check publication before either refresh path can spend a grant.
+
+        Unmapped bytes or an uncertain scan may hide a pending successor.
+        Known switch safety copies have a fingerprint and a displacement
+        reason, but no consumed grant; they are not pending rotations. Keep
+        them intact and out of adoption. Unknown metadata cannot establish
+        that distinction and must defer, even for another slot.
+        """
+        manifest, verdict = self._store._read_stash_manifest_ex()
+        if (verdict == "unreadable"
+                or self._store._stash_entry_files_exist(excluding=manifest)):
+            entries = self._store._list_unclaimed_credentials()
+            self._logger.warning(
+                "Account %s stash publication unproven, entries %s; "
+                "inspect with `cswap unclaimed` before retrying.",
+                account_num, ", ".join(sorted(entries)) or "unknown (scan unavailable)",
+            )
+            raise CredentialReadError("stash publication unavailable or incomplete")
+        rotations = {}
+        safety_reasons = {
+            "displaced-live-login", "foreign", "alien", "known-foreign",
+            "setup-token-mismatch", "api-key-mismatch",
+        }
+        for entry_id, meta in manifest.items():
+            if not isinstance(meta, dict):
+                valid = False
+            elif (meta.get("reason") in safety_reasons
+                    and meta.get("fingerprint")
+                    and meta.get("configSlot")
+                    and "consumedFp" not in meta):
+                continue
+            else:
+                valid = bool(
+                    isinstance(meta.get("consumedFp"), str)
+                    and meta["consumedFp"]
+                    and (isinstance(meta.get("identity"), dict)
+                         or (meta.get("identity") is None and meta.get("configSlot")))
+                )
+            if not valid:
+                self._logger.warning(
+                    "Account %s stash entry %s is unattributed; deferring refresh.",
+                    account_num, entry_id,
+                )
+                raise CredentialReadError("stash entry has unproven provenance")
+            rotations[entry_id] = meta
+        return rotations
+
     def _adopt_stashed_successor(
         self, account_num: str, email: str, current: str, *, persist=None,
         require_successor: bool = False,
@@ -3084,6 +3136,7 @@ class ClaudeAccountSwitcher:
         Caller holds the slot FileLock.
         """
         persist = persist or self._write_account_credentials
+        manifest = self._checked_refresh_stash(account_num)
         cur_fp = oauth.credential_fingerprint(current)
         if not cur_fp:
             return None
@@ -3094,37 +3147,6 @@ class ClaudeAccountSwitcher:
         # it and keep scanning; only defer via CredentialReadError once no
         # row adopted.
         deferred_entry_id: str | None = None
-        manifest, manifest_verdict = self._store._read_stash_manifest_ex()
-        if manifest_verdict == "unreadable" or (
-            manifest_verdict == "corrupt"
-            and self._store._stash_entry_files_exist()
-        ):
-            # Not "nothing stashed": the rows cannot be established, and entry
-            # bytes are at risk. Every row this scan would have read is the
-            # sole record of a generation some pass already consumed, so an
-            # empty scan makes the caller POST the slot's spent generation.
-            #
-            # That POST does not cost "one retry". The generation is spent by
-            # construction, so it returns invalid_grant, and the gate returns
-            # before any manifest write — nothing is set aside, nothing
-            # self-heals, and at AUTH_DEAD_STRIKES=1 a live account is
-            # quarantined while its successor sits orphaned on disk.
-            #
-            # CORRUPT with no entry files falls through instead: `{}` is then
-            # not a guess about a pending successor, there provably is none,
-            # and proceeding lets ``_write_stash_manifest`` set the bad file
-            # aside — the only repair, and it only runs on a write.
-            #
-            # Fail-closed still has an exit: ``_list_unclaimed_credentials``
-            # globs the entry files, so `cswap unclaimed` lists the orphans by
-            # id and `--purge` drops them even with the manifest unreadable.
-            raise CredentialReadError(
-                f"the unclaimed manifest is {manifest_verdict} and stashed "
-                f"entry files exist; deferring account {account_num}'s "
-                "adoption rather than POSTing a generation a stashed "
-                "successor may already have superseded (`cswap unclaimed` "
-                "lists them, `--purge` drops one)"
-            )
         for entry_id, meta in manifest.items():
             identity = self.account_identity(account_num)
             if meta.get("identity") is not None:
@@ -5103,7 +5125,7 @@ class ClaudeAccountSwitcher:
                         self.backup_dir, account_num,
                         self._session_dir(account_num, email),
                     ):
-                        return FetchRecord(error="ownership-lost")
+                        return FetchRecord(error="profile-busy")
                     generation = refresh_authority.login_generation(
                         self.backup_dir, email, org_uuid or ""
                     )
@@ -5224,10 +5246,7 @@ class ClaudeAccountSwitcher:
         The current collection snapshot cannot prove a first-pass state.
         Read all applicable rows before writing: conflicting successors defer.
         """
-        manifest, verdict = self._store._read_stash_manifest_ex()
-        if (verdict == "unreadable"
-                or self._store._stash_entry_files_exist(excluding=manifest)):
-            raise CredentialReadError("active successor manifest unavailable or incomplete")
+        manifest = self._checked_refresh_stash(account_num)
         candidates = {}
         entries = []
         for entry_id, meta in manifest.items():

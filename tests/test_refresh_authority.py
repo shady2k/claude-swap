@@ -74,7 +74,7 @@ def test_running_reservation_blocks_grant(temp_home, sample_sequence_data):
     try:
         with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
             result = s.consume_backup_grant("1", email, snapshot)
-        assert result.error == "ownership-lost"
+        assert result.error == "profile-busy"
         post.assert_not_called()
     finally:
         with profile_ownership.ownership_lock(s.backup_dir):

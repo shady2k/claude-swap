@@ -2075,7 +2075,15 @@ class CredentialStore:
             "createdAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             **context,
         }
-        self._mutate_stash_manifest(lambda entries: entries.update({entry_id: row}))
+        try:
+            self._mutate_stash_manifest(lambda entries: entries.update({entry_id: row}))
+        except Exception:
+            self._host._logger.warning(
+                "Stash publication failed for account %s, entry %s; "
+                "credential bytes preserved.", context.get("configSlot", "unknown"),
+                entry_id,
+            )
+            raise
         return entry_id
 
     def _list_unclaimed_credentials(self) -> dict[str, dict]:
@@ -2096,10 +2104,10 @@ class CredentialStore:
         ``_read_account_credentials_ex``. ``unreadable`` is True when the
         entry file EXISTS but its bytes could not be read (locked
         Keychain-adjacent volume, mid-unmount, transient EIO/permissions).
-        A stash entry exists only because a prior gate pass already
-        consumed a grant and could not persist the successor -- the entry
-        is the SOLE copy of that generation, so the caller must not treat
-        a transient read failure as "nothing to adopt".
+        A pending-rotation entry may be the sole copy of a consumed
+        grant's successor. Switch safety copies also live here, so callers
+        classify manifest metadata before attempting adoption. A transient
+        read failure is not evidence that a pending successor is absent.
 
         A genuinely ABSENT entry, or one that exists but is CORRUPT
         (undecodable base64 -- its bytes are unrecoverable, not merely

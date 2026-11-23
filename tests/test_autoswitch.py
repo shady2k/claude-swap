@@ -193,6 +193,49 @@ def harness(temp_home: Path) -> EngineHarness:
     return h
 
 
+@pytest.mark.parametrize("error", ["stash-unreadable", "profile-busy"])
+@pytest.mark.parametrize("backoff", [False, True])
+def test_poll_reports_recovery_blocker_with_retained_usage(temp_home, error, backoff):
+    from dataclasses import replace
+    from claude_swap.switcher import ERROR_NOTES
+
+    h = EngineHarness(temp_home)
+    h.seed(1, "a@example.com")
+    h.make_live("a@example.com", 1)
+    entry = replace(
+        _entry_for(_usage7(25, 10), h.clock.now),
+        last_error=error,
+        backoff_until=h.clock.now + 600 if backoff else None,
+    )
+    h.tick_with_entries({"1": entry})
+    poll = next(event for event in h.events if isinstance(event, PollEvent))
+    assert poll.to_json()["fetchErrors"] == {"1": error}
+    assert "25% used" in poll.human()
+    assert ERROR_NOTES[error] in poll.human()
+    assert entry.last_good == _usage7(25, 10)
+    assert not any(isinstance(event, QuarantineEvent) for event in h.events)
+    if error == "stash-unreadable":
+        assert "cswap unclaimed --purge ID" in poll.human()
+    else:
+        assert "log in again" not in poll.human()
+        assert "cswap add" not in poll.human()
+
+
+def test_freshen_reports_busy_profile_without_login_recovery(temp_home):
+    from claude_swap import oauth as oauth_mod
+    from claude_swap.autoswitch import _SYSTEMIC_MESSAGES
+
+    h = EngineHarness(temp_home)
+    h.seed(2, "b@example.com", expires_at=1)
+    with patch.object(
+        h.switcher, "consume_backup_grant",
+        return_value=oauth_mod.RefreshOutcome(None, "profile-busy"),
+    ):
+        assert h.engine._freshen_target("2", "b@example.com") == "profile-busy"
+    assert "log in again" not in _SYSTEMIC_MESSAGES["profile-busy"]
+    assert "cswap add" not in _SYSTEMIC_MESSAGES["profile-busy"]
+
+
 class TestEngineHarnessIsolation:
     """Pins the guarantee `EngineHarness.__init__`'s per-instance isolation
     exists for (see its docstring): two harnesses built against the SAME
@@ -2618,10 +2661,8 @@ class TestTokenIdentity:
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 3
 
-    def test_dead_slot_quarantined_even_with_safety_copy_present(self, harness):
-        """No automatic promotion (fail-open rework of the issue #117 guard):
-        a dead slot is quarantined outright; safety copies are forensic
-        material, and recovery is the documented /login + cswap add."""
+    def test_unproven_stash_blocks_refresh_without_quarantining_slot(self, harness):
+        """An unattributed stash blocks refresh without proving the token dead."""
         harness.switcher._store._write_unclaimed_credential(
             json.dumps({"claudeAiOauth": {
                 "accessToken": "sk-2-successor",
@@ -2629,8 +2670,7 @@ class TestTokenIdentity:
                 "expiresAt": 99_999_999_999_000,
             }}),
             {"resolvedIdentity": {
-                "uuid": "uuid-2", "email": "b@example.com",
-                "organizationUuid": "",
+                "uuid": "uuid-2", "email": "b@example.com", "organizationUuid": "",
             }},
         )
         harness.switcher._write_account_credentials(
@@ -2650,10 +2690,51 @@ class TestTokenIdentity:
         with patch(
             "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
             side_effect=refresh,
-        ):
+        ) as refresh_call:
             outcome = harness.tick_with_usage({
                 "1": _usage(95), "2": _usage(10), "3": _usage(80),
             })
+        refresh_call.assert_not_called()
+        q = harness.state().get("quarantine", {})
+        assert "2" not in q
+        # The safety copy was not consumed, and the switch landed elsewhere.
+        assert len(harness.switcher.list_unclaimed_credentials()) == 1
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+
+    def test_dead_slot_quarantined_even_with_safety_copy_present(self, harness):
+        """A normal safety copy does not block refresh or dead-token quarantine."""
+        harness.switcher._stash_live_credential(
+            json.dumps({"claudeAiOauth": {
+                "accessToken": "sk-2-successor",
+                "refreshToken": "rt-2-successor",
+                "expiresAt": 99_999_999_999_000,
+            }}),
+            "foreign", "1",
+            {"uuid": "uuid-2", "email": "b@example.com", "organizationUuid": ""},
+        )
+        harness.switcher._write_account_credentials(
+            "2", "b@example.com",
+            json.dumps({"claudeAiOauth": {
+                "accessToken": "sk-2-dead", "refreshToken": "rt-2-dead",
+                "expiresAt": 0,
+            }}),
+        )
+
+        def refresh(creds):
+            data = json.loads(creds)["claudeAiOauth"]
+            if data["refreshToken"] == "rt-2-dead":
+                return oauth.RefreshOutcome(None, "invalid_grant")
+            return oauth.RefreshOutcome(creds, None)
+
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            side_effect=refresh,
+        ) as refresh_call:
+            outcome = harness.tick_with_usage({
+                "1": _usage(95), "2": _usage(10), "3": _usage(80),
+            })
+        refresh_call.assert_called_once()
         q = harness.state().get("quarantine", {})
         assert q.get("2", {}).get("reason") == "invalid_grant"
         # The safety copy was not consumed, and the switch landed elsewhere.

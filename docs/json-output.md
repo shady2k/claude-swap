@@ -49,3 +49,5 @@ The two projections stay `--json`-only, since a linear projection is too rough t
 ## `cswap auto --json`
 
 `cswap auto --json` emits an event stream instead: one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}`) with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `error`. The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
+
+A `poll` event may include `fetchErrors`, keyed by slot number. It reports failures for unknown usage, and also `stash-unreadable` or `profile-busy` blockers alongside retained usage. These blockers remain visible during retry backoff; they do not erase `headroomPct` or `windowsPct` from a last-good reading.

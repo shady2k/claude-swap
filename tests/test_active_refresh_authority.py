@@ -34,7 +34,7 @@ def active(temp_home, monkeypatch):
         return oauth.UsageOutcome({"ok": True})
     monkeypatch.setattr(oauth, "try_fetch_usage_for_account", usage)
     calls = []
-    def refresh(value, timeout_s):
+    def refresh(value, timeout_s=10.0):
         calls.append((value, timeout_s))
         return oauth.RefreshOutcome(credential("successor"), None)
     monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", refresh)
@@ -333,7 +333,7 @@ def test_existing_profile_owner_refuses_active_post(active, monkeypatch, state):
     # records as busy; active recovery must honor that verdict before POST.
     monkeypatch.setattr(profile_ownership, "profile_busy_locked", lambda *a, **k: True)
     result = switcher._fetch_active_usage("1", EMAIL, old)
-    assert result.error == "ownership-lost"
+    assert result.error == "profile-busy"
     assert calls == []
 
 
@@ -560,7 +560,10 @@ def test_active_stash_controls_preserve_copies(active, monkeypatch, control):
         stash(switcher, backup, credential("different-successor"))
     entries = switcher.list_unclaimed_credentials()
     result = switcher._fetch_active_usage("1", EMAIL, live)
-    assert result.error in {"ownership-lost", "stash-unreadable"}
+    if control == "owner":
+        assert result.error == "profile-busy"
+    else:
+        assert result.error in {"ownership-lost", "stash-unreadable"}
     assert not calls
     assert switcher._read_credentials() == live
     assert switcher._read_account_credentials("1", EMAIL) == backup
@@ -809,3 +812,78 @@ def test_expiry_order_is_not_refresh_authority(active, shape):
     assert not calls
     assert switcher._read_credentials() == live
     assert switcher._read_account_credentials("1", EMAIL) == backup
+
+
+@pytest.mark.parametrize("path", ["active", "backup"])
+@pytest.mark.parametrize("state", ["orphan", "unknown-row", "bad-row", "unreadable-manifest", "scan-failed"])
+def test_shared_stash_guard_preserves_local_state(active, monkeypatch, path, state):
+    switcher, calls = active
+    b = Snapshot(credential("B"))
+    switcher._write_credentials(b)
+    switcher._write_account_credentials("1", EMAIL, b)
+    store = switcher._store
+    if state == "orphan":
+        store._atomic_b64_write(store._stash_entry_path("synthetic-orphan"), credential("pending"))
+    elif state == "unknown-row":
+        store._write_unclaimed_credential(credential("pending"), {"configSlot": "1"})
+    elif state == "bad-row":
+        store._write_stash_manifest({"synthetic-invalid": []})
+    elif state == "unreadable-manifest":
+        monkeypatch.setattr(store, "_read_stash_manifest_ex", lambda: ({}, "unreadable"))
+    else:
+        monkeypatch.setattr(store, "_stash_entry_files_exist", lambda **kw: True)
+    paths = list(switcher.credentials_dir.glob(".unclaimed-*"))
+    before = {p: p.read_bytes() for p in paths}
+    if path == "active":
+        result = switcher._fetch_active_usage("1", EMAIL, b)
+    else:
+        result = switcher.consume_backup_grant("1", EMAIL, switcher.credential_snapshot("1", EMAIL))
+    assert result.error == "stash-unreadable"
+    assert not calls
+    assert switcher._read_credentials() == b
+    assert switcher._read_account_credentials("1", EMAIL) == b
+    assert {p: p.read_bytes() for p in paths} == before
+
+
+@pytest.mark.parametrize("path", ["active", "backup"])
+@pytest.mark.parametrize("reason", [
+    "displaced-live-login", "foreign", "alien", "known-foreign",
+    "setup-token-mismatch", "api-key-mismatch",
+])
+def test_switch_safety_copy_does_not_block_refresh(active, path, reason):
+    switcher, calls = active
+    b = Snapshot(credential("B"))
+    switcher._write_credentials(b)
+    switcher._write_account_credentials("1", EMAIL, b)
+    entry = switcher._stash_live_credential(b, reason, "1", None)
+    before = switcher._store._stash_entry_path(entry).read_bytes()
+    if path == "backup":
+        data = switcher._read_json(switcher.sequence_file)
+        data["activeAccountNumber"] = None
+        switcher._write_json(switcher.sequence_file, data)
+        switcher._write_credentials(credential("another-account"))
+    if path == "active":
+        result = switcher._fetch_active_usage("1", EMAIL, b)
+        assert result.usage == {"ok": True}
+        assert switcher._read_credentials() == credential("successor")
+    else:
+        result = switcher.consume_backup_grant("1", EMAIL, switcher.credential_snapshot("1", EMAIL))
+        assert result.error is None
+        assert result.credentials == credential("successor")
+    assert len(calls) == 1
+    assert switcher._read_account_credentials("1", EMAIL) == credential("successor")
+    assert switcher._store._stash_entry_path(entry).read_bytes() == before
+    assert entry in switcher.list_unclaimed_credentials()
+
+
+def test_failed_stash_publication_logs_slot_and_entry_without_credentials(active, monkeypatch, caplog):
+    switcher, _ = active
+    def fail(*args):
+        raise OSError("synthetic publication failure")
+    monkeypatch.setattr(switcher._store, "_write_stash_manifest", fail)
+    with pytest.raises(OSError):
+        switcher._store._write_unclaimed_credential(credential("secret-pending"), {"configSlot": "1"})
+    entry = next(iter(switcher.list_unclaimed_credentials()))
+    assert "account 1" in caplog.text
+    assert entry in caplog.text
+    assert "secret-pending" not in caplog.text

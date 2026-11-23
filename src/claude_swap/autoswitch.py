@@ -66,7 +66,7 @@ from claude_swap.settings import (
     log_unrecognized_keys,
     parse_model_names,
 )
-from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.switcher import ERROR_NOTES, ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
@@ -89,9 +89,8 @@ _SYSTEMIC_MESSAGES = {
                         "run cswap from a normal shell",
     "invalid_client": "cswap's OAuth client was rejected — systemic, not this "
                       "account",
-    "stash-unreadable": "a stashed successor is unreadable — unlock the "
-                        "keychain or fix the file, then retry; "
-                        "`cswap unclaimed` inspects it",
+    "stash-unreadable": ERROR_NOTES["stash-unreadable"],
+    "profile-busy": ERROR_NOTES["profile-busy"],
     "consume-busy": "another cswap surface holds the slot — retries next pass",
 }
 # Insertion order IS the precedence order, so the remedy and its rank cannot
@@ -263,7 +262,8 @@ class PollEvent(AutoSwitchEvent):
     headroom: dict[str, float | None]  # account number → headroom pct (None=unknown)
     threshold: float
     # account number → last fetch-error cause ("http-429", "timeout", ...) for
-    # accounts whose usage is unknown this tick. Additive field.
+    # accounts whose usage is unknown this tick, plus stash recovery blockers
+    # even when a last-good reading is retained. Additive field.
     fetch_errors: dict[str, str] = field(default_factory=dict)
     # account number → ordered window label → utilization pct ("5h", "7d",
     # then scoped model display names). Additive field: the binding pct alone
@@ -330,9 +330,14 @@ class PollEvent(AutoSwitchEvent):
             if n != str(num)
         )
         tail = f" | others: {others}" if others else ""
+        recovery = "".join(
+            f" | Account-{number}: {ERROR_NOTES[error]}"
+            for number, error in self.fetch_errors.items()
+            if error in ("stash-unreadable", "profile-busy")
+        )
         return (
             f"Account-{num} ({self.active.get('email')}): {used} "
-            f"(switch at {pct_label(line)}%){tail}"
+            f"(switch at {pct_label(line)}%){tail}{recovery}"
         )
 
 
@@ -1158,7 +1163,10 @@ class AutoSwitchEngine:
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
-                    if usage.get(num) is None and entry.last_error
+                    if entry.last_error and (
+                        usage.get(num) is None
+                        or entry.last_error in ("stash-unreadable", "profile-busy")
+                    )
                 },
                 windows={
                     num: pcts
