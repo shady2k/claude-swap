@@ -5698,7 +5698,7 @@ class TestRefreshReservationWait:
         monkeypatch.setattr(refresh_authority, "consume_lock", busy_right)
         monkeypatch.setattr(session_mod, "FileLock",
                             lambda *a, **k: pytest.fail("account lock before refresh right"))
-        with pytest.raises(LockError, match="refresh still running"):
+        with pytest.raises(SessionError, match="Login refresh in progress"):
             with manager._reserve_profile(ACCOUNT_NUM):
                 pytest.fail("reservation admitted during refresh")
         assert not (manager.switcher.backup_dir / "profile-ownership" / "launches").exists()

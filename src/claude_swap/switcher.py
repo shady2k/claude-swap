@@ -4961,7 +4961,15 @@ class ClaudeAccountSwitcher:
         store under the account and Claude credential locks. Its refresh
         POST holds those locks for at most six seconds to serialize with
         Claude's default-login rotation. Ownership-state work runs only
-        after those locks are released. Fresh usage may resync an attributed
+        after those locks are released. Recovery selects backup when identical
+        to live or later-expiring with live still matching the snapshot; a
+        sole readable copy requires the other store to be confirmed empty.
+        The selected fingerprint keys both POST and failed-write stash. Each
+        write checks its own locked store observation. Identity/generation-
+        scoped stash metadata and successor bytes can prove a partial write
+        even when the selected copy already contains that successor; both
+        stores must be saved before retiring the stash. Unproven divergence
+        defers without writes or POST. Fresh usage may resync an attributed
         rotation through ``_resync_rotated_backup``.
         """
         oauth_data = oauth.extract_oauth_data(creds)
@@ -5104,39 +5112,53 @@ class ClaudeAccountSwitcher:
                     live_fp = oauth.credential_fingerprint(live) if live else None
                     backup_fp = oauth.credential_fingerprint(backup) if backup else None
                     snapshot_fp = oauth.credential_fingerprint(creds)
-                    if live and live_fp not in {backup_fp, snapshot_fp}:
-                        return FetchRecord(error="ownership-lost")
-
-                    def persist_successor(num: str, address: str, value: str) -> None:
-                        nonlocal saved_backup
-                        self._store._write_account_credentials(num, address, value)
-                        saved_backup = True
-                        self._write_credentials(value)
-
-                    # A failed persist can leave either store on the spent
-                    # input. Complete both writes before retiring its stash.
+                    # Select once from the locked observations. A stash can also
+                    # prove that one of these copies is an already saved successor.
+                    refresh_input = backup or live
+                    consumed_fp = oauth.credential_fingerprint(refresh_input) if refresh_input else None
+                    live_expiry = (oauth.extract_oauth_data(live) or {}).get("expiresAt") or 0
+                    backup_expiry = (oauth.extract_oauth_data(backup) or {}).get("expiresAt") or 0
+                    input_allowed = (
+                        not live or not backup or live_fp == backup_fp
+                        or backup_expiry > live_expiry
+                    )
                     try:
-                        successor = self._adopt_stashed_successor(
-                            account_num, email, live or backup or creds,
-                            persist=persist_successor, require_successor=True,
+                        successor = self._active_stashed_successor(
+                            account_num, expected_identity, generation,
+                            consumed_fp, live_fp, backup_fp, snapshot_fp,
+                            input_allowed,
                         )
                     except CredentialReadError:
                         return FetchRecord(error="stash-unreadable")
-                    if not successor and live and backup and live_fp != backup_fp:
-                        live_expiry = (oauth.extract_oauth_data(live) or {}).get("expiresAt") or 0
-                        backup_expiry = (oauth.extract_oauth_data(backup) or {}).get("expiresAt") or 0
-                        if backup_expiry <= live_expiry:
-                            return FetchRecord(error="ownership-lost")
                     if not successor:
-                        # A later expiry on a same-generation backup is the
-                        # existing rotation-precedence signal. Equal or older
-                        # backup bytes do not justify consuming over live bytes.
-                        refresh_input = backup or live or (
-                            creds if getattr(creds, "login_gen", None) is not None else ""
-                        )
+                        if live and live_fp not in {backup_fp, snapshot_fp}:
+                            return FetchRecord(error="ownership-lost")
+                        if not input_allowed:
+                            return FetchRecord(error="ownership-lost")
+
+                    def persist_successor(value: str) -> None:
+                        nonlocal saved_backup
+                        # Each store is guarded by its own locked observation,
+                        # not by the selected POST input (which may differ).
+                        current_backup, failed = self._read_account_credentials_ex(account_num, email)
+                        current_live = self._read_active_credentials()
+                        if (failed or current_live.value is None
+                                or current_live.keychain_unavailable or current_live.degraded
+                                or current_backup != backup or current_live.value != live):
+                            raise CredentialReadError("active refresh stores changed")
+                        self._store._write_account_credentials(account_num, email, value)
+                        saved_backup = True
+                        self._write_credentials(value)
+
+                    if successor:
+                        value, entry_ids = successor
+                        persist_successor(value)
+                        for entry_id in entry_ids:
+                            self._retire_stash_entry(entry_id, account_num)
+                        successor = value
+                    else:
                         if not (oauth.extract_oauth_data(refresh_input) or {}).get("refreshToken"):
                             return FetchRecord(error="no_refresh_token")
-                        consumed_fp = oauth.credential_fingerprint(refresh_input)
                         # Claude rotates the default login under this same lock.
                         # This bounded POST is the active-recovery exception to
                         # the rule against network I/O under the account lock.
@@ -5149,11 +5171,7 @@ class ClaudeAccountSwitcher:
                         try:
                             # Pure persistence here: the switcher wrapper takes
                             # ownership state, which must never follow account.
-                            self._store._write_account_credentials(
-                                account_num, email, successor
-                            )
-                            saved_backup = True
-                            self._write_credentials(successor)
+                            persist_successor(successor)
                         except Exception:
                             self._store._write_unclaimed_credential(successor, {
                                 "reason": "active-refresh-persist-failed",
@@ -5188,6 +5206,71 @@ class ClaudeAccountSwitcher:
             usage=outcome.usage, error=outcome.error,
             retry_after_s=outcome.retry_after_s,
         )
+
+    def _active_stashed_successor(
+        self, account_num, identity, generation, selected_fp,
+        live_fp, backup_fp, snapshot_fp, input_allowed,
+    ):
+        """Resolve a pending active rotation, including either partial write.
+
+        A consumed-input match authorizes recovery only against the snapshot
+        or identical copies. A saved-successor match proves the partial write
+        when the other copy is the consumed input or the collected snapshot.
+        Read all applicable rows before writing: conflicting successors defer.
+        """
+        manifest, verdict = self._store._read_stash_manifest_ex()
+        if verdict == "unreadable" or (
+            verdict == "corrupt" and self._store._stash_entry_files_exist()
+        ):
+            raise CredentialReadError("active successor manifest unavailable")
+        candidates = {}
+        entries = []
+        for entry_id, meta in manifest.items():
+            consumed = meta.get("consumedFp")
+            saved = meta.get("fingerprint")
+            input_match = selected_fp and consumed == selected_fp
+            partial = saved and (
+                live_fp == backup_fp == saved
+                or (live_fp == saved and backup_fp in {consumed, snapshot_fp, None})
+                or (backup_fp == saved and live_fp in {consumed, snapshot_fp, None})
+            )
+            if not input_match and not partial and saved:
+                continue
+            if not isinstance(meta.get("identity"), dict):
+                if input_match or partial:
+                    raise CredentialReadError("active successor has no identity")
+                continue
+            if (not refresh_authority.same_identity(meta["identity"], identity)
+                    or meta.get("loginGen") != generation):
+                continue
+            value, unreadable = self._store._read_unclaimed_credential(entry_id)
+            if unreadable or not value:
+                if input_match or partial or (not saved and consumed in {live_fp, backup_fp}):
+                    raise CredentialReadError("active successor bytes unavailable")
+                continue
+            fp = oauth.credential_fingerprint(value)
+            if not fp or (saved and saved != fp):
+                raise CredentialReadError("active successor fingerprint mismatch")
+            # Older stash rows may omit fingerprint; their readable bytes
+            # still prove the saved-successor side of a partial write.
+            partial = (
+                live_fp == backup_fp == fp
+                or (live_fp == fp and backup_fp in {consumed, snapshot_fp, None})
+                or (backup_fp == fp and live_fp in {consumed, snapshot_fp, None})
+            )
+            if not partial and not input_match:
+                continue
+            if not partial and (not input_allowed or (
+                live_fp and live_fp not in {backup_fp, snapshot_fp}
+            )):
+                raise CredentialReadError("unproven active successor relationship")
+            candidates[fp] = value
+            entries.append(entry_id)
+        if len(candidates) > 1:
+            raise CredentialReadError("ambiguous active successors")
+        if candidates:
+            return next(iter(candidates.values())), entries
+        return None
 
     def _resync_rotated_backup(
         self, account_num: str, email: str, org_uuid: str, creds: str
@@ -5501,13 +5584,21 @@ class ClaudeAccountSwitcher:
         )
 
     def _refresh_usage_backup(
-        self, account_num: str, email: str, _display_credentials: str,
+        self, account_num: str, email: str, display_credentials: str,
     ) -> "oauth.RefreshOutcome":
         """Acquire fresh authority lazily; display-cache bytes never authorize POST."""
         try:
             snapshot = self.credential_snapshot(account_num, email)
         except Exception:
             return oauth.RefreshOutcome(None, error="unreadable")
+        if (
+            (oauth.extract_oauth_data(snapshot) or {}).get("accessToken")
+            and oauth.credential_fingerprint(snapshot) != oauth.credential_fingerprint(display_credentials)
+            and not oauth.is_oauth_token_expired(
+                (oauth.extract_oauth_data(snapshot) or {}).get("expiresAt")
+            )
+        ):
+            return oauth.RefreshOutcome(snapshot, None)
         return self.consume_backup_grant(account_num, email, snapshot)
 
     def _read_only_fetch(
@@ -7939,10 +8030,15 @@ class ClaudeAccountSwitcher:
                     self._write_account_config(
                         current_account, current_email, original_config
                     )
-                    self._logger.info(
-                        f"Backed up account {current_account} (config only; "
-                        "the stored setup-token was kept)"
+                    msg = (
+                        f"Backed up Account-{current_account} config only; "
+                        "the stored setup-token was kept. The different live "
+                        "login was preserved in unclaimed credentials."
                     )
+                    if emit_output:
+                        warning(msg)
+                    else:
+                        warnings_out.append(msg)
                 elif kind == "api-key-mismatch":
                     # The slot stores a Console key and the live bytes are
                     # not one, so they are never its backup. An item holding

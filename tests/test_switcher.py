@@ -1566,7 +1566,7 @@ class TestFetchAccountUsageFromAnotherProfile:
 
         assert record.usage == {"five_hour": {"pct": 5}}
         refresh = mock_fetch.call_args.kwargs["refresh_via"]
-        snapshot = object()
+        snapshot = _oauth_creds("sk-current-idle", -3600)
         with patch.object(switcher, "credential_snapshot", return_value=snapshot) as capture, \
                 patch.object(switcher, "consume_backup_grant") as consume:
             refresh("3", "idle@example.com", expired)
@@ -6608,7 +6608,8 @@ class TestProvenanceGuard:
         profile = {"email": "test@example.com", "uuid": sample_sequence_data["accounts"]["1"].get("uuid"), "organizationUuid": ""} if resolved else None
         try:
             with patch("claude_swap.oauth.try_refresh_oauth_credentials") as refresh, patch("claude_swap.oauth.fetch_usage") as usage:
-                self._run_switch(switcher, resolver=profile)
+                result = self._run_switch(switcher, resolver=profile)
+            assert any("setup-token" in message and "config" in message for message in result["warnings"])
             refresh.assert_not_called()
             usage.assert_not_called()
         finally:

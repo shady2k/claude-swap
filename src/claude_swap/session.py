@@ -771,6 +771,21 @@ class SessionManager:
             raise SessionError("Account identity changed during profile preparation")
 
     @contextmanager
+    def _reservation_refresh_right(self, root, email, org):
+        # Translate only admission failure, not errors from the reserved work.
+        right = refresh_authority.consume_lock(
+            root, email, org, timeout=_BOOTSTRAP_LOCK_TIMEOUT,
+        )
+        try:
+            right.__enter__()
+        except LockError as exc:
+            raise SessionError("Login refresh in progress; retry after it completes") from exc
+        try:
+            yield
+        finally:
+            right.__exit__(None, None, None)
+
+    @contextmanager
     def _reserve_profile(self, identifier: str, *, retain: bool = False):
         """Wait up to 30 seconds for refresh before locking account state."""
         if getattr(self, "_launch_reservation", None) is not None:
@@ -791,16 +806,16 @@ class SessionManager:
         profile = session_dir_for(root, num, email)
         # Wait outside the account lock so an in-flight refresh can persist
         # its successor. Keep the right until reservation is recorded.
-        with profile_ownership.ownership_lock(root), refresh_authority.consume_lock(
-            root, email, org, timeout=_BOOTSTRAP_LOCK_TIMEOUT,
-        ), FileLock(self.switcher.lock_file):
-            if self.switcher.resolve_account(identifier) != (num, email, org):
-                raise SessionError("Account identity changed before profile reservation")
-            recipient_identity = self._profile_recipient_identity(num)
-            record = profile_ownership.reserve_locked(
-                root, num, profile, warming=True, refresh_right_held=True,
-            )
-            record["recipientIdentity"] = recipient_identity
+        with profile_ownership.ownership_lock(root):
+            with self._reservation_refresh_right(root, email, org):
+                with FileLock(self.switcher.lock_file):
+                    if self.switcher.resolve_account(identifier) != (num, email, org):
+                        raise SessionError("Account identity changed before profile reservation")
+                    recipient_identity = self._profile_recipient_identity(num)
+                    record = profile_ownership.reserve_locked(
+                        root, num, profile, warming=True, refresh_right_held=True,
+                    )
+                    record["recipientIdentity"] = recipient_identity
         self._launch_reservation = record
         self._launch_published = False
         succeeded = False

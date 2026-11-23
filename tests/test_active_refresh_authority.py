@@ -92,7 +92,7 @@ def test_active_retry_after_live_persist_failure(active, monkeypatch):
     assert switcher._read_credentials() == credential("successor")
 
 
-@pytest.mark.parametrize("source", ["live", "backup", "snapshot", "stale-live"])
+@pytest.mark.parametrize("source", ["live", "backup", "stale-live"])
 def test_active_refresh_uses_locked_source(active, source):
     switcher, calls = active
     original = Snapshot(credential("collected"))
@@ -329,3 +329,250 @@ def test_existing_profile_owner_refuses_active_post(active, monkeypatch, state):
     result = switcher._fetch_active_usage("1", EMAIL, old)
     assert result.error == "ownership-lost"
     assert calls == []
+
+
+@pytest.mark.parametrize("shape", ["live-older", "equal", "only-live", "only-backup"])
+@pytest.mark.parametrize("failed_store", ["backup", "live"])
+def test_stale_live_retry_consumes_selected_grant_once(active, monkeypatch, failed_store, shape):
+    switcher, calls = active
+    live = Snapshot(credential("A"))
+    payload = json.loads(credential("B"))
+    payload["claudeAiOauth"]["expiresAt"] = 2000
+    backup = json.dumps(payload)
+    if shape in {"equal", "only-live"}:
+        live = Snapshot(backup)
+    stored_live = "" if shape == "only-backup" else live
+    stored_backup = "" if shape == "only-live" else backup
+    switcher._write_credentials(stored_live)
+    if stored_backup:
+        switcher._write_account_credentials("1", EMAIL, stored_backup)
+    with monkeypatch.context() as failure:
+        def fail(*args):
+            raise OSError("synthetic persist failure")
+        if failed_store == "backup":
+            failure.setattr(switcher._store, "_write_account_credentials", fail)
+        else:
+            failure.setattr(switcher, "_write_credentials", fail)
+        assert switcher._fetch_active_usage("1", EMAIL, live).error == "transient"
+    assert switcher.list_unclaimed_credentials()
+    result = switcher._fetch_active_usage("1", EMAIL, live)
+    assert result.usage == {"ok": True}
+    assert [json.loads(value)["claudeAiOauth"]["refreshToken"] for value, _ in calls] == ["B-refresh"]
+    assert switcher._read_credentials() == credential("successor")
+    assert switcher._read_account_credentials("1", EMAIL) == credential("successor")
+    assert not switcher.list_unclaimed_credentials()
+
+
+def aged(name, expiry=1000):
+    value = json.loads(credential(name))
+    value["claudeAiOauth"]["expiresAt"] = expiry
+    return json.dumps(value)
+
+
+def stash(switcher, consumed, successor=None, **overrides):
+    successor = successor or credential("successor")
+    meta = {
+        "reason": "active-refresh-persist-failed", "configSlot": "1",
+        "identity": Snapshot.identity, "loginGen": 0,
+        "consumedFp": oauth.credential_fingerprint(consumed),
+        "fingerprint": oauth.credential_fingerprint(successor),
+    }
+    meta.update(overrides)
+    return switcher._store._write_unclaimed_credential(successor, meta)
+
+
+@pytest.mark.parametrize("shape", ["equal", "live-older", "backup-older", "equal-expiry", "only-live", "only-backup"])
+@pytest.mark.parametrize("pending", [False, True])
+def test_active_acceptance_matrix(active, monkeypatch, shape, pending):
+    switcher, calls = active
+    c = aged("successor", 9999999999999)
+    def refresh(value, timeout_s):
+        calls.append((value, timeout_s))
+        return oauth.RefreshOutcome(c, None)
+    monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", refresh)
+    b = aged("B", 2000)
+    pairs = {
+        "equal": (b, b), "live-older": (aged("A"), b),
+        "backup-older": (b, aged("A")),
+        "equal-expiry": (aged("A", 2000), b),
+        "only-live": (b, ""), "only-backup": ("", b),
+    }
+    live, backup = pairs[shape]
+    snapshot = Snapshot(live or backup)
+    switcher._write_credentials(live)
+    if backup:
+        switcher._write_account_credentials("1", EMAIL, backup)
+    allowed = shape not in {"backup-older", "equal-expiry"}
+    if pending:
+        stash(switcher, b, c)
+    for _ in range(2):
+        result = switcher._fetch_active_usage("1", EMAIL, snapshot)
+        if allowed:
+            assert result.usage == {"ok": True}
+            # A new collection sees the committed live credential.
+            snapshot = Snapshot(c)
+        else:
+            assert result.error in {"ownership-lost", "stash-unreadable"}
+    if allowed:
+        assert switcher._read_credentials() == c
+        assert switcher._read_account_credentials("1", EMAIL) == c
+        assert not switcher.list_unclaimed_credentials()
+    else:
+        assert switcher._read_credentials() == live
+        assert switcher._read_account_credentials("1", EMAIL) == backup
+        assert bool(switcher.list_unclaimed_credentials()) == pending
+    assert [json.loads(v)["claudeAiOauth"]["refreshToken"] for v, _ in calls] == ([] if pending or not allowed else ["B-refresh"])
+
+
+@pytest.mark.parametrize("missing", ["live", "backup", "both"])
+def test_active_missing_or_unreadable_source_defers(active, monkeypatch, missing):
+    switcher, calls = active
+    snapshot = Snapshot(credential("B"))
+    if missing == "live":
+        switcher._write_account_credentials("1", EMAIL, snapshot)
+        # Reuse the concrete reader result shape, including Keychain status.
+        read = switcher._read_active_credentials()
+        monkeypatch.setattr(switcher, "_read_active_credentials", lambda: read._replace(value=None))
+    elif missing == "backup":
+        switcher._write_credentials(snapshot)
+        monkeypatch.setattr(switcher, "_read_account_credentials_ex", lambda *a: ("", True))
+    result = switcher._fetch_active_usage("1", EMAIL, snapshot)
+    assert result.error in {"unreadable", "no_refresh_token"}
+    assert not calls
+
+
+@pytest.mark.parametrize("fault", ["manifest", "bytes"])
+@pytest.mark.parametrize("failed_store", ["backup", "live"])
+def test_stale_live_unreadable_stash_recovers(active, monkeypatch, fault, failed_store):
+    switcher, calls = active
+    live, backup = Snapshot(aged("A")), aged("B", 2000)
+    switcher._write_credentials(live)
+    switcher._write_account_credentials("1", EMAIL, backup)
+    with monkeypatch.context() as failure:
+        def fail(*args):
+            raise OSError("synthetic failure")
+        failure.setattr(switcher._store if failed_store == "backup" else switcher,
+                        "_write_account_credentials" if failed_store == "backup" else "_write_credentials", fail)
+        assert switcher._fetch_active_usage("1", EMAIL, live).error == "transient"
+    before = (switcher._read_credentials(), switcher._read_account_credentials("1", EMAIL))
+    entries = switcher.list_unclaimed_credentials()
+    with monkeypatch.context() as failure:
+        if fault == "manifest":
+            failure.setattr(switcher._store, "_read_stash_manifest_ex", lambda: ({}, "unreadable"))
+        else:
+            failure.setattr(switcher._store, "_read_unclaimed_credential", lambda *a: ("", True))
+        assert switcher._fetch_active_usage("1", EMAIL, live).error == "stash-unreadable"
+    assert before == (switcher._read_credentials(), switcher._read_account_credentials("1", EMAIL))
+    assert switcher.list_unclaimed_credentials() == entries
+    assert switcher._fetch_active_usage("1", EMAIL, live).usage == {"ok": True}
+    assert len(calls) == 1
+    assert switcher._read_credentials() == credential("successor")
+    assert switcher._read_account_credentials("1", EMAIL) == credential("successor")
+    assert not switcher.list_unclaimed_credentials()
+
+
+@pytest.mark.parametrize("saved_store", ["live", "backup"])
+def test_partial_completion_with_older_backup_or_equal_expiry(active, saved_store):
+    switcher, calls = active
+    b, c = aged("B", 2000), aged("successor", 2000)
+    live, backup = (c, b) if saved_store == "live" else (aged("A", 3000), c)
+    switcher._write_credentials(live)
+    switcher._write_account_credentials("1", EMAIL, backup)
+    stash(switcher, b, c)
+    assert switcher._fetch_active_usage("1", EMAIL, Snapshot(live)).usage == {"ok": True}
+    assert not calls
+    assert switcher._read_credentials() == c
+    assert switcher._read_account_credentials("1", EMAIL) == c
+    assert not switcher.list_unclaimed_credentials()
+
+
+@pytest.mark.parametrize("control", ["identity", "generation", "owner", "ambiguous", "fingerprint"])
+def test_active_stash_controls_preserve_copies(active, monkeypatch, control):
+    from claude_swap import profile_ownership
+    switcher, calls = active
+    live, backup = Snapshot(aged("A", 3000)), aged("B", 2000)
+    switcher._write_credentials(live)
+    switcher._write_account_credentials("1", EMAIL, backup)
+    overrides = {}
+    if control == "identity":
+        overrides["identity"] = {"email": "foreign@example.com"}
+    if control == "generation":
+        overrides["loginGen"] = 1
+    if control == "fingerprint":
+        overrides["fingerprint"] = "mismatch"
+    stash(switcher, backup, **overrides)
+    if control == "owner":
+        monkeypatch.setattr(profile_ownership, "profile_busy_locked", lambda *a, **k: True)
+    if control == "ambiguous":
+        stash(switcher, backup, credential("different-successor"))
+    entries = switcher.list_unclaimed_credentials()
+    result = switcher._fetch_active_usage("1", EMAIL, live)
+    assert result.error in {"ownership-lost", "stash-unreadable"}
+    assert not calls
+    assert switcher._read_credentials() == live
+    assert switcher._read_account_credentials("1", EMAIL) == backup
+    assert switcher.list_unclaimed_credentials() == entries
+
+
+def test_lazy_backup_refresh_returns_fresh_store_without_post(active):
+    switcher, calls = active
+    fresh = aged("S", 9999999999999)
+    switcher._write_account_credentials("1", EMAIL, fresh)
+    outcome = switcher._refresh_usage_backup("1", EMAIL, credential("D"))
+    assert outcome.credentials == fresh
+    assert not calls
+
+
+def test_both_saved_successors_retire_stash_without_network(active):
+    switcher, calls = active
+    b, c = credential("B"), credential("successor")
+    switcher._write_credentials(c)
+    switcher._write_account_credentials("1", EMAIL, c)
+    stash(switcher, b, c)
+    result = switcher._fetch_active_usage("1", EMAIL, Snapshot(b))
+    assert result.usage == {"ok": True}
+    assert not calls
+    assert switcher._read_credentials() == c
+    assert switcher._read_account_credentials("1", EMAIL) == c
+    assert not switcher.list_unclaimed_credentials()
+
+
+def test_partial_legacy_row_with_unreadable_bytes_never_posts(active, monkeypatch):
+    switcher, calls = active
+    b, c = credential("B"), credential("successor")
+    switcher._write_credentials(b)
+    switcher._write_account_credentials("1", EMAIL, c)
+    stash(switcher, b, c, fingerprint=None)
+    with monkeypatch.context() as fault:
+        fault.setattr(switcher._store, "_read_unclaimed_credential", lambda *a: ("", True))
+        assert switcher._fetch_active_usage("1", EMAIL, Snapshot(b)).error == "stash-unreadable"
+    assert not calls
+    assert switcher._read_credentials() == b
+    assert switcher._read_account_credentials("1", EMAIL) == c
+    assert switcher.list_unclaimed_credentials()
+    assert switcher._fetch_active_usage("1", EMAIL, Snapshot(b)).usage == {"ok": True}
+    assert not calls
+    assert switcher._read_credentials() == c
+    assert not switcher.list_unclaimed_credentials()
+
+
+@pytest.mark.parametrize("store", ["backup", "live"])
+def test_adoption_write_failure_preserves_stash_until_both_saved(active, monkeypatch, store):
+    switcher, calls = active
+    live, b = Snapshot(aged("A")), aged("B", 2000)
+    switcher._write_credentials(live)
+    switcher._write_account_credentials("1", EMAIL, b)
+    stash(switcher, b)
+    with monkeypatch.context() as fault:
+        def fail(*a):
+            raise OSError("synthetic adoption write failure")
+        fault.setattr(switcher._store if store == "backup" else switcher,
+                      "_write_account_credentials" if store == "backup" else "_write_credentials", fail)
+        assert switcher._fetch_active_usage("1", EMAIL, live).error == "transient"
+    assert not calls
+    assert switcher.list_unclaimed_credentials()
+    assert switcher._fetch_active_usage("1", EMAIL, live).usage == {"ok": True}
+    assert not calls
+    assert switcher._read_credentials() == credential("successor")
+    assert switcher._read_account_credentials("1", EMAIL) == credential("successor")
+    assert not switcher.list_unclaimed_credentials()
