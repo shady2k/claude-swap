@@ -3,6 +3,7 @@
 import hashlib
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,21 @@ def _executable(directory: Path, content: bytes = b"#!/bin/sh\nexit 0\n") -> Pat
     target.write_bytes(content)
     target.chmod(0o700)
     return target
+
+
+def _wait_for_new_change_time(probe: Path, previous: int) -> None:
+    """Wait until the filesystem reports a change time other than ``previous``.
+
+    A same-size edit with a restored mtime is visible only through
+    ``st_ctime_ns``, which the filesystem reports at its clock granularity
+    (1 ms on ext4). An edit inside the same tick leaves that field equal.
+    """
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        os.utime(probe)
+        if probe.stat().st_ctime_ns != previous:
+            return
+    raise AssertionError("filesystem change time did not advance")
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX links and permissions")
@@ -72,6 +88,9 @@ def test_fingerprint_and_probe_use_checked_realpath(tmp_path, monkeypatch):
     original = target.stat()
     digest = child.fingerprint()
     assert digest == hashlib.sha256(target.read_bytes()).hexdigest()
+    clock = tmp_path / "clock"
+    clock.touch()
+    _wait_for_new_change_time(clock, original.st_ctime_ns)
     target.write_bytes(b"#!/bin/sh\nexit 1\n")
     os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns))
     with pytest.raises(real_claude.ResolveError, match="changed after resolution"):
