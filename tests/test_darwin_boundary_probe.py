@@ -24,6 +24,8 @@ def test_job_configuration_is_single_run_synthetic_and_isolated(tmp_path):
     config = probe.configuration("unique-test-label", tmp_path, True)
     assert config["KeepAlive"] is False
     assert config["LaunchOnlyOnce"] is True
+    assert config["StandardOutPath"] == str(tmp_path / "stdout.log")
+    assert config["StandardErrorPath"] == str(tmp_path / "stderr.log")
     assert config["AbandonProcessGroup"] is False
     assert config["EnvironmentVariables"] == {
         "HOME": str(tmp_path / "home"), "PATH": "/usr/bin:/bin"}
@@ -45,7 +47,7 @@ def test_failed_bootstrap_never_opens_target_barrier(job_root, monkeypatch):
     calls = []
     def reject(*args):
         calls.append(args)
-        return Mock(returncode=5, stderr="synthetic failure")
+        return Mock(returncode=5, stdout="", stderr="synthetic failure")
     monkeypatch.setattr(probe, "launchctl", reject)
     try:
         with pytest.raises(RuntimeError, match="bootstrap failed"):
@@ -62,8 +64,33 @@ def test_cleanup_only_addresses_this_service(job_root, monkeypatch):
     assert first.label != second.label
     calls = []
     monkeypatch.setattr(probe, "launchctl", lambda *args: (
-        calls.append(args) or Mock(returncode=0)))
+        calls.append(args) or Mock(returncode=0, stdout="", stderr="")))
     first.submitted = True
     first.close()
     second.close()
     assert calls == [("bootout", first.service)]
+
+
+def test_barrier_timeout_records_service_and_target_logs(job_root, monkeypatch):
+    job = probe.Job(job_root, True)
+    job.listener.close()
+    job.listener = Mock()
+    job.listener.accept.side_effect = TimeoutError("synthetic timeout")
+    calls = []
+    def command(*args):
+        calls.append(args)
+        return Mock(returncode=0, stdout="state = exited; last exit code = 1", stderr="")
+    monkeypatch.setattr(probe, "launchctl", command)
+    (job.directory / "stderr.log").write_text("synthetic startup error")
+    try:
+        with pytest.raises(TimeoutError, match="synthetic timeout"):
+            job.start()
+        diagnostic = job.diagnostics()
+        assert diagnostic["logs"]["stderr.log"] == "synthetic startup error"
+        assert diagnostic["events"][1]["stage"] == "waiting for ready barrier"
+        assert diagnostic["events"][2]["stage"] == "ready barrier failed"
+        assert diagnostic["events"][3]["stdout"] == "state = exited; last exit code = 1"
+    finally:
+        job.close()
+    assert calls == [("bootstrap", job.domain, str(job.plist)),
+                     ("print", job.service), ("bootout", job.service)]
