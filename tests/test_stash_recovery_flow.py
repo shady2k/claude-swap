@@ -208,3 +208,38 @@ def test_401_publication_failure_is_visible_on_first_collection(recovery, monkey
         credential("C", expired=False), False,
     )
     assert switcher._read_account_credentials("1", EMAIL) == original
+
+
+def test_active_double_persistence_failure_logs_without_secrets(recovery, monkeypatch, caplog):
+    import logging
+
+    switcher, calls, now = recovery
+    def fail(*args, **kwargs):
+        raise OSError("synthetic storage unavailable")
+
+    monkeypatch.setattr(switcher._store, "_write_account_credentials", fail)
+    monkeypatch.setattr(switcher._store, "_write_unclaimed_credential", fail)
+    with caplog.at_level(logging.ERROR, logger="claude-swap"):
+        first = collect(switcher)
+    assert first.last_error == "stash-unreadable"
+    assert calls == ["B-refresh"]
+    records = [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert records and records[-1].exc_info
+    rendered = caplog.text
+    assert "fix credential storage" in rendered.lower()
+    assert "cswap unclaimed" not in rendered
+    for secret in ("B-access", "B-refresh", "C-access", "C-refresh"):
+        assert secret not in rendered
+
+
+def test_unclaimed_lists_malformed_row_without_crashing(recovery, monkeypatch, capsys):
+    from claude_swap import cli
+
+    switcher, _, _ = recovery
+    switcher._store._write_stash_manifest({"broken-row": ["not a row"]})
+    monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda **kwargs: switcher)
+    monkeypatch.setattr(cli, "_guard_root", lambda value: None)
+    cli._unclaimed_command([])
+    output = capsys.readouterr().out
+    assert "broken-row" in output
+    assert "invalid manifest row" in output
