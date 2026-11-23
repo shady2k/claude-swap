@@ -9,8 +9,9 @@ from claude_swap import profile_ownership as ownership
 
 @pytest.fixture
 def processes(monkeypatch):
-    monkeypatch.setattr(ownership, "process_start_ticks", lambda pid: "123")
-    monkeypatch.setattr(ownership, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(ownership, "_process_identity", lambda pid: ownership._ProcessIdentity(
+        "present", ownership._PosixStart("123"), "linux",
+    ))
 
 
 def test_reservation_is_external_and_busy(tmp_path, processes):
@@ -43,23 +44,27 @@ def test_running_record_tracks_child_identity(tmp_path, processes, monkeypatch):
     with ownership.ownership_lock(tmp_path):
         record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
         ownership.mark_running_locked(tmp_path, record["launchId"], 4242)
-        monkeypatch.setattr(ownership, "process_start_ticks", lambda pid: "999")
+        monkeypatch.setattr(ownership, "_process_identity", lambda pid: ownership._ProcessIdentity(
+            "present", ownership._PosixStart("999"), "linux",
+        ))
         assert ownership.profile_busy_locked(tmp_path, "1")
 
 
 def test_unknown_process_identity_is_busy(tmp_path, processes, monkeypatch):
     with ownership.ownership_lock(tmp_path):
         ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
-        monkeypatch.setattr(ownership, "process_start_ticks", lambda pid: None)
+        monkeypatch.setattr(ownership, "_process_identity", lambda pid: ownership._ProcessIdentity(
+            "present", None, "linux",
+        ))
         assert ownership.profile_busy_locked(tmp_path, "1")
-        monkeypatch.setattr(ownership, "_pid_alive", lambda pid: None)
+        monkeypatch.setattr(ownership, "_process_identity", lambda pid: ownership._ProcessIdentity("unknown", None, "linux"))
         assert ownership.profile_busy_locked(tmp_path, "1")
 
 
 def test_dead_launcher_does_not_block(tmp_path, processes, monkeypatch):
     with ownership.ownership_lock(tmp_path):
         ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
-        monkeypatch.setattr(ownership, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(ownership, "_process_identity", lambda pid: ownership._ProcessIdentity("absent", None, "linux"))
         assert not ownership.profile_busy_locked(tmp_path, "1")
 
 
@@ -131,7 +136,7 @@ def test_running_ownership_survives_holder_death(tmp_path, processes, monkeypatc
     with ownership.ownership_lock(tmp_path):
         record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
         ownership.mark_running_locked(tmp_path, record["launchId"], 4242)
-        monkeypatch.setattr(ownership, "_pid_alive", lambda pid: pid == 4242)
+        monkeypatch.setattr(ownership, "_process_identity", lambda pid: ownership._ProcessIdentity("absent", None, "linux"))
         assert ownership.profile_busy_locked(tmp_path, "1")
 
 
@@ -145,8 +150,8 @@ def test_malformed_generation_blocks_admission_with_session_error(tmp_path, proc
             ownership.reserve_locked(tmp_path, "1", profile)
 
 
+@pytest.mark.skipif(__import__("sys").platform == "win32", reason="POSIX kill probe")
 def test_pid_probe_permission_error_is_unknown(monkeypatch):
-    monkeypatch.setattr(ownership.sys, "platform", "linux")
     def denied(pid, signal):
         raise PermissionError("denied")
     monkeypatch.setattr(ownership.os, "kill", denied)
@@ -187,7 +192,7 @@ def test_running_record_remains_busy_after_target_death(tmp_path, processes, mon
     with ownership.ownership_lock(tmp_path):
         record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
         ownership.mark_running_locked(tmp_path, record["launchId"], 4242)
-        monkeypatch.setattr(ownership, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(ownership, "_process_identity", lambda pid: ownership._ProcessIdentity("absent", None, "linux"))
         assert ownership.profile_busy_locked(tmp_path, "1")
 
 
@@ -204,7 +209,9 @@ def test_running_release_requires_confirmed_completion(tmp_path, processes):
 def test_unknown_owner_ticks_cannot_publish(tmp_path, processes, monkeypatch):
     with ownership.ownership_lock(tmp_path):
         record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
-        monkeypatch.setattr(ownership, "process_start_ticks", lambda pid: None)
+        monkeypatch.setattr(ownership, "_process_identity", lambda pid: ownership._ProcessIdentity(
+            "present", None, "linux",
+        ))
         with pytest.raises(ownership.SessionError):
             ownership.mark_running_locked(tmp_path, record["launchId"], 4242)
 
@@ -349,7 +356,9 @@ def test_abandoned_atomic_temp_does_not_block_any_profile(tmp_path):
 def test_reserved_pid_reuse_is_not_running_tree_completion(tmp_path, processes, monkeypatch, current, expected):
     with ownership.ownership_lock(tmp_path):
         ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
-        monkeypatch.setattr(ownership, "process_start_ticks", lambda pid: current)
+        monkeypatch.setattr(ownership, "_process_identity", lambda pid: ownership._ProcessIdentity(
+            "present", ownership._PosixStart(current) if current is not None else None, "linux",
+        ))
         assert ownership.profile_busy_locked(tmp_path, "1") is expected
 
 
@@ -421,6 +430,7 @@ def test_malformed_boot_tag_does_not_prove_completion(tmp_path, processes, monke
         assert ownership.profile_busy_locked(tmp_path, "1")
 
 
+@pytest.mark.skipif(__import__("sys").platform != "linux", reason="Linux boot files")
 @pytest.mark.parametrize("machine,boot,available", [
     ("a" * 32, "11111111-1111-1111-1111-111111111111", True),
     ("", "11111111-1111-1111-1111-111111111111", False),
@@ -429,7 +439,6 @@ def test_malformed_boot_tag_does_not_prove_completion(tmp_path, processes, monke
     ("a" * 32, "00000000-0000-0000-0000-000000000000", False),
 ])
 def test_boot_identity_requires_os_identifiers(monkeypatch, machine, boot, available):
-    monkeypatch.setattr(ownership.sys, "platform", "linux")
     def read(path, **kwargs):
         return machine if str(path) == "/etc/machine-id" else boot
     monkeypatch.setattr(ownership.Path, "read_text", read)
@@ -547,3 +556,134 @@ def test_completed_release_retains_running_record_on_flock_io_error(tmp_path, pr
     assert lock.depth == 0
     assert ownership._read(ownership._record_path(tmp_path, record["launchId"]))["state"] == "running"
     assert "lock" in capsys.readouterr().err.lower()
+
+
+@pytest.fixture
+def windows_identity(monkeypatch):
+    reads = []
+    values = {}
+    def source(pid):
+        reads.append(pid)
+        if type(pid) is not int or not 1 <= pid <= 0xffffffff:
+            return ownership._ProcessIdentity("unknown", None, "win32")
+        return values.get(pid, ownership._ProcessIdentity(
+            "present", ownership._WindowsStart(200), "win32",
+        ))
+    monkeypatch.setattr(ownership, "_process_identity", source)
+    return values, reads
+
+
+@pytest.mark.parametrize("stored,current,status,pid,busy", [
+    ("win32:0200", 200, "present", 4242, True),
+    ("win32:200", 201, "present", 4242, False),
+    ("win32:1", 1, "present", 4242, True),
+    ("win32:1", 2, "present", 4242, False),
+    ("win32:18446744073709551615", 18446744073709551615, "present", 4242, True),
+    ("win32:18446744073709551615", 200, "present", 4242, False),
+    ("win32:18446744073709551616", 200, "present", 4242, True),
+    ("win32:0", 200, "present", 4242, True),
+    ("", 200, "present", 4242, True),
+    ("123", 200, "present", 4242, True),
+    ("win32:unknown", 200, "present", 4242, True),
+    ("win32:+200", 200, "present", 4242, True),
+    ("win32:２００", 200, "present", 4242, True),
+    ("win32:" + "9" * 5000, 200, "present", 4242, True),
+    ("win32:200", None, "unknown", 4242, True),
+    ("win32:200", None, "absent", 4242, False),
+    ("foreign", None, "absent", 4242, True),
+    ("win32:200", None, "unknown", 0, True),
+    ("win32:200", None, "unknown", -1, True),
+    ("win32:200", None, "unknown", 0x100000000, True),
+])
+def test_windows_reservation_cleanup_boundary(
+    tmp_path, windows_identity, stored, current, status, pid, busy,
+):
+    values, reads = windows_identity
+    with ownership.ownership_lock(tmp_path):
+        record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
+        path = ownership._record_path(tmp_path, record["launchId"])
+        record.update(ownerTicks=stored, ownerPid=pid)
+        ownership._write(path, record)
+        values[pid] = ownership._ProcessIdentity(
+            status, ownership._WindowsStart(current) if current is not None else None, "win32",
+        )
+        assert ownership.profile_busy_locked(tmp_path, "1") is busy
+        # A snapshot proves whether the reservation protects the profile; it never unlinks it.
+        assert path.exists()
+
+
+@pytest.mark.parametrize("failure", ["changed-owner", "unknown-owner", "foreign-owner", "unknown-child", None])
+def test_windows_publication_checks_each_identity_once(tmp_path, windows_identity, failure):
+    values, reads = windows_identity
+    owner = ownership.os.getpid()
+    child = 4242 if owner != 4242 else 4243
+    with ownership.ownership_lock(tmp_path):
+        record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
+        path = ownership._record_path(tmp_path, record["launchId"])
+        record["ownerTicks"] = "win32:0200"
+        if failure == "foreign-owner":
+            record["ownerTicks"] = "old-posix"
+        ownership._write(path, record)
+        if failure == "changed-owner":
+            values[owner] = ownership._ProcessIdentity("present", ownership._WindowsStart(201), "win32")
+        elif failure == "unknown-owner":
+            values[owner] = ownership._ProcessIdentity("unknown", None, "win32")
+        if failure == "unknown-child":
+            values[child] = ownership._ProcessIdentity("unknown", None, "win32")
+        else:
+            values[child] = ownership._ProcessIdentity("present", ownership._WindowsStart(300), "win32")
+        reads.clear()
+        if failure:
+            with pytest.raises(ownership.SessionError):
+                ownership.mark_running_locked(tmp_path, record["launchId"], child)
+            assert ownership._read(path)["state"] == "reserved"
+        else:
+            ownership.mark_running_locked(tmp_path, record["launchId"], child)
+            published = ownership._read(path)
+            assert published["state"] == "running"
+            assert published["procStart"] == "win32:300"
+            assert reads == [owner, child]
+
+
+@pytest.mark.parametrize("operation", ["verify", "release", "acknowledge"])
+@pytest.mark.parametrize("stored,status", [("win32:200", "unknown"), ("foreign", "present")])
+def test_windows_uncertain_owner_cannot_mutate(tmp_path, windows_identity, operation, stored, status):
+    values, _ = windows_identity
+    with ownership.ownership_lock(tmp_path):
+        record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile", warming=True)
+        path = ownership._record_path(tmp_path, record["launchId"])
+        record["ownerTicks"] = stored
+        ownership._write(path, record)
+        values[ownership.os.getpid()] = ownership._ProcessIdentity(
+            status, ownership._WindowsStart(200) if status == "present" else None, "win32",
+        )
+        with pytest.raises(ownership.SessionError):
+            if operation == "verify":
+                ownership.verify_reservation_locked(tmp_path, record["launchId"])
+            elif operation == "release":
+                ownership.release_locked(tmp_path, record["launchId"])
+            else:
+                ownership.acknowledge_generation_locked(tmp_path, record["launchId"], record["profileGen"])
+        assert ownership._read(path)["state"] == "reserved"
+
+
+def test_windows_record_on_posix_retains_protection(tmp_path, processes):
+    with ownership.ownership_lock(tmp_path):
+        record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
+        record["ownerTicks"] = "win32:200"
+        ownership._write(ownership._record_path(tmp_path, record["launchId"]), record)
+        assert ownership.profile_busy_locked(tmp_path, "1")
+
+
+@pytest.mark.parametrize("state", ["present", "absent"])
+def test_foreign_windows_record_never_authorizes_posix_cleanup(tmp_path, processes, monkeypatch, state):
+    with ownership.ownership_lock(tmp_path):
+        record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
+        record["ownerTicks"] = "win32:200"
+        ownership._write(ownership._record_path(tmp_path, record["launchId"]), record)
+        monkeypatch.setattr(ownership, "_process_identity", lambda pid: ownership._ProcessIdentity(
+            state, ownership._PosixStart("123") if state == "present" else None, "linux",
+        ))
+        assert ownership.profile_busy_locked(tmp_path, "1")
+        with pytest.raises(ownership.SessionError):
+            ownership.release_locked(tmp_path, record["launchId"])

@@ -9,8 +9,11 @@ process. Unreadable records and unknown process identity block mutation.
 Linux identity uses process start ticks, unchanged across exec. A trustworthy
 machine identity and different boot ID prove an old tree ended; missing or
 foreign boot metadata never authorizes clearing running ownership.
-Publication is unsupported where those ticks are unavailable, including macOS
-and Windows; an unknown identity never authorizes handoff.
+Windows identity uses the process creation FILETIME read through one handle.
+Saved Windows times are bounded ASCII decimals, compared numerically; unknown
+or foreign identities retain protection. Publication requires a confirmed owner
+and child identity; it remains unsupported where start times are unavailable,
+including macOS.
 
 Callers take ``ownership_lock`` before the switcher lock. The ``*_locked``
 functions do local I/O only and never acquire either lock. Network preparation
@@ -28,6 +31,7 @@ import sys
 import threading
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from claude_swap.exceptions import SessionError
@@ -130,12 +134,98 @@ def _pid_alive(pid: int) -> bool | None:
     return True
 
 
-def _live(pid: int, ticks: str | None) -> bool:
+@dataclass(frozen=True)
+class _WindowsStart:
+    filetime: int
+
+
+@dataclass(frozen=True)
+class _PosixStart:
+    ticks: str
+
+
+@dataclass(frozen=True)
+class _ProcessIdentity:
+    state: str
+    start: _WindowsStart | _PosixStart | None
+    platform: str
+
+
+def _process_identity(pid: int) -> _ProcessIdentity:
+    """One locally replaceable reader; Windows uses one handle for both facts."""
+    if sys.platform == "win32":
+        from claude_swap._win_process import process_identity
+        state, ticks = process_identity(pid)
+        return _ProcessIdentity(
+            "unknown" if state == "denied" else state,
+            _WindowsStart(ticks) if ticks is not None else None, "win32",
+        )
     alive = _pid_alive(pid)
-    if alive is False:
+    ticks = process_start_ticks(pid)
+    return _ProcessIdentity(
+        "absent" if alive is False else "present" if alive else "unknown",
+        _PosixStart(ticks) if ticks is not None else None, sys.platform,
+    )
+
+
+def _parse_start(value: str | None, platform: str) -> _WindowsStart | _PosixStart | None:
+    """Decode persisted identity without accepting foreign or unbounded FILETIME."""
+    if not isinstance(value, str):
+        return None
+    if platform != "win32":
+        return None if value.startswith("win32:") else _PosixStart(value)
+    if not value.startswith("win32:") or len(value) > 256:
+        return None
+    digits = value[6:]
+    if not digits or any(c < "0" or c > "9" for c in digits):
+        return None
+    number = int(digits)
+    return _WindowsStart(number) if 1 <= number <= 2**64 - 1 else None
+
+
+def _compare_start(stored, current: _ProcessIdentity) -> str:
+    """Match/different/unknown; only trustworthy same-type values prove reuse."""
+    if stored is None or current.state != "present" or current.start is None:
+        return "unknown"
+    if type(stored) is not type(current.start):
+        return "unknown"
+    return "match" if stored == current.start else "different"
+
+
+def _encoded_start(identity: _ProcessIdentity) -> str | None:
+    if identity.state != "present":
+        return None
+    if isinstance(identity.start, _WindowsStart):
+        return f"win32:{identity.start.filetime}"
+    if isinstance(identity.start, _PosixStart):
+        return identity.start.ticks
+    return None
+
+
+def _owner_matches(data: dict, *, require_known: bool = False) -> bool:
+    if data["ownerPid"] != os.getpid():
         return False
-    current = process_start_ticks(pid)
-    return not (ticks is not None and current is not None and ticks != current)
+    current = _process_identity(data["ownerPid"])
+    stored = _parse_start(data.get("ownerTicks"), current.platform)
+    comparison = _compare_start(stored, current)
+    if current.platform == "win32" or require_known or (
+        isinstance(data.get("ownerTicks"), str) and data["ownerTicks"].startswith("win32:")
+    ):
+        return comparison == "match"
+    # Preserve POSIX's permissive own-reservation checks when ticks are missing.
+    return comparison != "different"
+
+
+def _live(pid: int, ticks: str | None) -> bool:
+    current = _process_identity(pid)
+    stored = _parse_start(ticks, current.platform)
+    if stored is None and (
+        current.platform == "win32" or isinstance(ticks, str) and ticks.startswith("win32:")
+    ):
+        return True
+    if current.state == "absent":
+        return False
+    return _compare_start(stored, current) != "different"
 
 
 def _record_path(backup_dir: Path, launch_id: str) -> Path:
@@ -314,7 +404,7 @@ def reserve_locked(
         "profile": _profile_key(session_dir),
         "profileGen": _generation(backup_dir, session_dir),
         "state": "reserved", "warming": warming,
-        "ownerPid": os.getpid(), "ownerTicks": process_start_ticks(os.getpid()),
+        "ownerPid": os.getpid(), "ownerTicks": _encoded_start(_process_identity(os.getpid())),
     }
     if boot := _boot_identity():
         data.update(machineId=boot[0], bootId=boot[1])
@@ -326,13 +416,17 @@ def verify_reservation_locked(
     backup_dir: Path, launch_id: str, *, expected_profile_gen: str | None = None,
 ) -> dict:
     """Re-read an own reservation and reject generation or owner changes."""
+    return _verified_reservation(backup_dir, launch_id, expected_profile_gen=expected_profile_gen)
+
+
+def _verified_reservation(
+    backup_dir: Path, launch_id: str, *, expected_profile_gen: str | None = None,
+    require_known: bool = False,
+) -> dict:
     try:
         data = _read(_record_path(backup_dir, launch_id))
         _validate(data)
-        if data["ownerPid"] != os.getpid():
-            raise ValueError("Ownership changed")
-        ticks = process_start_ticks(os.getpid())
-        if data["ownerTicks"] is not None and ticks is not None and data["ownerTicks"] != ticks:
+        if not _owner_matches(data, require_known=require_known):
             raise ValueError("Ownership changed")
         generation = _generation(backup_dir, Path(data["profile"]))
         if data["profileGen"] != generation or (
@@ -350,14 +444,12 @@ def mark_running_locked(
 ) -> None:
     if type(pid) is not int or pid <= 0:
         raise SessionError("Invalid running process")
-    data = verify_reservation_locked(
-        backup_dir, launch_id, expected_profile_gen=expected_profile_gen,
+    data = _verified_reservation(
+        backup_dir, launch_id, expected_profile_gen=expected_profile_gen, require_known=True,
     )
     if data["state"] != "reserved":
         raise SessionError("Only a reserved profile can become running")
-    if data["ownerTicks"] is None or process_start_ticks(os.getpid()) is None:
-        raise SessionError("Profile owner process identity is unknown")
-    ticks = process_start_ticks(pid)
+    ticks = _encoded_start(_process_identity(pid))
     if ticks is None:
         raise SessionError("Running process identity is unknown")
     data.update(state="running", pid=pid, procStart=ticks, warming=False)
@@ -377,11 +469,8 @@ def acknowledge_generation_locked(
         path = _record_path(backup_dir, launch_id)
         data = _read(path)
         _validate(data)
-        ticks = process_start_ticks(os.getpid())
         if (
-            data["ownerPid"] != os.getpid()
-            or data["ownerTicks"] is None or ticks is None
-            or data["ownerTicks"] != ticks
+            not _owner_matches(data, require_known=True)
             or data["state"] != "reserved" or not data["warming"]
             or data["profileGen"] != expected_previous_gen
         ):
@@ -461,10 +550,7 @@ def release_locked(
     try:
         data = _read(path)
         _validate(data)
-        ticks = process_start_ticks(os.getpid())
-        if data["ownerPid"] != os.getpid() or (
-            data["ownerTicks"] is not None and ticks is not None and data["ownerTicks"] != ticks
-        ):
+        if not _owner_matches(data):
             raise ValueError("Ownership changed")
     except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
         raise SessionError("Profile reservation cannot be released") from exc
