@@ -507,7 +507,6 @@ def _publish_launch(root: Path, directory: Path, policy: dict, prepared: _Launch
                 make_dir_link(history, profile / "projects")
         _journal(directory, _OUTSIDE if prepared.outside_reason else "launch")
         if prepared.reservation:
-            spawn.require_supervision()
             profile_ownership.mark_running_locked(
                 root, prepared.reservation["launchId"], os.getpid(),
                 expected_profile_gen=prepared.reservation["profileGen"],
@@ -529,30 +528,31 @@ def _launch(marker: str, args: list[str], root: Path) -> None:
             check_transparent_history(root)
             accounts = launch_policy.accounts(root) if test else {}
         prepared = _prepare_launch(root, directory, marker, args, policy, accounts, test=test)
-        try:
-            if _publish_launch(root, directory, policy, prepared):
-                break
-        except BaseException:
-            _release_launch(root, prepared)
-            raise
-        _release_launch(root, prepared)
+        if prepared.reservation:
+            class PolicyChanged(Exception):
+                pass
+
+            def publish():
+                if not _publish_launch(root, directory, policy, prepared):
+                    raise PolicyChanged
+
+            try:
+                result = spawn.owned_launch(
+                    lambda: prepared.real.handoff(prepared.args, prepared.env, job=True),
+                    publish=publish,
+                    release=lambda: profile_ownership.release_completed(root, prepared.reservation["launchId"]),
+                    abort=lambda: profile_ownership.release_completed(root, prepared.reservation["launchId"]),
+                )
+            except PolicyChanged:
+                continue
+            raise SystemExit(result)
+        if _publish_launch(root, directory, policy, prepared):
+            break
     else:
         raise ConfigError("Transparent policy kept changing; retry the launch")
     if prepared.outside_reason:
         print(f"claude-swap: {_OUTSIDE}: {prepared.outside_reason}", file=sys.stderr)
-    if prepared.reservation:
-        result = spawn.supervise(
-            lambda: prepared.real.handoff(prepared.args, prepared.env, job=True)
-        )
-        profile_ownership.release_completed(root, prepared.reservation["launchId"])
-        raise SystemExit(result)
     prepared.real.handoff(prepared.args, prepared.env, job=True)
-
-
-def _release_launch(root: Path, prepared: _Launch) -> None:
-    if prepared.reservation:
-        with profile_ownership.ownership_lock(root):
-            profile_ownership.release_locked(root, prepared.reservation["launchId"])
 
 
 def main() -> None:

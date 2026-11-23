@@ -426,6 +426,7 @@ def test_malformed_boot_tag_does_not_prove_completion(tmp_path, processes, monke
     ("", "11111111-1111-1111-1111-111111111111", False),
     ("0" * 32, "11111111-1111-1111-1111-111111111111", False),
     ("a" * 32, "not-a-boot", False),
+    ("a" * 32, "00000000-0000-0000-0000-000000000000", False),
 ])
 def test_boot_identity_requires_os_identifiers(monkeypatch, machine, boot, available):
     monkeypatch.setattr(ownership.sys, "platform", "linux")
@@ -468,3 +469,81 @@ def test_reservation_distinguishes_supervised_reuse_from_unknown_legacy(
         else:
             with pytest.raises(ownership.SessionError, match="legacy ownership"):
                 ownership.reserve_locked(tmp_path, "1", profile)
+
+
+@pytest.mark.parametrize("check", [ownership.profile_busy_locked, ownership.profile_running_locked])
+@pytest.mark.parametrize("stored,current", [
+    ("zero", "valid"), ("valid", "zero"), ("zero", "zero"),
+])
+def test_zero_boot_uuid_never_proves_running_completion(
+    tmp_path, processes, monkeypatch, check, stored, current,
+):
+    boots = {"zero": "00000000-0000-0000-0000-000000000000",
+             "valid": "11111111-1111-1111-1111-111111111111"}
+    monkeypatch.setattr(ownership, "_boot_identity", lambda: ("a" * 32, boots[stored]))
+    with ownership.ownership_lock(tmp_path):
+        record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
+        ownership.mark_running_locked(tmp_path, record["launchId"], 4242)
+        monkeypatch.setattr(ownership, "_boot_identity", lambda: ("a" * 32, boots[current]))
+        assert check(tmp_path, "1")
+
+
+def test_completed_release_reports_waiting_only_on_first_contention(tmp_path, processes, monkeypatch, capsys):
+    with ownership.ownership_lock(tmp_path):
+        record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
+        ownership.mark_running_locked(tmp_path, record["launchId"], 4242)
+    lock = ownership.ownership_lock(tmp_path)
+    acquire = lock.acquire
+    attempts = iter([False, False, True])
+    monkeypatch.setattr(lock, "acquire", lambda: acquire() if next(attempts) else False)
+
+    ownership.release_completed(tmp_path, record["launchId"])
+
+    diagnostic = capsys.readouterr()
+    assert not diagnostic.out
+    assert len(diagnostic.err.splitlines()) == 1
+    assert "waiting" in diagnostic.err.lower()
+    assert "lock" in diagnostic.err.lower()
+    assert not ownership._record_path(tmp_path, record["launchId"]).exists()
+
+
+def test_completed_release_diagnoses_permanent_lock_error(tmp_path, monkeypatch, capsys):
+    import errno
+
+    def fail():
+        raise OSError(errno.EIO, "synthetic lock I/O error")
+
+    monkeypatch.setattr(ownership.ownership_lock(tmp_path), "acquire", fail)
+    with pytest.raises(ownership.SessionError, match="state lock"):
+        ownership.release_completed(tmp_path, "a" * 32)
+
+    diagnostic = capsys.readouterr()
+    assert not diagnostic.out
+    assert "lock" in diagnostic.err.lower()
+    assert "error" in diagnostic.err.lower()
+
+
+@pytest.mark.skipif(__import__("sys").platform == "win32", reason="POSIX flock")
+def test_completed_release_retains_running_record_on_flock_io_error(tmp_path, processes, monkeypatch, capsys):
+    import errno
+    from claude_swap import locking
+
+    with ownership.ownership_lock(tmp_path):
+        record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
+        ownership.mark_running_locked(tmp_path, record["launchId"], 4242)
+    lock = ownership.ownership_lock(tmp_path)
+    attempts = []
+
+    def fail(fd, operation):
+        attempts.append(fd)
+        raise OSError(errno.EIO, "synthetic flock I/O error")
+
+    monkeypatch.setattr(locking.fcntl, "flock", fail)
+    with pytest.raises(ownership.SessionError, match="state lock") as caught:
+        ownership.release_completed(tmp_path, record["launchId"])
+    assert caught.value.__cause__.errno == errno.EIO
+    assert len(attempts) == 1
+    assert lock._lock_file is None
+    assert lock.depth == 0
+    assert ownership._read(ownership._record_path(tmp_path, record["launchId"]))["state"] == "running"
+    assert "lock" in capsys.readouterr().err.lower()

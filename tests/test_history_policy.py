@@ -326,7 +326,12 @@ def test_archive_checks_are_outside_locks_except_publication(shim, monkeypatch):
         platform=sys.platform, flags=SimpleNamespace(isolated=True), stderr=sys.stderr,
     ))
     monkeypatch.setattr(transparent.spawn, "require_supervision", lambda: None)
-    monkeypatch.setattr(transparent.spawn, "supervise", lambda callback: (callback(), 0)[1])
+    def owned_launch(callback, *, publish, release, abort):
+        publish()
+        callback()
+        release()
+        return 0
+    monkeypatch.setattr(transparent.spawn, "owned_launch", owned_launch)
     real = test_mode.claude_binary(backup_root=root)
     monkeypatch.setattr(test_mode, "claude_binary", lambda **_: real)
     monkeypatch.setattr(real, "handoff", lambda *args, **kwargs: _assert_lock_free(root))
@@ -403,7 +408,12 @@ def test_policy_is_rechecked_at_publication_not_handoff(shim, monkeypatch, chang
         platform=sys.platform, flags=SimpleNamespace(isolated=True), stderr=sys.stderr,
     ))
     monkeypatch.setattr(transparent.spawn, "require_supervision", lambda: None)
-    monkeypatch.setattr(transparent.spawn, "supervise", lambda callback: (callback(), 0)[1])
+    def owned_launch(callback, *, publish, release, abort):
+        publish()
+        callback()
+        release()
+        return 0
+    monkeypatch.setattr(transparent.spawn, "owned_launch", owned_launch)
     selected = []
     real = test_mode.claude_binary(backup_root=root)
     monkeypatch.setattr(test_mode, "claude_binary", lambda **_: real)

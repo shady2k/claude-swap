@@ -5735,7 +5735,9 @@ class TestLaunchReservation:
 
         events = []
         monkeypatch.setattr(session_mod.spawn, "require_supervision", lambda: events.append("require"))
-        def supervise(callback):
+        def owned_launch(callback, *, publish, release, abort):
+            session_mod.spawn.require_supervision()
+            publish()
             record = manager._launch_reservation
             with profile_ownership.ownership_lock(manager.switcher.backup_dir):
                 current = profile_ownership.verify_reservation_locked(
@@ -5743,8 +5745,9 @@ class TestLaunchReservation:
                 )
             assert current["state"] == "running"
             events.append("supervise")
+            release()
             return 27
-        monkeypatch.setattr(session_mod.spawn, "supervise", supervise)
+        monkeypatch.setattr(session_mod.spawn, "owned_launch", owned_launch)
         with manager._reserve_profile("2", retain=True):
             pass
         record = manager._launch_reservation
@@ -5763,9 +5766,32 @@ class TestLaunchReservation:
 
     def test_external_handoff_cannot_redirect_reserved_profile(self, manager, monkeypatch):
         monkeypatch.setattr(session_mod.spawn, "require_supervision", lambda: None)
-        monkeypatch.setattr(session_mod.spawn, "supervise",
-                            lambda callback: pytest.fail("redirected launch"))
+        monkeypatch.setattr(session_mod.spawn, "owned_launch",
+                            lambda *a, **kw: pytest.fail("redirected launch"))
         with manager._reserve_profile("2", retain=True):
             pass
         with pytest.raises(SessionError, match="profile.*handoff"):
             manager._exec(_ClaudeStub(), ["-p", "hello"], env={"CLAUDE_CONFIG_DIR": "/other"})
+
+
+def test_prepublication_cleanup_error_is_not_retried_by_reservation(manager, monkeypatch):
+    from claude_swap import profile_ownership
+
+    events = []
+    def refused():
+        raise OSError("synthetic pidfd unavailable")
+    def release_completed(*args):
+        events.append("completed")
+        raise OSError("synthetic release I/O error")
+    def second_cleanup(*args):
+        events.append("outer-cleanup")
+    monkeypatch.setattr(session_mod.spawn, "require_supervision", refused)
+    monkeypatch.setattr(profile_ownership, "release_completed", release_completed)
+    monkeypatch.setattr(profile_ownership, "release_locked", second_cleanup)
+    with pytest.raises(session_mod.real_claude.ResolveError, match="release I/O error"):
+        with manager._reserve_profile("2"):
+            record = manager._launch_reservation
+            manager._exec(_ClaudeStub(), ["-p", "hello"], env={
+                "CLAUDE_CONFIG_DIR": record["profile"],
+            })
+    assert events == ["completed"]

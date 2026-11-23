@@ -34,17 +34,23 @@ reservation is released only after it has reaped the leader and all descendants,
 including descendants that change session. A failed handoff also releases it
 once the tree is empty. Supervisor death or an uncertain wait leaves it busy;
 a PID disappearing alone does not prove completion. A live launch must finish
-its entire descendant tree: after the leader exits, INT/TERM/HUP are forwarded
-to remaining verified descendants and supervision keeps waiting. A descendant
-that ignores the signal keeps the profile protected. After proven completion,
-release retries ownership-lock contention without an overall deadline; storage
-errors are reported separately.
+its entire descendant tree. Before publication, the supervisor checks subreaper
+and pidfd support, including signal delivery to its own pidfd. Signals are held
+across publication and fork; the child restores normal launch signal handling.
+TERM/HUP are forwarded to verified descendants while waiting; INT is forwarded
+only after the leader is reaped, since the foreground leader receives terminal
+INT directly. Delivery errors are diagnosed without ending supervision. A
+descendant that ignores the signal keeps the profile protected. After proven
+completion, the same signal scope protects release and preserves the leader's
+exit code. Release retries ownership-lock contention without an overall deadline,
+with a waiting message; permanent storage errors are reported and retain the
+record.
 
 A dead supervisor leaves completion unconfirmed; repeating a switch does not
 clear that uncertainty. There is no forced-reset or recovery command. On the
 same machine, a recorded Linux boot ID different from the current trustworthy
-boot ID proves the old tree ended. Missing boot metadata, an unreadable boot ID,
-or a different machine identity does not. PID start ticks distinguish process
+boot ID proves the old tree ended. Missing boot metadata, an unreadable or zero
+boot ID on either side, or a different machine identity does not. PID start ticks distinguish process
 instances within a boot, not boots. Non-Linux publication fails closed; Windows
 job completion is not verified.
 

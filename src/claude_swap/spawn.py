@@ -310,6 +310,20 @@ def require_supervision() -> None:
         raise OSError("Profile tree supervision requires a launcher without children")
     if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
         raise OSError("Profile tree supervision requires the default SIGCHLD handler")
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
+                      ctypes.c_ulong, ctypes.c_ulong]
+    prctl.restype = ctypes.c_int
+    if prctl(36, 1, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "Cannot enable profile subreaper")
+    fd = os.pidfd_open(os.getpid())
+    try:
+        signal.pidfd_send_signal(fd, 0)
+    finally:
+        os.close(fd)
 
 
 def _signal_descendants(signum: int) -> None:
@@ -377,74 +391,148 @@ def _signal_descendants(signum: int) -> None:
             os.close(fd)
 
 
-def supervise(handoff) -> int:
-    """Run a terminal handoff and return only after every descendant exits.
-
-    The caller publishes running ownership before entering and releases it
-    only on normal return. Any supervisor failure or death leaves ownership
-    busy. This process must remain a dedicated launcher: it may not create
-    unrelated children concurrently. No timeout can establish completion.
-    """
-    import ctypes
-    import signal
-
-    require_supervision()
-    libc = ctypes.CDLL(None, use_errno=True)
-    prctl = libc.prctl
-    prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
-                      ctypes.c_ulong, ctypes.c_ulong]
-    prctl.restype = ctypes.c_int
-    # PR_SET_CHILD_SUBREAPER. Set before forking, so even an immediate orphan
-    # is adopted by this supervisor rather than escaping to init.
-    if prctl(36, 1, 0, 0, 0) != 0:
-        # The checked dedicated launcher has not forked; the tree is empty.
-        return 127
-    forwarded = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
-    # Block forwarding signals across fork and handler installation. The
-    # child deliberately unblocks these before exec.
-    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, forwarded)
-    old_handlers = {}
-
-    def forward(signum, frame):
-        _signal_descendants(signum)
-
+def _diagnose(message: str) -> None:
+    """Report launch state without allowing a broken stderr to change it."""
     try:
+        print(message, file=sys.stderr)
+    except OSError:
+        pass
+
+
+class _Supervision:
+    """One signal lifetime from admission through the caller's storage cleanup.
+
+    Publication and fork run with termination signals blocked. During wait,
+    TERM/HUP reach verified descendants; INT does so only after leader reap,
+    because the foreground leader already receives terminal INT. QUIT reaches
+    terminal children directly. After ECHILD, handlers consume signals until
+    cleanup finishes, preserving the leader's status. Delivery failures never
+    establish completion and never unwind wait.
+    """
+
+    def __enter__(self):
+        import signal
+
+        self.signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+        self.mask = signal.pthread_sigmask(signal.SIG_BLOCK, self.signals)
+        self.handlers = {}
+        self.waiting = False
+        self.forwarding = False
+        self.result = None
+        for sig in self.signals:
+            self.handlers[sig] = signal.signal(sig, self.forward)
+        return self
+
+    def forward(self, signum, frame):
+        import signal
+
+        if (not self.waiting or self.forwarding or signum == signal.SIGQUIT
+                or (signum == signal.SIGINT and self.result is None)):
+            return
+        self.forwarding = True
+        try:
+            _signal_descendants(signum)
+        except (OSError, ValueError):
+            _diagnose("claude-swap: Could not deliver profile signal; still waiting for descendants")
+        finally:
+            self.forwarding = False
+
+    def __exit__(self, *args):
+        import signal
+
+        # Keep restoration protected, then consume boundary signals before
+        # the original mask permits ordinary handling again.
+        self.waiting = False
+        signal.pthread_sigmask(signal.SIG_BLOCK, self.signals)
+        for sig, handler in self.handlers.items():
+            signal.signal(sig, handler)
+        while signal.sigtimedwait(self.signals, 0) is not None:
+            continue
+        signal.pthread_sigmask(signal.SIG_SETMASK, self.mask)
+
+    def wait(self, handoff):
+        import signal
+
         try:
             pid = os.fork()
         except OSError:
-            # A failed fork creates no child; the precondition excludes
-            # existing children, so returning proves the tree is empty.
+            _diagnose("claude-swap: Could not fork profile leader; no child launched")
             return 127
         if pid == 0:
             try:
-                signal.pthread_sigmask(signal.SIG_UNBLOCK, forwarded)
+                for sig, handler in self.handlers.items():
+                    signal.signal(sig, handler)
+                signal.pthread_sigmask(signal.SIG_SETMASK, set(self.mask) - set(self.signals))
                 handoff()
             except BaseException:
-                # Do not print callback exceptions that may contain secrets.
+                # Callback exceptions may contain secrets.
                 os._exit(127)
             os._exit(127)
+        self.waiting = True
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, self.signals)
+        try:
+            while True:
+                try:
+                    reaped, status = os.waitpid(-1, 0)
+                except InterruptedError:
+                    continue
+                except ChildProcessError:
+                    if self.result is None:
+                        raise OSError("Profile leader completion could not be observed")
+                    return self.result
+                if reaped == pid:
+                    self.result = os.waitstatus_to_exitcode(status)
+                    if self.result < 0:
+                        self.result = 128 - self.result
+        except OSError:
+            _diagnose("claude-swap: Profile completion is unconfirmed; ownership remains running")
+            raise
+        finally:
+            self.waiting = False
 
-        # QUIT reaches terminal children directly. INT/TERM/HUP also reach
-        # detached descendants, including after the leader has been reaped.
-        old_handlers[signal.SIGQUIT] = signal.signal(signal.SIGQUIT, signal.SIG_IGN)
-        for sig in forwarded:
-            old_handlers[sig] = signal.signal(sig, forward)
-        signal.pthread_sigmask(signal.SIG_UNBLOCK, forwarded)
-        result = None
-        while True:
-            try:
-                reaped, status = os.waitpid(-1, 0)
-            except InterruptedError:
-                continue
-            except ChildProcessError:
-                if result is None:
-                    raise OSError("Profile leader completion could not be observed")
-                return result
-            if reaped == pid:
-                result = os.waitstatus_to_exitcode(status)
-                if result < 0:
-                    result = 128 - result
-    finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
-        for sig, handler in old_handlers.items():
-            signal.signal(sig, handler)
+
+def owned_launch(handoff, *, publish, release, abort) -> int:
+    """Admit, publish, supervise and release within one protected signal scope.
+
+    Callbacks take their own storage locks. Before successful publication any
+    failure removes only this launch's reservation. After publication only a
+    proven empty tree permits release; uncertain completion retains running.
+    Storage errors propagate before ordinary signal handling is restored.
+    """
+    if sys.platform != "linux":
+        try:
+            require_supervision()
+        except OSError:
+            _diagnose("claude-swap: Profile launch refused before fork")
+            abort()
+            raise
+    with _Supervision() as scope:
+        try:
+            require_supervision()
+            publish()
+        except BaseException:
+            _diagnose("claude-swap: Profile launch refused before fork")
+            abort()
+            raise
+        result = scope.wait(handoff)
+        try:
+            release()
+        except OSError:
+            _diagnose("claude-swap: Could not release completed profile ownership; record retained")
+            raise
+        return result
+
+
+def supervise(handoff) -> int:
+    """Wait for a dedicated Linux launch, without managing an ownership record.
+
+    Profile launch callers use owned_launch so signal protection also spans
+    publication and release. No unrelated children may exist in this process.
+    """
+    with _Supervision() as scope:
+        try:
+            require_supervision()
+        except OSError:
+            _diagnose("claude-swap: Profile subreaper/pidfd supervision unavailable; no child launched")
+            return 127
+        return scope.wait(handoff)

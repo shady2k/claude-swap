@@ -259,7 +259,12 @@ def test_f8_cold_profile_pins_auth_probe_and_launch(route, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
     monkeypatch.setattr(real_claude, "resolve", lambda **_: binary)
     monkeypatch.setattr(session.spawn, "require_supervision", lambda: None)
-    monkeypatch.setattr(session.spawn, "supervise", lambda callback: callback())
+    def owned_launch(callback, *, publish, release, abort):
+        publish()
+        result = callback()
+        release()
+        return result
+    monkeypatch.setattr(session.spawn, "owned_launch", owned_launch)
     assert not profile.exists()
     with pytest.raises(Finished):
         manager.run("1", ["-p", "synthetic prompt"])

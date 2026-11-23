@@ -96,7 +96,10 @@ def _boot_identity() -> tuple[str, str] | None:
             return None
         if not int(machine, 16):
             return None
-        return machine.lower(), str(uuid.UUID(boot))
+        boot_id = uuid.UUID(boot)
+        if not boot_id.int:
+            return None
+        return machine.lower(), str(boot_id)
     except (OSError, ValueError, UnicodeError):
         return None
 
@@ -106,10 +109,11 @@ def _previous_boot(data: dict) -> bool:
     if not current or data.get("machineId") != current[0]:
         return False
     try:
-        recorded = str(uuid.UUID(data["bootId"]))
+        recorded = uuid.UUID(data["bootId"])
+        current_boot = uuid.UUID(current[1])
     except (ValueError, TypeError, KeyError, AttributeError):
         return False
-    return recorded != current[1]
+    return bool(recorded.int and current_boot.int and recorded != current_boot)
 
 
 def _pid_alive(pid: int) -> bool | None:
@@ -477,10 +481,14 @@ def release_completed(backup_dir: Path, launch_id: str) -> None:
     contention and are reported rather than retried forever.
     """
     lock = ownership_lock(backup_dir)
+    waiting_reported = False
     try:
         while not lock.acquire():
-            continue
+            if not waiting_reported:
+                print("Waiting for profile ownership lock to release completed launch.", file=sys.stderr)
+                waiting_reported = True
     except OSError as exc:
+        print("Error acquiring completed launch state lock; ownership retained.", file=sys.stderr)
         raise SessionError("Completed launch state lock cannot be opened") from exc
     try:
         release_locked(backup_dir, launch_id, confirmed_complete=True)

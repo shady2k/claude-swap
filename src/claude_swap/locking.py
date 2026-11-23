@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import sys
 import time
 from pathlib import Path
@@ -34,6 +35,9 @@ class FileLock:
 
         Returns:
             True if lock acquired, False if timeout.
+
+        Raises:
+            OSError: Lock storage failed for a reason other than contention.
         """
         if timeout is None:
             timeout = self.timeout
@@ -52,7 +56,14 @@ class FileLock:
                     fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 self._locked = True
                 return True
-            except (BlockingIOError, OSError):
+            except OSError as exc:
+                contention = {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}
+                if sys.platform == "win32":
+                    contention.add(errno.EDEADLK)
+                if exc.errno not in contention:
+                    self._lock_file.close()
+                    self._lock_file = None
+                    raise
                 if time.monotonic() - start > timeout:
                     self._lock_file.close()
                     self._lock_file = None

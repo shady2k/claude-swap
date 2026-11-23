@@ -1089,12 +1089,14 @@ class SessionManager:
             )
             claude_args, env = test_mode.pinned_launch(claude_args, env)
         record = getattr(self, "_launch_reservation", None)
-        if record is not None:
-            config_home = env.get("CLAUDE_CONFIG_DIR")
-            if config_home is None or str(Path(config_home).resolve()) != record["profile"]:
-                raise SessionError("Reserved profile does not match handoff configuration")
-            self._admit_profile_launch(claude_args)
-            spawn.require_supervision()
+        if record is None:
+            claude_bin.handoff(claude_args, env)
+        config_home = env.get("CLAUDE_CONFIG_DIR")
+        if config_home is None or str(Path(config_home).resolve()) != record["profile"]:
+            raise SessionError("Reserved profile does not match handoff configuration")
+        self._admit_profile_launch(claude_args)
+
+        def publish():
             with profile_ownership.ownership_lock(self.switcher.backup_dir), FileLock(self.switcher.lock_file):
                 self._verify_profile_recipient(record)
                 num, email, _ = self.switcher.resolve_account(record["accountNum"])
@@ -1107,12 +1109,18 @@ class SessionManager:
                     expected_profile_gen=record["profileGen"],
                 )
                 self._launch_published = True
-        try:
-            if record is None:
-                claude_bin.handoff(claude_args, env)
-            result = spawn.supervise(lambda: claude_bin.handoff(claude_args, env))
-            profile_ownership.release_completed(self.switcher.backup_dir, record["launchId"])
+
+        def release():
+            # The protected cleanup owns this attempt even if storage fails.
+            # The outer reservation context must not retry with normal signals.
             self._launch_reservation = None
+            profile_ownership.release_completed(self.switcher.backup_dir, record["launchId"])
+
+        try:
+            result = spawn.owned_launch(
+                lambda: claude_bin.handoff(claude_args, env),
+                publish=publish, release=release, abort=release,
+            )
             raise SystemExit(result)
         except OSError as exc:
             raise real_claude.ResolveError(f"Could not launch {claude_bin.path}: {exc}") from exc

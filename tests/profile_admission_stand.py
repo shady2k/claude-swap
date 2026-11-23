@@ -19,16 +19,18 @@ class Child:
         self.log.write_text('')
         reader, writer = os.pipe()
         commands, command_writer = os.pipe()
+        scope_commands, self.scope_writer = os.pipe()
         self.reader, self.writer = reader, command_writer
         env = stand.env | {'ADMISSION_LOG': str(self.log), 'ADMISSION_EVENTS': str(writer),
-                           'ADMISSION_COMMANDS': str(commands), 'ADMISSION_BARRIER': str(int(barrier)),
+                           'ADMISSION_COMMANDS': str(commands), 'ADMISSION_SCOPE_COMMANDS': str(scope_commands), 'ADMISSION_BARRIER': str(int(barrier)),
                            'ADMISSION_SCAN_PID': str(scan_pid or ''), 'ADMISSION_MODE': mode}
         self.process = subprocess.Popen([sys.executable, '-I', '-c',
             f"import sys; sys.path.insert(0, {str(PROJECT)!r}); from tests.profile_admission_stand import worker; worker()",
             mode, stand.route], env=env, cwd=stand.directory,
-            pass_fds=(writer, commands), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            pass_fds=(writer, commands, scope_commands), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         os.close(writer)
         os.close(commands)
+        os.close(scope_commands)
         self.pending = b''
     def event(self, expected):
         while b'\n' not in self.pending:
@@ -40,6 +42,8 @@ class Child:
         assert line.decode() == expected, (line, self.log.read_text())
     def send(self, command):
         os.write(self.writer, (command + '\n').encode())
+    def send_scope(self, command):
+        os.write(self.scope_writer, (command + "\n").encode())
     def finish(self):
         output, errors = self.process.communicate(timeout=20)
         self.output, self.errors = output, errors
@@ -58,6 +62,7 @@ class Child:
             self.process.communicate(timeout=10)
         os.close(self.reader)
         os.close(self.writer)
+        os.close(self.scope_writer)
 
 class AdmissionStand:
     def __init__(self, directory, route, *, warm=False, disabled=False):
@@ -107,10 +112,11 @@ def emit(event):
     with open(os.environ['ADMISSION_LOG'], 'a') as stream: stream.write(event+'\n')
     os.write(int(os.environ['ADMISSION_EVENTS']), (event+'\n').encode())
 
-def command(expected):
+def command(expected, *, scope=False):
     value = b''
     while not value.endswith(b'\n'):
-        chunk = os.read(int(os.environ['ADMISSION_COMMANDS']), 1)
+        key = 'ADMISSION_SCOPE_COMMANDS' if scope else 'ADMISSION_COMMANDS'
+        chunk = os.read(int(os.environ[key]), 1)
         assert chunk, 'controller disconnected'
         value += chunk
     assert value.decode().strip() == expected
@@ -120,10 +126,22 @@ def synthetic():
         if event in ('socket.connect', 'socket.getaddrinfo', 'socket.__new__'):
             raise RuntimeError('network denied')
     sys.addaudithook(deny)
+    import signal
+    # Every synthetic tree has a finite life, including on a failed assertion.
+    signal.alarm(12)
+    if os.environ['ADMISSION_MODE'].startswith('signal-'):
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+            signal.signal(sig, signal.SIG_IGN)
     emit('launch')
+    if os.environ['ADMISSION_MODE'] == 'signal-live':
+        emit('live')
+        command('exit')
+        os._exit(7)
     # The direct exec exits, leaving its detached child supervised.
-    if os.fork(): os._exit(7 if os.environ['ADMISSION_MODE'] == 'release-contention' else 0)
+    if os.fork(): os._exit(7 if os.environ['ADMISSION_MODE'] == 'release-contention' or os.environ['ADMISSION_MODE'].startswith('signal-') else 0)
     os.setsid()
+    signal.alarm(12)
+    Path(os.environ['ADMISSION_LOG'] + '.pid').write_text(str(os.getpid()))
     emit('live')
     command('exit')
     os._exit(0)
@@ -203,6 +221,59 @@ def worker():
                 raise LockError('synthetic journal lock contention')
             raise OSError('synthetic journal write failure')
         transparent._journal = journal
+    if mode == 'capability-refusal':
+        import errno
+        from claude_swap import spawn
+        def refuse(*args, **kwargs):
+            raise OSError(errno.ENOSYS, 'synthetic pidfd capability unavailable')
+        spawn.os.pidfd_open = refuse
+    if mode == 'generation-publication':
+        original_mark = own.mark_running_locked
+        def generation_mark(backup, launch_id, *args, **kwargs):
+            own.invalidate_generation_locked(backup, profile)
+            return original_mark(backup, launch_id, *args, **kwargs)
+        own.mark_running_locked = generation_mark
+    if mode == 'signal-publication':
+        original_mark = own.mark_running_locked
+        def publication(*args, **kwargs):
+            result = original_mark(*args, **kwargs)
+            emit('publication')
+            command('continue')
+            return result
+        own.mark_running_locked = publication
+    if mode == 'signal-before-fork':
+        from claude_swap import spawn
+        original_fork = spawn.os.fork
+        def before_fork():
+            emit('before-fork')
+            command('continue')
+            return original_fork()
+        spawn.os.fork = before_fork
+    if mode in ('signal-after-reap', 'unknown-wait'):
+        from claude_swap import spawn
+        original_wait = spawn.os.waitpid
+        paused_reap = False
+        def after_reap(*args):
+            nonlocal paused_reap
+            if mode == 'unknown-wait' and paused_reap:
+                import errno
+                raise OSError(errno.EIO, 'synthetic unknown wait')
+            result = original_wait(*args)
+            if not paused_reap:
+                paused_reap = True
+                if mode != 'unknown-wait':
+                    emit('after-reap')
+                    command('continue', scope=True)
+            return result
+        spawn.os.waitpid = after_reap
+    if mode == 'signal-release':
+        original_completed = own.release_completed
+        def real_release(root, launch_id):
+            emit('release-wait')
+            command('release')
+            emit('release-attempt')
+            return original_completed(root, launch_id)
+        own.release_completed = real_release
     if mode == 'release-contention':
         original_completed = own.release_completed
         def release_completed(root, launch_id):

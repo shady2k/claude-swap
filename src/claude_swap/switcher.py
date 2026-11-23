@@ -2536,7 +2536,7 @@ class ClaudeAccountSwitcher:
         """The gate through which a backup refresh token is consumed.
 
         Active usage recovery does not consume a grant; it defers until
-        refresh authority is implemented (ALX-1125).
+        refresh authority is implemented.
 
         A refresh token is one-time-use, so the POST must consume the
         provably-freshest copy of the slot's grant — never a caller's
@@ -4884,7 +4884,7 @@ class ClaudeAccountSwitcher:
         """Read active usage without consuming its refresh token.
 
         Expired and server-rejected credentials defer recovery until refresh
-        authority is implemented (ALX-1125). Neither the live login nor its
+        authority is implemented. Neither the live login nor its
         slot backup is restored or rotated on that path. Fresh usage may still
         resync an attributed rotation through ``_resync_rotated_backup``.
         """
@@ -4966,7 +4966,7 @@ class ClaudeAccountSwitcher:
 
         # No authority to consume or restore the active login yet. In
         # particular, do not hold ownership/account/credential locks across
-        # a refresh POST; ALX-1125 owns the refresh-authority protocol.
+        # a refresh POST until refresh authority is available.
         return FetchRecord(error="active-refresh-deferred")
 
     def _resync_rotated_backup(
