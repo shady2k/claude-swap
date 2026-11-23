@@ -42,9 +42,11 @@ only after the leader is reaped, since the foreground leader receives terminal
 INT directly. Delivery errors are diagnosed without ending supervision. A
 descendant that ignores the signal keeps the profile protected. After proven
 completion, the same signal scope protects release and preserves the leader's
-exit code. Release retries ownership-lock contention without an overall deadline,
-with a waiting message; permanent storage errors are reported and retain the
-record.
+exit code through the dedicated launcher's exit. A refusal before fork instead
+restores ordinary delivery of pending signals after a bounded reservation cleanup
+attempt. Release after completion retries ownership-lock contention without an
+overall deadline. Diagnostic output is best-effort; permanent storage errors are
+reported and retain the record.
 
 A dead supervisor leaves completion unconfirmed; repeating a switch does not
 clear that uncertainty. There is no forced-reset or recovery command. On the

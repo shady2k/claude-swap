@@ -230,8 +230,10 @@ def handoff():
 assert spawn.owned_launch(handoff, publish=lambda: None,
     release=lambda: None, abort=lambda: None) == 23
 assert (root / "restored").exists()
-assert signal.getsignal(signal.SIGINT) is original
-assert signal.getsignal(signal.SIGQUIT) is original
+# After proven completion this dedicated launcher consumes termination
+# until process exit so the external leader status cannot be replaced.
+assert signal.getsignal(signal.SIGINT).__self__.completed
+assert signal.getsignal(signal.SIGQUIT).__self__.completed
 assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == expected_mask
 signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 """

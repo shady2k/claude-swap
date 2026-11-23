@@ -473,6 +473,25 @@ def release_locked(
     path.unlink()
 
 
+def _diagnose_release(message: str) -> None:
+    """Report release state without letting a failed sink change cleanup."""
+    try:
+        print(message, file=sys.stderr)
+    except (OSError, ValueError):
+        pass
+
+
+def release_aborted(backup_dir: Path, launch_id: str) -> None:
+    """Release an own launch refused before fork with one bounded lock wait.
+
+    Publication may have marked the record running, but no child was created.
+    On contention retain the record and restore ordinary signal handling
+    rather than retrying while termination signals are blocked.
+    """
+    with ownership_lock(backup_dir):
+        release_locked(backup_dir, launch_id, confirmed_complete=True)
+
+
 def release_completed(backup_dir: Path, launch_id: str) -> None:
     """Release this launch after supervision proved the whole tree empty.
 
@@ -485,10 +504,10 @@ def release_completed(backup_dir: Path, launch_id: str) -> None:
     try:
         while not lock.acquire():
             if not waiting_reported:
-                print("Waiting for profile ownership lock to release completed launch.", file=sys.stderr)
+                _diagnose_release("Waiting for profile ownership lock to release completed launch.")
                 waiting_reported = True
     except OSError as exc:
-        print("Error acquiring completed launch state lock; ownership retained.", file=sys.stderr)
+        _diagnose_release("Error acquiring completed launch state lock; ownership retained.")
         raise SessionError("Completed launch state lock cannot be opened") from exc
     try:
         release_locked(backup_dir, launch_id, confirmed_complete=True)

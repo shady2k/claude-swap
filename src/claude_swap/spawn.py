@@ -406,8 +406,9 @@ class _Supervision:
     TERM/HUP reach verified descendants; INT does so only after leader reap,
     because the foreground leader already receives terminal INT. QUIT reaches
     terminal children directly. After ECHILD, handlers consume signals until
-    cleanup finishes, preserving the leader's status. Delivery failures never
-    establish completion and never unwind wait.
+    cleanup finishes and through this dedicated launcher's exit, preserving
+    the leader's status. Refusal before fork restores pending signal delivery.
+    Delivery failures never establish completion and never unwind wait.
     """
 
     def __enter__(self):
@@ -419,6 +420,7 @@ class _Supervision:
         self.waiting = False
         self.forwarding = False
         self.result = None
+        self.completed = False
         for sig in self.signals:
             self.handlers[sig] = signal.signal(sig, self.forward)
         return self
@@ -440,14 +442,19 @@ class _Supervision:
     def __exit__(self, *args):
         import signal
 
-        # Keep restoration protected, then consume boundary signals before
-        # the original mask permits ordinary handling again.
         self.waiting = False
         signal.pthread_sigmask(signal.SIG_BLOCK, self.signals)
-        for sig, handler in self.handlers.items():
-            signal.signal(sig, handler)
-        while signal.sigtimedwait(self.signals, 0) is not None:
-            continue
+        if self.completed:
+            # This dedicated launcher now owns only delivery of the leader's
+            # status to its caller. Keep consuming handlers through process
+            # exit: draining pending signals cannot close the unmask race.
+            while signal.sigtimedwait(self.signals, 0) is not None:
+                continue
+        else:
+            # A refusal before fork (or unconfirmed wait) is not completion.
+            # Pending termination must reach the original handlers.
+            for sig, handler in self.handlers.items():
+                signal.signal(sig, handler)
         signal.pthread_sigmask(signal.SIG_SETMASK, self.mask)
 
     def wait(self, handoff):
@@ -479,6 +486,7 @@ class _Supervision:
                 except ChildProcessError:
                     if self.result is None:
                         raise OSError("Profile leader completion could not be observed")
+                    self.completed = True
                     return self.result
                 if reaped == pid:
                     self.result = os.waitstatus_to_exitcode(status)
@@ -497,7 +505,9 @@ def owned_launch(handoff, *, publish, release, abort) -> int:
     Callbacks take their own storage locks. Before successful publication any
     failure removes only this launch's reservation. After publication only a
     proven empty tree permits release; uncertain completion retains running.
-    Storage errors propagate before ordinary signal handling is restored.
+    A dedicated launcher must exit with the returned status, or with any
+    propagated storage error. After proven completion it consumes termination
+    through process exit; it must not resume unrelated work or launch again.
     """
     if sys.platform != "linux":
         try:
@@ -528,6 +538,7 @@ def supervise(handoff) -> int:
 
     Profile launch callers use owned_launch so signal protection also spans
     publication and release. No unrelated children may exist in this process.
+    This dedicated launcher must exit with the result, not resume other work.
     """
     with _Supervision() as scope:
         try:

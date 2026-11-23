@@ -142,6 +142,8 @@ def synthetic():
     os.setsid()
     signal.alarm(12)
     Path(os.environ['ADMISSION_LOG'] + '.pid').write_text(str(os.getpid()))
+    if os.environ['ADMISSION_MODE'] == 'signal-after-reap':
+        signal.signal(signal.SIGINT, lambda *_: emit('descendant-int'))
     emit('live')
     command('exit')
     os._exit(0)
@@ -233,6 +235,26 @@ def worker():
             own.invalidate_generation_locked(backup, profile)
             return original_mark(backup, launch_id, *args, **kwargs)
         own.mark_running_locked = generation_mark
+    if mode == 'signal-publication-refusal':
+        if route == 'transparent':
+            def refuse_publication(*args, **kwargs):
+                emit('publication-refusal')
+                command('continue', scope=True)
+                return False
+            transparent._publish_launch = refuse_publication
+        else:
+            def refuse_publication(*args, **kwargs):
+                from claude_swap.exceptions import ConfigError
+                emit('publication-refusal')
+                command('continue', scope=True)
+                raise ConfigError('Synthetic publication refused')
+            own.mark_running_locked = refuse_publication
+        original_release = own.release_aborted
+        def refused_abort(*args, **kwargs):
+            result = original_release(*args, **kwargs)
+            emit('abort-complete')
+            return result
+        own.release_aborted = refused_abort
     if mode == 'signal-publication':
         original_mark = own.mark_running_locked
         def publication(*args, **kwargs):
@@ -249,23 +271,36 @@ def worker():
             command('continue')
             return original_fork()
         spawn.os.fork = before_fork
-    if mode in ('signal-after-reap', 'unknown-wait'):
+    if mode == 'signal-after-reap':
+        from claude_swap import spawn
+        original_waitpid = spawn.os.waitpid
+        original_wait = spawn._Supervision.wait
+        paused_reap = False
+        def wait(scope, handoff):
+            def after_reap(*args):
+                nonlocal paused_reap
+                # Enter the next wait only after the leader result is stored.
+                if scope.result is not None and not paused_reap:
+                    paused_reap = True
+                    emit('after-reap')
+                    command('continue', scope=True)
+                return original_waitpid(*args)
+            spawn.os.waitpid = after_reap
+            return original_wait(scope, handoff)
+        spawn._Supervision.wait = wait
+    if mode == 'unknown-wait':
         from claude_swap import spawn
         original_wait = spawn.os.waitpid
         paused_reap = False
-        def after_reap(*args):
+        def unknown_wait(*args):
             nonlocal paused_reap
-            if mode == 'unknown-wait' and paused_reap:
+            if paused_reap:
                 import errno
                 raise OSError(errno.EIO, 'synthetic unknown wait')
             result = original_wait(*args)
-            if not paused_reap:
-                paused_reap = True
-                if mode != 'unknown-wait':
-                    emit('after-reap')
-                    command('continue', scope=True)
+            paused_reap = True
             return result
-        spawn.os.waitpid = after_reap
+        spawn.os.waitpid = unknown_wait
     if mode == 'signal-release':
         original_completed = own.release_completed
         def real_release(root, launch_id):

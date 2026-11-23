@@ -80,6 +80,8 @@ def test_signal_scope_keeps_ownership_until_completion(tmp_path, route, phase, s
                 return
             launch.process.send_signal(signum)
             if phase == "after-reap":
+                if signum == signal.SIGINT:
+                    launch.event("descendant-int")
                 launch.send_scope("continue")
         assert not stand.free(), "ownership disappeared before completion/release"
         assert stand.switch() == 4

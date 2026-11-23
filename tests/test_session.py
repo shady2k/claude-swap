@@ -5780,13 +5780,13 @@ def test_prepublication_cleanup_error_is_not_retried_by_reservation(manager, mon
     events = []
     def refused():
         raise OSError("synthetic pidfd unavailable")
-    def release_completed(*args):
-        events.append("completed")
+    def release_aborted(*args):
+        events.append("aborted")
         raise OSError("synthetic release I/O error")
     def second_cleanup(*args):
         events.append("outer-cleanup")
     monkeypatch.setattr(session_mod.spawn, "require_supervision", refused)
-    monkeypatch.setattr(profile_ownership, "release_completed", release_completed)
+    monkeypatch.setattr(profile_ownership, "release_aborted", release_aborted)
     monkeypatch.setattr(profile_ownership, "release_locked", second_cleanup)
     with pytest.raises(session_mod.real_claude.ResolveError, match="release I/O error"):
         with manager._reserve_profile("2"):
@@ -5794,4 +5794,4 @@ def test_prepublication_cleanup_error_is_not_retried_by_reservation(manager, mon
             manager._exec(_ClaudeStub(), ["-p", "hello"], env={
                 "CLAUDE_CONFIG_DIR": record["profile"],
             })
-    assert events == ["completed"]
+    assert events == ["aborted"]

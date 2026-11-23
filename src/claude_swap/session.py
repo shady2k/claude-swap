@@ -1116,10 +1116,14 @@ class SessionManager:
             self._launch_reservation = None
             profile_ownership.release_completed(self.switcher.backup_dir, record["launchId"])
 
+        def abort():
+            self._launch_reservation = None
+            profile_ownership.release_aborted(self.switcher.backup_dir, record["launchId"])
+
         try:
             result = spawn.owned_launch(
                 lambda: claude_bin.handoff(claude_args, env),
-                publish=publish, release=release, abort=release,
+                publish=publish, release=release, abort=abort,
             )
             raise SystemExit(result)
         except OSError as exc:

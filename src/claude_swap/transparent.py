@@ -541,7 +541,7 @@ def _launch(marker: str, args: list[str], root: Path) -> None:
                     lambda: prepared.real.handoff(prepared.args, prepared.env, job=True),
                     publish=publish,
                     release=lambda: profile_ownership.release_completed(root, prepared.reservation["launchId"]),
-                    abort=lambda: profile_ownership.release_completed(root, prepared.reservation["launchId"]),
+                    abort=lambda: profile_ownership.release_aborted(root, prepared.reservation["launchId"]),
                 )
             except PolicyChanged:
                 continue

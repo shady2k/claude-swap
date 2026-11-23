@@ -83,3 +83,69 @@ assert spawn.owned_launch(lambda: os._exit(23), publish=lambda: None,
     release=release, abort=lambda: None) == 23
 """, tmp_path)
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux supervision")
+def test_term_after_final_drain_preserves_external_leader_status(tmp_path):
+    result = _run(r"""
+import os, signal, sys
+from claude_swap import spawn
+restoring = False
+original_mask = signal.pthread_sigmask
+original_wait = signal.sigtimedwait
+empty_read = False
+def drain(*args):
+    global empty_read
+    result = original_wait(*args)
+    if result is None:
+        empty_read = True
+    return result
+def mask(how, signals):
+    if restoring and how == signal.SIG_SETMASK:
+        assert empty_read, "injection must follow the final empty drain"
+        # The terminal race: no further drain can see this pending TERM.
+        os.kill(os.getpid(), signal.SIGTERM)
+    return original_mask(how, signals)
+signal.sigtimedwait = drain
+signal.pthread_sigmask = mask
+def release():
+    global restoring
+    restoring = True
+rc = spawn.owned_launch(lambda: os._exit(23), publish=lambda: None,
+    release=release, abort=lambda: None)
+assert empty_read
+# Code delivery remains protected after returning from the storage scope.
+os.kill(os.getpid(), signal.SIGTERM)
+sys.exit(rc)
+""", tmp_path)
+    assert result.returncode == 23, result.stderr
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux supervision")
+@pytest.mark.parametrize("signum", [1, 2, 15])
+def test_publication_refusal_delivers_pending_termination(tmp_path, signum):
+    code = r"""
+import os, signal
+from pathlib import Path
+from claude_swap import spawn
+class PolicyChanged(Exception):
+    pass
+def publish():
+    os.kill(os.getpid(), SIGNUM)
+    raise PolicyChanged()
+def abort():
+    Path(os.environ["HOME"], "aborted").touch()
+try:
+    spawn.owned_launch(lambda: os._exit(99), publish=publish,
+        release=lambda: None, abort=abort)
+except PolicyChanged:
+    pass
+raise SystemExit(42)
+""".replace("SIGNUM", str(signum))
+    result = _run(code, tmp_path)
+    assert (tmp_path / "aborted").exists()
+    if signum == 2:
+        assert result.returncode in (-signum, 130), result.stderr
+        assert "KeyboardInterrupt" in result.stderr
+    else:
+        assert result.returncode == -signum, result.stderr
