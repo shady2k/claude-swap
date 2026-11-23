@@ -13379,3 +13379,87 @@ def test_backup_write_preserves_profile_with_unreadable_session_record(temp_home
     switcher._post_backup_write("1", "synthetic@example.com")
     assert credential.read_text() == "synthetic-profile-credential"
     assert is_session_stale(profile)
+
+
+@pytest.mark.parametrize("method", ["live", "token"])
+@pytest.mark.parametrize("operation", ["replace", "relocate"])
+def test_add_refuses_reservation_before_mutation(temp_home, method, operation):
+    from claude_swap import profile_ownership
+
+    switcher = TestAddAccountSlot()._make_switcher(temp_home, email="new@example.com")
+    switcher.add_account_from_token("synthetic-old", "old@example.com", slot=1)
+    if operation != "replace":
+        switcher.add_account_from_token("synthetic-new", "new@example.com", slot=2)
+    busy_num = "1" if operation == "replace" else "2"
+    busy_email = "old@example.com" if operation == "replace" else "new@example.com"
+    with profile_ownership.ownership_lock(switcher.backup_dir):
+        profile_ownership.reserve_locked(
+            switcher.backup_dir, busy_num, switcher._session_dir(busy_num, busy_email)
+        )
+    before = switcher.sequence_file.read_bytes()
+    credentials_before = switcher._read_account_credentials(busy_num, busy_email)
+    target = 1 if operation == "replace" else 3
+    with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(
+        json.dumps({"claudeAiOauth": {"accessToken": "synthetic-live"}}), False
+    )):
+        with pytest.raises(SessionError, match="busy"):
+            if method == "live":
+                switcher.add_account(slot=target, assume_yes=True)
+            else:
+                switcher.add_account_from_token("synthetic-replacement", "new@example.com", slot=target, assume_yes=True)
+    assert switcher.sequence_file.read_bytes() == before
+    assert switcher._read_account_credentials(busy_num, busy_email) == credentials_before
+
+
+@pytest.mark.parametrize("method", ["live", "token"])
+def test_add_reservation_cannot_enter_between_idle_check_and_delete(temp_home, method):
+    import threading
+    from claude_swap import profile_ownership
+
+    switcher = TestAddAccountSlot()._make_switcher(temp_home, email="new@example.com")
+    switcher.add_account_from_token("synthetic-old", "old@example.com", slot=1)
+    checked = threading.Event()
+    attempted = threading.Event()
+    reserved = threading.Event()
+    errors = []
+    original_delete = switcher._delete_account_files
+
+    def reserve():
+        try:
+            assert checked.wait(5)
+            attempted.set()
+            with profile_ownership.ownership_lock(switcher.backup_dir):
+                profile_ownership.reserve_locked(
+                    switcher.backup_dir, "1", switcher._session_dir("1", "old@example.com")
+                )
+                reserved.set()
+        except BaseException as exc:
+            errors.append(exc)
+
+    def delete(num, email):
+        checked.set()
+        assert attempted.wait(5)
+        # A reservation attempted at the mutation boundary must be excluded
+        # until deletion and the replacement record have both been written.
+        assert not reserved.wait(0.1)
+        original_delete(num, email)
+        assert not reserved.is_set()
+
+    worker = threading.Thread(target=reserve)
+    worker.start()
+    try:
+        with patch.object(switcher, "_delete_account_files", side_effect=delete), \
+             patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(
+                 json.dumps({"claudeAiOauth": {"accessToken": "synthetic-live"}}), False
+             )):
+            if method == "live":
+                switcher.add_account(slot=1, assume_yes=True)
+            else:
+                switcher.add_account_from_token("synthetic-replacement", "new@example.com", slot=1, assume_yes=True)
+    finally:
+        checked.set()
+        worker.join(5)
+    assert not worker.is_alive()
+    assert not errors
+    assert reserved.is_set()
+    assert switcher.account_email("1") == "new@example.com"
