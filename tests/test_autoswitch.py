@@ -205,6 +205,7 @@ def test_poll_reports_recovery_blocker_with_retained_usage(temp_home, error, bac
     entry = replace(
         _entry_for(_usage7(25, 10), h.clock.now),
         last_error=error,
+        recovery_error=error,
         backoff_until=h.clock.now + 600 if backoff else None,
     )
     h.tick_with_entries({"1": entry})

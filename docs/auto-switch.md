@@ -65,7 +65,9 @@ An account whose refresh token has died is quarantined and reported until you ei
 2. If the credential cannot be recovered, log in again with Claude Code and run `cswap add --slot N` for the affected slot.
 3. After inspection and recovery, run `cswap unclaimed --purge ID` for the blocking entry. This deletes its preserved credential bytes; do not purge a credential you still need to recover.
 
-A busy session profile is different: let its Claude Code launch finish, then retry. It does not mean the stored login needs replacing.
+A busy session profile is different: let its Claude Code launch finish, then retry. It does not mean the stored login needs replacing. While a profile is live, `profile-busy` takes precedence over a stored recovery error.
+
+`credential-unproven` means active recovery cannot prove the credential relationship. Log in again with Claude Code, then run `cswap add --slot N`. Once the account is inactive, this active-only warning is no longer shown. Current credential states, such as a foreign live login or an unavailable keychain, take precedence over old recovery errors; an active token's expiry pause during backoff does not hide the recovery guidance. The TUI's compact rows keep the usage or last-seen reading and show a short recovery label after the login note; expanded cards and `cswap list` show the full instructions.
 
 ## Running alongside Claude Code
 

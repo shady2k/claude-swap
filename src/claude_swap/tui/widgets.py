@@ -20,7 +20,7 @@ from claude_swap.json_output import USAGE_API_KEY, USAGE_RELOGIN_REQUIRED
 from claude_swap.models import AccountSnapshot
 from claude_swap.oauth import FIVE_HOUR_LABEL
 from claude_swap.printer import format_age
-from claude_swap.switcher import ERROR_NOTES
+from claude_swap.switcher import ERROR_NOTES, RECOVERY_ERRORS
 from claude_swap.usage_store import STALE_OK_S
 from claude_swap.tui import data
 from claude_swap.tui.theme import Palette
@@ -291,8 +291,8 @@ def account_card_text(
         style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
         marker = "·" if sentinel == USAGE_API_KEY else "⚠"
         note = (
-            ERROR_NOTES[acc.usage.last_error]
-            if acc.usage.last_error in ("stash-unreadable", "profile-busy", "credential-unproven")
+            ERROR_NOTES[acc.usage.recovery_error]
+            if acc.usage.recovery_error is not None
             else data.sentinel_label(sentinel)
         )
         text.append(f"{marker} {note}", style=style)
@@ -310,7 +310,9 @@ def account_card_text(
     if not rows:
         text.append("\n    ")
         text.append("usage unavailable", style=palette.muted)
-        if acc.usage.last_error:
+        if acc.usage.recovery_error is not None:
+            text.append(" · " + ERROR_NOTES[acc.usage.recovery_error], style=palette.sev_warn)
+        elif acc.usage.last_error is not None and acc.usage.last_error not in RECOVERY_ERRORS:
             # Same wording as the CLI detail line: error KINDS with a
             # friendly note render it, so both surfaces describe the state
             # identically.
@@ -346,8 +348,8 @@ def account_card_text(
                 palette=palette,
             )
         )
-    if acc.usage.last_error in ("stash-unreadable", "profile-busy", "credential-unproven"):
-        text.append("\n    ⚠ " + ERROR_NOTES[acc.usage.last_error], style=palette.sev_warn)
+    if acc.usage.recovery_error is not None:
+        text.append("\n    ⚠ " + ERROR_NOTES[acc.usage.recovery_error], style=palette.sev_warn)
     return text
 
 
@@ -365,6 +367,8 @@ def _end_mini(text: Text, acc: AccountSnapshot, form: str | None, now: float, pa
     if note:
         text.append(" · ", style=palette.track)
         text.append(note, style=palette.muted)
+    if acc.usage.recovery_error is not None:
+        text.append(" · " + acc.usage.recovery_error, style=palette.sev_warn)
     return text
 
 
@@ -403,13 +407,9 @@ def mini_account_text(
     sentinel = acc.usage.sentinel
     if sentinel is not None:
         style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
-        note = (
-            ERROR_NOTES[acc.usage.last_error]
-            if acc.usage.last_error in ("stash-unreadable", "profile-busy", "credential-unproven")
-            else data.sentinel_label(sentinel)
-        )
+        note = "token expired" if acc.usage.recovery_error is not None else data.sentinel_label(sentinel)
         text.append(note, style=style)
-        if acc.usage.last_error in ("stash-unreadable", "profile-busy", "credential-unproven"):
+        if acc.usage.recovery_error is not None:
             last_seen = data.last_seen_note(acc.usage)
             if last_seen is not None:
                 text.append(" · " + last_seen, style=palette.muted)
@@ -458,8 +458,6 @@ def mini_account_text(
         parts += 1
     if not parts:
         text.append("usage unknown", style=palette.muted)
-    if acc.usage.last_error in ("stash-unreadable", "profile-busy", "credential-unproven"):
-        text.append(" · " + ERROR_NOTES[acc.usage.last_error], style=palette.sev_warn)
     return _end_mini(text, acc, login, now, palette)
 
 

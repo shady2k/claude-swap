@@ -362,15 +362,18 @@ class TestFormatting:
 
         entry = dataclasses.replace(
             make_entry() if has_history else UsageEntry(), last_error=error,
+            recovery_error=error,
             backoff_until=time.time() + 600 if backoff else None,
             sentinel=USAGE_TOKEN_EXPIRED if expired_sentinel else None,
         )
         from claude_swap.switcher import _usage_entry_lines
 
         account = make_account(1, entry=entry)
+        mini = mini_account_text(account, time.time()).plain
+        assert mini.endswith(error)
+        assert ERROR_NOTES[error] not in mini
         for text in (
             account_card_text(account, 100).plain,
-            mini_account_text(account, time.time()).plain,
             "\n".join(_usage_entry_lines(entry)),
         ):
             assert ERROR_NOTES[error] in text
@@ -382,6 +385,29 @@ class TestFormatting:
             else:
                 assert "log in again" not in text
                 assert "cswap add" not in text
+
+    def test_recovery_mini_fits_rendered_width_after_login_note(self):
+        from io import StringIO
+        from rich.console import Console
+        from rich.cells import cell_len
+        from claude_swap.tui.widgets import fit_login, mini_account_text
+
+        now = time.time()
+        acc = dataclasses.replace(
+            make_account(2, email="work@example.com", entry=dataclasses.replace(
+                make_entry(), recovery_error="stash-unreadable",
+            )),
+            login_expires_at=now + 2 * 86400 + 3600,
+        )
+        (row,) = fit_login(lambda form: [mini_account_text(acc, now, login=form)], 88)
+        output = StringIO()
+        Console(file=output, width=88, color_system=None).print(row)
+        rendered = output.getvalue().strip()
+        assert cell_len(rendered) <= 88
+        assert "5h 25%" in rendered
+        assert "7d 10%" in rendered
+        assert rendered.endswith("stash-unreadable")
+        assert rendered.index("re-login") < rendered.index("stash-unreadable")
 
     def test_account_card_uses_light_palette_when_passed(self):
         from claude_swap.tui.theme import ACCENT_LIGHT, CSWAP_LIGHT, Palette

@@ -66,7 +66,7 @@ from claude_swap.settings import (
     log_unrecognized_keys,
     parse_model_names,
 )
-from claude_swap.switcher import ERROR_NOTES, ClaudeAccountSwitcher
+from claude_swap.switcher import ERROR_NOTES, RECOVERY_ERRORS, ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
@@ -79,11 +79,11 @@ _logger = logging.getLogger("claude-swap")
 # and the order decides which, because reporting the wrong one is how a cause
 # needing a human hides behind one that clears itself. store-unmirrored and
 # invalid_client stay until somebody unsets an env var or fixes a client
-# registration, and stash-unreadable until they unlock a keychain, fix a mode,
-# or purge the row; consume-busy is gone by the next pass. stash-unreadable is
-# the one that is per-SLOT rather than global, which costs nothing here: this
-# message is only ever emitted when NO candidate freshened, so naming the real
-# cause of the only slot that had one beats "(network?)".
+# registration, and stash-unreadable until they inspect and recover the login,
+# then purge the blocking entry; consume-busy is gone by the next pass.
+# Unknown stash ownership blocks every slot; a proven entry can block only
+# its own slot. This message is emitted when no candidate freshened, so it
+# names the actionable cause rather than guessing at a network failure.
 _SYSTEMIC_MESSAGES = {
     "store-unmirrored": "CLAUDE_SECURESTORAGE_CONFIG_DIR is set — unset it or "
                         "run cswap from a normal shell",
@@ -1162,11 +1162,12 @@ class AutoSwitchEngine:
                 threshold=thresholds[current],
                 weekly_threshold=settings.weekly_threshold,
                 fetch_errors={
-                    num: entry.last_error
+                    num: entry.recovery_error or entry.last_error
                     for num, entry in entries.items()
-                    if entry.last_error and (
+                    if entry.recovery_error is not None or (
                         usage.get(num) is None
-                        or entry.last_error in ("stash-unreadable", "profile-busy", "credential-unproven")
+                        and entry.last_error is not None
+                        and entry.last_error not in RECOVERY_ERRORS
                     )
                 },
                 windows={

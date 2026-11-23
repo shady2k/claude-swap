@@ -50,6 +50,56 @@ def _raise_locked(*args, **kwargs):
     raise KeychainError("locked")
 
 
+
+
+@pytest.mark.parametrize("active,live,static,expected", [
+    (True, False, None, "credential-unproven"),
+    (False, False, None, None),
+    (False, True, None, "profile-busy"),
+    (True, False, USAGE_FOREIGN_CREDENTIAL, None),
+    (True, True, "keychain_unavailable", None),
+])
+def test_collector_recovery_overlay_priority(temp_home, monkeypatch, active, live, static, expected):
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    creds = json.dumps({"claudeAiOauth": {"accessToken": "synthetic", "expiresAt": 1000}})
+    info = [(1, "user@example.com", "", "", active, creds, "")]
+    store = switcher._usage_store
+    identities = {"1": ("user@example.com", "")}
+    history = {"five_hour": {"pct": 25}}
+    store.record({"1": FetchRecord(usage=history)}, identities)
+    store.record({"1": FetchRecord(error="credential-unproven")}, identities)
+    monkeypatch.setattr(switcher, "_static_usage_sentinel", lambda info: static)
+    monkeypatch.setattr(switcher, "_live_session_pids", lambda *args: [123] if live else [])
+    entry = switcher._collect_usage_entries(info, fetch=set())["1"]
+    assert entry.recovery_error == expected
+    assert entry.last_error == "credential-unproven"
+    assert entry.last_good == history
+    assert store.entries(identities)["1"].recovery_error is None
+    if static:
+        assert entry.sentinel == static
+        assert "credential relationship is unproven" not in "\n".join(_usage_entry_lines(entry))
+
+
+def test_current_fetch_sentinel_clears_stored_recovery_guidance(temp_home, monkeypatch):
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    info = [(1, "user@example.com", "", "", False, "", "")]
+    identities = {"1": ("user@example.com", "")}
+    store = switcher._usage_store
+    store.record({"1": FetchRecord(error="stash-unreadable")}, identities)
+    monkeypatch.setattr(switcher, "_static_usage_sentinel", lambda info: None)
+    monkeypatch.setattr(store, "reserve", lambda *args, **kwargs: {"1": "synthetic-claim"})
+    monkeypatch.setattr(switcher, "_run_usage_fetches", lambda *args: {"1": FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)})
+    monkeypatch.setattr(switcher, "_plans_after_fetch", lambda *args: {})
+    # Simulate an accepted sentinel-only fetch retaining the last fetch error.
+    monkeypatch.setattr(store, "record", lambda *args: {"1"})
+    entry = switcher._collect_usage_entries(info)["1"]
+    assert entry.last_error == "stash-unreadable"
+    assert entry.sentinel == USAGE_TOKEN_EXPIRED
+    assert entry.recovery_error is None
+
+
 class TestEmailValidation:
     """Test email validation."""
 
