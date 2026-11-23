@@ -122,9 +122,6 @@ def _previous_boot(data: dict) -> bool:
 
 def _pid_alive(pid: int) -> bool | None:
     """False only for proven absence; every other failure is unknown."""
-    if sys.platform == "win32":
-        # OpenProcess failures cannot distinguish denial from absence.
-        return None
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -185,7 +182,9 @@ def _parse_start(value: str | None, platform: str) -> _WindowsStart | _PosixStar
 
 def _compare_start(stored, current: _ProcessIdentity) -> str:
     """Match/different/unknown; only trustworthy same-type values prove reuse."""
-    if stored is None or current.state != "present" or current.start is None:
+    if stored is None or current.state == "absent" or current.start is None:
+        return "unknown"
+    if current.platform == "win32" and current.state != "present":
         return "unknown"
     if type(stored) is not type(current.start):
         return "unknown"

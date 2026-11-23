@@ -99,8 +99,9 @@ def process_identity(pid: int) -> ProcessIdentity:
             c.byref(kernel_time), c.byref(user_time),
         ):
             return ProcessIdentity("unknown", None)
-        return ProcessIdentity(
-            "present", (creation.dwHighDateTime << 32) | creation.dwLowDateTime,
-        )
+        creation_time = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+        if not creation_time:
+            return ProcessIdentity("unknown", None)
+        return ProcessIdentity("present", creation_time)
     finally:
         _function(kernel, "CloseHandle", w.BOOL, w.HANDLE)(handle)

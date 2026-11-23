@@ -149,3 +149,50 @@ def test_native_identity_is_stable_and_a_child_differs(tmp_path):
 @pytest.mark.skipif(sys.platform != "win32", reason="native Windows process API")
 def test_native_pid_zero_is_unknown():
     assert _win_process.process_identity(0).state == "unknown"
+
+
+def test_zero_creation_time_is_unknown_and_closes_handle(monkeypatch):
+    calls = _fake_kernel(monkeypatch, creation=(0, 0))
+    assert _win_process.process_identity(4242) == _win_process.ProcessIdentity("unknown", None)
+    assert calls["times"] == [11]
+    assert calls["close"] == [11]
+
+
+def test_zero_creation_time_retains_reserved_profile(tmp_path, monkeypatch):
+    from claude_swap import profile_ownership as ownership
+
+    monkeypatch.setattr(ownership, "sys", SimpleNamespace(platform="win32"))
+    _fake_kernel(monkeypatch, creation=(0, 200))
+    with ownership.ownership_lock(tmp_path):
+        record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
+        assert record["ownerTicks"] == "win32:200"
+        path = ownership._record_path(tmp_path, record["launchId"])
+        calls = _fake_kernel(monkeypatch, creation=(0, 0))
+        assert ownership.profile_busy_locked(tmp_path, "1")
+        assert ownership._read(path) == record
+        assert calls["close"] == [11]
+
+
+def test_zero_child_creation_time_rejects_publication(tmp_path, monkeypatch):
+    from claude_swap import profile_ownership as ownership
+
+    monkeypatch.setattr(ownership, "sys", SimpleNamespace(platform="win32"))
+    calls = _fake_kernel(monkeypatch, creation=(0, 200))
+    kernel = _win_process._kernel32()
+    valid_times = kernel.GetProcessTimes.side_effect
+    def get_times(process, created, exited, kernel_time, user_time):
+        if calls["open"][-1][2] == os.getpid():
+            return valid_times(process, created, exited, kernel_time, user_time)
+        calls["times"].append(process)
+        created._obj.dwHighDateTime = created._obj.dwLowDateTime = 0
+        return 1
+    kernel.GetProcessTimes.side_effect = get_times
+    child = 4242 if os.getpid() != 4242 else 4243
+    with ownership.ownership_lock(tmp_path):
+        record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
+        path = ownership._record_path(tmp_path, record["launchId"])
+        with pytest.raises(ownership.SessionError):
+            ownership.mark_running_locked(tmp_path, record["launchId"], child)
+        assert ownership._read(path) == record
+        assert [call[2] for call in calls["open"]] == [os.getpid(), os.getpid(), child]
+        assert calls["close"] == [11, 11, 11]

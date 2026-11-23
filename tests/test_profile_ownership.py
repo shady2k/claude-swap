@@ -591,9 +591,6 @@ def windows_identity(monkeypatch):
     ("win32:200", None, "unknown", 4242, True),
     ("win32:200", None, "absent", 4242, False),
     ("foreign", None, "absent", 4242, True),
-    ("win32:200", None, "unknown", 0, True),
-    ("win32:200", None, "unknown", -1, True),
-    ("win32:200", None, "unknown", 0x100000000, True),
 ])
 def test_windows_reservation_cleanup_boundary(
     tmp_path, windows_identity, stored, current, status, pid, busy,
@@ -687,3 +684,105 @@ def test_foreign_windows_record_never_authorizes_posix_cleanup(tmp_path, process
         assert ownership.profile_busy_locked(tmp_path, "1")
         with pytest.raises(ownership.SessionError):
             ownership.release_locked(tmp_path, record["launchId"])
+
+
+@pytest.mark.parametrize("state", ["unknown", "denied"])
+def test_windows_different_ticks_require_present_state(tmp_path, windows_identity, state):
+    values, _ = windows_identity
+    with ownership.ownership_lock(tmp_path):
+        record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
+        values[record["ownerPid"]] = ownership._ProcessIdentity(
+            state, ownership._WindowsStart(201), "win32",
+        )
+        assert ownership.profile_busy_locked(tmp_path, "1")
+
+
+@pytest.mark.skipif(__import__("sys").platform == "win32", reason="POSIX process identity")
+@pytest.mark.parametrize("current,busy", [("123", True), ("456", False)])
+def test_posix_permission_denied_still_compares_start_ticks(tmp_path, monkeypatch, current, busy):
+    def denied(pid, signal):
+        raise PermissionError("synthetic EPERM")
+
+    monkeypatch.setattr(ownership, "scan_sessions", lambda _: ([], 0))
+    monkeypatch.setattr(ownership, "process_start_ticks", lambda pid: "123")
+    with ownership.ownership_lock(tmp_path):
+        ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
+        monkeypatch.setattr(ownership.os, "kill", denied)
+        monkeypatch.setattr(ownership, "process_start_ticks", lambda pid: current)
+        assert ownership.profile_busy_locked(tmp_path, "1") is busy
+
+
+@pytest.mark.skipif(__import__("sys").platform == "win32", reason="POSIX process identity")
+@pytest.mark.parametrize("probe,state", [
+    (None, "present"), (ProcessLookupError, "absent"), (PermissionError, "unknown"),
+])
+@pytest.mark.parametrize("ticks", ["123", None])
+def test_posix_process_identity(monkeypatch, probe, state, ticks):
+    calls = []
+
+    def kill(pid, signal):
+        calls.append((pid, signal))
+        if probe:
+            raise probe("synthetic process probe")
+
+    monkeypatch.setattr(ownership.os, "kill", kill)
+    monkeypatch.setattr(ownership, "process_start_ticks", lambda pid: ticks)
+    identity = ownership._process_identity(4242)
+    assert identity == ownership._ProcessIdentity(
+        state, ownership._PosixStart(ticks) if ticks is not None else None,
+        ownership.sys.platform,
+    )
+    assert calls == [(4242, 0)]
+
+
+def test_windows_length_limit_alone_retains_reservation(tmp_path, windows_identity):
+    values, _ = windows_identity
+    with ownership.ownership_lock(tmp_path):
+        record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
+        path = ownership._record_path(tmp_path, record["launchId"])
+        record["ownerTicks"] = "win32:" + "0" * 300 + "200"
+        ownership._write(path, record)
+        values[record["ownerPid"]] = ownership._ProcessIdentity(
+            "present", ownership._WindowsStart(201), "win32",
+        )
+        assert ownership.profile_busy_locked(tmp_path, "1")
+        assert ownership._read(path)["state"] == "reserved"
+
+
+@pytest.mark.parametrize("pid", [0, -1])
+def test_corrupt_record_retains_profile_without_identity_probe(tmp_path, windows_identity, pid):
+    _, reads = windows_identity
+    with ownership.ownership_lock(tmp_path):
+        record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile")
+        path = ownership._record_path(tmp_path, record["launchId"])
+        record["ownerPid"] = pid
+        ownership._write(path, record)
+        reads.clear()
+        assert ownership.profile_busy_locked(tmp_path, "1")
+        assert reads == []
+        assert ownership._read(path)["state"] == "reserved"
+
+
+@pytest.mark.parametrize("stored", ["win32:0", "win32:00000000000000000000"])
+@pytest.mark.parametrize("operation", ["verify", "release", "acknowledge", "publish"])
+def test_zero_windows_start_never_authorizes_owner_mutation(
+    tmp_path, windows_identity, stored, operation,
+):
+    with ownership.ownership_lock(tmp_path):
+        record = ownership.reserve_locked(tmp_path, "1", tmp_path / "profile", warming=True)
+        path = ownership._record_path(tmp_path, record["launchId"])
+        record["ownerTicks"] = stored
+        ownership._write(path, record)
+        with pytest.raises(ownership.SessionError):
+            if operation == "verify":
+                ownership.verify_reservation_locked(tmp_path, record["launchId"])
+            elif operation == "release":
+                ownership.release_locked(tmp_path, record["launchId"])
+            elif operation == "acknowledge":
+                ownership.acknowledge_generation_locked(
+                    tmp_path, record["launchId"], record["profileGen"],
+                )
+            else:
+                ownership.mark_running_locked(tmp_path, record["launchId"], 4242)
+        assert ownership._read(path) == record
+        assert ownership.profile_busy_locked(tmp_path, "1")
