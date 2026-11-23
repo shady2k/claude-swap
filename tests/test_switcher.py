@@ -1565,7 +1565,13 @@ class TestFetchAccountUsageFromAnotherProfile:
             )
 
         assert record.usage == {"five_hour": {"pct": 5}}
-        assert mock_fetch.call_args.kwargs["refresh_via"] == switcher.consume_backup_grant
+        refresh = mock_fetch.call_args.kwargs["refresh_via"]
+        snapshot = object()
+        with patch.object(switcher, "credential_snapshot", return_value=snapshot) as capture, \
+                patch.object(switcher, "consume_backup_grant") as consume:
+            refresh("3", "idle@example.com", expired)
+        capture.assert_called_once_with("3", "idle@example.com")
+        consume.assert_called_once_with("3", "idle@example.com", snapshot)
 
 
 class TestAdoptSessionCredential:
