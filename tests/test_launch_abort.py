@@ -15,6 +15,10 @@ from claude_swap.exceptions import LockError, SessionError
 def launch_route(tmp_path, monkeypatch):
     root = tmp_path / "backup"
     profile = tmp_path / "profile"
+    # Cleanup semantics need a publishable identity, not native supervision.
+    monkeypatch.setattr(ownership, "_process_identity", lambda pid: ownership._ProcessIdentity(
+        "present", ownership._PosixStart(f"synthetic-{pid}"), "synthetic",
+    ))
     monkeypatch.setattr(ownership, "scan_sessions", lambda _: ([], 0))
     with ownership.ownership_lock(root):
         record = ownership.reserve_locked(root, "1", profile)
@@ -79,13 +83,19 @@ def test_prefork_abort_releases_only_own_record(launch_route, monkeypatch, route
         if published:
             ownership.mark_running_locked(root, record["launchId"], os.getpid())
 
+    aborted = []
+
     def abort_before_fork(handoff, *, publish, release, abort):
         abort()
+        aborted.append(record["launchId"])
         raise OSError("synthetic pre-fork refusal")
 
     monkeypatch.setattr(spawn, "owned_launch", abort_before_fork)
-    with pytest.raises((OSError, SessionError)):
+    with pytest.raises((OSError, SessionError), match="synthetic pre-fork refusal") as error:
         launch(route)
+    refusal = error.value.__cause__ if route == "session" else error.value
+    assert str(refusal) == "synthetic pre-fork refusal"
+    assert aborted == [record["launchId"]]
     assert not ownership._record_path(root, record["launchId"]).exists()
     assert ownership._record_path(root, peer["launchId"]).exists()
 

@@ -981,7 +981,7 @@ class TestIsSessionValid:
 
 
 @pytest.fixture
-def share_setup(temp_home: Path, seeded_switcher):
+def share_setup(temp_home: Path, seeded_switcher, manager):
     """Source items in ~/.claude and an existing (seeded-enough) session dir."""
     source = temp_home / ".claude"
     (source / "settings.json").write_text("{}")
@@ -991,7 +991,7 @@ def share_setup(temp_home: Path, seeded_switcher):
 
     session_dir = session_dir_for(seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
     session_dir.mkdir(parents=True)
-    return source, session_dir, SessionManager(seeded_switcher)
+    return source, session_dir, manager
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlink mode is POSIX-only")
@@ -5687,11 +5687,19 @@ def test_run_keeps_reservation_across_setup_to_exec(manager, monkeypatch):
 
 
 class TestLaunchReservation:
+    @pytest.mark.parametrize("windows_key", [False, True], ids=["native", "WindowsCase"])
     def test_setup_keeps_reservation_until_external_handoff(
-        self, manager, auth_status_tracks_seed, refresh_rotates
+        self, manager, auth_status_tracks_seed, refresh_rotates, monkeypatch, windows_key
     ):
         from claude_swap import profile_ownership
 
+        if windows_key:
+            original_directory = session_mod.session_dir_for
+            monkeypatch.setattr(session_mod, "session_dir_for", lambda *args:
+                original_directory(*args).with_name("CaseProfile"))
+            path_adapter = SimpleNamespace(**{**vars(os.path), "normcase": str.lower})
+            monkeypatch.setattr(profile_ownership, "os", SimpleNamespace(
+                **{**vars(os), "path": path_adapter}))
         profile, num, _ = manager.setup_session("2", share=False)
         record = manager._launch_reservation
         assert record is not None
@@ -5700,7 +5708,7 @@ class TestLaunchReservation:
                 manager.switcher.backup_dir, record["launchId"]
             )
         assert current["state"] == "reserved"
-        assert current["profile"] == str(profile.resolve())
+        assert current["profile"] == profile_ownership.profile_key(profile)
 
     def test_default_fast_path_does_not_need_profile_admission(
         self, manager, capture_exec, monkeypatch

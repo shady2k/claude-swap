@@ -263,7 +263,7 @@ def test_f17v_blocked_escape_in_grandchild_is_a_detected_attempt(tmp_path, call,
         stand.assert_clean()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="Windows shim not admitted before launcher verification")
+@pytest.mark.skipif(sys.platform != "linux", reason="Installed shim requires admitted Linux tree supervision")
 @pytest.mark.parametrize(("call", "event"), [
     ("print('synthetic Claude')", None),
     ("socket.socket(socket.AF_INET, socket.SOCK_DGRAM).bind(('127.0.0.1', 0))", "socket.bind"),
@@ -285,12 +285,10 @@ def test_f20_audits_plain_claude_through_the_installed_shim(tmp_path, call, even
     """)
     result = stand.run_shim(installer, "import os, socket, subprocess\n" + call, "--", "prompt")
     records = stand.records()
-    launch = records[:5] if sys.platform == "linux" else records[:4]
-    expected = ["startup", "startup", "supervise", "exec", "startup"] if sys.platform == "linux" else ["startup", "startup", "exec", "startup"]
-    assert [r["kind"] for r in launch] == expected, result.stderr
+    launch = records[:5]
+    assert [r["kind"] for r in launch] == ["startup", "startup", "supervise", "exec", "startup"], result.stderr
     assert launch[-2]["pid"] == launch[-1]["pid"]
-    if sys.platform == "linux":
-        assert launch[1]["pid"] == launch[2]["pid"] != launch[-1]["pid"]
+    assert launch[1]["pid"] == launch[2]["pid"] != launch[-1]["pid"]
     assert [r["stage"] for r in launch if r["kind"] == "startup"] == ["root", "root", "descendant"]
     if event is None:
         stand.assert_clean()
@@ -301,6 +299,36 @@ def test_f20_audits_plain_claude_through_the_installed_shim(tmp_path, call, even
         assert records[-1]["event"] == event
         with pytest.raises(AssertionError, match="stand blocked"):
             stand.assert_clean()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Native Darwin fail-closed launch policy")
+def test_installed_shim_refuses_unsupported_tree_supervision(tmp_path):
+    stand = StandAudit(tmp_path)
+    installer = _script(tmp_path, "installer.py", """
+        import runpy
+        import sys
+
+        sys.argv[:] = ["cswap", "transparent", "enable", "--accept-shared-history", "--account", "1"]
+        runpy.run_module("claude_swap", run_name="__main__", alter_sys=True)
+    """)
+    result = stand.run_shim(installer, "raise AssertionError('synthetic body must not run')", "--", "prompt")
+    assert result.returncode != 0
+    assert not result.stdout
+    assert "Profile launch refused before fork" in result.stderr
+    assert "Profile tree supervision is unsupported on this platform" in result.stderr
+    assert [(record["kind"], record["stage"]) for record in stand.records()] == [
+        ("startup", "root"), ("startup", "root"),
+    ]
+    from claude_swap import paths
+    from claude_swap.session import session_dir_for
+
+    backup = Path(stand.env["HOME"]) / paths.LEGACY_BACKUP_DIRNAME
+    profile = session_dir_for(backup, "1", "audit@example.test")
+    assert json.loads((profile / ".claude.json").read_text()) == {
+        "oauthAccount": {"emailAddress": "audit@example.test", "accountUuid": "audit-profile"},
+    }
+    assert not list((backup / "profile-ownership" / "launches").glob("*.json"))
+    stand.assert_clean()
 
 
 @pytest.mark.parametrize(("call", "event"), [

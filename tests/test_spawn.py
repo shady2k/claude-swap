@@ -367,10 +367,12 @@ class TestCallSites:
         monkeypatch.setattr(spawn, "run", fake)
         return calls
 
-    def test_ps(self, routed, monkeypatch):
-        monkeypatch.setattr(spawn, "sys", SimpleNamespace(platform="linux", stderr=sys.stderr))
+    @pytest.mark.parametrize("platform", ["linux", "win32"])
+    def test_ps(self, routed, monkeypatch, platform):
+        monkeypatch.setattr(process_detection, "sys", SimpleNamespace(platform=platform))
         assert process_detection._ps(1234, "lstart") is None
-        assert routed == [["ps", "-o", "lstart=", "-p", "1234"]]
+        expected = [] if platform == "win32" else [["ps", "-o", "lstart=", "-p", "1234"]]
+        assert routed == expected
 
     @pytest.mark.no_keychain_fake
     def test_security(self, routed):

@@ -213,6 +213,12 @@ def test_transparent_pool_and_revoke_cli_do_not_use_network(
 
 
 def test_f8_cold_profile_pins_auth_probe_and_launch(route, monkeypatch):
+    from claude_swap import profile_ownership as ownership
+
+    # This test owns argument pinning at a synthetic handoff boundary.
+    monkeypatch.setattr(ownership, "_process_identity", lambda pid: ownership._ProcessIdentity(
+        "present", ownership._PosixStart(f"synthetic-{pid}"), "synthetic",
+    ))
     fake, _, values = route
     backup = paths.get_backup_root()
     profile = session.session_dir_for(backup, "1", "synthetic@example.test")
@@ -328,7 +334,7 @@ def test_f34_direct_discards_inherited_proxies(direct_route, no_attempts, monkey
 
 
 def test_f34_direct_refuses_other_platforms(direct_route, no_attempts, monkeypatch):
-    monkeypatch.setattr(test_mode.sys, "platform", "darwin")
+    monkeypatch.setattr(test_mode, "sys", SimpleNamespace(**(vars(sys) | {"platform": "darwin"})))
     with pytest.raises(test_mode.TestModeConfigError, match="Linux stand"):
         test_mode.preflight(["--version"])
 

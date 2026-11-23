@@ -10,8 +10,9 @@ pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux supervisi
 
 
 @pytest.mark.parametrize("route", ["session", "transparent"])
-@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
+@pytest.mark.parametrize("signum", ["SIGTERM", "SIGHUP"])
 def test_publication_refusal_preserves_pending_termination(tmp_path, route, signum):
+    signum = getattr(signal, signum)
     with AdmissionStand(tmp_path, route) as stand:
         launch = stand.launch("refusal", mode="signal-publication-refusal")
         if route == "session":

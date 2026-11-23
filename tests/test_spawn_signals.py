@@ -14,8 +14,9 @@ from tests.profile_admission_stand import AdmissionStand
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux pidfd supervision")
 
 
-@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP])
+@pytest.mark.parametrize("signum", ["SIGINT", "SIGTERM", "SIGHUP"])
 def test_signal_reaches_detached_descendants_after_leader_reaped(tmp_path, signum):
+    signum = getattr(signal, signum)
     code = r"""
 import os, signal, sys, time
 from pathlib import Path
@@ -242,8 +243,9 @@ signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 
 
 @pytest.mark.parametrize("phase", ["publish", "release"])
-@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP])
+@pytest.mark.parametrize("signum", ["SIGINT", "SIGTERM", "SIGHUP"])
 def test_owned_launch_handles_signals_at_ownership_boundaries(tmp_path, phase, signum):
+    signum = getattr(signal, signum)
     code = r"""
 import os, signal, sys
 from pathlib import Path

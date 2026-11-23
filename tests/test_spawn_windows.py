@@ -278,7 +278,23 @@ import os, sys
 from pathlib import Path
 from claude_swap import spawn
 spawn.require_supervision()
-child = "import os,sys,json; print(json.dumps([sys.argv[1:], os.environ['CSWAP_SYNTHETIC'], os.environ['=C:'], sys.stdin.readline().strip()])); print('synthetic stderr', file=sys.stderr); sys.exit(41)"
+child = r'''
+import ctypes, json, os, sys
+from ctypes import wintypes as w
+# Hidden drive keys can be absent from Python's os.environ mapping.
+kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+get_environment = kernel.GetEnvironmentVariableW
+get_environment.argtypes = [w.LPCWSTR, w.LPWSTR, w.DWORD]
+get_environment.restype = w.DWORD
+required = get_environment("=C:", None, 0)
+assert required, ctypes.WinError(ctypes.get_last_error())
+drive = ctypes.create_unicode_buffer(required)
+assert get_environment("=C:", drive, required) == required - 1
+print(json.dumps([sys.argv[1:], os.environ["CSWAP_SYNTHETIC"], drive.value,
+                  sys.stdin.readline().strip()]))
+print("synthetic stderr", file=sys.stderr)
+sys.exit(41)
+'''
 def launch():
     env = dict(os.environ, CSWAP_SYNTHETIC="value with spaces \u03bb")
     env["=C:"] = "C:\\synthetic"
