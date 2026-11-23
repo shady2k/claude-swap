@@ -87,10 +87,12 @@ def test_barrier_timeout_records_service_and_target_logs(job_root, monkeypatch):
             job.start()
         diagnostic = job.diagnostics()
         assert diagnostic["logs"]["stderr.log"] == "synthetic startup error"
-        assert diagnostic["events"][1]["stage"] == "waiting for ready barrier"
-        assert diagnostic["events"][2]["stage"] == "ready barrier failed"
-        assert diagnostic["events"][3]["stdout"] == "state = exited; last exit code = 1"
+        assert diagnostic["events"][1]["command"] == ["print", job.service]
+        assert diagnostic["events"][2]["stage"] == "waiting for ready barrier"
+        assert diagnostic["events"][3]["stage"] == "ready barrier failed"
+        assert diagnostic["events"][4]["stdout"] == "state = exited; last exit code = 1"
     finally:
         job.close()
     assert calls == [("bootstrap", job.domain, str(job.plist)),
-                     ("print", job.service), ("bootout", job.service)]
+                     ("print", job.service), ("print", job.service),
+                     ("bootout", job.service)]

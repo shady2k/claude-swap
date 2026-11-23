@@ -27,17 +27,41 @@ def target(directory: Path, detached: bool) -> None:
     # Persist milestones even after inherited stdout/stderr are closed.
     def milestone(stage):
         with (directory / "target-stages.log").open("a") as stream:
-            stream.write(stage + "\n")
+            stream.write(f"pid={os.getpid()} {stage}\n")
+            stream.flush()
+            os.fsync(stream.fileno())
 
     milestone("entered target")
     # No credentials, network clients or product launch path involved.
     if detached:
-        if os.fork():
+        import select
+
+        ready_read, ready_write = os.pipe()
+        milestone("before first fork")
+        child = os.fork()
+        if child:
+            os.close(ready_write)
+            milestone(f"first fork child={child}; waiting for detached grandchild")
+            readable, _, _ = select.select([ready_read], [], [], 15)
+            ready = os.read(ready_read, 1) if readable else b""
+            os.close(ready_read)
+            if ready != b"R":
+                milestone("leader exit: detached readiness missing")
+                os._exit(125)
+            milestone("leader exit: detached grandchild acknowledged")
             os._exit(0)
+        os.close(ready_read)
+        milestone("first fork child entered; before setsid")
         os.setsid()
-        milestone("setsid complete")
-        if os.fork():
+        milestone("setsid complete; before second fork")
+        grandchild = os.fork()
+        if grandchild:
+            os.close(ready_write)
+            milestone(f"second fork child={grandchild}; intermediate exit")
             os._exit(0)
+        milestone("second fork grandchild entered; acknowledging detached readiness")
+        os.write(ready_write, b"R")
+        os.close(ready_write)
     maximum = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
     os.closerange(0, int(maximum))
     milestone("inherited descriptors closed")
@@ -125,6 +149,8 @@ class Job:
         if result["returncode"]:
             raise RuntimeError(f"bootstrap failed: {result['returncode']}: {result['stderr']}")
         self.submitted = True
+        # Capture the service while the single-run leader may still exist.
+        self.snapshot()
         self.events.append({"stage": "waiting for ready barrier"})
         try:
             self.channel, _ = self.listener.accept()
