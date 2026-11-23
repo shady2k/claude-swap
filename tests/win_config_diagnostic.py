@@ -125,11 +125,16 @@ def _probe():
     install()  # Retain the CLI unit guard against real network and Keychain use.
     root = paths.get_backup_root()
     set_exit, set_error = _config(["set", "autoswitch.cooldownSeconds", "600"])
-    print(f"config-set exit={set_exit} first-exception={set_error} root={_stat_state(root)}")
+    root_state = _stat_state(root)
+    print(f"config-set exit={set_exit} first-exception={set_error} root={root_state}")
     policy = root / "transparent.json"
-    state = _stat_state(policy)
     actual_exit, actual_error = _config(["list"])
+    state = _stat_state(policy)
     print(f"config-list exit={actual_exit} first-exception={actual_error} policy={state}")
+    actual_ok = (
+        (set_exit, set_error, root_state) == ("0", "none", "present")
+        and (actual_exit, actual_error, state) == ("0", "none", "absent")
+    )
 
     read = launch_policy._read
     check_dacl = security._check_dacl
@@ -152,12 +157,13 @@ def _probe():
         legacy_exit, legacy_error = _config(["list"])
     ace = rejection[0] if rejection else "none"
     print(f"legacy-root-first exit={legacy_exit} first-exception={legacy_error} policy={state} ace={ace}")
+    return 0 if actual_ok else 1
 
 
 def main():
     if sys.platform != "win32":
         print("win-config non-windows")
-        return
+        return 1
     # Use ordinary mkdir inheritance, as pytest's temp homes and the settings
     # writer do. Do not probe or change the developer's real backup directory.
     home = Path(tempfile.gettempdir()) / f"cswap-win-config-{uuid4().hex}"
@@ -173,12 +179,13 @@ def main():
             clean.update(HOME=str(home), USERPROFILE=str(home), NO_COLOR="1")
             clean[test_mode.MODE] = "1"
             with patch.dict(os.environ, clean, clear=True):
-                _probe()
+                return _probe()
         finally:
             shutil.rmtree(home)
     except Exception as exc:
         print(f"win-config unavailable first-exception={_exception_category(exc)}")
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

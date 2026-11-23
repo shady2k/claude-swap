@@ -45,9 +45,14 @@ def probe(tmp_path):
 
 
 def main():
-    with TemporaryDirectory(prefix="cswap-audit-", dir=os.environ.get("RUNNER_TEMP")) as tmp:
-        print(json.dumps(probe(Path(tmp).resolve()), sort_keys=True))
+    try:
+        with TemporaryDirectory(prefix="cswap-audit-", dir=os.environ.get("RUNNER_TEMP")) as tmp:
+            report = probe(Path(tmp).resolve())
+    except Exception:
+        report = {"exit": 1, "error": "unexpected-probe-failure"}
+    print(json.dumps(report, sort_keys=True))
+    return report["exit"]
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
