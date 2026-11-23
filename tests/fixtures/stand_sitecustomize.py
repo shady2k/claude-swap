@@ -15,6 +15,11 @@ class StandBlocked(BaseException):
     """An audited operation was refused before Python could execute it."""
 
 
+def exit_startup(reason):
+    os.write(2, f"no-network stand could not establish audited startup: {reason}\n".encode("ascii"))
+    os._exit(125)
+
+
 def install():
     policy = json.loads(Path(__file__).with_name("stand-policy.json").read_text(encoding="utf-8"))
     journal = policy["journal"]
@@ -140,16 +145,26 @@ def install():
             finally:
                 active_launch.allowed = False
 
+    def reject_startup(reason):
+        record("blocked", event="startup", reason=reason)
+        exit_startup(reason)
+
     sys.addaudithook(hook)
     subprocess.Popen = StandPopen
+    if not (sys.flags.isolated and sys.flags.ignore_environment and sys.flags.no_user_site):
+        reject_startup("flags")
+    if os.path.normcase(sys.executable) != os.path.normcase(policy["python"]):
+        reject_startup("interpreter")
     number = 0 if shim_main else script_id(sys.argv[0])
+    if number is None:
+        reject_startup("script")
     env_ok = shim_child_env(os.environ) if shim_script and number == shim_script else safe_env(None)
-    if (
-        not sys.flags.isolated or not sys.flags.ignore_environment or not sys.flags.no_user_site
-        or os.path.normcase(sys.executable) != os.path.normcase(policy["python"])
-        or number is None or not env_ok
-    ):
-        blocked("startup")
+    if not env_ok:
+        # Diagnose the CPython launcher key if it survives initialization.
+        # Its presence is not an exception to exact environment matching.
+        if "__PYVENV_LAUNCHER__" in os.environ:
+            reject_startup("environment-with-venv-launcher")
+        reject_startup("environment")
     sys.path.insert(0, policy["source"])
     record("startup", script=number, isolated=True)
 
@@ -158,5 +173,4 @@ try:
     install()
 except BaseException:
     # site.py normally catches startup errors and runs the user's script anyway.
-    os.write(2, b"no-network stand could not establish audited startup\n")
-    os._exit(125)
+    exit_startup("setup")

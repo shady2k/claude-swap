@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 import sys
 import textwrap
 
@@ -15,6 +17,45 @@ def _script(tmp_path, name, source):
     path = tmp_path / name
     path.write_text(textwrap.dedent(source), encoding="utf-8")
     return path
+
+
+@pytest.mark.parametrize("reason", ["flags", "interpreter", "script", "environment", "environment-with-venv-launcher"])
+def test_startup_refusal_reports_only_a_fixed_reason(tmp_path, reason):
+    stand = StandAudit(tmp_path)
+    canary = "private-startup-canary"
+    script = _script(tmp_path, f"{canary}.py", "print('script ran')")
+    stand.allow(script)
+    flags = ["-I"]
+    env = stand.env
+    if reason == "flags":
+        flags = ["-E", "-s"]
+    elif reason == "interpreter":
+        policy = json.loads(stand._policy.read_text(encoding="utf-8"))
+        policy["python"] = str(tmp_path / canary)
+        stand._policy.write_text(json.dumps(policy), encoding="utf-8")
+    elif reason == "script":
+        script.write_text("print('changed script ran')", encoding="utf-8")
+    elif reason == "environment":
+        env["EXTRA_TEST_VARIABLE"] = canary
+    else:
+        # CPython consumes __PYVENV_LAUNCHER__ before sitecustomize. Simulate
+        # it being visible at the environment check without affecting getpath.
+        stand._policy.with_name("synthetic_launcher.pth").write_text(
+            f"import os; os.environ['__PYVENV_LAUNCHER__'] = {canary!r}\n", encoding="utf-8",
+        )
+    result = subprocess.run(
+        [str(stand.python), *flags, str(script), canary], cwd=stand.cwd, env=env,
+        close_fds=True, stdin=subprocess.DEVNULL, capture_output=True, encoding="utf-8", timeout=30,
+    )
+    assert result.returncode == 125
+    assert not result.stdout
+    assert result.stderr.strip() == f"no-network stand could not establish audited startup: {reason}"
+    with pytest.raises(AssertionError, match=f"^stand blocked startup: {reason}$"):
+        stand.assert_clean()
+    blocked, = stand.records()
+    assert isinstance(blocked.pop("pid"), int)
+    assert blocked == {"kind": "blocked", "event": "startup", "reason": reason}
+    assert canary not in stand.journal.read_text(encoding="utf-8")
 
 
 def test_f20_audited_python_process_tree_uses_only_temporary_state(tmp_path, monkeypatch):
@@ -168,7 +209,8 @@ def test_f20_blocks_network_use_and_unapproved_process_launch(tmp_path, call, ev
     result = stand.run(child, sys.executable, str(same_basename), check_audit=False)
     assert result.returncode != 0
     assert not result.stdout
-    assert stand.records()[-1]["event"] == event
+    blocked = stand.records()[-1]
+    assert blocked["event"] == event, blocked
     assert "arg-canary" not in stand.journal.read_text(encoding="utf-8")
     with pytest.raises(AssertionError, match="stand blocked"):
         stand.assert_clean()

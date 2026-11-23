@@ -190,9 +190,12 @@ class StandAudit:
 
     def assert_clean(self) -> None:
         records = self.records()
-        blocked = [r for r in records if r["kind"] == "blocked"]
-        if blocked:
-            raise AssertionError(f"stand blocked an operation: {blocked}")
+        blocked = next((r for r in records if r["kind"] == "blocked"), None)
+        if blocked is not None:
+            event = blocked["event"]
+            if event == "startup":
+                raise AssertionError(f"stand blocked startup: {blocked['reason']}")
+            raise AssertionError(f"stand blocked an operation: {event}")
         expected = self._roots + Counter(r["script"] for r in records if r["kind"] in {"spawn", "exec"})
         started = Counter(r["script"] for r in records if r["kind"] == "startup")
         if not expected or started != expected:
