@@ -290,6 +290,22 @@ async def _dashboard(tmp_path, accounts, size):
 
 
 class TestDashboardFit:
+    @pytest.fixture(autouse=True)
+    def fixed_clock(self, monkeypatch):
+        from tests import test_tui
+
+        # Freeze both reset timestamps in the snapshots and the render clock.
+        now = datetime(2026, 1, 15, 12, tzinfo=timezone.utc)
+
+        class FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now.astimezone(tz) if tz is not None else now.astimezone().replace(tzinfo=None)
+
+        monkeypatch.setattr(test_tui, "datetime", FixedDatetime)
+        monkeypatch.setattr(oauth, "datetime", FixedDatetime)
+        monkeypatch.setattr(time, "time", lambda: now.timestamp())
+
     @pytest.mark.asyncio
     async def test_fresh_logins_render_exactly_as_without_the_field(self, tmp_path):
         # The mixed case that once wrapped: the rows must be the ones a

@@ -104,7 +104,7 @@ ownership.release_completed(backup, record["launchId"])
 def test_descendant_discovery_includes_nonleader_threads(monkeypatch):
     root = os.getpid()
     files = {
-        f"/proc/{root}/task/{root}/children": "", 
+        f"/proc/{root}/task/{root}/children": "",
         f"/proc/{root}/task/{root + 1}/children": "2345",
         "/proc/2345/stat": f"2345 (synthetic (name)) S {root} 0 0",
         "/proc/2345/task/2345/children": "",

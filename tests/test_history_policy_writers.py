@@ -28,13 +28,17 @@ def test_policy_update_in_inherited_profile_home(monkeypatch):
     # Do not repair the ACL: this controls the product's ordinary mkdir path,
     # not pytest's temp-directory ACL or the private-root fixture.
     # CSIDL_LOCAL_APPDATA resolves the account profile independently of pytest's
-    # HOME redirection, including in xdist workers. Its existing directory is
-    # outside the guarded real account store; only this fresh child is touched.
+    # HOME redirection, including in xdist workers. CSIDL_FLAG_CREATE lets the
+    # shell create LocalAppData if the runner profile has not populated it yet.
+    # The fresh child inherits the profile ACL without any repair.
     shell = c.WinDLL("shell32", use_last_error=True)
     locate = security._function(shell, "SHGetFolderPathW", c.c_long,
                                 w.HWND, c.c_int, w.HANDLE, w.DWORD, w.LPWSTR)
     buffer = c.create_unicode_buffer(32768)
-    assert locate(None, 0x1C, None, 0, buffer) == 0
+    csidl_local_appdata = 0x1C
+    csidl_flag_create = 0x8000
+    result = locate(None, csidl_local_appdata | csidl_flag_create, None, 0, buffer)
+    assert result == 0, f"SHGetFolderPathW failed: HRESULT=0x{result & 0xFFFFFFFF:08X}"
     home = Path(buffer.value) / f"cswap-policy-control-{uuid4().hex}"
     home.mkdir()
     try:
