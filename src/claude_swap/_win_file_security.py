@@ -7,6 +7,7 @@ from ctypes import wintypes as w
 from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
+from typing import NamedTuple
 
 from claude_swap.fsguard import GuardError
 
@@ -68,19 +69,69 @@ class _BasicInfo(c.Structure):
     ]
 
 
-def change_time(path: Path) -> int | None:
-    """Real NTFS ChangeTime, not Python's st_ctime (birth time on Windows)."""
+class _FileInfo(c.Structure):
+    _fields_ = [
+        ("attributes", w.DWORD), ("creation", w.FILETIME), ("access", w.FILETIME),
+        ("write", w.FILETIME), ("volume", w.DWORD), ("size_high", w.DWORD),
+        ("size_low", w.DWORD), ("links", w.DWORD), ("index_high", w.DWORD),
+        ("index_low", w.DWORD),
+    ]
+
+
+class ExecutableIdentity(NamedTuple):
+    volume: int
+    file_id: int
+    attributes: int
+    size: int
+    creation_time: int
+    write_time: int
+    change_time: int | None
+
+
+def _dwords(high: int, low: int) -> int:
+    return (high << 32) | low
+
+
+def _change_time(handle: int) -> int | None:
+    """NTFS ChangeTime, not Python's st_ctime (birth time on Windows)."""
     kernel, _ = _libraries()
     query = _function(kernel, "GetFileInformationByHandleEx", w.BOOL, w.HANDLE, c.c_int,
                       c.c_void_p, w.DWORD)
     info = _BasicInfo()
-    try:
-        with _handle(path, 0x80) as handle:  # FILE_READ_ATTRIBUTES
-            if query(handle, 0, c.byref(info), c.sizeof(info)) and info.change > 0:
-                return info.change
-    except OSError:
-        pass
+    if query(handle, 0, c.byref(info), c.sizeof(info)) and info.change > 0:
+        return info.change
     return None
+
+
+def _executable_identity(handle: int) -> ExecutableIdentity:
+    # CPython 3.12.10's lstat and fstat do not normalize Windows times alike.
+    # Use one native query for handles acquired by path and handles backing fds.
+    kernel, _ = _libraries()
+    query = _function(kernel, "GetFileInformationByHandle", w.BOOL, w.HANDLE,
+                      c.POINTER(_FileInfo))
+    info = _FileInfo()
+    if not query(handle, c.byref(info)):
+        raise c.WinError(c.get_last_error())
+    return ExecutableIdentity(
+        info.volume, _dwords(info.index_high, info.index_low), info.attributes,
+        _dwords(info.size_high, info.size_low),
+        _dwords(info.creation.dwHighDateTime, info.creation.dwLowDateTime),
+        _dwords(info.write.dwHighDateTime, info.write.dwLowDateTime),
+        _change_time(handle),
+    )
+
+
+def executable_identity_at_path(path: Path) -> ExecutableIdentity:
+    """Inspect the named entry, including while a read-only pin is held."""
+    with _handle(path, 0x80) as handle:  # FILE_READ_ATTRIBUTES
+        return _executable_identity(handle)
+
+
+def executable_identity_at_fd(fd: int) -> ExecutableIdentity:
+    """Inspect the same handle that pins the executable against writes/deletion."""
+    import msvcrt
+
+    return _executable_identity(msvcrt.get_osfhandle(fd))
 
 
 def _sid_string(sid: c.c_void_p | int) -> str:

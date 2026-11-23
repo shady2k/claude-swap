@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_swap import real_claude
+from claude_swap import _win_file_security, real_claude
 from claude_swap.settings import set_setting
 
 
@@ -95,12 +95,35 @@ def test_windows_path_resolves_claude_in_user_profile(tmp_path, monkeypatch):
     child.run(["auth", "status", "--json"])
     assert captured == [[str(child.path), "auth", "status", "--json"]]
 
+    # Same lengths and write times still identify two different files.
+    initial = target.stat()
+    replacement = target.with_name("replacement.exe")
+    replacement.write_bytes(b"MZ replaced! executable")
+    assert replacement.stat().st_size == initial.st_size
+    os.utime(replacement, ns=(initial.st_atime_ns, initial.st_mtime_ns))
+    replacement.replace(target)
+    monkeypatch.setattr(real_claude.spawn, "handoff", lambda *a, **kw: pytest.fail("unexpected spawn"))
+    with pytest.raises(real_claude.ResolveError, match="opened-fd:file_id"):
+        child.handoff([], {})
 
-def test_windows_fingerprint_without_change_time_is_never_cached(tmp_path, monkeypatch):
-    target = _executable(tmp_path / "bin")
+
+@pytest.fixture
+def windows_identity(monkeypatch):
+    """Model native snapshots while running the Windows resolver on any OS."""
+    initial = _win_file_security.ExecutableIdentity(1, 2, 0, 16, 3, 4, None)
+    snapshots = {"path": initial, "fd": initial}
+    if sys.platform != "win32":
+        monkeypatch.setattr(_win_file_security, "open_executable", lambda path: os.open(path, os.O_RDONLY))
     monkeypatch.setattr(real_claude.sys, "platform", "win32")
-    times = {target.resolve(): None}
-    monkeypatch.setattr(real_claude, "_change_time", times.get)
+    monkeypatch.setattr(_win_file_security, "executable_identity_at_path", lambda path: snapshots["path"])
+    monkeypatch.setattr(_win_file_security, "executable_identity_at_fd", lambda fd: snapshots["fd"])
+    return snapshots
+
+
+def test_windows_fingerprint_without_change_time_is_never_cached(
+    tmp_path, monkeypatch, windows_identity,
+):
+    target = _executable(tmp_path / "bin")
     child = real_claude.resolve(backup_root=tmp_path, configured_path=target)
     calls = []
     real_hash = real_claude._hash
@@ -112,11 +135,42 @@ def test_windows_fingerprint_without_change_time_is_never_cached(tmp_path, monke
     monkeypatch.setattr(real_claude, "_hash", digest)
     assert child.fingerprint() == child.fingerprint()
     assert len(calls) == 2
-    times[child.path] = 1
+    windows_identity["path"] = windows_identity["fd"] = windows_identity["fd"]._replace(change_time=1)
     other = real_claude.resolve(backup_root=tmp_path, configured_path=target)
     assert other.fingerprint() == other.fingerprint()
     assert len(calls) == 3
-    times[child.path] = 2
-    with pytest.raises(real_claude.ResolveError, match="changed after resolution"):
+    windows_identity["fd"] = windows_identity["fd"]._replace(change_time=2)
+    with pytest.raises(real_claude.ResolveError, match="opened-fd:change_time"):
         other.fingerprint()
     assert len(calls) == 3
+
+
+@pytest.mark.parametrize("launch", ["handoff", "run"])
+def test_windows_checks_path_before_spawn_while_handle_is_open(
+    tmp_path, monkeypatch, windows_identity, launch,
+):
+    target = _executable(tmp_path / "bin")
+    child = real_claude.resolve(backup_root=tmp_path, configured_path=target)
+    fd = None
+
+    def pinned_identity(checked_fd):
+        nonlocal fd
+        fd = checked_fd
+        return windows_identity["fd"]
+
+    def replaced_path(path):
+        assert path == child.path
+        assert fd is not None
+        os.fstat(fd)  # The name is checked while the original is still pinned.
+        return windows_identity["path"]._replace(file_id=3, write_time=5)
+
+    monkeypatch.setattr(_win_file_security, "executable_identity_at_fd", pinned_identity)
+    monkeypatch.setattr(_win_file_security, "executable_identity_at_path", replaced_path)
+    monkeypatch.setattr(real_claude.spawn, launch, lambda *a, **kw: pytest.fail("unexpected spawn"))
+    with pytest.raises(real_claude.ResolveError, match=r"\(before-launch-path:file_id\)$"):
+        if launch == "handoff":
+            child.handoff([], {})
+        else:
+            child.run([])
+    with pytest.raises(OSError):
+        os.fstat(fd)
