@@ -59,15 +59,14 @@ def test_rechecks_permissions_after_success(layout, index):
     with pytest.raises(fsguard.GuardError, match="Writable by group or others"):
         python_chain.check_python_chain()
 
-
-def test_rejects_group_writable_ancestor_of_interpreter_target(layout):
-    invocation, (binary, *_) = layout
-    versions = binary.parents[2]
-    assert python_chain.check_python_chain() == invocation
-
-    versions.chmod(0o775)
-    with pytest.raises(fsguard.GuardError, match="Writable by group or others: .*Versions"):
-        python_chain.check_python_chain()
+    if index == 0:
+        # Check the interpreter target's ancestor independently of its mode.
+        item.chmod(0o755)
+        assert python_chain.check_python_chain() == invocation
+        versions = item.parents[2]
+        versions.chmod(0o775)
+        with pytest.raises(fsguard.GuardError, match="Writable by group or others: .*Versions"):
+            python_chain.check_python_chain()
 
 
 def test_import_symlink_from_guarded_site_to_writable_target_is_rejected(layout):
