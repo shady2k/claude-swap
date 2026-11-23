@@ -11293,22 +11293,23 @@ class TestGateUltraReviewFixes:
         s._write_account_credentials("1", "test@example.com", self._OLD)
 
         order: list[str] = []
-        real_lock = s._read_account_credentials
+        real_read = s._store._read_account_credentials
 
         def watched_read(*a, **k):
             order.append("read")
-            return real_lock(*a, **k)
+            return real_read(*a, **k)
 
         from claude_swap.locking import FileLock as real_filelock
 
         class WatchedLock:
             def __init__(self, path, *a, **k):
-                self._name = str(path)
+                self._consume = Path(path).name == "consume.lock"
                 self._inner = real_filelock(path, *a, **k)
             def acquire(self, *a, **k):
-                if self._name.endswith("/consume.lock"):
+                acquired = self._inner.acquire(*a, **k)
+                if acquired and self._consume:
                     order.append("consume-lock")
-                return self._inner.acquire(*a, **k)
+                return acquired
             def release(self):
                 self._inner.release()
             def __enter__(self):
@@ -11317,13 +11318,15 @@ class TestGateUltraReviewFixes:
                 return self._inner.__exit__(*a)
 
         monkeypatch.setattr("claude_swap.refresh_authority.FileLock", WatchedLock)
-        with patch.object(s, "_read_account_credentials", side_effect=watched_read), \
+        with patch.object(s._store, "_read_account_credentials",
+                          side_effect=watched_read), \
              patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    return_value=oauth.RefreshOutcome(self._NEW, None)):
             s.consume_backup_grant("1", "test@example.com", snapshot)
 
+        assert "read" in order, "the gate must actually read the store"
         assert "consume-lock" in order, "the consume lock must be taken"
-        assert order.index("consume-lock") == 0, (
+        assert order.index("consume-lock") < order.index("read"), (
             f"order was {order}: the store is read before the consume lock, so "
             "two gates can select the same one-time-use grant"
         )
@@ -11347,7 +11350,7 @@ class TestGateUltraReviewFixes:
 
         class ConsumeLockBusy:
             def __init__(self, path, *a, **k):
-                self._busy = str(path).endswith("/consume.lock")
+                self._busy = Path(path).name == "consume.lock"
                 self._inner = real_filelock(path, *a, **k)
             def acquire(self, *a, **k):
                 return False if self._busy else self._inner.acquire(*a, **k)
@@ -11360,12 +11363,14 @@ class TestGateUltraReviewFixes:
                 return self._inner.__exit__(*a)
 
         monkeypatch.setattr("claude_swap.refresh_authority.FileLock", ConsumeLockBusy)
-        out = s.consume_backup_grant("1", "test@example.com", snapshot)
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
+            out = s.consume_backup_grant("1", "test@example.com", snapshot)
 
         assert out.error == "consume-busy", (
             f"got {out.error!r}: contention reads as a transient failure and "
             "surfaces as (network?)"
         )
+        post.assert_not_called()
 
     # -- exception containment (findings: window-3 persist raise) --------
 
