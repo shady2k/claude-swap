@@ -405,7 +405,7 @@ def _cli_positive(ca: Path) -> dict:
         "NODE_EXTRA_CA_CERTS": str(ca),
     }
     auth_checked = False
-    response = None
+    response_path = Path(os.environ["CSWAP_STAND_ROOT"]) / "cli-response.json"
 
     def check_launch(argv, env, args):
         assert argv[:2] == [claude, "--settings"]
@@ -428,14 +428,20 @@ def _cli_positive(ca: Path) -> dict:
         }))
 
     def final_exec(binary, argv, env):
-        nonlocal response
         assert binary == claude and auth_checked
         check_launch(argv, env, PRINT_ARGS)
+        # The consumed supervisor permit must not admit a callback's own fork.
+        try:
+            os.fork()
+        except RuntimeError as exc:
+            assert str(exc) == "stand processes must use the guarded subprocess launcher"
+        else:
+            raise AssertionError("fake Claude could fork outside the supervisor")
         # Exercise the synthetic HTTPS path under the environment that the
         # real CLI prepared, without relaxing the native exec allowlist.
         with patch.dict(os.environ, env, clear=True):
-            response = _https_probe()
-        raise SystemExit(0)
+            response_path.write_text(json.dumps(_https_probe()))
+        os._exit(0)
 
     with patch.object(spawn, "run", auth_status), patch.object(os, "execve", final_exec):
         try:
@@ -443,8 +449,8 @@ def _cli_positive(ca: Path) -> dict:
         except SystemExit as exc:
             if exc.code != 0:
                 raise
-    assert response is not None, "CLI did not reach the fake Claude launch"
-    return response
+    assert response_path.is_file(), "CLI did not reach the fake Claude launch"
+    return json.loads(response_path.read_text())
 
 
 def _attempt_direct(ca: Path) -> None:

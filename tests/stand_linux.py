@@ -210,6 +210,8 @@ def _worker(module: str, args: list[str]) -> None:
     )
 
     blocked_resolver = None
+    supervision_used = False
+    supervisor_pid = os.getpid()
     if role in _SHIM_SPAWN_ROLES:
         from tests.stand_shim import command
 
@@ -218,7 +220,22 @@ def _worker(module: str, args: list[str]) -> None:
         shim_command = None
 
     def restrict_worker(event: str, values: tuple) -> None:
-        nonlocal blocked_resolver
+        nonlocal blocked_resolver, supervision_used
+        if event == "os.fork" and role == ("stand_mock", "client", "cli_positive") and not supervision_used:
+            from claude_swap import paths, session, spawn
+
+            frame = sys._getframe(1)
+            profile = session.session_dir_for(paths.get_backup_root(), "1", "account@example.test")
+            records = [json.loads(path.read_text()) for path in
+                       (paths.get_backup_root() / "profile-ownership" / "launches").glob("*.json")]
+            running = [entry for entry in records if entry.get("state") == "running"
+                       and entry.get("pid") == supervisor_pid and entry.get("ownerPid") == supervisor_pid
+                       and entry.get("profile") == str(profile) and entry.get("accountNum") == "1"]
+            if (os.getpid() == supervisor_pid and frame.f_code is spawn.supervise.__code__
+                    and Path(frame.f_code.co_filename).resolve() == PROJECT / "src" / "claude_swap" / "spawn.py"
+                    and len(running) == 1):
+                supervision_used = True
+                return
         # Mock workers use numeric addresses and must never ask the resolver.
         # The standalone controls deliberately exercise strace alone.
         if module == "stand_mock":
@@ -420,9 +437,11 @@ def _audit(
                 result = _RESULT.search(line)
                 successful = bool(result and result[1].isdigit() and parents.get(int(result[1])) == pid)
                 supervisor_split = False
-                if role in {("path-shim",), ("shim-python",)} and "CLONE_THREAD" not in line:
+                if role == ("stand_mock", "client", "cli_positive") and "CLONE_THREAD" in line:
+                    violations.append(f"pid {pid}: explicit supervisor fixture created a thread")
+                if role in {("path-shim",), ("shim-python",), ("stand_mock", "client", "cli_positive")} and "CLONE_THREAD" not in line:
                     supervisor_split = bool(
-                        role in {("shim-python",)} and subreaper and not split
+                        role in {("shim-python",), ("stand_mock", "client", "cli_positive")} and subreaper and not split
                         and not supervised_child and successful and call in {"fork", "clone"}
                         and "CLONE_VM" not in line and "CLONE_VFORK" not in line
                     )
@@ -434,7 +453,7 @@ def _audit(
                 if successful:
                     visit(int(result[1]), role, supervised_child=supervisor_split)
             elif call == "prctl":
-                if re.fullmatch(r"prctl\(PR_SET_CHILD_SUBREAPER, 1\)\s+= 0", line) and role in {("shim-python",)} and not split:
+                if re.fullmatch(r"prctl\(PR_SET_CHILD_SUBREAPER, 1\)\s+= 0", line) and role in {("shim-python",), ("stand_mock", "client", "cli_positive")} and not split:
                     subreaper = True
             elif call in {"execve", "execveat"}:
                 argv = _exec_argv(line) or []
@@ -459,6 +478,8 @@ def _audit(
             elif call in {"connect", "sendto", "sendmsg", "sendmmsg"}:
                 if role in {("path-shim",), ("shim-python",)}:
                     violations.append(f"pid {pid}: network before pinned handoff")
+                if role == ("stand_mock", "client", "cli_positive") and not supervised_child:
+                    violations.append(f"pid {pid}: network outside supervisor child")
                 result = _RESULT.search(line)
                 if not result or "<unfinished ...>" in line:
                     raise StandError(f"cannot audit {call} for pid {pid}")
@@ -477,7 +498,7 @@ def _audit(
                             f"pid {pid} {role!r} {call}: {label} {target!r} ({attempt.result})"
                         )
 
-        if supervised_child and not child_handoff:
+        if supervised_child and role == ("shim-python",) and not child_handoff:
             violations.append(f"pid {pid}: supervisor child did not perform the pinned handoff")
 
     visit(root, root_role)

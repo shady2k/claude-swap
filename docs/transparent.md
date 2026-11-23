@@ -19,8 +19,10 @@ when disabled or removed from the transparent pool.
 
 Isolated explicit account launches also require build and invocation admission
 before reuse, including when the shim is disabled. A launch using the unchanged
-default login does not prepare an isolated profile. No production build is admitted.
-Only the isolated synthetic Linux route can publish a running reservation.
+default login does not prepare an isolated profile. Production build admission
+is deferred to PR3 (`transparent._prepare_launch`); no production build is
+admitted here. Only the isolated synthetic Linux route can publish a running
+reservation.
 Linux launches use a dedicated single-threaded subreaper supervisor. The
 reservation is released only after it has reaped the leader and all descendants,
 including descendants that change session. A failed handoff also releases it

@@ -62,7 +62,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from claude_swap import claude_forms, macos_keychain, profile_ownership, real_claude, spawn, test_mode
+from claude_swap import claude_forms, launch_policy, macos_keychain, profile_ownership, real_claude, spawn, test_mode
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
@@ -762,6 +762,14 @@ class SessionManager:
         self._run_reserved(identifier, claude_args, share, share_history,
                            require_session, binary=binary)
 
+    def _profile_recipient_identity(self, account_num: str):
+        accounts = self.switcher._get_sequence_data().get("accounts", {})
+        return launch_policy.identity(accounts.get(str(account_num)))
+
+    def _verify_profile_recipient(self, record: dict) -> None:
+        if self._profile_recipient_identity(record["accountNum"]) != record["recipientIdentity"]:
+            raise SessionError("Account identity changed during profile preparation")
+
     @contextmanager
     def _reserve_profile(self, identifier: str, *, retain: bool = False):
         if getattr(self, "_launch_reservation", None) is not None:
@@ -771,6 +779,7 @@ class SessionManager:
                     self.switcher.backup_dir, record["launchId"],
                     expected_profile_gen=record["profileGen"],
                 )
+                self._verify_profile_recipient(record)
                 if profile_ownership.profile_busy_locked(
                     self.switcher.backup_dir, record["accountNum"], Path(record["profile"]),
                     ignore_launch_id=record["launchId"],
@@ -784,7 +793,9 @@ class SessionManager:
         with profile_ownership.ownership_lock(root), FileLock(self.switcher.lock_file):
             if self.switcher.resolve_account(identifier) != (num, email, org):
                 raise SessionError("Account identity changed before profile reservation")
+            recipient_identity = self._profile_recipient_identity(num)
             record = profile_ownership.reserve_locked(root, num, profile, warming=True)
+            record["recipientIdentity"] = recipient_identity
         self._launch_reservation = record
         succeeded = False
         try:
@@ -1086,6 +1097,7 @@ class SessionManager:
             self._admit_profile_launch(claude_args)
             spawn.require_supervision()
             with profile_ownership.ownership_lock(self.switcher.backup_dir), FileLock(self.switcher.lock_file):
+                self._verify_profile_recipient(record)
                 num, email, _ = self.switcher.resolve_account(record["accountNum"])
                 if str(session_dir_for(self.switcher.backup_dir, num, email).resolve()) != record["profile"]:
                     raise SessionError("Account identity changed before handoff")
@@ -1193,6 +1205,7 @@ class SessionManager:
                     self.switcher.backup_dir, record["launchId"],
                     expected_profile_gen=record["profileGen"],
                 )
+                self._verify_profile_recipient(record)
                 if self.switcher.resolve_account(identifier) != (account_num, email, org_uuid):
                     raise SessionError("Account identity changed before profile reuse")
                 if self.switcher._get_current_account() == (email, org_uuid) and not self._default_login_signed_out():
@@ -1215,6 +1228,7 @@ class SessionManager:
                 self.switcher.backup_dir, record["launchId"],
                 expected_profile_gen=record["profileGen"],
             )
+            self._verify_profile_recipient(record)
             if self.switcher.resolve_account(identifier) != (account_num, email, org_uuid):
                 raise SessionError("Account identity changed before credential preparation")
             if self.switcher._get_current_account() == (email, org_uuid) and not self._default_login_signed_out():
@@ -1302,6 +1316,7 @@ class SessionManager:
                 self.switcher.backup_dir, record["launchId"],
                 expected_profile_gen=record["profileGen"],
             )
+            self._verify_profile_recipient(record)
             if self.switcher.resolve_account(identifier) != (account_num, email, org_uuid):
                 raise SessionError("Account identity changed during profile preparation")
             # A backup refresh can mark the reserved profile stale. Re-check
@@ -1604,6 +1619,8 @@ class SessionManager:
         difference between a correct cleanup and deleting a working profile,
         and this boolean cannot express it.
         """
+        if record := getattr(self, "_launch_reservation", None):
+            self._verify_profile_recipient(record)
         verdict = self._session_validity(session_dir, email, org_uuid, binary=binary)
         if verdict == "unknown":
             return _artifacts_say_usable(session_dir, email, org_uuid)
