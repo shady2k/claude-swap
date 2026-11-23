@@ -113,6 +113,23 @@ def _install(directory: Path, strict: bool) -> None:
         raise
 
 
+def _safe_label(text: str) -> str:
+    label = ""
+    for char in text:
+        if not char.isprintable():
+            code = ord(char)
+            if code <= 0xff:
+                char = f"\\x{code:02x}"
+            elif code <= 0xffff:
+                char = f"\\u{code:04x}"
+            else:
+                char = f"\\U{code:08x}"
+        if len(label) + len(char) > 120:
+            break
+        label += char
+    return label
+
+
 def enable(
     backup_root: Path, *, accept_shared_history: bool = False, pool: list[str] | None = None,
 ) -> Path:
@@ -137,13 +154,14 @@ def enable(
             reviewed = pool_members(launch_policy.read(backup_root))
         print(launch_policy.CONSENT_TEXT, file=sys.stderr)
         members = reviewed[1]
-        label = ", ".join(f"Account-{slot} ({identity[0]!r}, organization {identity[1]!r})"
+        label = ", ".join(_safe_label(f"Account-{slot} ({identity[0]}, organization {identity[1]})")
                           for slot, identity in members.items())
         print(f"Approve shared history for {label or 'an empty pool'}? [y/N] ",
               end="", file=sys.stderr, flush=True)
         if sys.stdin.readline().strip().lower() not in {"y", "yes"}:
             raise ConfigError("Shared history was not approved")
     directory = paths.get_shim_dir(backup_root)
+    launch_policy.archive()
 
     def change(data: dict) -> bool:
         selected, members = pool_members(data)
@@ -151,7 +169,6 @@ def enable(
             raise ConfigError("The recipient identities changed; run cswap transparent enable again")
         with settings_lock(backup_root):
             check_transparent_history(backup_root)
-            launch_policy.archive()
             settings = load_transparent_settings(backup_root, policy=data)
             _install(directory, settings.require_proxy)
         data.update(enabled=True, pool=list(selected), historyZone={
@@ -407,7 +424,7 @@ def _prepare_launch(
     failures = []
     for slot in launch_policy.slots(policy.get("pool", [])):
         identity = launch_policy.identity(accounts.get(slot))
-        label = f"Account-{slot} ({' '.join(identity[0].split())})" if identity else f"Account-{slot}"
+        label = _safe_label(f"Account-{slot} ({identity[0]})" if identity else f"Account-{slot}")
         try:
             recipient = _recipient(slot, accounts, members)
         except ConfigError as exc:
@@ -435,8 +452,10 @@ def _publish_launch(root: Path, directory: Path, policy: dict, prepared: _Launch
         check_transparent_history(root)
         if current != policy:
             return False
-        history = launch_policy.archive(inspect_contents=True)
+        history = launch_policy.archive()
         if recipient := prepared.recipient:
+            if not history.is_dir():
+                raise ConfigError("Shared projects/ disappeared before publication; retry the launch")
             accounts = launch_policy.accounts(root)
             try:
                 current_recipient = _recipient(recipient.slot, accounts, members)
@@ -451,7 +470,6 @@ def _publish_launch(root: Path, directory: Path, policy: dict, prepared: _Launch
             if profile != prepared.profile:
                 return False
             if not os.path.lexists(profile / "projects"):
-                history = launch_policy.archive(create=True)
                 make_dir_link(history, profile / "projects")
         _journal(directory, _OUTSIDE if prepared.outside_reason else "launch")
         return True
@@ -469,9 +487,11 @@ def _launch(marker: str, args: list[str], root: Path) -> None:
             policy = launch_policy.read(root)
             launch_policy.consent(policy)
             check_transparent_history(root)
-            history = launch_policy.archive()
             accounts = launch_policy.accounts(root) if test else {}
+        history = launch_policy.archive()
         prepared = _prepare_launch(root, directory, marker, args, policy, accounts, history, test=test)
+        if prepared.recipient and not history.exists():
+            launch_policy.archive(create=True)
         if _publish_launch(root, directory, policy, prepared):
             break
     else:

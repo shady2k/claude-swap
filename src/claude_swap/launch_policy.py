@@ -21,12 +21,13 @@ from claude_swap.exceptions import ConfigError
 from claude_swap.fsutil import atomic_write_text
 from claude_swap.locking import FileLock
 
-HISTORY_SCOPE = "all-projects-v1"
+HISTORY_SCOPE = "all-history-v1"
 CONSENT_TEXT = (
     "Shared history covers the entire projects/ archive, including past and future "
     "conversations from the default login and cswap run, even if that account is "
     "not in (or was removed from) the pool. Any approved recipient can resume "
-    "these conversations and send them to Claude under that account."
+    "these conversations and send them to Claude under that account. "
+    "Disabling transparent mode does not take back anything already sent."
 )
 CONSENT_HINT = "Run cswap transparent enable to approve shared history for the pool (use --accept-shared-history without a terminal)."
 _SLOT = re.compile(r"[1-9][0-9]*", re.ASCII)
@@ -103,53 +104,33 @@ def consent(data: dict) -> dict:
     return zone["members"]
 
 
-def _owned_directory(path: Path) -> None:
-    info = path.stat()
+def _owned_directory(path: Path) -> int:
+    info = path.lstat()
     if not stat.S_ISDIR(info.st_mode):
         raise ConfigError("Shared history must be a directory")
     if sys.platform == "win32" or info.st_uid != os.geteuid():
         raise ConfigError("Shared history must be owned by the current user")
+    return info.st_mode
 
 
-def _check_contents(root: Path) -> None:
-    pending = [root]
-    while pending:
-        with os.scandir(pending.pop()) as entries:
-            for entry in entries:
-                info = entry.stat(follow_symlinks=False)
-                mode = info.st_mode
-                if (
-                    info.st_uid != os.geteuid() or mode & (stat.S_IWGRP | stat.S_IWOTH)
-                    or not (stat.S_ISDIR(mode) or stat.S_ISREG(mode) and info.st_nlink == 1)
-                    or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
-                ):
-                    raise ConfigError("Shared projects/ contains an unsafe entry")
-                if stat.S_ISDIR(mode):
-                    pending.append(Path(entry.path))
-
-
-def archive(*, create: bool = False, inspect_contents: bool = False) -> Path:
-    """Check archive metadata without opening any conversation files."""
-    home = Path.home().resolve(strict=True)
+def archive(*, create: bool = False) -> Path:
+    """Check the archive path, never its contents; create it privately if requested."""
+    home = Path.home()
     target = paths.get_default_claude_config_home() / "projects"
     try:
-        canonical = target.resolve()
-        if canonical == home or not canonical.is_relative_to(home):
-            raise ConfigError("Shared projects/ must stay inside the current user's home")
+        fsguard.check_path(home, follow_links=False)
+        _owned_directory(home)
         for directory in (target.parent, target):
-            if os.path.lexists(directory):
-                resolved = fsguard.check_path(directory)
-                if resolved == home or not resolved.is_relative_to(home):
-                    raise ConfigError("Shared projects/ must stay inside the current user's home")
-                for entry in (resolved, *resolved.parents):
-                    _owned_directory(entry)
-                    if entry == home:
-                        break
-            elif create:
-                directory.mkdir(mode=0o700)
-                _owned_directory(directory)
-        if inspect_contents and target.exists():
-            _check_contents(canonical)
-        return canonical
-    except (OSError, RuntimeError, fsguard.GuardError) as exc:
+            try:
+                directory.lstat()
+            except FileNotFoundError:
+                if not create:
+                    break
+                directory.mkdir(mode=0o700, exist_ok=True)
+            fsguard.check_path(directory, follow_links=False)
+            mode = _owned_directory(directory)
+            if directory == target and mode & (stat.S_IRWXG | stat.S_IRWXO):
+                raise ConfigError("Shared projects/ must not be accessible to group or others")
+        return target
+    except (OSError, fsguard.GuardError) as exc:
         raise ConfigError("Shared projects/ is not a safe directory owned by the current user") from exc

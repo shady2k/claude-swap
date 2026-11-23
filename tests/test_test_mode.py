@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from claude_swap import cli, paths, real_claude, session, test_mode
+from claude_swap import cli, launch_policy, paths, real_claude, session, test_mode
 
 
 def test_default_mode_reaches_subprocess_without_stand_configuration():
@@ -173,7 +173,7 @@ def test_preflight_binary_can_be_reused_for_checked_launch(route, no_attempts, m
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("verb", ["enable", "status", "disable"])
+@pytest.mark.parametrize("verb", ["enable", "status", "disable", "pool", "revoke-shared-history"])
 def test_transparent_admin_checks_route_without_resolving_claude(route, no_attempts, monkeypatch, verb):
     def cannot_resolve(**kwargs):
         pytest.fail("admin preflight should not resolve claude")
@@ -183,6 +183,32 @@ def test_transparent_admin_checks_route_without_resolving_claude(route, no_attem
     monkeypatch.delenv(test_mode.ENDPOINT)
     with pytest.raises(test_mode.TestModeConfigError, match=test_mode.ENDPOINT):
         test_mode.preflight(["transparent", verb])
+
+
+def test_transparent_pool_and_revoke_cli_do_not_use_network(route, no_attempts, monkeypatch, capsys):
+    root = paths.get_backup_root()
+    root.mkdir(parents=True, exist_ok=True)
+    members = {slot: [f"account{slot}@example.test", "", slot, "oauth"] for slot in ("1", "2")}
+
+    def seed(policy):
+        policy.update(enabled=True, pool=["1", "2"], historyZone={
+            "scope": launch_policy.HISTORY_SCOPE, "members": members,
+        })
+        return True
+
+    launch_policy.update(root, seed)
+    monkeypatch.setattr(sys, "argv", ["cswap", "transparent", "pool", "--account", "2"])
+    cli.main()
+    assert "pool updated" in capsys.readouterr().out
+    policy = launch_policy.read(root)
+    assert policy["pool"] == ["2"]
+    assert policy["historyZone"]["members"] == {"2": members["2"]}
+    monkeypatch.setattr(sys, "argv", ["cswap", "transparent", "revoke-shared-history"])
+    cli.main()
+    assert "consent revoked" in capsys.readouterr().out
+    policy = launch_policy.read(root)
+    assert policy["pool"] == ["2"]
+    assert "historyZone" not in policy
 
 
 def test_f8_cold_profile_pins_auth_probe_and_launch(route, monkeypatch):

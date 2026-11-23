@@ -230,11 +230,11 @@ def preflight(argv: list[str]) -> RealClaude | None:
             raise TestModeConfigError("cswap run invocation form: explicit account required")
         _check_form(tail)
         return claude_binary()
-    if argv[:2] == ["transparent", "enable"]:
+    if argv[:2] in (["transparent", "enable"], ["transparent", "pool"]):
         options = iter(argv[2:])
         accepted = False
         for option in options:
-            if option == "--accept-shared-history" and not accepted:
+            if argv[1] == "enable" and option == "--accept-shared-history" and not accepted:
                 accepted = True
             elif option != "--account" or not re.fullmatch(r"[1-9][0-9]*", next(options, "")):
                 break
@@ -243,6 +243,7 @@ def preflight(argv: list[str]) -> RealClaude | None:
     if argv not in (
         ["help"], ["--help"], ["-h"], ["--version"],
         ["transparent", "status"], ["transparent", "disable"],
+        ["transparent", "revoke-shared-history"],
     ):
         # Do not dispatch unrelated surfaces (update, service helpers, etc.).
         verb = argv[0] if argv and argv[0] in {"auth", "update", "upgrade", "install", "mcp"} else "unsupported"

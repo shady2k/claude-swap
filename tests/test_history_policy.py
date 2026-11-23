@@ -1,7 +1,9 @@
 """F32: consent and selection at the POSIX shim's launch boundary."""
 
+import ast
 import json
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -9,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from claude_swap import launch_policy, paths, session, test_mode, transparent
+from claude_swap import cli, launch_policy, paths, session, test_mode, transparent
 from claude_swap.locking import FileLock
 from claude_swap.settings import set_setting
 
@@ -36,16 +38,20 @@ def shim(tmp_path, monkeypatch, archive):
     projects, _ = archive
     programs = tmp_path / "bin"
     programs.mkdir()
+    monkeypatch.setenv("HISTORY_TEST_HANDOFF", str(tmp_path / "handoff"))
+    monkeypatch.setenv("HISTORY_TEST_READ", str(tmp_path / "read"))
     binary = programs / "claude"
     binary.write_text(
         f"#!{sys.executable} -I\n"
         "import json, os, sys\n"
         "from pathlib import Path\n"
-        "profile = Path(os.environ['CLAUDE_CONFIG_DIR'])\n"
+        "Path(os.environ['HISTORY_TEST_HANDOFF']).touch()\n"
+        "profile = Path(os.environ.get('CLAUDE_CONFIG_DIR', 'default'))\n"
         "status = {'profile': profile.name}\n"
         "if '--resume' in sys.argv:\n"
         "    sid = sys.argv[sys.argv.index('--resume') + 1]\n"
         "    history = profile / 'projects' / 'project' / (sid + '.jsonl')\n"
+        "    Path(os.environ['HISTORY_TEST_READ']).touch()\n"
         "    status['previous'] = history.read_text(encoding='utf-8').splitlines()\n"
         "    with history.open('a', encoding='utf-8') as out:\n"
         f"        out.write({(APPENDED + chr(10))!r})\n"
@@ -143,36 +149,77 @@ def test_resume_shares_full_archive_with_member_but_never_journals_transcript(sh
     assert all(value not in journal for value in (SESSION_ID, PREVIOUS, APPENDED))
 
 
-@pytest.mark.parametrize("redirect", ["outside-home", "group-writable", "linked-transcript"])
-def test_unsafe_archive_refuses_before_handoff(shim, archive, tmp_path, redirect):
-    projects, transcript = archive
-    if redirect == "outside-home":
-        elsewhere = tmp_path / "external-archive"
-        projects.rename(elsewhere)
-        projects.symlink_to(elsewhere, target_is_directory=True)
-    elif redirect == "linked-transcript":
-        elsewhere = tmp_path / "external-transcript.jsonl"
-        transcript.rename(elsewhere)
-        transcript.symlink_to(elsewhere)
+@pytest.mark.parametrize("mode", [0o755, 0o750, 0o770, 0o700])
+def test_archive_permissions_checked_before_read_or_handoff(shim, archive, tmp_path, mode):
+    root, profiles = shim
+    projects, _ = archive
+    projects.chmod(mode)
+    # Ancestor permissions keep using fsguard's no-foreign-write rule.
+    projects.parent.chmod(0o755)
+    result = _invoke("--resume", SESSION_ID)
+    allowed = mode == 0o700
+    assert (tmp_path / "handoff").exists() is allowed
+    assert (tmp_path / "read").exists() is allowed
+    assert (paths.get_shim_dir(root) / "launches.json").exists() is allowed
+    if allowed:
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == {"profile": profiles["2"].name, "previous": [PREVIOUS]}
     else:
-        projects.chmod(0o770)
+        assert result.returncode == 4 and not result.stdout
+
+
+@pytest.mark.parametrize("component", ["projects", ".claude"])
+@pytest.mark.parametrize("location", ["inside", "outside"])
+def test_archive_path_rejects_links_before_handoff(shim, archive, tmp_path, component, location):
+    projects, _ = archive
+    directory = projects if component == "projects" else projects.parent
+    elsewhere = (Path.home() if location == "inside" else tmp_path) / "linked-archive"
+    directory.rename(elsewhere)
+    directory.symlink_to(elsewhere, target_is_directory=True)
     result = _invoke("--resume", SESSION_ID)
     assert result.returncode == 4 and not result.stdout
-    assert transcript.read_text(encoding="utf-8") == PREVIOUS + "\n"
+    assert not (tmp_path / "handoff").exists()
+    assert not (tmp_path / "read").exists()
+
+
+def test_routed_launch_creates_missing_archive_privately(shim, archive):
+    _, profiles = shim
+    projects, _ = archive
+    projects.rename(projects.with_name("old-projects"))
+    (profiles["2"] / "projects").unlink()
+    result = _invoke("-p", "hello")
+    assert result.returncode == 0, result.stderr
+    assert stat.S_IMODE(projects.stat().st_mode) == 0o700
+    assert (profiles["2"] / "projects").resolve() == projects
+
+
+def test_launch_does_not_scan_archive_contents(shim, archive, tmp_path, monkeypatch):
+    root, _ = shim
+    projects, transcript = archive
+    transcript.chmod(0o664)
+    (projects / "unrelated").symlink_to(tmp_path / "missing")
+    result = _invoke("--resume", SESSION_ID)
+    assert result.returncode == 0, result.stderr
+    monkeypatch.delenv(test_mode.MODE)
+    result = _invoke("--version")
+    assert result.returncode == 0, result.stderr
+    assert "outside the profile route" in result.stderr
 
 
 def test_foreign_archive_owner_refuses_before_publication(shim, archive, monkeypatch):
     root, _ = shim
     projects, transcript = archive
-    original = Path.stat
+    original = Path.lstat
 
     def stat_with_foreign_owner(path, *args, **kwargs):
         info = original(path, *args, **kwargs)
         if path == projects:
-            return SimpleNamespace(st_mode=info.st_mode, st_uid=os.geteuid() + 1)
+            fields = list(info)
+            fields[4] = os.geteuid() + 1
+            return os.stat_result(fields)
         return info
 
-    monkeypatch.setattr(Path, "stat", stat_with_foreign_owner)
+    monkeypatch.setattr(Path, "lstat", stat_with_foreign_owner)
     with pytest.raises(transparent.ConfigError, match="current user"):
         launch_policy.archive()
     assert transcript.read_text(encoding="utf-8") == PREVIOUS + "\n"
@@ -189,7 +236,11 @@ def test_enable_without_a_tty_requires_explicit_archive_consent(shim, accept):
     result = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
     assert result.returncode == (0 if accept else 4), result.stderr
     assert (paths.get_shim_dir(root) / "claude").exists() is accept
-    assert "projects/" in result.stdout + result.stderr
+    output = result.stdout + result.stderr
+    assert "projects/" in output
+    assert "Disabling transparent mode does not take back anything already sent." in output
+    if accept:
+        assert launch_policy.read(root)["historyZone"]["scope"] == "all-history-v1"
 
 
 def _change_policy(root, change):
@@ -229,7 +280,84 @@ def test_policy_writer_uses_slot_lock_and_advances_revision(shim, monkeypatch):
     monkeypatch.setattr(launch_policy, "atomic_write_text", observe_write)
     transparent.set_pool(root, ["1"])
     transparent.revoke_history(root)
-    assert observed == [first + 1, first + 2]
+    transparent.disable(root)
+    transparent.enable(root, accept_shared_history=True)
+    monkeypatch.delenv(test_mode.MODE)
+    for key, value in [("claudePath", str(Path.home() / "claude")),
+                       ("allowUnverified", "true"), ("requireProxy", "false")]:
+        cli._config_command(["set", f"transparent.{key}", value])
+    assert observed == list(range(first + 1, first + 8))
+    assert launch_policy.read(root)["rev"] == observed[-1]
+
+
+def test_archive_checks_are_outside_locks_except_publication(shim, monkeypatch):
+    root, _ = shim
+    directory = paths.get_shim_dir(root)
+    marker = transparent._invocation_marker(directory, False)
+    monkeypatch.setattr(transparent, "sys", SimpleNamespace(
+        platform=sys.platform, flags=SimpleNamespace(isolated=True), stderr=sys.stderr,
+    ))
+    real = test_mode.claude_binary(backup_root=root)
+    monkeypatch.setattr(test_mode, "claude_binary", lambda **_: real)
+    monkeypatch.setattr(real, "handoff", lambda *args, **kwargs: _assert_lock_free(root))
+    original = launch_policy.archive
+    checked = []
+
+    def observe_archive(**kwargs):
+        if len(checked) < 2:
+            _assert_lock_free(root)
+        else:
+            for path in (paths.account_lock_path(root), root / "settings.lock"):
+                assert not FileLock(path, timeout=0).acquire()
+        checked.append(None)
+        return original(**kwargs)
+
+    monkeypatch.setattr(launch_policy, "archive", observe_archive)
+    transparent.enable(root, accept_shared_history=True)
+    transparent._launch(marker, ["-p", "hello"], root)
+    assert len(checked) == 3
+
+
+def test_only_launch_policy_update_writes_policy_file():
+    # Pin the only two production references to the filename: the read and
+    # the atomic write. A new reference, including an alias, needs review.
+    source = Path(launch_policy.__file__).parent
+    accesses = []
+    for path in sorted(source.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or node.value != "transparent.json":
+                continue
+            call = parents[node]
+            while not isinstance(call, (ast.Call, ast.Module)):
+                call = parents[call]
+            owner = call
+            while not isinstance(owner, (ast.FunctionDef, ast.Module)):
+                owner = parents[owner]
+            accesses.append((
+                path.relative_to(source).as_posix(), getattr(owner, "name", "<module>"),
+                ast.unparse(call.func) if isinstance(call, ast.Call) else "<reference>",
+            ))
+    assert sorted(accesses) == [
+        ("launch_policy.py", "read", "_read"),
+        ("launch_policy.py", "update", "atomic_write_text"),
+    ]
+
+
+def test_summary_escapes_controls_and_bounds_label(shim):
+    root, _ = shim
+    sequence = root / "sequence.json"
+    data = json.loads(sequence.read_text(encoding="utf-8"))
+    data["accounts"]["2"]["email"] = "\x1b[0m\n\x85" + "x" * 200
+    sequence.write_text(json.dumps(data), encoding="utf-8")
+    transparent.set_pool(root, ["2"])
+    result = _invoke("-p", "hello")
+    assert result.returncode == 3 and not result.stdout
+    label, reason = result.stderr.rstrip("\n").split(": ", 1)
+    assert label.startswith(r"Account-2 (\x1b[0m\x0a\x85")
+    assert len(label) == 120
+    assert reason == "not a member of the current history zone; resets unknown"
 
 
 @pytest.mark.parametrize("change", ["pool", "members", "scope", "revoke", "share-history", "disable"])

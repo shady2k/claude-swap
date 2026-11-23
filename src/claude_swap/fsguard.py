@@ -20,8 +20,8 @@ class GuardError(ClaudeSwitchError):
     """The path's ownership, permissions, or type could not be trusted."""
 
 
-def check_path(path: Path | str) -> Path:
-    """Return the checked canonical path; reject relative paths and link loops."""
+def check_path(path: Path | str, *, follow_links: bool = True) -> Path:
+    """Return the checked canonical path; optionally reject all links and junctions."""
     path = Path(path)
     if not path.is_absolute():
         raise GuardError(f"Not an absolute path: {path}")
@@ -43,6 +43,8 @@ def check_path(path: Path | str) -> Path:
                 raise GuardError(f"Expected a protected directory inside {current}: {next_path}")
             sticky = _check_component(next_path, info, bool(parts))
             if is_link:
+                if not follow_links:
+                    raise GuardError(f"Links and junctions are not allowed: {next_path}")
                 links += 1
                 if links > 40:
                     raise GuardError(f"Too many symlinks: {path}")
