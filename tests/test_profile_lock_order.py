@@ -148,3 +148,165 @@ def test_actual_backup_write_holds_state_and_account_lock(temp_home, monkeypatch
     monkeypatch.setattr(manager._store, "_write_account_credentials", write)
     manager.persist_backup_credentials("1", "synthetic@example.com", "synthetic")
     assert writes == [("1", "synthetic@example.com")]
+
+
+def _helper_ownership_inversions(sources):
+    """Follow local calls, self methods and imported helpers across lock scopes.
+
+    This is a source guard, not a Python evaluator: dynamic dispatch and lock
+    aliases are outside its scope. Lock state follows calls, but never escapes
+    the with statement that acquired it. An outer state lock permits reentry.
+    """
+    trees = {name: ast.parse(source) for name, source in sources.items()}
+    functions = {}
+    imports = {}
+    for filename, tree in trees.items():
+        imports[filename] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                for alias in node.names:
+                    if node.module == "claude_swap":
+                        target = (alias.name + ".py", None)
+                    elif node.module.startswith("claude_swap."):
+                        target = (node.module.rsplit(".", 1)[-1] + ".py", alias.name)
+                    else:
+                        continue
+                    imports[filename][alias.asname or alias.name] = target
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                functions[filename, None, node.name] = node
+            elif isinstance(node, ast.ClassDef):
+                for method in node.body:
+                    if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        functions[filename, node.name, method.name] = method
+
+    def resolve(call, filename, cls):
+        name = _call_name(call)
+        if isinstance(call.func, ast.Name):
+            if (filename, None, name) in functions:
+                return filename, None, name
+            module, member = imports[filename].get(name, (None, None))
+            return module, None, member
+        if name.startswith("self.") and name.count(".") == 1:
+            return filename, cls, call.func.attr
+        if name.startswith(("self.switcher.", "switcher.")):
+            return "switcher.py", "ClaudeAccountSwitcher", call.func.attr
+        if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name):
+            module, member = imports[filename].get(call.func.value.id, (None, None))
+            if member is None:
+                return module, None, call.func.attr
+        return None
+
+    violations = set()
+    visited = set()
+
+    def follow(key, owned, account):
+        state = key, owned, account
+        if key not in functions or state in visited:
+            return
+        visited.add(state)
+        filename, cls, _ = key
+        for statement in functions[key].body:
+            visit(statement, filename, cls, owned, account)
+
+    def visit(node, filename, cls, owned, account):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                expr = item.context_expr
+                visit(expr, filename, cls, owned, account)
+                if _call_name(expr).endswith("ownership_lock"):
+                    owned = True
+                if _call_name(expr) == "FileLock" and any(
+                    (isinstance(arg, ast.Attribute) and arg.attr == "lock_file")
+                    or _call_name(arg).endswith("account_lock_path")
+                    for arg in expr.args
+                ):
+                    account = True
+            for statement in node.body:
+                visit(statement, filename, cls, owned, account)
+            return
+        if isinstance(node, ast.Call):
+            if _call_name(node).endswith("ownership_lock") and account and not owned:
+                violations.add((filename, node.lineno))
+            target = resolve(node, filename, cls)
+            if target is not None:
+                follow(target, owned, account)
+        for child in ast.iter_child_nodes(node):
+            visit(child, filename, cls, owned, account)
+
+    for key in functions:
+        follow(key, False, False)
+    return sorted(violations)
+
+
+def test_helper_ownership_inversion_negative_control():
+    sources = {
+        "surface.py": """
+from claude_swap import helper
+
+def mutate(self):
+    with FileLock(self.lock_file):
+        helper.prepare(self.backup_dir)
+""",
+        "helper.py": """
+def prepare(root):
+    read_state(root)
+
+def read_state(root):
+    with ownership_lock(root):
+        pass
+""",
+    }
+    violations = _helper_ownership_inversions(sources)
+    assert violations, "account -> helper -> state must be rejected"
+    assert any(module == "helper.py" for module, line in violations)
+
+
+def test_helper_ownership_inversion_allows_outer_reentrant_state():
+    sources = {
+        "surface.py": """
+from claude_swap import helper
+
+def mutate(self):
+    with ownership_lock(self.backup_dir), FileLock(self.lock_file):
+        helper.prepare(self.backup_dir)
+""",
+        "helper.py": """
+def prepare(root):
+    with ownership_lock(root):
+        pass
+""",
+    }
+    assert not _helper_ownership_inversions(sources)
+
+
+def test_called_helpers_do_not_invert_profile_lock_order():
+    filenames = (
+        "switcher.py", "transfer.py", "session.py", "transparent.py",
+        "profile_ownership.py",
+    )
+    sources = {name: (ROOT / name).read_text(encoding="utf-8") for name in filenames}
+    violations = _helper_ownership_inversions(sources)
+    assert not violations, violations
+
+
+def test_helper_ownership_state_does_not_escape_with_scope():
+    sources = {
+        "surface.py": """
+class Manager:
+    def mutate(self):
+        with ownership_lock(self.backup_dir):
+            pass
+        with FileLock(self.lock_file):
+            self.prepare()
+
+    def prepare(self):
+        with ownership_lock(self.backup_dir):
+            pass
+""",
+    }
+    violations = _helper_ownership_inversions(sources)
+    assert len(violations) == 1
+    assert violations[0][0] == "surface.py"

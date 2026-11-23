@@ -12,8 +12,14 @@ The isolated Linux stand can opt into synthetic direct TLS with `CLAUDE_SWAP_TES
 ## Profile ownership
 
 Both explicit `cswap run ACCOUNT` and routed shim launches reserve the selected
-profile before reuse or preparation. Reservations and `profileGen` live under
-`profile-ownership/` outside the removable profile. Swap, move, remove, switch
+profile before reuse or preparation, excluding the default-login account both
+when reserving and publishing. Multiple launches may reserve and reuse the same
+profile. Reserved/warming peers do not block preparation. First creation of an
+absent profile keeps its generation; rebuilding or deleting an existing profile
+changes `profileGen`, so stale preparations refuse and remove
+only their own records. Running launches block overwrite or deletion of their
+profile. Reservations and `profileGen` live under `profile-ownership/` outside
+the removable profile. Swap, move, remove, switch
 (including auto-switch), and replacement import refuse affected busy slots even
 when disabled or removed from the transparent pool.
 
@@ -27,8 +33,20 @@ Linux launches use a dedicated single-threaded subreaper supervisor. The
 reservation is released only after it has reaped the leader and all descendants,
 including descendants that change session. A failed handoff also releases it
 once the tree is empty. Supervisor death or an uncertain wait leaves it busy;
-a PID disappearing alone does not prove completion. Non-Linux publication
-fails closed; Windows job completion is not verified.
+a PID disappearing alone does not prove completion. A live launch must finish
+its entire descendant tree: after the leader exits, INT/TERM/HUP are forwarded
+to remaining verified descendants and supervision keeps waiting. A descendant
+that ignores the signal keeps the profile protected. After proven completion,
+release retries ownership-lock contention without an overall deadline; storage
+errors are reported separately.
+
+A dead supervisor leaves completion unconfirmed; repeating a switch does not
+clear that uncertainty. There is no forced-reset or recovery command. On the
+same machine, a recorded Linux boot ID different from the current trustworthy
+boot ID proves the old tree ended. Missing boot metadata, an unreadable boot ID,
+or a different machine identity does not. PID start ticks distinguish process
+instances within a boot, not boots. Non-Linux publication fails closed; Windows
+job completion is not verified.
 
 Invalidation, deletion and backup credential changes advance the external
 profile generation, including for disabled accounts outside the pool. Purge
