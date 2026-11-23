@@ -11,7 +11,7 @@ pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode and 
 
 @pytest.fixture
 def layout(monkeypatch, tmp_path):
-    base = tmp_path / "base"
+    base = tmp_path / "Versions" / "base"
     base_bin = base / "bin"
     base_bin.mkdir(parents=True)
     binary = base_bin / "python"
@@ -57,6 +57,16 @@ def test_rechecks_permissions_after_success(layout, index):
     item.chmod(item.stat().st_mode | 0o020)
     assert parent.stat().st_mtime_ns == parent_mtime
     with pytest.raises(fsguard.GuardError, match="Writable by group or others"):
+        python_chain.check_python_chain()
+
+
+def test_rejects_group_writable_ancestor_of_interpreter_target(layout):
+    invocation, (binary, *_) = layout
+    versions = binary.parents[2]
+    assert python_chain.check_python_chain() == invocation
+
+    versions.chmod(0o775)
+    with pytest.raises(fsguard.GuardError, match="Writable by group or others: .*Versions"):
         python_chain.check_python_chain()
 
 
