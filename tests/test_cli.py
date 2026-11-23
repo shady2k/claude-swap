@@ -1512,9 +1512,7 @@ class TestRunCommand:
         )
 
         assert result.returncode == 0, result.stderr
-        assert [json.loads(line) for line in result.stdout.splitlines()] == [
-            {"args": ["--output-format", "stream-json"]}
-        ]
+        assert result.stdout == json.dumps({"args": ["--output-format", "stream-json"]}) + "\n"
         assert "No account mapped" in result.stderr
 
 
