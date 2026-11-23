@@ -59,7 +59,7 @@ An account whose refresh token has died is quarantined and reported until you ei
 
 ### Credential recovery
 
-`stash-unreadable` means a preserved successor credential is unreadable or cannot be proven to belong to the slot. cswap does not consume another refresh token while that entry blocks recovery. `cswap list`, the TUI, and auto-switch show the recovery guidance on the first failure and while retries back off, alongside any last-good usage reading.
+`stash-unreadable` means a preserved successor credential is unreadable or cannot be proven to belong to the slot. A stash file outside the manifest has no proven owner and blocks refresh for every slot until `cswap unclaimed --purge ID`; replacing a login alone does not remove it. `cswap list`, the TUI, and auto-switch show the recovery guidance on the first failure and while retries back off, alongside any last-good usage reading.
 
 1. Run `cswap unclaimed` to inspect the preserved entries. Unlock the keychain or fix unreadable files first, then retry.
 2. If the credential cannot be recovered, log in again with Claude Code and run `cswap add --slot N` for the affected slot.

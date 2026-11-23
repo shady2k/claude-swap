@@ -1362,7 +1362,8 @@ def fetch_usage(access_token: str) -> dict | None:
 # a grant the live login also holds; the retry would be declined the same way.
 _DETERMINISTIC_REFRESH_ERRORS = (
     "store-unmirrored", "invalid_client", "consume-busy", "stash-unreadable",
-    "live-login", "ownership-lost", "superseded", "unreadable",
+    "live-login", "ownership-lost", "profile-busy", "credential-unproven",
+    "superseded", "unreadable",
 )
 
 
@@ -1415,6 +1416,8 @@ def try_fetch_usage_for_account(
         and is_oauth_token_expired(oauth.get("expiresAt"))
     ):
         refresh = refresh_via(account_num, email, working_credentials)
+        if refresh.error == "stash-unreadable":
+            return UsageOutcome(None, error=refresh.error)
         if refresh.credentials:
             working_credentials = refresh.credentials
             oauth = extract_oauth_data(working_credentials) or oauth

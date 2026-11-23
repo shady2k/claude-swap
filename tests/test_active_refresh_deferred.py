@@ -123,7 +123,7 @@ def test_unsafe_recovery_does_not_post_or_write(
 
     assert local_token_server[0] == []
     assert snapshot(switcher) == before
-    assert result.error == ("unreadable" if shape == "unreadable" else "ownership-lost")
+    assert result.error == ("unreadable" if shape == "unreadable" else "credential-unproven" if shape == "foreign-live" else "ownership-lost")
     assert result.sentinel is None
 
 

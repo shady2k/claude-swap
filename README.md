@@ -207,7 +207,7 @@ cswap add
 
 This will update the stored credentials without creating a duplicate.
 
-If active refresh reports unproven copies or stash uncertainty, cswap defers without rewriting live or backup credentials. See [credential recovery](docs/auto-switch.md#credential-recovery) for inspection, login recovery, and removal of a blocking preserved entry.
+If active refresh reports unproven copies or stash uncertainty, cswap defers without rewriting live or backup credentials. Follow [credential recovery](docs/auto-switch.md#credential-recovery): inspect entries, recover the login, run `cswap add --slot N`, then `cswap unclaimed --purge ID` for the blocking entry.
 
 If the refresh token itself has died (auto-switch quarantines and reports such an account), log in with it and re-run `cswap add --slot N`, or replace its stored credentials from a known-good export: a plain `cswap import backup.cswap` replaces dead-token slots on its own (a stale export can carry an already-superseded token).
 

@@ -11388,7 +11388,7 @@ class TestGateUltraReviewFixes:
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=mock_refresh):
             out = s.consume_backup_grant("1", "test@example.com", snapshot)
-        assert out.error == "transient", (
+        assert out.error == "stash-unreadable", (
             "reported success on a spent grant with nothing stashed"
         )
         assert out.credentials == self._NEW

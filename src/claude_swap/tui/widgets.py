@@ -290,7 +290,12 @@ def account_card_text(
         text.append("\n    ")
         style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
         marker = "·" if sentinel == USAGE_API_KEY else "⚠"
-        text.append(f"{marker} {data.sentinel_label(sentinel)}", style=style)
+        note = (
+            ERROR_NOTES[acc.usage.last_error]
+            if acc.usage.last_error in ("stash-unreadable", "profile-busy", "credential-unproven")
+            else data.sentinel_label(sentinel)
+        )
+        text.append(f"{marker} {note}", style=style)
         # Same supplementary line `cswap list` prints: the last good
         # measurement behind the sentinel (API-key accounts have no quota to
         # have "seen").
@@ -341,7 +346,7 @@ def account_card_text(
                 palette=palette,
             )
         )
-    if acc.usage.last_error in ("stash-unreadable", "profile-busy"):
+    if acc.usage.last_error in ("stash-unreadable", "profile-busy", "credential-unproven"):
         text.append("\n    ⚠ " + ERROR_NOTES[acc.usage.last_error], style=palette.sev_warn)
     return text
 
@@ -398,7 +403,16 @@ def mini_account_text(
     sentinel = acc.usage.sentinel
     if sentinel is not None:
         style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
-        text.append(data.sentinel_label(sentinel), style=style)
+        note = (
+            ERROR_NOTES[acc.usage.last_error]
+            if acc.usage.last_error in ("stash-unreadable", "profile-busy", "credential-unproven")
+            else data.sentinel_label(sentinel)
+        )
+        text.append(note, style=style)
+        if acc.usage.last_error in ("stash-unreadable", "profile-busy", "credential-unproven"):
+            last_seen = data.last_seen_note(acc.usage)
+            if last_seen is not None:
+                text.append(" · " + last_seen, style=palette.muted)
         return _end_mini(text, acc, login, now, palette)
 
     last_good = acc.usage.last_good
@@ -444,7 +458,7 @@ def mini_account_text(
         parts += 1
     if not parts:
         text.append("usage unknown", style=palette.muted)
-    if acc.usage.last_error in ("stash-unreadable", "profile-busy"):
+    if acc.usage.last_error in ("stash-unreadable", "profile-busy", "credential-unproven"):
         text.append(" · " + ERROR_NOTES[acc.usage.last_error], style=palette.sev_warn)
     return _end_mini(text, acc, login, now, palette)
 

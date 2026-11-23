@@ -108,7 +108,7 @@ def test_active_refresh_uses_locked_source(active, source):
     )
     result = switcher._fetch_active_usage("1", EMAIL, original)
     if source == "stale-live":
-        assert result.error == "ownership-lost"
+        assert result.error == "credential-unproven"
         assert not calls
         assert switcher._read_credentials() == original
         assert switcher._read_account_credentials("1", EMAIL) == backup
@@ -145,7 +145,7 @@ def test_foreign_live_grant_is_not_consumed(active):
     switcher._write_credentials(credential("foreign"))
     result = switcher._fetch_active_usage("1", EMAIL, Snapshot(credential("own")))
     assert calls == []
-    assert result.error == "ownership-lost"
+    assert result.error == "credential-unproven"
 
 
 def test_failed_persist_stashes_successor(active, monkeypatch):
@@ -245,7 +245,7 @@ def test_unproven_backup_does_not_replace_live_snapshot(active):
     switcher._write_account_credentials("1", EMAIL, credential("unknown-age"))
     result = switcher._fetch_active_usage("1", EMAIL, live)
     assert calls == []
-    assert result.error == "ownership-lost"
+    assert result.error == "credential-unproven"
 
 
 def test_claude_rotation_before_locked_read_does_not_double_post(active):
@@ -255,7 +255,7 @@ def test_claude_rotation_before_locked_read_does_not_double_post(active):
     switcher._write_account_credentials("1", EMAIL, old)
     result = switcher._fetch_active_usage("1", EMAIL, old)
     assert calls == []
-    assert result.error == "ownership-lost"
+    assert result.error == "credential-unproven"
 
 
 def test_active_holds_claude_and_identity_locks_during_post(active, monkeypatch):
@@ -367,7 +367,7 @@ def test_stale_live_retry_consumes_selected_grant_once(active, monkeypatch, fail
         return
     if shape == "live-older":
         for _ in range(2):
-            assert fetch().error == "ownership-lost"
+            assert fetch().error == "credential-unproven"
         assert not calls
         assert switcher._read_credentials() == stored_live
         assert switcher._read_account_credentials("1", EMAIL) == stored_backup
@@ -463,7 +463,7 @@ def test_active_acceptance_matrix(active, monkeypatch, shape, pending, productio
             # A new collection sees the committed live credential.
             snapshot = Snapshot(c)
         else:
-            assert result.error in {"ownership-lost", "stash-unreadable"}
+            assert result.error in {"credential-unproven", "stash-unreadable"}
     if allowed:
         assert switcher._read_credentials() == c
         assert switcher._read_account_credentials("1", EMAIL) == c
@@ -563,7 +563,7 @@ def test_active_stash_controls_preserve_copies(active, monkeypatch, control):
     if control == "owner":
         assert result.error == "profile-busy"
     else:
-        assert result.error in {"ownership-lost", "stash-unreadable"}
+        assert result.error in {"credential-unproven", "stash-unreadable"}
     assert not calls
     assert switcher._read_credentials() == live
     assert switcher._read_account_credentials("1", EMAIL) == backup
@@ -808,7 +808,7 @@ def test_expiry_order_is_not_refresh_authority(active, shape):
     switcher._write_account_credentials("1", EMAIL, backup)
     for _ in range(2):
         result = switcher._fetch_account_usage((1, EMAIL, "", "", True, live, ""))
-        assert result.error == "ownership-lost"
+        assert result.error == "credential-unproven"
     assert not calls
     assert switcher._read_credentials() == live
     assert switcher._read_account_credentials("1", EMAIL) == backup
@@ -887,3 +887,19 @@ def test_failed_stash_publication_logs_slot_and_entry_without_credentials(active
     assert "account 1" in caplog.text
     assert entry in caplog.text
     assert "secret-pending" not in caplog.text
+
+
+def test_busy_profile_never_requests_relogin_in_collected_output(active, monkeypatch):
+    from claude_swap import profile_ownership
+    from claude_swap.switcher import _usage_entry_lines
+    switcher, calls = active
+    b = Snapshot(credential("B"))
+    switcher._write_credentials(b)
+    switcher._write_account_credentials("1", EMAIL, b)
+    monkeypatch.setattr(profile_ownership, "profile_busy_locked", lambda *a, **k: True)
+    infos = [(1, EMAIL, "", "", True, str(b), "")]
+    entry = switcher._collect_usage_entries(infos, {"1"})["1"]
+    text = " ".join(_usage_entry_lines(entry)).lower()
+    assert "log in again" not in text
+    assert "cswap add" not in text
+    assert not calls

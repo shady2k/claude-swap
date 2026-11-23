@@ -91,6 +91,7 @@ _SYSTEMIC_MESSAGES = {
                       "account",
     "stash-unreadable": ERROR_NOTES["stash-unreadable"],
     "profile-busy": ERROR_NOTES["profile-busy"],
+    "credential-unproven": ERROR_NOTES["credential-unproven"],
     "consume-busy": "another cswap surface holds the slot — retries next pass",
 }
 # Insertion order IS the precedence order, so the remedy and its rank cannot
@@ -333,7 +334,7 @@ class PollEvent(AutoSwitchEvent):
         recovery = "".join(
             f" | Account-{number}: {ERROR_NOTES[error]}"
             for number, error in self.fetch_errors.items()
-            if error in ("stash-unreadable", "profile-busy")
+            if error in ("stash-unreadable", "profile-busy", "credential-unproven")
         )
         return (
             f"Account-{num} ({self.active.get('email')}): {used} "
@@ -1165,7 +1166,7 @@ class AutoSwitchEngine:
                     for num, entry in entries.items()
                     if entry.last_error and (
                         usage.get(num) is None
-                        or entry.last_error in ("stash-unreadable", "profile-busy")
+                        or entry.last_error in ("stash-unreadable", "profile-busy", "credential-unproven")
                     )
                 },
                 windows={

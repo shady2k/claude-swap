@@ -272,9 +272,10 @@ ERROR_NOTES = {
     "consume-busy": (
         "another cswap surface holds the slot — retries next pass"
     ),
-    "ownership-lost": (
-        "account ownership or credential relationship is unproven — "
-        "log in again with Claude Code, then run: cswap add --slot N"
+    "ownership-lost": "account ownership changed — retries with the current login",
+    "credential-unproven": (
+        "credential relationship is unproven — log in again with Claude Code, "
+        "then run: cswap add --slot N"
     ),
     "superseded": "login was replaced — retries with the current credential",
     "unreadable": "stored login is unreadable — unlock the keychain or fix the file",
@@ -370,7 +371,12 @@ def _usage_entry_lines(
     login_row = _login_row(login_expires_at, entry.sentinel == USAGE_RELOGIN_REQUIRED)
     login_line = muted(_pad_row(*login_row, len(login_row[0]) + 1)) if login_row else None
     if entry.sentinel is not None:
-        out = [dimmed(SENTINEL_NOTES.get(entry.sentinel, entry.sentinel))]
+        note = (
+            ERROR_NOTES[entry.last_error]
+            if entry.last_error in {"stash-unreadable", "profile-busy", "credential-unproven"}
+            else SENTINEL_NOTES.get(entry.sentinel, entry.sentinel)
+        )
+        out = [dimmed(note)]
         last_seen = last_seen_note(entry)
         children = []
         if last_seen is not None and entry.sentinel != USAGE_API_KEY:
@@ -393,7 +399,7 @@ def _usage_entry_lines(
             and entry.fetched_at is not None
         ):
             lines[usage_count - 1] += f" · {format_age(int(entry.fetched_at * 1000))}"
-        if entry.last_error in {"stash-unreadable", "profile-busy"}:
+        if entry.last_error in {"stash-unreadable", "profile-busy", "credential-unproven"}:
             lines.append(ERROR_NOTES[entry.last_error])
         return [
             f"{dimmed('└' if j == len(lines) - 1 else '├')} {muted(line)}"
@@ -2983,10 +2989,9 @@ class ClaudeAccountSwitcher:
                 # with nothing stashed.
                 stashed_reason = "consume-gate-unpersisted"
                 self._logger.error(
-                    "Account %s's consumed successor could not be persisted "
-                    "or stashed — it survives only for this pass. Fix the "
-                    "storage failure, then re-login and `cswap add` if the "
-                    "slot strikes.", account_num, exc_info=True,
+                    "Account %s's consumed successor could not be fully published. "
+                    "Inspect `cswap unclaimed` and fix storage; recover the login "
+                    "before `cswap unclaimed --purge ID`.", account_num, exc_info=True,
                 )
         if stashed_reason in _DEMOTING_STASH_REASONS:
             # The successor is parked, not persisted: the slot still holds the
@@ -3013,7 +3018,9 @@ class ClaudeAccountSwitcher:
             # candidate (network?)" on every multi-surface race — the exact
             # contention this gate was built for, turned into a false alarm.
             return oauth.RefreshOutcome(
-                outcome_creds, "transient", result.token_account, consumed_fp,
+                outcome_creds,
+                "stash-unreadable" if stashed_reason == "consume-gate-unpersisted" else "transient",
+                result.token_account, consumed_fp,
                 # `consume-gate-unpersisted` is set precisely WHEN the stash
                 # write raised, so it is the one demoting reason that did not
                 # park anything. Every other one wrote the entry first.
@@ -5157,9 +5164,9 @@ class ClaudeAccountSwitcher:
                         return FetchRecord(error="stash-unreadable")
                     if not successor:
                         if live and live_fp not in {backup_fp, snapshot_fp}:
-                            return FetchRecord(error="ownership-lost")
+                            return FetchRecord(error="credential-unproven")
                         if not input_allowed:
-                            return FetchRecord(error="ownership-lost")
+                            return FetchRecord(error="credential-unproven")
 
                     def persist_successor(value: str) -> None:
                         nonlocal saved_backup
@@ -5198,16 +5205,19 @@ class ClaudeAccountSwitcher:
                             # ownership state, which must never follow account.
                             persist_successor(successor)
                         except Exception:
-                            self._store._write_unclaimed_credential(successor, {
-                                "reason": "active-refresh-persist-failed",
-                                "configSlot": account_num,
-                                "identity": expected_identity,
-                                "loginGen": generation,
-                                "consumedFp": consumed_fp,
-                                "observedLiveFp": live_fp,
-                                "observedBackupFp": backup_fp,
-                                "fingerprint": oauth.credential_fingerprint(successor),
-                            })
+                            try:
+                                self._store._write_unclaimed_credential(successor, {
+                                    "reason": "active-refresh-persist-failed",
+                                    "configSlot": account_num,
+                                    "identity": expected_identity,
+                                    "loginGen": generation,
+                                    "consumedFp": consumed_fp,
+                                    "observedLiveFp": live_fp,
+                                    "observedBackupFp": backup_fp,
+                                    "fingerprint": oauth.credential_fingerprint(successor),
+                                })
+                            except Exception:
+                                return FetchRecord(error="stash-unreadable")
                             return FetchRecord(error="transient")
             finally:
                 authority.release()

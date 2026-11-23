@@ -355,13 +355,15 @@ class TestFormatting:
     @pytest.mark.parametrize("error", ["stash-unreadable", "profile-busy"])
     @pytest.mark.parametrize("has_history", [False, True])
     @pytest.mark.parametrize("backoff", [False, True])
-    def test_recovery_card_keeps_guidance_and_prior_usage(self, error, has_history, backoff):
+    @pytest.mark.parametrize("expired_sentinel", [False, True])
+    def test_recovery_card_keeps_guidance_and_prior_usage(self, error, has_history, backoff, expired_sentinel):
         from claude_swap.switcher import ERROR_NOTES
         from claude_swap.tui.widgets import account_card_text, mini_account_text
 
         entry = dataclasses.replace(
             make_entry() if has_history else UsageEntry(), last_error=error,
             backoff_until=time.time() + 600 if backoff else None,
+            sentinel=USAGE_TOKEN_EXPIRED if expired_sentinel else None,
         )
         from claude_swap.switcher import _usage_entry_lines
 
@@ -372,8 +374,9 @@ class TestFormatting:
             "\n".join(_usage_entry_lines(entry)),
         ):
             assert ERROR_NOTES[error] in text
+            assert "retries automatically" not in text
             if has_history:
-                assert "25%" in text
+                assert "last seen" in text if expired_sentinel else "25%" in text
             if error == "stash-unreadable":
                 assert "cswap unclaimed --purge ID" in text
             else:
