@@ -287,7 +287,8 @@ def _records(backup_dir: Path) -> list[dict]:
     return records
 
 
-def _profile_key(profile: Path) -> str:
+def profile_key(profile: Path) -> str:
+    """Canonical key shared by ownership records and handoff validation."""
     return os.path.normcase(str(profile.resolve()))
 
 
@@ -309,7 +310,7 @@ def profile_busy_locked(
             if data["launchId"] == ignore_launch_id:
                 continue
             if data["accountNum"] != str(account_num) and (
-                session_dir is None or data["profile"] != _profile_key(session_dir)
+                session_dir is None or data["profile"] != profile_key(session_dir)
             ):
                 continue
             if data["state"] == "running":
@@ -328,7 +329,7 @@ def profile_busy_locked(
 
 def _generation_path(backup_dir: Path, profile: Path) -> Path:
     import hashlib
-    key = hashlib.sha256(_profile_key(profile).encode("utf-8")).hexdigest()
+    key = hashlib.sha256(profile_key(profile).encode("utf-8")).hexdigest()
     return _root(backup_dir) / "generations" / f"{key}.json"
 
 
@@ -360,7 +361,7 @@ def profile_running_locked(
             if _previous_boot(data) or data["launchId"] == ignore_launch_id:
                 continue
             if data["accountNum"] != str(account_num) and (
-                session_dir is None or data["profile"] != _profile_key(session_dir)
+                session_dir is None or data["profile"] != profile_key(session_dir)
             ):
                 continue
             if data["state"] == "running":
@@ -384,7 +385,7 @@ def check_admission_locked(backup_dir: Path, account_num: str, session_dir: Path
         supervised = any(
             data["state"] == "running" and not _previous_boot(data)
             and data["accountNum"] == str(account_num)
-            and data["profile"] == _profile_key(session_dir)
+            and data["profile"] == profile_key(session_dir)
             for data in records
         )
         if unreadable or (live and not supervised):
@@ -400,7 +401,7 @@ def reserve_locked(
     launch_id = uuid.uuid4().hex
     data = {
         "launchId": launch_id, "accountNum": str(account_num),
-        "profile": _profile_key(session_dir),
+        "profile": profile_key(session_dir),
         "profileGen": _generation(backup_dir, session_dir),
         "state": "reserved", "warming": warming,
         "ownerPid": os.getpid(), "ownerTicks": _encoded_start(_process_identity(os.getpid())),

@@ -1092,7 +1092,7 @@ class SessionManager:
         if record is None:
             claude_bin.handoff(claude_args, env)
         config_home = env.get("CLAUDE_CONFIG_DIR")
-        if config_home is None or str(Path(config_home).resolve()) != record["profile"]:
+        if config_home is None or profile_ownership.profile_key(Path(config_home)) != record["profile"]:
             raise SessionError("Reserved profile does not match handoff configuration")
         self._admit_profile_launch(claude_args)
 
@@ -1100,7 +1100,7 @@ class SessionManager:
             with profile_ownership.ownership_lock(self.switcher.backup_dir), FileLock(self.switcher.lock_file):
                 self._verify_profile_recipient(record)
                 num, email, _ = self.switcher.resolve_account(record["accountNum"])
-                if str(session_dir_for(self.switcher.backup_dir, num, email).resolve()) != record["profile"]:
+                if profile_ownership.profile_key(session_dir_for(self.switcher.backup_dir, num, email)) != record["profile"]:
                     raise SessionError("Account identity changed before handoff")
                 if self.switcher._get_current_account() == self.switcher.resolve_account(num)[1:] and not self._default_login_signed_out():
                     raise SessionError("Selected account became the default login before handoff")
