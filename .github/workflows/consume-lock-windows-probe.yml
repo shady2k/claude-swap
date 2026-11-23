@@ -1,0 +1,42 @@
+name: Windows consume lock checks
+
+on:
+  push:
+    branches: [ci/alx1122-win-probe-84f52a5]
+
+permissions:
+  contents: read
+
+jobs:
+  windows-consume-lock:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 84f52a5ba343cead58540fd6737b1bc43f0f2fee
+          persist-credentials: false
+
+      - name: Verify the candidate commit
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD) -ne '84f52a5ba343cead58540fd6737b1bc43f0f2fee') {
+            throw 'Unexpected candidate commit'
+          }
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12.10'
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Run three lock checks
+        run: >-
+          uv run pytest -n 0 -vv --junitxml=consume-lock.xml
+          tests/test_switcher.py::TestGateUltraReviewFixes::test_contention_reports_its_own_kind_not_transient
+          tests/test_switcher.py::TestGateUltraReviewFixes::test_no_store_read_happens_before_the_consume_lock
+          tests/test_refresh_authority.py::test_identity_right_survives_slot_number_and_serializes
+
+      - name: Confirm every check passed
+        run: uv run python -c "import xml.etree.ElementTree as ET; tests = ET.parse('consume-lock.xml').findall('.//testcase'); assert len(tests) == 3 and all(len(test) == 0 for test in tests)"
