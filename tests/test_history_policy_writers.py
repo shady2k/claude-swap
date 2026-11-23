@@ -10,18 +10,16 @@ from types import SimpleNamespace
 
 import pytest
 
-from claude_swap import cli, launch_policy, menubar, paths, settings, transparent
+from claude_swap import cli, launch_policy, menubar, settings, transparent
 from claude_swap.locking import FileLock
 
 
 @pytest.fixture
-def root():
-    root = paths.get_backup_root()
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    settings.settings_path(root).write_text(json.dumps({
+def root(private_backup_root):
+    settings.settings_path(private_backup_root).write_text(json.dumps({
         "schemaVersion": 1, "future": {"keep": True}, "ui": {"orgTag": "off"},
     }), encoding="utf-8")
-    return root
+    return private_backup_root
 
 
 def test_concurrent_settings_keys_are_read_and_written_under_one_lock(root, monkeypatch):
