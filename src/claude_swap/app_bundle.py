@@ -61,6 +61,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from claude_swap import spawn
 from claude_swap.printer import warning
 
 BUNDLE_ID = "com.claude-swap.menubar"
@@ -256,7 +257,7 @@ def interpreter_error(python: Path) -> str | None:
     wiring leaves site-packages unreachable.
     """
     try:
-        proc = subprocess.run(
+        proc = spawn.run(
             [str(python), "-c", "import claude_swap"],
             capture_output=True,
             text=True,
@@ -290,9 +291,9 @@ def reexec_reason(platform: str = sys.platform, environ=None) -> str | None:
 def maybe_reexec(backup_dir: Path, argv: list[str] | None = None) -> str | None:
     """Replace this process with the same command run from inside the bundle.
 
-    Returns only when staying put, with the reason; on success ``execv`` never
+    Returns only when staying put, with the reason; on success ``execve`` never
     returns. A bundle that cannot be built, whose interpreter fails its startup
-    check, or that ``execv`` refuses falls back to the plain interpreter (the
+    check, or that ``execve`` refuses falls back to the plain interpreter (the
     menu bar still works, it just stays invisible to menu bar managers).
     """
     reason = reexec_reason()
@@ -314,10 +315,10 @@ def maybe_reexec(backup_dir: Path, argv: list[str] | None = None) -> str | None:
         return _stay_put(f"the bundled interpreter cannot start: {error}")
     args = sys.argv[1:] if argv is None else argv
     try:
-        os.execv(str(python), [str(python), "-m", "claude_swap", *args])
+        spawn.handoff(str(python), ["-m", "claude_swap", *args], dict(os.environ))
     except OSError as exc:
         return _stay_put(f"could not exec {python}: {exc}")
-    return None  # pragma: no cover - execv does not return
+    return None  # pragma: no cover - handoff does not return
 
 
 def _stay_put(reason: str) -> str:

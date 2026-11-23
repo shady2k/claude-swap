@@ -15,6 +15,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from claude_swap import test_mode
 from claude_swap.printer import warning as print_warning
 
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
@@ -294,7 +295,7 @@ def try_refresh_oauth_credentials(
         }).encode()
 
         req = urllib.request.Request(
-            OAUTH_TOKEN_URL,
+            test_mode.service_url(OAUTH_TOKEN_URL),
             data=body,
             headers={
                 "Content-Type": "application/json",
@@ -302,7 +303,7 @@ def try_refresh_oauth_credentials(
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        with test_mode.open_service(req, timeout=timeout_s) as resp:
             resp_data = json.loads(resp.read().decode())
 
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -466,7 +467,7 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
     evidence is sufficient for each decision. Must not be called while any
     credential/config lock is held (network under locks is forbidden).
     """
-    url = "https://api.anthropic.com/api/oauth/profile"
+    url = test_mode.service_url("https://api.anthropic.com/api/oauth/profile")
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
@@ -474,7 +475,7 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
     }
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with test_mode.open_service(req, timeout=5) as resp:
             data = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         if e.code == 401:
@@ -583,14 +584,14 @@ def fresh_reset_strings(window: dict) -> tuple[str, str] | None:
 
 def request_usage_data(access_token: str) -> dict:
     """Request raw utilization data from the Anthropic usage API."""
-    url = "https://api.anthropic.com/api/oauth/usage"
+    url = test_mode.service_url("https://api.anthropic.com/api/oauth/usage")
     headers = {
         "Authorization": f"Bearer {access_token}",
         "anthropic-beta": OAUTH_BETA_HEADER,
         "User-Agent": "claude-swap/1.0",
     }
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=5) as resp:
+    with test_mode.open_service(req, timeout=5) as resp:
         return json.loads(resp.read().decode())
 
 
@@ -741,7 +742,7 @@ def request_usage_via_probe(access_token: str) -> dict:
     with its Retry-After.
     """
     try:
-        with urllib.request.urlopen(
+        with test_mode.open_service(
             _probe_request(access_token, USAGE_PROBE_MODEL), timeout=10
         ) as resp:
             return parse_unified_ratelimit_headers(resp.headers)
@@ -776,7 +777,7 @@ def _probe_request(access_token: str, model: str) -> urllib.request.Request:
         "User-Agent": "claude-swap/1.0",
     }
     return urllib.request.Request(
-        USAGE_PROBE_URL, data=body, headers=headers, method="POST"
+        test_mode.service_url(USAGE_PROBE_URL), data=body, headers=headers, method="POST"
     )
 
 
@@ -864,7 +865,7 @@ def _probe_scoped_limit(
     access to the model, a network error) says nothing about it: None.
     """
     try:
-        with urllib.request.urlopen(
+        with test_mode.open_service(
             _probe_request(access_token, model), timeout=10
         ) as resp:
             return _scoped_limit_from_headers(resp.headers, prefix, None, now)

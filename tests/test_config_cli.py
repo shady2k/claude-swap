@@ -12,6 +12,9 @@ import pytest
 from claude_swap import cli
 
 
+pytestmark = pytest.mark.mock_stand_routing
+
+
 def _run(argv: list[str], capsys) -> tuple[int, str, str]:
     """Run `cswap config <argv>`; returns (exit_code, stdout, stderr).
 
@@ -39,7 +42,7 @@ class TestConfigList:
     def test_lists_all_keys_as_defaults(self, temp_home, capsys):
         code, out, _ = _run([], capsys)
         assert code == 0
-        for key in (
+        keys = (
             "autoswitch.threshold",
             "autoswitch.weeklyThreshold",
             "autoswitch.intervalSeconds",
@@ -55,9 +58,13 @@ class TestConfigList:
             "updates.check",
             "usage.headerProbe",
             "usage.fableProbe",
-        ):
+            "transparent.claudePath",
+            "transparent.requireProxy",
+            "transparent.allowUnverified",
+        )
+        for key in keys:
             assert key in out
-        assert out.count("(default)") == 15
+        assert out.count("(default)") == len(keys)
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -84,7 +91,10 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 15
+        assert len(by_key) == 18
+        for key, value in (("claudePath", None), ("requireProxy", False), ("allowUnverified", False)):
+            path = f"transparent.{key}"
+            assert by_key[path] == {"key": path, "value": value, "isSet": False}
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         # An unset weekly line reports null, not the threshold it falls back

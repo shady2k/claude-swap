@@ -14,6 +14,7 @@ import json
 import sys
 import threading
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -25,6 +26,9 @@ from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui import data as tui_data
 from claude_swap.usage_store import UsageEntry
+
+
+pytestmark = pytest.mark.mock_stand_routing
 
 
 # ---------------------------------------------------------------------------
@@ -226,13 +230,14 @@ class BlockingSnapshotSwitcher(FakeSwitcher):
         self.fetch_sets.append(fetch)
         if fetch is None:
             self.normal_started.set()
-            self.normal_release.wait(timeout=2)
+            if not self.normal_release.wait(timeout=2):
+                raise TimeoutError("normal snapshot was not released")
             self.normal_done.set()
             account = self.normal_account
         else:
             self.store_started.set()
-            if self.block_store:
-                self.store_release.wait(timeout=2)
+            if self.block_store and not self.store_release.wait(timeout=2):
+                raise TimeoutError("store snapshot was not released")
             self.store_done.set()
             account = self.store_account
         return AccountsSnapshot(
@@ -1315,63 +1320,101 @@ class TestWatchScreen:
             await pilot.pause()
             assert isinstance(app.screen, DashboardScreen)
 
-    async def test_blocked_normal_allows_store_only_repaint_without_stale_overpaint(
-        self, tmp_path
+    @asynccontextmanager
+    async def _run_blocking_app(self, app, fake, monkeypatch):
+        # Drive the real tick explicitly, including the first poll after mount.
+        tick = app._tick
+        monkeypatch.setattr(app, "_tick", lambda: None)
+        async with app.run_test(size=(100, 40)):
+            try:
+                tick()
+                yield tick
+            finally:
+                fake.normal_release.set()
+                fake.store_release.set()
+                # Drain workers before Textual can cancel them on app shutdown.
+                # Do not mask a test failure with a worker error during cleanup.
+                await asyncio.gather(
+                    *(worker.wait() for worker in app.workers), return_exceptions=True
+                )
+
+    @pytest.mark.parametrize("store_only", [False, True], ids=["normal", "store"])
+    async def test_snapshot_timeout_does_not_publish(
+        self, tmp_path, monkeypatch, store_only
     ):
-        normal = make_account(1, active=True, entry=make_usage_at(100.0, pct=10.0))
-        store = make_account(1, active=True, entry=make_usage_at(200.0, pct=80.0))
+        account = make_account(1, active=True)
+        fake = BlockingSnapshotSwitcher(account, account, tmp_path)
+        fake.block_store = True
+        release = fake.store_release if store_only else fake.normal_release
+        done = fake.store_done if store_only else fake.normal_done
+        wait = release.wait
+        monkeypatch.setattr(release, "wait", lambda timeout: wait(timeout=0))
+
+        source = tui_data.SnapshotSource(fake)
+        with pytest.raises(TimeoutError):
+            source.take(store_only=store_only)
+        assert not release.is_set()
+        assert not done.is_set()
+
+    async def test_blocked_normal_allows_store_only_repaint_without_stale_overpaint(
+        self, tmp_path, monkeypatch
+    ):
+        await self._check_late_normal(tmp_path, monkeypatch, normal_is_newer=False)
+
+    async def test_late_normal_can_advance_usage_after_store_repaint(
+        self, tmp_path, monkeypatch
+    ):
+        await self._check_late_normal(tmp_path, monkeypatch, normal_is_newer=True)
+
+    async def _check_late_normal(self, tmp_path, monkeypatch, *, normal_is_newer):
+        older = make_account(1, active=True, entry=make_usage_at(100.0, pct=10.0))
+        newer = make_account(1, active=True, entry=make_usage_at(200.0, pct=80.0))
+        normal, store = (newer, older) if normal_is_newer else (older, newer)
         fake = BlockingSnapshotSwitcher(normal, store, tmp_path)
         app = make_app(fake)
 
-        async with app.run_test(size=(100, 40)) as pilot:
+        async with self._run_blocking_app(app, fake, monkeypatch) as tick:
             await wait_event(fake.normal_started)
-            app._tick()
-            await wait_event(fake.store_done)
-            await pilot.pause()
-            assert app.snapshot.accounts[0].usage.last_good["five_hour"]["pct"] == 80.0
+            (normal_worker,) = app.workers
+            tick()
+            store_worker = next(w for w in app.workers if w.group == "refresh-store")
+            # The worker returns only after its call_from_thread(_apply_snapshot).
+            await store_worker.wait()
+            assert not fake.normal_release.is_set()
+            assert not fake.normal_done.is_set()
+            assert app.snapshot.accounts[0].usage.last_good["five_hour"]["pct"] == (
+                10.0 if normal_is_newer else 80.0
+            )
 
             fake.normal_release.set()
-            await wait_event(fake.normal_done)
-            await pilot.pause()
+            await normal_worker.wait()
+            assert fake.normal_done.is_set()
             assert app.snapshot.accounts[0].usage.last_good["five_hour"]["pct"] == 80.0
             assert fake.fetch_sets == [None, set()]
 
-    async def test_late_normal_can_advance_usage_after_store_repaint(self, tmp_path):
-        normal = make_account(1, active=True, entry=make_usage_at(200.0, pct=80.0))
-        store = make_account(1, active=True, entry=make_usage_at(100.0, pct=10.0))
-        fake = BlockingSnapshotSwitcher(normal, store, tmp_path)
-        app = make_app(fake)
-
-        async with app.run_test(size=(100, 40)) as pilot:
-            await wait_event(fake.normal_started)
-            app._tick()
-            await wait_event(fake.store_done)
-            await pilot.pause()
-            assert app.snapshot.accounts[0].usage.last_good["five_hour"]["pct"] == 10.0
-
-            fake.normal_release.set()
-            await wait_event(fake.normal_done)
-            await pilot.pause()
-            assert app.snapshot.accounts[0].usage.last_good["five_hour"]["pct"] == 80.0
-
-    async def test_repeated_ticks_keep_store_lane_single_flight(self, tmp_path):
+    async def test_repeated_ticks_keep_store_lane_single_flight(self, tmp_path, monkeypatch):
         normal = make_account(1, active=True, entry=make_usage_at(100.0, pct=10.0))
         store = make_account(1, active=True, entry=make_usage_at(200.0, pct=80.0))
         fake = BlockingSnapshotSwitcher(normal, store, tmp_path)
         fake.block_store = True
         app = make_app(fake)
 
-        async with app.run_test(size=(100, 40)):
+        async with self._run_blocking_app(app, fake, monkeypatch) as tick:
             await wait_event(fake.normal_started)
-            app._tick()
+            tick()
             await wait_event(fake.store_started)
-            app._tick()
-            app._tick()
+            tick()
+            tick()
             assert fake.fetch_sets == [None, set()]
-            fake.store_release.set()
-            fake.normal_release.set()
-            await wait_event(fake.store_done)
-            await wait_event(fake.normal_done)
+            workers = list(app.workers)
+            assert len(workers) == 2
+            assert all(not worker.is_finished for worker in workers)
+
+        assert fake.normal_release.is_set() and fake.store_release.is_set()
+        assert all(worker.is_finished for worker in workers)
+        for worker in workers:
+            await worker.wait()  # Assert success, not just cancellation or failure.
+        assert fake.normal_done.is_set() and fake.store_done.is_set()
 
     async def test_store_only_mode_launches_only_store_lane(self, tmp_path):
         fake = self._fake(tmp_path)

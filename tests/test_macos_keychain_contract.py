@@ -1,19 +1,8 @@
 """macOS Keychain contract tests.
 
-Two layers of coverage:
-
-1. **Mocked tests** (run on every PR, every platform): assert that the macOS
-   backup-credentials path passes the correct `(service, account)` tuple to the
-   `macos_keychain` security wrapper, under the new `claude-swap` service. This
-   guards the multi-account backup namespace on every CI run.
-
-2. **Real-keychain integration tests** (GHA macOS only): exercise
-   `_read_credentials` / `_write_credentials` end-to-end against a temporary
-   keychain, comparing token values rather than argv shape.
-
-The Layer 2 gate (`GITHUB_ACTIONS=true AND sys.platform=="darwin"`, plus the
-`no_keychain_fake` marker) is deliberate: no local opt-in, so a developer cannot
-accidentally swap their default keychain by running pytest.
+Mocked tests run everywhere and check the backup namespace. The real tests run
+only on GitHub Actions macOS. They check active credentials and the real wrapper
+against a temporary Keychain, using the same implicit selection as production.
 """
 
 from __future__ import annotations
@@ -21,8 +10,10 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import call, patch
+from uuid import uuid4
 
 import pytest
 
@@ -131,163 +122,212 @@ class TestBackupCredentialsSecurity:
 
 mac_ci_only = pytest.mark.skipif(
     os.environ.get("GITHUB_ACTIONS") != "true" or sys.platform != "darwin",
-    reason="Modifies default Keychain — runs on GitHub Actions macOS only",
+    reason="Real Keychain contract runs on GitHub Actions macOS only",
 )
 
 
-@pytest.fixture
-def tmp_keychain(tmp_path: Path):
-    """Create a temporary keychain, swap it in as default + sole user search-list
-    entry, and restore both on teardown.
-
-    `default-keychain` controls where new items go; `list-keychains -d user`
-    controls what `find-generic-password` searches. These are independent — both
-    must be redirected for `_read_credentials` (which doesn't pass `-k`) to find
-    the seeded entry.
-
-    The try/finally is the safety-critical part: a crash mid-test must still
-    restore the user's original keychain config. CI doesn't care, but the safe
-    shape is kept so the same code is risk-free if anyone copies it.
-    """
-    test_keychain = str(tmp_path / "test.keychain")
-    subprocess.run(
-        ["security", "create-keychain", "-p", "", test_keychain], check=True
-    )
-    subprocess.run(
-        ["security", "unlock-keychain", "-p", "", test_keychain], check=True
-    )
-
-    # CI runners don't reliably have a default keychain configured (rc 1,
-    # "A default keychain could not be found") — and an earlier swap/restore
-    # cycle in this job may have cleared it. Capture it only if present and
-    # skip the restore otherwise, rather than failing setup.
-    default_proc = subprocess.run(
-        ["security", "default-keychain"],
-        capture_output=True,
-        text=True,
-    )
-    original_default = (
-        default_proc.stdout.strip().strip('"')
-        if default_proc.returncode == 0
-        else None
-    )
-    list_proc = subprocess.run(
-        ["security", "list-keychains", "-d", "user"],
-        capture_output=True,
-        text=True,
-    )
-    original_list = [
-        line.strip().strip('"')
-        for line in (list_proc.stdout if list_proc.returncode == 0 else "").splitlines()
-        if line.strip()
-    ]
-
+def _security(label: str, *args: str, allowed=(0,)) -> str:
+    # Never show argv, stdout, or stderr: password lookups return data on stdout.
     try:
-        subprocess.run(
-            ["security", "default-keychain", "-s", test_keychain], check=True
+        result = subprocess.run(
+            ["/usr/bin/security", *args],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=macos_keychain._TIMEOUT,
         )
-        subprocess.run(
-            ["security", "list-keychains", "-d", "user", "-s", test_keychain],
-            check=True,
-        )
-        # Harden against an invisible SecurityAgent dialog hanging the job: a
-        # `security` call against a (re-)locked keychain blocks forever on a
-        # headless runner waiting for an unlock prompt nobody can click. Remove
-        # the auto-lock timeout and unlock *after* the default/search-list swap
-        # (the order fastlane's setup_ci uses).
-        subprocess.run(
-            ["security", "set-keychain-settings", test_keychain], check=True
-        )
-        subprocess.run(
-            ["security", "unlock-keychain", "-p", "", test_keychain], check=True
-        )
-        yield test_keychain
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"keychain-{label}-timeout", pytrace=False)
+    except OSError:
+        pytest.fail(f"keychain-{label}-launch-error", pytrace=False)
+    if result.returncode not in allowed:
+        reason = "not-found" if result.returncode == 44 else "error"
+        pytest.fail(f"keychain-{label}-{reason}", pytrace=False)
+    return result.stdout
+
+
+def _check_keychain_path(label: str, output: str, keychain: Path) -> None:
+    entries = output.splitlines()
+    if len(entries) != 1 or Path(entries[0].strip().strip('"')).resolve() != keychain:
+        pytest.fail(f"keychain-{label}-mismatch", pytrace=False)
+
+
+def _expect_keychain_value(label: str, actual: str | None, expected: str | None) -> None:
+    if actual != expected:
+        pytest.fail(f"keychain-{label}-value-mismatch", pytrace=False)
+
+
+def _preflight_keychain(keychain: Path) -> None:
+    _check_keychain_path("default", _security("default", "default-keychain"), keychain)
+    # Check the user list we control. The effective list can also include
+    # common or dynamic keychains; prove implicit lookup with the probe below.
+    _check_keychain_path(
+        "search-list", _security("search-list", "list-keychains", "-d", "user"), keychain,
+    )
+
+    # Use an independent item so the active-contract write still creates its own.
+    value = "synthetic-keychain-preflight"
+    item = ("-a", os.environ["USER"], "-s", "claude-swap-test-probe")
+    _security("seed-probe", "add-generic-password", *item, "-w", value, str(keychain))
+    for label, target in (("explicit-read", (str(keychain),)), ("implicit-read", ())):
+        output = _security(label, "find-generic-password", *item, "-w", *target)
+        _expect_keychain_value(label, output.removesuffix("\n"), value)
+
+
+@pytest.mark.parametrize(
+    ("default_matches", "list_has_extra", "label"),
+    [(False, False, "default"), (True, True, "search-list")],
+)
+def test_keychain_preflight_refuses_to_seed_after_mismatch(
+    tmp_path: Path, default_matches: bool, list_has_extra: bool, label: str,
+):
+    keychain = tmp_path.resolve() / "test.keychain"
+    expected = f'    "{keychain}"\n'
+    other = f'    "{keychain.with_name("other.keychain")}"\n'
+    with patch(f"{__name__}._security", side_effect=[
+        expected if default_matches else other,
+        expected + other if list_has_extra else expected,
+    ]) as security:
+        with pytest.raises(pytest.fail.Exception, match=f"^keychain-{label}-mismatch$"):
+            _preflight_keychain(keychain)
+    assert security.call_count == (2 if default_matches else 1)
+
+
+def test_keychain_preflight_reads_probe_explicitly_and_implicitly(tmp_path, monkeypatch):
+    keychain = tmp_path.resolve() / "test.keychain"
+    listed = f'    "{keychain}"\n'
+    monkeypatch.setenv("USER", "test-user")
+    with patch(f"{__name__}._security") as security:
+        probe_value = None
+
+        def run(label, command, *args):
+            nonlocal probe_value
+            if command in {"default-keychain", "list-keychains"}:
+                return listed
+            if command == "add-generic-password":
+                probe_value = args[args.index("-w") + 1]
+                return ""
+            assert command == "find-generic-password" and probe_value
+            return probe_value + "\n"
+
+        security.side_effect = run
+        _preflight_keychain(keychain)
+    assert [c.args[:2] for c in security.call_args_list] == [
+        ("default", "default-keychain"),
+        ("search-list", "list-keychains"),
+        ("seed-probe", "add-generic-password"),
+        ("explicit-read", "find-generic-password"),
+        ("implicit-read", "find-generic-password"),
+    ]
+    assert security.call_args_list[1].args[2:] == ("-d", "user")
+    assert security.call_args_list[2].args[-1] == str(keychain)
+    assert security.call_args_list[3].args[-1] == str(keychain)
+    assert security.call_args_list[4].args[1:] == security.call_args_list[3].args[1:-1]
+
+
+@pytest.fixture
+def tmp_keychain(temp_home: Path, tmp_path: Path, monkeypatch):
+    """Use per-test HOME preferences and restore their initial absent state."""
+    # Apple's Security-61901.0.87.0.1 DLDbListCFPref::writePropertyList
+    # writes ~/Library/Preferences/com.apple.security.plist without creating
+    # its parent and can return without reporting a failed open.
+    preferences = temp_home / "Library" / "Preferences"
+    preferences.mkdir(parents=True)
+    user_prefs = preferences / "com.apple.security.plist"
+    keychain = (tmp_path / "test.keychain").resolve()
+    name = str(keychain)
+    monkeypatch.setenv("USER", f"cswap-keychain-contract-{uuid4().hex}")
+
+    # Refuse to change any existing settings if the CLI is not using this HOME.
+    if user_prefs.exists():
+        pytest.fail("keychain-initial-preferences-exist", pytrace=False)
+    initial_default = _security(
+        "initial-default", "default-keychain", "-d", "user", allowed=(0, 1),
+    )
+    if initial_default.strip():
+        pytest.fail("keychain-initial-default-not-empty", pytrace=False)
+    if _security("initial-search-list", "list-keychains", "-d", "user").strip():
+        pytest.fail("keychain-initial-search-list-not-empty", pytrace=False)
+    try:
+        _security("create", "create-keychain", "-p", "", name)
+        try:
+            _security("set-default", "default-keychain", "-d", "user", "-s", name)
+            _security("set-search-list", "list-keychains", "-d", "user", "-s", name)
+            if not user_prefs.is_file():
+                pytest.fail("keychain-preferences-not-persisted", pytrace=False)
+            _security("set-settings", "set-keychain-settings", name)
+            _security("unlock", "unlock-keychain", "-p", "", name)
+            _preflight_keychain(keychain)
+            yield name
+        finally:
+            _security("delete", "delete-keychain", name)
     finally:
-        # Restore the search list BEFORE the default: macOS won't report a
-        # default keychain that isn't in the search list, so the reverse order
-        # leaves the default dangling for whatever runs next in this job.
-        if original_list:
-            subprocess.run(
-                ["security", "list-keychains", "-d", "user", "-s", *original_list],
-                check=False,
-            )
-        if original_default:
-            subprocess.run(
-                ["security", "default-keychain", "-s", original_default], check=False
-            )
-        subprocess.run(["security", "delete-keychain", test_keychain], check=False)
+        # Both default and user search list started empty. Deleting the keychain
+        # unregisters it; removing the scratch plist restores the absent state.
+        try:
+            user_prefs.unlink(missing_ok=True)
+        except OSError:
+            pytest.fail("keychain-restore-preferences-error", pytrace=False)
+
+
+@contextmanager
+def _keychain_operation(label: str):
+    try:
+        yield
+    except (macos_keychain.KeychainTimeout, subprocess.TimeoutExpired):
+        pytest.fail(f"keychain-{label}-timeout", pytrace=False)
+    except macos_keychain.KeychainError:
+        pytest.fail(f"keychain-{label}-error", pytrace=False)
+    except OSError:
+        pytest.fail(f"keychain-{label}-launch-error", pytrace=False)
 
 
 @pytest.mark.no_keychain_fake
 @mac_ci_only
 def test_read_credentials_finds_claude_code_seeded_entry(tmp_keychain: str):
-    username = os.environ["USER"]
-    subprocess.run(
-        [
-            "security",
-            "add-generic-password",
-            "-a",
-            username,
-            "-s",
-            "Claude Code-credentials",
-            "-w",
-            "fake-token-read",
-            "-A",
-            tmp_keychain,
-        ],
-        check=True,
+    expected = "fake-token-read"
+    _security(
+        "seed-active", "add-generic-password", "-a", os.environ["USER"],
+        "-s", "Claude Code-credentials", "-w", expected, tmp_keychain,
     )
-
     switcher = ClaudeAccountSwitcher()
-    switcher.platform = Platform.MACOS
-    assert switcher._read_credentials() == "fake-token-read"
+    with patch.object(switcher._logger, "warning"), _keychain_operation("active-read"):
+        active = switcher._store._read_active_credentials()
+    if active.keychain_unavailable or active.degraded:
+        pytest.fail("keychain-active-read-unavailable", pytrace=False)
+    _expect_keychain_value("active-read", active.value, expected)
 
 
 @pytest.mark.no_keychain_fake
 @mac_ci_only
 def test_write_credentials_creates_user_scoped_entry(tmp_keychain: str):
-    # If _write_credentials ever stores the entry under a hardcoded account name
-    # (or any value other than $USER), the verification lookup below — which
-    # mirrors Claude Code's own read shape — returns 44 and the test fails.
+    expected = "fake-token-write"
     switcher = ClaudeAccountSwitcher()
-    switcher.platform = Platform.MACOS
-    switcher._write_credentials("fake-token-write")
-
-    username = os.environ["USER"]
-    result = subprocess.run(
-        [
-            "security",
-            "find-generic-password",
-            "-a",
-            username,
-            "-s",
-            "Claude Code-credentials",
-            "-w",
-            tmp_keychain,
-        ],
-        capture_output=True,
-        text=True,
+    with patch.object(switcher._logger, "warning"), _keychain_operation("active-write"):
+        switcher._write_credentials(expected)
+    if switcher._store._last_active_credentials_backend != "keychain":
+        pytest.fail("keychain-active-write-wrong-backend", pytrace=False)
+    output = _security(
+        "verify-active-write", "find-generic-password", "-a", os.environ["USER"],
+        "-s", "Claude Code-credentials", "-w", tmp_keychain,
     )
-    assert result.returncode == 0, (
-        f"security find-generic-password failed: {result.stderr}"
-    )
-    assert result.stdout.strip() == "fake-token-write"
+    _expect_keychain_value("verify-active-write", output.removesuffix("\n"), expected)
 
 
 @pytest.mark.no_keychain_fake
 @mac_ci_only
 def test_wrapper_roundtrip_real_keychain(tmp_keychain: str):
-    """set → get → delete through the real wrapper against the temp keychain.
-
-    Covers the full production read/write/delete path the other Layer-2 tests
-    only half-exercise: a wrapper-created item (no ``-A`` any-app access) read
-    back via the keychain *search list* (no explicit keychain argument), then
-    deleted, with the rc-44 "not found" contract checked at the end.
-    """
-    macos_keychain.set_password("claude-swap-test", "acct-1", "round-trip-token")
-    assert macos_keychain.get_password("claude-swap-test", "acct-1") == "round-trip-token"
-    macos_keychain.delete_password("claude-swap-test", "acct-1")
-    assert macos_keychain.get_password("claude-swap-test", "acct-1") is None
+    """Test implicit set/get/delete without widening the item's access list."""
+    item = ("claude-swap-test", os.environ["USER"])
+    expected = "round-trip-token"
+    with _keychain_operation("roundtrip-write"):
+        macos_keychain.set_password(*item, expected)
+    with _keychain_operation("roundtrip-read"):
+        _expect_keychain_value("roundtrip-read", macos_keychain.get_password(*item), expected)
+    with _keychain_operation("roundtrip-delete"):
+        macos_keychain.delete_password(*item)
+    with _keychain_operation("roundtrip-miss"):
+        _expect_keychain_value("roundtrip-miss", macos_keychain.get_password(*item), None)
 
 
 class TestOurOwnFileModeIsNotAKeychainFailure:

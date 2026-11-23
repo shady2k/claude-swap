@@ -9,7 +9,7 @@ import math
 import os
 import sys
 
-from claude_swap import __version__, paths, printer
+from claude_swap import __version__, paths, printer, real_claude, test_mode
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
 from claude_swap.models import (
@@ -109,7 +109,7 @@ def _translate_subcommand(argv: list[str]) -> list[str]:
     return argv
 
 
-def _run_command(argv: list[str]) -> None:
+def _run_command(argv: list[str], *, binary: real_claude.RealClaude | None = None) -> None:
     """Handle `cswap run NUM|EMAIL [--no-share] [-- <claude args>]`.
 
     Pre-dispatched before the main parser is built: a positional subcommand
@@ -199,10 +199,12 @@ Examples:
     # The parser's --help belongs on stdout. Nothing printed after it does:
     # see _run_launch.
     with contextlib.redirect_stdout(sys.stderr):
-        _run_launch(args, tail)
+        _run_launch(args, tail, binary=binary)
 
 
-def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
+def _run_launch(
+    args: argparse.Namespace, tail: list[str], *, binary: real_claude.RealClaude | None = None,
+) -> None:
     """Resolve the account for `cswap run` and hand the terminal to claude.
 
     Runs with stdout redirected to stderr. Stdout belongs to claude, and a
@@ -216,6 +218,7 @@ def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
     bootstrap's included, and rebinds only Python's ``sys.stdout``: claude
     inherits the real stream.
     """
+    extra = {"binary": binary} if binary is not None else {}
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
@@ -233,6 +236,7 @@ def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
                 share=not args.no_share,
                 share_history=args.share_history,
                 require_session=args.require_session,
+                **extra,
             )
             return  # only reachable in tests where exec/exit is mocked
 
@@ -260,12 +264,22 @@ def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
                 )
             )
         manager.exec_default(tail)
+    except test_mode.TestModeConfigError as exc:
+        sys.exit(_test_mode_error(exc))
+    except real_claude.ResolveError as exc:
+        print(f"claude-swap: {exc}", file=sys.stderr)
+        sys.exit(4)
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+def _test_mode_error(exc: test_mode.TestModeConfigError) -> int:
+    print(f"TestModeConfigError: {exc}", file=sys.stderr)
+    return 4
 
 
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
@@ -1109,6 +1123,10 @@ Examples:
                 print(format_setting_value(value))
         elif action == "set":
             value = set_setting(root, args.key, args.value)
+            if args.key == "transparent.requireProxy":
+                from claude_swap.transparent import refresh_install
+
+                refresh_install(root)
             print(f"{args.key} = {format_setting_value(value)}")
             usage = load_usage_settings(root)
             if (
@@ -1126,6 +1144,10 @@ Examples:
                 )
         elif action == "unset":
             if unset_setting(root, args.key):
+                if args.key == "transparent.requireProxy":
+                    from claude_swap.transparent import refresh_install
+
+                    refresh_install(root)
                 default = setting_spec(args.key).default
                 print(f"{args.key} unset (default: {format_setting_value(default)})")
             else:
@@ -1434,11 +1456,57 @@ def _menubar_service(args) -> int:
     return 0
 
 
+def _transparent_command(argv: list[str]) -> None:
+    import shlex
+
+    from claude_swap import transparent
+
+    parser = argparse.ArgumentParser(prog="cswap transparent")
+    actions = parser.add_subparsers(dest="action", required=True)
+    enable = actions.add_parser("enable")
+    enable.add_argument("--accept-shared-history", action="store_true")
+    enable.add_argument("--account", action="append", metavar="SLOT")
+    pool = actions.add_parser("pool", help="remove or reorder approved recipients")
+    pool.add_argument("--account", action="append", metavar="SLOT", default=[])
+    actions.add_parser("revoke-shared-history")
+    actions.add_parser("status")
+    actions.add_parser("disable")
+    args = parser.parse_args(argv)
+    root = paths.get_backup_root()
+    try:
+        if args.action == "enable":
+            directory = transparent.enable(root, accept_shared_history=args.accept_shared_history, pool=args.account)
+            export = f'export PATH={shlex.quote(str(directory))}:"$PATH"'
+            print(transparent.launch_policy.CONSENT_TEXT)
+            print(f"Prepend the shim for clients that should use it: {export}")
+        elif args.action == "disable":
+            transparent.disable(root)
+            print("Shim disabled. You can remove its directory from your PATH.")
+        elif args.action == "pool":
+            transparent.set_pool(root, args.account)
+            print("Transparent pool updated.")
+        elif args.action == "revoke-shared-history":
+            transparent.revoke_history(root)
+            print("Shared history consent revoked.")
+        else:
+            print("\n".join(transparent.status(root)))
+    except (ClaudeSwitchError, OSError) as exc:
+        print(f"claude-swap: {exc}", file=sys.stderr)
+        sys.exit(4)
+
+
 def main() -> None:
     """Main entry point for the CLI."""
+    argv = sys.argv[1:]
+    try:
+        binary = test_mode.preflight(argv)
+    except test_mode.TestModeConfigError as exc:
+        sys.exit(_test_mode_error(exc))
+    if argv[:1] == ["transparent"]:
+        _transparent_command(argv[1:])
+        return
     force_utf8_output()
     _use_native_tls()
-    argv = sys.argv[1:]
     try:
         from claude_swap.appearance import cli_should_probe, cli_theme
         # `run` execs a child that takes over the terminal, and `--json`
@@ -1452,7 +1520,7 @@ def main() -> None:
 
     # `run` and `auto` keep their dedicated pre-dispatch parsers.
     if argv and argv[0] == "run":
-        _run_command(argv[1:])
+        _run_command(argv[1:], binary=binary)
         return  # only reachable in tests where exec/exit is mocked
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
@@ -1529,6 +1597,7 @@ Commands:
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
+  %(prog)s transparent <action>       enable, inspect or disable the PATH shim
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts

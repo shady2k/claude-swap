@@ -345,6 +345,7 @@ def test_existing_strategies_ignore_configured_priorities(temp_home, strategy, t
     assert h.active_number() == target
 
 
+@pytest.mark.mock_stand_routing
 class TestPriorityCli(PolicyCliBase):
     def test_set_by_email_list_unset_and_default_strategy(self, temp_home, capsys):
         s = self._fleet(temp_home)

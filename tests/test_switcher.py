@@ -42,6 +42,9 @@ from claude_swap.switcher import (
 )
 
 
+pytestmark = pytest.mark.mock_stand_routing
+
+
 def _raise_locked(*args, **kwargs):
     """Stand-in for a locked/unavailable Keychain operation."""
     raise KeychainError("locked")
