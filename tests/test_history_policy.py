@@ -415,7 +415,11 @@ def test_policy_is_rechecked_at_publication_not_handoff(shim, monkeypatch, chang
     ))
     monkeypatch.setattr(transparent.spawn, "require_supervision", lambda: None)
     def owned_launch(callback, *, publish, release, abort):
-        publish()
+        try:
+            publish()
+        except BaseException:
+            abort()
+            raise
         callback()
         release()
         return 0
@@ -444,7 +448,11 @@ def test_policy_is_rechecked_at_publication_not_handoff(shim, monkeypatch, chang
         # Policy writers run outside publication locks, after the saved
         # running record but before handoff.
         def owned_launch(callback, *, publish, release, abort):
-            publish()
+            try:
+                publish()
+            except BaseException:
+                abort()
+                raise
             _change_policy(root, change)
             callback()
             release()
@@ -475,6 +483,9 @@ def test_policy_is_rechecked_at_publication_not_handoff(shim, monkeypatch, chang
         assert done.value.code == 0
         assert selected == [profiles["1" if when == "before" else "2"]]
         assert SESSION_ID not in journal.read_text(encoding="utf-8")
+    ownership = [json.loads(path.read_text(encoding="utf-8"))
+                 for path in (root / "profile-ownership" / "launches").glob("*.json")]
+    assert not ownership, [(record["state"], record.get("pid")) for record in ownership]
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="direct routing is Linux-only")
@@ -644,6 +655,7 @@ def test_f37_settings_write_serializes_with_running(shim, monkeypatch, order, ke
             assert running_saved.is_set() and written.is_set()
         else:
             assert entries == [setting]
+            assert trace.empty()
             assert not (directory / "launches.json").exists()
         assert not list((root / "profile-ownership" / "launches").glob("*.json"))
     finally:
