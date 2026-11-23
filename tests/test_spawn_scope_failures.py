@@ -13,9 +13,10 @@ def _run(code, tmp_path):
 
 def test_unsupported_platform_aborts_without_posix_signal_api(tmp_path):
     result = _run(r"""
-import signal
+import signal, sys
+from types import SimpleNamespace
 from claude_swap import spawn
-spawn.sys.platform = "win32"
+spawn.sys = SimpleNamespace(platform="darwin", stderr=sys.stderr)
 if hasattr(signal, "pthread_sigmask"):
     del signal.pthread_sigmask
 events = []

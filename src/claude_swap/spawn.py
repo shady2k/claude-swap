@@ -145,7 +145,8 @@ def handoff(
         raise OSError("exec by file descriptor is unavailable")
     if sys.platform == "win32":
         try:
-            rc = run(argv, env=env).returncode
+            rc = (_windows_handoff(argv, env) if _job_handle is not None
+                  else run(argv, env=env).returncode)
         except KeyboardInterrupt:
             rc = 130
         sys.exit(rc)
@@ -158,21 +159,48 @@ _job_handle: int | None = None
 
 
 def ensure_windows_job() -> None:
-    """Contain this process and future descendants in a kill-on-close job.
+    """Prepare an unnamed kill-on-close job, owned only by this launcher.
 
-    Call before the first Claude spawn but after any unrelated helper spawn.
-    The non-inheritable handle stays open for the lifetime of this process;
-    closing it (including at process exit) terminates remaining descendants.
-    An incompatible outer job raises before any Claude process is created.
+    The launcher is not a member: only the child tree enters the job, atomically
+    at CreateProcessW via PROC_THREAD_ATTRIBUTE_JOB_LIST (Windows 10+).
+    Neither breakaway flag is enabled. Nested-job restrictions fail creation
+    before child code can execute. The sole, non-inheritable handle remains
+    open until launcher exit, including when observation fails.
     """
     global _job_handle
     if sys.platform == "win32":
         with _job_lock:
             if _job_handle is None:
-                _job_handle = _assign_current_process_to_job()
+                _job_handle = _create_windows_job()
 
 
-def _assign_current_process_to_job() -> int:
+def _windows_api():
+    import ctypes
+    from ctypes import wintypes as w
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    signatures = {
+        "CreateJobObjectW": ([ctypes.c_void_p, w.LPCWSTR], w.HANDLE),
+        "SetInformationJobObject": ([w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD], w.BOOL),
+        "QueryInformationJobObject": ([w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD, ctypes.c_void_p], w.BOOL),
+        "CloseHandle": ([w.HANDLE], w.BOOL),
+        "InitializeProcThreadAttributeList": ([ctypes.c_void_p, w.DWORD, w.DWORD, ctypes.POINTER(ctypes.c_size_t)], w.BOOL),
+        "UpdateProcThreadAttribute": ([ctypes.c_void_p, w.DWORD, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p], w.BOOL),
+        "DeleteProcThreadAttributeList": ([ctypes.c_void_p], None),
+        "CreateProcessW": ([w.LPCWSTR, w.LPWSTR, ctypes.c_void_p, ctypes.c_void_p, w.BOOL, w.DWORD, ctypes.c_void_p, w.LPCWSTR, ctypes.c_void_p, ctypes.c_void_p], w.BOOL),
+        "WaitForSingleObject": ([w.HANDLE, w.DWORD], w.DWORD),
+        "GetExitCodeProcess": ([w.HANDLE, ctypes.POINTER(w.DWORD)], w.BOOL),
+        "GetStdHandle": ([w.DWORD], w.HANDLE),
+        "GetCurrentProcess": ([], w.HANDLE),
+        "DuplicateHandle": ([w.HANDLE, w.HANDLE, w.HANDLE, ctypes.POINTER(w.HANDLE), w.DWORD, w.BOOL, w.DWORD], w.BOOL),
+    }
+    for name, (args, result) in signatures.items():
+        fn = getattr(kernel, name)
+        fn.argtypes, fn.restype = args, result
+    return kernel
+
+
+def _create_windows_job() -> int:
     import ctypes
     from ctypes import wintypes as w
 
@@ -192,48 +220,178 @@ def _assign_current_process_to_job() -> int:
     class ExtendedLimitInformation(ctypes.Structure):
         _fields_ = [
             ("BasicLimitInformation", BasicLimitInformation),
-            ("IoInfo", ctypes.c_ulonglong * 6),  # IO_COUNTERS
+            ("IoInfo", ctypes.c_ulonglong * 6),
             ("ProcessMemoryLimit", ctypes.c_size_t),
             ("JobMemoryLimit", ctypes.c_size_t),
             ("PeakProcessMemoryUsed", ctypes.c_size_t),
             ("PeakJobMemoryUsed", ctypes.c_size_t),
         ]
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    create = kernel32.CreateJobObjectW
-    create.argtypes = [ctypes.c_void_p, w.LPCWSTR]
-    create.restype = w.HANDLE
-    job_extended_limit_information = 9  # JobObjectExtendedLimitInformation
-    job_kill_on_close = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-    set_info = kernel32.SetInformationJobObject
-    set_info.argtypes = [w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD]
-    set_info.restype = w.BOOL
-    assign = kernel32.AssignProcessToJobObject
-    assign.argtypes = [w.HANDLE, w.HANDLE]
-    assign.restype = w.BOOL
-    current = kernel32.GetCurrentProcess
-    current.argtypes = []
-    current.restype = w.HANDLE
-    close = kernel32.CloseHandle
-    close.argtypes = [w.HANDLE]
-    close.restype = w.BOOL
-
-    handle = create(None, None)  # No name, no inherited handle.
+    kernel = _windows_api()
+    handle = kernel.CreateJobObjectW(None, None)
     if not handle:
         raise ctypes.WinError(ctypes.get_last_error())
     try:
         info = ExtendedLimitInformation()
-        info.BasicLimitInformation.LimitFlags = job_kill_on_close
-        if not set_info(
-            handle, job_extended_limit_information, ctypes.byref(info), ctypes.sizeof(info)
-        ):
+        info.BasicLimitInformation.LimitFlags = 0x2000  # KILL_ON_JOB_CLOSE, no breakaway
+        if not kernel.SetInformationJobObject(handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
             raise ctypes.WinError(ctypes.get_last_error())
-        if not assign(handle, current()):
-            raise ctypes.WinError(ctypes.get_last_error())
-    except OSError:
-        close(handle)
+    except BaseException:
+        kernel.CloseHandle(handle)
         raise
     return handle
+
+
+_windows_supervising = False
+_windows_leader_complete = False
+
+
+def _windows_handoff(argv: Sequence[str], env: dict[str, str]) -> int:
+    import ctypes
+    import signal
+    from ctypes import wintypes as w
+
+    class StartupInfo(ctypes.Structure):
+        _fields_ = [
+            ("cb", w.DWORD), ("lpReserved", w.LPWSTR),
+            ("lpDesktop", w.LPWSTR), ("lpTitle", w.LPWSTR),
+            ("dwX", w.DWORD), ("dwY", w.DWORD),
+            ("dwXSize", w.DWORD), ("dwYSize", w.DWORD),
+            ("dwXCountChars", w.DWORD), ("dwYCountChars", w.DWORD),
+            ("dwFillAttribute", w.DWORD), ("dwFlags", w.DWORD),
+            ("wShowWindow", w.WORD), ("cbReserved2", w.WORD),
+            ("lpReserved2", ctypes.c_void_p),
+            ("hStdInput", w.HANDLE), ("hStdOutput", w.HANDLE), ("hStdError", w.HANDLE),
+        ]
+
+    class StartupInfoEx(ctypes.Structure):
+        _fields_ = [("StartupInfo", StartupInfo), ("lpAttributeList", ctypes.c_void_p)]
+
+    class ProcessInformation(ctypes.Structure):
+        _fields_ = [("hProcess", w.HANDLE), ("hThread", w.HANDLE),
+                    ("dwProcessId", w.DWORD), ("dwThreadId", w.DWORD)]
+
+    for key, value in env.items():
+        if not key or "\0" in key or "=" in key[1:] or key == "=":
+            raise ValueError("illegal environment variable name")
+        if "\0" in value:
+            raise ValueError("embedded null character")
+
+    old_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        kernel = _windows_api()
+        size = ctypes.c_size_t()
+        kernel.InitializeProcThreadAttributeList(None, 2, 0, ctypes.byref(size))
+        attributes = ctypes.create_string_buffer(size.value)
+        if not kernel.InitializeProcThreadAttributeList(attributes, 2, 0, ctypes.byref(size)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        process = ProcessInformation()
+        duplicates = []
+        try:
+            jobs = (w.HANDLE * 1)(_job_handle)
+            if not kernel.UpdateProcThreadAttribute(attributes, 0, 0x0002000D, jobs,
+                                                   ctypes.sizeof(jobs), None, None):
+                raise ctypes.WinError(ctypes.get_last_error())
+            startup = StartupInfoEx()
+            startup.StartupInfo.cb = ctypes.sizeof(startup)
+            startup.lpAttributeList = ctypes.addressof(attributes)
+            # Inherit the console and stdio, but never the job handle. No new
+            # process group: console Ctrl+C reaches the leader directly.
+            startup.StartupInfo.dwFlags = 0x100  # STARTF_USESTDHANDLES
+            current = kernel.GetCurrentProcess()
+            for field, number in (("hStdInput", -10), ("hStdOutput", -11), ("hStdError", -12)):
+                source = kernel.GetStdHandle(number & 0xffffffff)
+                if not source or source == ctypes.c_void_p(-1).value:
+                    setattr(startup.StartupInfo, field, source)
+                    continue
+                duplicate = w.HANDLE()
+                if not kernel.DuplicateHandle(current, source, current, ctypes.byref(duplicate),
+                                              0, True, 2):  # DUPLICATE_SAME_ACCESS
+                    raise ctypes.WinError(ctypes.get_last_error())
+                duplicates.append(duplicate.value)
+                setattr(startup.StartupInfo, field, duplicate.value)
+            if duplicates:
+                handles = (w.HANDLE * len(duplicates))(*duplicates)
+                if not kernel.UpdateProcThreadAttribute(attributes, 0, 0x00020002, handles,
+                                                       ctypes.sizeof(handles), None, None):
+                    raise ctypes.WinError(ctypes.get_last_error())
+            environment = ctypes.create_unicode_buffer(
+                "\0".join(f"{key}={value}" for key, value in sorted(env.items(), key=lambda item: item[0].upper())) + "\0\0"
+            )
+            command = ctypes.create_unicode_buffer(subprocess.list2cmdline(argv))
+            if not kernel.CreateProcessW(argv[0], command, None, None, bool(duplicates),
+                                         0x00080000 | 0x00000400, environment, None,
+                                         ctypes.byref(startup), ctypes.byref(process)):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            for handle in duplicates:
+                kernel.CloseHandle(handle)
+            kernel.DeleteProcThreadAttributeList(attributes)
+        kernel.CloseHandle(process.hThread)
+        try:
+            while True:
+                status = kernel.WaitForSingleObject(process.hProcess, 100)
+                if status == 0:
+                    break
+                if status != 258:  # WAIT_TIMEOUT
+                    raise ctypes.WinError(ctypes.get_last_error())
+            result = w.DWORD()
+            if not kernel.GetExitCodeProcess(process.hProcess, ctypes.byref(result)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            global _windows_leader_complete
+            _windows_leader_complete = True
+            return result.value
+        finally:
+            kernel.CloseHandle(process.hProcess)
+    finally:
+        signal.signal(signal.SIGINT, old_handler)
+
+
+def _supervise_windows(handoff) -> int:
+    import ctypes
+    import signal
+    import time
+    from ctypes import wintypes as w
+
+    class Accounting(ctypes.Structure):
+        _fields_ = [("times", ctypes.c_longlong * 4),
+                    ("TotalPageFaultCount", w.DWORD), ("TotalProcesses", w.DWORD),
+                    ("ActiveProcesses", w.DWORD), ("TotalTerminatedProcesses", w.DWORD)]
+
+    global _windows_supervising, _windows_leader_complete
+    if _windows_supervising:
+        raise OSError("Profile supervision is already active")
+    _windows_supervising = True
+    _windows_leader_complete = False
+    old_handlers = {}
+    try:
+        # Console signals reach the child tree directly, including after the
+        # leader exits. Keep observing the job until all descendants finish.
+        for name in ("SIGINT", "SIGBREAK"):
+            sig = getattr(signal, name, None)
+            if sig is not None:
+                old_handlers[sig] = signal.signal(sig, signal.SIG_IGN)
+        try:
+            handoff()
+        except SystemExit as exc:
+            result = exc.code
+        else:
+            raise OSError("Profile handoff returned without leader completion")
+        if not _windows_leader_complete:
+            raise OSError("Profile leader completion could not be observed")
+        kernel = _windows_api()
+        while True:
+            info = Accounting()
+            if not kernel.QueryInformationJobObject(_job_handle, 1, ctypes.byref(info),
+                                                    ctypes.sizeof(info), None):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if info.ActiveProcesses == 0:
+                return result
+            time.sleep(0.05)
+    finally:
+        _windows_supervising = False
+        for sig, handler in old_handlers.items():
+            signal.signal(sig, handler)
 
 
 def _spawn_path_applies(cmd: Any, kwargs: dict[str, Any]) -> bool:
@@ -295,12 +453,16 @@ def require_supervision() -> None:
 
     Linux subreapers adopt orphaned descendants even when they change session
     or process group. A dedicated, single-threaded launcher with no existing
-    children can therefore wait until ECHILD to prove tree completion. Other
-    platforms are deliberately unsupported rather than treating leader exit
-    as tree completion.
+    children can therefore wait until ECHILD to prove tree completion.
+    Windows prepares an unassigned kill-on-close job before publication and
+    requires observed leader exit plus an empty job. Other platforms reject
+    rather than treating leader exit as tree completion.
     """
     import signal
 
+    if sys.platform == "win32":
+        ensure_windows_job()
+        return
     if sys.platform != "linux":
         raise OSError("Profile tree supervision is unsupported on this platform")
     tasks = list(Path("/proc/self/task").iterdir())
@@ -397,6 +559,38 @@ def _diagnose(message: str) -> None:
         print(message, file=sys.stderr)
     except OSError:
         pass
+
+
+class _WindowsSupervision:
+    """Protect console signal delivery from admission through ownership cleanup.
+
+    Children keep the console's direct signal delivery. After confirmed job
+    completion this dedicated launcher consumes console signals through exit,
+    preserving the leader's status while storage cleanup finishes.
+    """
+
+    def __enter__(self):
+        import signal
+
+        self.handlers = {}
+        self.completed = False
+        for name in ("SIGINT", "SIGBREAK"):
+            sig = getattr(signal, name, None)
+            if sig is not None:
+                self.handlers[sig] = signal.signal(sig, signal.SIG_IGN)
+        return self
+
+    def __exit__(self, *args):
+        import signal
+
+        if not self.completed:
+            for sig, handler in self.handlers.items():
+                signal.signal(sig, handler)
+
+    def wait(self, handoff):
+        result = _supervise_windows(handoff)
+        self.completed = True
+        return result
 
 
 class _Supervision:
@@ -509,14 +703,14 @@ def owned_launch(handoff, *, publish, release, abort) -> int:
     propagated storage error. After proven completion it consumes termination
     through process exit; it must not resume unrelated work or launch again.
     """
-    if sys.platform != "linux":
+    if sys.platform not in ("linux", "win32"):
         try:
             require_supervision()
         except OSError:
             _diagnose("claude-swap: Profile launch refused before fork")
             abort()
             raise
-    with _Supervision() as scope:
+    with (_WindowsSupervision() if sys.platform == "win32" else _Supervision()) as scope:
         try:
             require_supervision()
             publish()
@@ -534,16 +728,18 @@ def owned_launch(handoff, *, publish, release, abort) -> int:
 
 
 def supervise(handoff) -> int:
-    """Wait for a dedicated Linux launch, without managing an ownership record.
+    """Wait for a dedicated Linux or Windows launch without an ownership record.
 
     Profile launch callers use owned_launch so signal protection also spans
     publication and release. No unrelated children may exist in this process.
     This dedicated launcher must exit with the result, not resume other work.
     """
-    with _Supervision() as scope:
+    with (_WindowsSupervision() if sys.platform == "win32" else _Supervision()) as scope:
         try:
             require_supervision()
         except OSError:
+            if sys.platform == "win32":
+                raise
             _diagnose("claude-swap: Profile subreaper/pidfd supervision unavailable; no child launched")
             return 127
         return scope.wait(handoff)
