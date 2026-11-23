@@ -47,39 +47,30 @@ def _windows_entry(path: Path, *, directory: bool) -> os.stat_result | None:
     return info
 
 
-def _windows_policy_root(root: Path) -> bool:
-    """Check the data store, not an executable trust chain.
-
-    Windows pool administration uses the current user's backup root. Reject
-    path redirections throughout, but require trusted owner and write access
-    only at the backup root and the policy files, not on OS-owned ancestors.
-    Windows cannot enable the shim.
-    """
+def _windows_policy_root(root: Path) -> os.stat_result | None:
+    """Walk the data path without following links or testing ancestor ACLs."""
     if not root.is_absolute() or ".." in root.parts:
         raise fsguard.GuardError(f"Expected an absolute policy directory with no parent traversal: {root}")
     for parent in reversed(root.parents):
         if _windows_entry(parent, directory=True) is None:
-            return False
-    info = _windows_entry(root, directory=True)
-    if info is None:
-        return False
-    fsguard.check_leaf(root, info)
-    return True
-
-
-def _windows_policy_file(path: Path) -> bool:
-    info = _windows_entry(path, directory=False)
-    if info is None:
-        return False
-    fsguard.check_leaf(path, info)
-    return True
+            return None
+    return _windows_entry(root, directory=True)
 
 
 def _read(path: Path) -> dict:
     try:
         if sys.platform == "win32":
-            if not _windows_policy_root(path.parent) or not _windows_policy_file(path):
+            root = _windows_policy_root(path.parent)
+            if root is None:
                 return {}
+            info = _windows_entry(path, directory=False)
+            if info is None:
+                return {}
+            # No policy is safe to treat as absent after the path walk. A
+            # present policy requires trusted owner and write access on both
+            # the backup root and the file, not on OS-owned ancestors.
+            fsguard.check_leaf(path.parent, root)
+            fsguard.check_leaf(path, info)
         else:
             if not os.path.lexists(path):
                 return {}
@@ -102,11 +93,16 @@ def update(root: Path, change: Callable[[dict], bool]) -> bool:
     """Read/modify/write under the slot lock. A true result adds one revision."""
     lock = paths.account_lock_path(root)
     if sys.platform == "win32":
-        if not _windows_policy_root(root):
+        info = _windows_policy_root(root)
+        if info is None:
             root.mkdir(parents=True, exist_ok=True)
-            if not _windows_policy_root(root):
+            info = _windows_policy_root(root)
+            if info is None:
                 raise ConfigError("Could not create the policy directory")
-        _windows_policy_file(lock)
+        fsguard.check_leaf(root, info)
+        lock_info = _windows_entry(lock, directory=False)
+        if lock_info is not None:
+            fsguard.check_leaf(lock, lock_info)
     elif root.exists():
         fsguard.check_path(root)
     with FileLock(lock):
