@@ -54,6 +54,10 @@ class StandAudit:
             "LC_ALL": "C",
             "CLAUDE_SWAP_TEST_MODE": "1",
         }
+        if sys.platform == "darwin":
+            # CoreFoundation supplies this key if absent. Give the stand its
+            # own UID and zero encoding fields before any audited process starts.
+            self._env["__CF_USER_TEXT_ENCODING"] = f"0x{os.getuid():X}:0:0"
         if os.name == "nt" and "SystemRoot" in os.environ:
             self._env["SYSTEMROOT"] = os.environ["SystemRoot"]
 
