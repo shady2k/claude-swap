@@ -8089,11 +8089,8 @@ class TestActiveRefreshProvenance:
             snapshot = CredentialSnapshot(live, saved.identity, saved.login_gen)
             result = switcher._fetch_active_usage("1", "test@example.com", snapshot)
 
-        eligible = backup_refresh == "rt-live" or backup_expiry > 1000
-        expected_error = (
-            "no_refresh_token" if eligible and not backup_refresh
-            else "transient" if eligible else "ownership-lost"
-        )
+        eligible = backup_refresh == "rt-live"
+        expected_error = "transient" if eligible else "ownership-lost"
         assert result.error == expected_error
         assert result.sentinel is None
         assert result.struck_fp is None

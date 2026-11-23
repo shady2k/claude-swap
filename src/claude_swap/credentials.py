@@ -1924,14 +1924,14 @@ class CredentialStore:
             return {}, "corrupt"
         return entries, "ok"
 
-    def _stash_entry_files_exist(self) -> bool:
-        """Is there any stashed credential's BYTES on disk?
+    def _stash_entry_files_exist(self, *, excluding=()) -> bool:
+        """Are there stash entry files outside the supplied manifest entry IDs?
 
-        Asked only when the manifest is corrupt, to tell "the mapping is gone
-        and there is nothing it could have mapped" from "the mapping is gone
-        and a consumed generation's only copy is sitting right here". The
-        entry files are named independently of the manifest, so they answer
-        even when it cannot.
+        With no exclusions this checks whether a corrupt manifest could hide
+        a consumed generation's only successor. Excluding mapped entries
+        detects unpublished successors even with a readable manifest. Entry
+        files are named independently of the manifest, so they answer even
+        when publication failed.
 
         Unknowable answers TRUE: a directory we cannot list is not evidence
         that nothing is at risk, and the caller uses this to decide whether to
@@ -1952,7 +1952,8 @@ class CredentialStore:
         try:
             for entry in self._host.credentials_dir.iterdir():
                 name = entry.name
-                if name.startswith(".unclaimed-") and name.endswith(".enc"):
+                if (name.startswith(".unclaimed-") and name.endswith(".enc")
+                        and name[len(".unclaimed-"):-len(".enc")] not in excluding):
                     return True
         except FileNotFoundError:
             return False

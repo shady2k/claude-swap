@@ -207,6 +207,8 @@ cswap add
 
 This will update the stored credentials without creating a duplicate.
 
+If active refresh reports unproven copies or stash uncertainty, cswap defers without rewriting live or backup credentials. Log in again with Claude Code and run `cswap add --slot N`; `cswap unclaimed` lists preserved stash entries.
+
 If the refresh token itself has died (auto-switch quarantines and reports such an account), log in with it and re-run `cswap add --slot N`, or replace its stored credentials from a known-good export: a plain `cswap import backup.cswap` replaces dead-token slots on its own (a stale export can carry an already-superseded token).
 
 ### Other commands

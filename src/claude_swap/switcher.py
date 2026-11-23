@@ -272,12 +272,17 @@ ERROR_NOTES = {
     "consume-busy": (
         "another cswap surface holds the slot — retries next pass"
     ),
-    "ownership-lost": "account ownership changed — retries with the current login",
+    "ownership-lost": (
+        "account ownership or credential relationship is unproven — "
+        "log in again with Claude Code, then run: cswap add --slot N"
+    ),
     "superseded": "login was replaced — retries with the current credential",
     "unreadable": "stored login is unreadable — unlock the keychain or fix the file",
     "stash-unreadable": (
-        "this slot's stashed successor is unreadable — unlock the keychain "
-        "or fix the file, then retry; `cswap unclaimed` inspects it"
+        "this slot's stashed successor is unreadable or unproven — "
+        "log in again with Claude Code, then run: cswap add --slot N; "
+        "unlock the keychain or fix unreadable files first; "
+        "`cswap unclaimed` inspects preserved entries"
     ),
     "live-login": (
         "the live login is this account's, so Claude Code renews it — "
@@ -4961,17 +4966,19 @@ class ClaudeAccountSwitcher:
         store under the account and Claude credential locks. Its refresh
         POST holds those locks for at most six seconds to serialize with
         Claude's default-login rotation. Ownership-state work runs only
-        after those locks are released. Recovery selects backup when identical
-        to live or later-expiring with live still matching the snapshot; a
-        sole readable copy requires the other store to be confirmed empty.
+        after those locks are released. Recovery selects backup only when
+        identical to live; a sole readable copy requires the other store to
+        be confirmed empty. Expiry ordering does not prove grant lineage.
         The selected fingerprint keys both POST and failed-write stash. Each
         write checks its own locked store observation. Identity/generation-
         scoped stash metadata records both first-pass store fingerprints,
         including confirmed emptiness. Recovery requires each copy to match
         its recorded observation or the successor; legacy rows prove only
         consumed/successor pairs. Both stores must be saved before retiring
-        the stash. Unproven divergence
-        defers without writes or POST. Fresh usage may resync an attributed
+        the stash. Unmapped entry files or an uncertain directory scan defer
+        without inferring authority from orphan bytes. Unproven divergence
+        defers without writes or POST and asks the user to log in again.
+        Fresh usage may resync an attributed
         rotation through ``_resync_rotated_backup``.
         """
         oauth_data = oauth.extract_oauth_data(creds)
@@ -5118,12 +5125,7 @@ class ClaudeAccountSwitcher:
                     # prove that one of these copies is an already saved successor.
                     refresh_input = backup or live
                     consumed_fp = oauth.credential_fingerprint(refresh_input) if refresh_input else None
-                    live_expiry = (oauth.extract_oauth_data(live) or {}).get("expiresAt") or 0
-                    backup_expiry = (oauth.extract_oauth_data(backup) or {}).get("expiresAt") or 0
-                    input_allowed = (
-                        not live or not backup or live_fp == backup_fp
-                        or backup_expiry > live_expiry
-                    )
+                    input_allowed = not live or not backup or live_fp == backup_fp
                     try:
                         successor = self._active_stashed_successor(
                             account_num, expected_identity, generation,
@@ -5223,10 +5225,9 @@ class ClaudeAccountSwitcher:
         Read all applicable rows before writing: conflicting successors defer.
         """
         manifest, verdict = self._store._read_stash_manifest_ex()
-        if verdict == "unreadable" or (
-            verdict == "corrupt" and self._store._stash_entry_files_exist()
-        ):
-            raise CredentialReadError("active successor manifest unavailable")
+        if (verdict == "unreadable"
+                or self._store._stash_entry_files_exist(excluding=manifest)):
+            raise CredentialReadError("active successor manifest unavailable or incomplete")
         candidates = {}
         entries = []
         for entry_id, meta in manifest.items():
