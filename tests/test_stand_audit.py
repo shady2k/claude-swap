@@ -10,6 +10,7 @@ import textwrap
 
 import pytest
 
+from tests import stand_startup_diagnostic
 from tests.stand_audit import StandAudit
 
 
@@ -19,14 +20,16 @@ def _script(tmp_path, name, source):
     return path
 
 
-@pytest.mark.parametrize("reason", ["flags", "interpreter", "script", "environment", "environment-with-venv-launcher"])
-def test_startup_refusal_reports_only_a_fixed_reason(tmp_path, reason):
+@pytest.mark.parametrize("reason", ["flags", "interpreter", "script", "environment", "venv-launcher"])
+def test_startup_refusal_reports_only_fixed_categories(tmp_path, reason):
     stand = StandAudit(tmp_path)
     canary = "private-startup-canary"
+    variable = "EXTRA_TEST_VARIABLE"
     script = _script(tmp_path, f"{canary}.py", "print('script ran')")
     stand.allow(script)
     flags = ["-I"]
     env = stand.env
+    details = {"stage": "root"}
     if reason == "flags":
         flags = ["-E", "-s"]
     elif reason == "interpreter":
@@ -36,26 +39,75 @@ def test_startup_refusal_reports_only_a_fixed_reason(tmp_path, reason):
     elif reason == "script":
         script.write_text("print('changed script ran')", encoding="utf-8")
     elif reason == "environment":
-        env["EXTRA_TEST_VARIABLE"] = canary
+        env[variable] = canary
+        del env["NO_PROXY"]
+        env["LC_ALL"] = canary
+        details["environment"] = {
+            "added": {"count": 1, "known": []},
+            "missing": {"count": 1, "known": []},
+            "changed": {"count": 1, "known": ["locale-all"]},
+        }
     else:
         # CPython consumes __PYVENV_LAUNCHER__ before sitecustomize. Simulate
         # it being visible at the environment check without affecting getpath.
         stand._policy.with_name("synthetic_launcher.pth").write_text(
             f"import os; os.environ['__PYVENV_LAUNCHER__'] = {canary!r}\n", encoding="utf-8",
         )
+        reason = "environment"
+        details["environment"] = {
+            "added": {"count": 1, "known": ["venv-launcher"]},
+            "missing": {"count": 0, "known": []},
+            "changed": {"count": 0, "known": []},
+        }
     result = subprocess.run(
         [str(stand.python), *flags, str(script), canary], cwd=stand.cwd, env=env,
         close_fds=True, stdin=subprocess.DEVNULL, capture_output=True, encoding="utf-8", timeout=30,
     )
     assert result.returncode == 125
     assert not result.stdout
-    assert result.stderr.strip() == f"no-network stand could not establish audited startup: {reason}"
-    with pytest.raises(AssertionError, match=f"^stand blocked startup: {reason}$"):
+    prefix = f"no-network stand could not establish audited startup: {reason} "
+    assert result.stderr.startswith(prefix)
+    assert json.loads(result.stderr[len(prefix):]) == details
+    with pytest.raises(AssertionError, match=f"^stand blocked startup: {reason} ") as error:
         stand.assert_clean()
     blocked, = stand.records()
     assert isinstance(blocked.pop("pid"), int)
-    assert blocked == {"kind": "blocked", "event": "startup", "reason": reason}
-    assert canary not in stand.journal.read_text(encoding="utf-8")
+    assert blocked == {"kind": "blocked", "event": "startup", "reason": reason, **details}
+    observations = result.stderr + str(error.value) + stand.journal.read_text(encoding="utf-8")
+    assert canary not in observations and variable not in observations
+
+
+@pytest.mark.parametrize("contaminate_descendant", [False, True], ids=["clean", "contaminated-descendant"])
+def test_startup_probe_tracks_reached_bodies(tmp_path, monkeypatch, contaminate_descendant):
+    if contaminate_descendant:
+        def make_stand(path):
+            stand = StandAudit(path)
+            # Change the environment after the parent approves the launch.
+            stand._policy.with_name("synthetic_darwin.pth").write_text(
+                "import os, sys; "
+                "sys.argv[0].endswith('descendant.py') and "
+                "os.environ.update(__CF_USER_TEXT_ENCODING='private-darwin-canary')\n",
+                encoding="utf-8",
+            )
+            return stand
+
+        monkeypatch.setattr(stand_startup_diagnostic, "StandAudit", make_stand)
+        expected = {
+            "started": ["root"],
+            "exit": 125,
+            "refusal": {
+                "stage": "descendant",
+                "reason": "environment",
+                "environment": {
+                    "added": {"count": 1, "known": ["darwin-user-text-encoding"]},
+                    "missing": {"count": 0, "known": []},
+                    "changed": {"count": 0, "known": []},
+                },
+            },
+        }
+    else:
+        expected = {"started": ["root", "descendant"], "exit": 0}
+    assert stand_startup_diagnostic.probe(tmp_path) == expected
 
 
 def test_f20_audited_python_process_tree_uses_only_temporary_state(tmp_path, monkeypatch):
@@ -120,6 +172,7 @@ def test_f20_audited_python_process_tree_uses_only_temporary_state(tmp_path, mon
     started = [r for r in stand.records() if r["kind"] == "startup"]
     assert len(started) == 2 and len({r["pid"] for r in started}) == 2
     assert all(r["isolated"] for r in started)
+    assert [r["stage"] for r in started] == ["root", "descendant"]
 
 
 @pytest.mark.parametrize(("call", "event", "target"), [
@@ -178,6 +231,7 @@ def test_f20_audits_plain_claude_through_the_installed_shim(tmp_path, call, even
     records = stand.records()
     assert [r["kind"] for r in records[:4]] == ["startup", "startup", "exec", "startup"], result.stderr
     assert records[1]["pid"] == records[2]["pid"] == records[3]["pid"]
+    assert [r["stage"] for r in records[:4] if r["kind"] == "startup"] == ["root", "root", "descendant"]
     if event is None:
         stand.assert_clean()
         assert result.returncode == 0, result.stderr

@@ -101,6 +101,7 @@ class StandAudit:
         self._policy.write_text(json.dumps({
             "python": str(self.python),
             "root": str(self.root),
+            "launch_journal_start": self.journal.stat().st_size,
             "source": str(_SOURCE),
             "journal": str(self.journal),
             "env": self._env,
@@ -179,6 +180,7 @@ class StandAudit:
         if installed.returncode or not (shim_dir / "claude").is_file():
             raise AssertionError(f"shim install failed: {installed.stderr}")
         self._roots[0] += 1  # Audited startup of the installed shim, not a .py script.
+        self._write_policy()
         return subprocess.run(
             ["claude", *args], cwd=self.cwd, env=self.env, close_fds=True,
             stdin=subprocess.DEVNULL, capture_output=True, encoding="utf-8", timeout=30,
@@ -194,7 +196,8 @@ class StandAudit:
         if blocked is not None:
             event = blocked["event"]
             if event == "startup":
-                raise AssertionError(f"stand blocked startup: {blocked['reason']}")
+                details = {key: blocked[key] for key in ("stage", "environment") if key in blocked}
+                raise AssertionError(f"stand blocked startup: {blocked['reason']} {json.dumps(details)}")
             raise AssertionError(f"stand blocked an operation: {event}")
         expected = self._roots + Counter(r["script"] for r in records if r["kind"] in {"spawn", "exec"})
         started = Counter(r["script"] for r in records if r["kind"] == "startup")

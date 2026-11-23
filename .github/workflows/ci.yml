@@ -69,6 +69,9 @@ jobs:
       - name: Check legacy executable identity on the venv Python
         run: uv run python -m tests.win_handoff_diagnostic
 
+      - name: Diagnose policy lookup in an isolated Windows profile
+        run: uv run python -m tests.win_config_diagnostic
+
       - name: Run tests
         # Includes the TUI tests: the Textual TUI (unlike the old curses one)
         # runs on stock Windows, and this job is the proof.
@@ -104,6 +107,9 @@ jobs:
           ), "venv is not using the job-managed Python"
           check_python_chain()
           '
+
+      - name: Diagnose audited startup on the managed Python
+        run: .venv/bin/python -m tests.stand_startup_diagnostic
 
       - name: Run the whole suite (not only the Keychain files)
         # THE NARROW SELECTION WAS A BLIND SPOT, not a saving. Three cases

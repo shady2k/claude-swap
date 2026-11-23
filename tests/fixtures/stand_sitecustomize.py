@@ -15,8 +15,33 @@ class StandBlocked(BaseException):
     """An audited operation was refused before Python could execute it."""
 
 
-def exit_startup(reason):
-    os.write(2, f"no-network stand could not establish audited startup: {reason}\n".encode("ascii"))
+_ENV_LABELS = {
+    "LANG": "locale-lang",
+    "LC_ALL": "locale-all",
+    "LC_CTYPE": "locale-ctype",
+    "__CF_USER_TEXT_ENCODING": "darwin-user-text-encoding",
+    "__PYVENV_LAUNCHER__": "venv-launcher",
+}
+
+
+def environment_difference(expected, live):
+    def summarize(keys):
+        return {
+            "count": len(keys),
+            "known": sorted(_ENV_LABELS[key] for key in keys if key in _ENV_LABELS),
+        }
+
+    return {
+        "added": summarize(live.keys() - expected.keys()),
+        "missing": summarize(expected.keys() - live.keys()),
+        "changed": summarize({key for key in expected.keys() & live.keys()
+                              if expected[key] != live[key]}),
+    }
+
+
+def exit_startup(reason, details=None):
+    suffix = f" {json.dumps(details)}" if details else ""
+    os.write(2, f"no-network stand could not establish audited startup: {reason}{suffix}\n".encode("ascii"))
     os._exit(125)
 
 
@@ -75,12 +100,12 @@ def install():
         live = os.environ if env is None else env
         return live == policy["env"]
 
-    def shim_child_env(env):
-        return env == {**shim["child_env"], "CLAUDE_SWAP_LAUNCHED": str(os.getpid())}
+    def expected_shim_child_env():
+        return {**shim["child_env"], "CLAUDE_SWAP_LAUNCHED": str(os.getpid())}
 
     def exec_shim_child(args):
         path, argv, env = args
-        if not (shim_main and shim_script and path == shim["fake"] and shim_child_env(env)):
+        if not (shim_main and shim_script and path == shim["fake"] and env == expected_shim_child_env()):
             return False
         if len(argv) < 3 or list(argv[:2]) != [path, "--settings"] or list(argv[3:]) != shim["argv"]:
             return False
@@ -145,9 +170,17 @@ def install():
             finally:
                 active_launch.allowed = False
 
-    def reject_startup(reason):
-        record("blocked", event="startup", reason=reason)
-        exit_startup(reason)
+    # Each top-level invocation is synchronous and starts with a fresh
+    # journal offset. Its audited Popen/exec records before a descendant
+    # starts. PPIDs are not reliable: venv launchers may insert a process.
+    with open(journal, "rb") as observations:
+        observations.seek(policy["launch_journal_start"])
+        stage = "descendant" if observations.read(1) else "root"
+
+    def reject_startup(reason, **fields):
+        details = {"stage": stage, **fields}
+        record("blocked", event="startup", reason=reason, **details)
+        exit_startup(reason, details)
 
     sys.addaudithook(hook)
     subprocess.Popen = StandPopen
@@ -158,15 +191,14 @@ def install():
     number = 0 if shim_main else script_id(sys.argv[0])
     if number is None:
         reject_startup("script")
-    env_ok = shim_child_env(os.environ) if shim_script and number == shim_script else safe_env(None)
-    if not env_ok:
-        # Diagnose the CPython launcher key if it survives initialization.
-        # Its presence is not an exception to exact environment matching.
-        if "__PYVENV_LAUNCHER__" in os.environ:
-            reject_startup("environment-with-venv-launcher")
-        reject_startup("environment")
+    if shim_script and number == shim_script:
+        expected_env = expected_shim_child_env()
+    else:
+        expected_env = policy["env"]
+    if os.environ != expected_env:
+        reject_startup("environment", environment=environment_difference(expected_env, os.environ))
     sys.path.insert(0, policy["source"])
-    record("startup", script=number, isolated=True)
+    record("startup", script=number, isolated=True, stage=stage)
 
 
 try:
