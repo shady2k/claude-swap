@@ -185,9 +185,10 @@ def test_transparent_admin_checks_route_without_resolving_claude(route, no_attem
         test_mode.preflight(["transparent", verb])
 
 
-def test_transparent_pool_and_revoke_cli_do_not_use_network(route, no_attempts, monkeypatch, capsys):
-    root = paths.get_backup_root()
-    root.mkdir(parents=True, exist_ok=True)
+def test_transparent_pool_and_revoke_cli_do_not_use_network(
+    route, no_attempts, monkeypatch, capsys, private_backup_root,
+):
+    root = private_backup_root
     members = {slot: [f"account{slot}@example.test", "", slot, "oauth"] for slot in ("1", "2")}
 
     def seed(policy):

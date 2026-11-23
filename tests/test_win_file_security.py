@@ -7,6 +7,7 @@ from ctypes import wintypes as w
 import pytest
 
 from claude_swap import _win_file_security as security, fsguard
+from tests.win_config_diagnostic import _observe_dacl
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="native Windows ACL APIs")
@@ -34,10 +35,13 @@ def test_check_dacl_distinguishes_inherit_only_modify_from_add_subdirectory(
         assert get_dacl(descriptor, c.byref(present), c.byref(dacl), c.byref(defaulted))
         assert present.value
         trusted = frozenset({"S-1-5-18"})  # SYSTEM, not Authenticated Users
+        rejection = []
         if add_subdirectory:
             with pytest.raises(fsguard.GuardError, match="Writable by another user or group"):
-                security._check_dacl(tmp_path, dacl, trusted)
+                _observe_dacl(security._check_dacl, tmp_path, dacl, trusted, rejection)
+            assert rejection == ["allow/explicit/authenticated-users rights=append-data-or-add-subdirectory"]
         else:
-            security._check_dacl(tmp_path, dacl, trusted)
+            _observe_dacl(security._check_dacl, tmp_path, dacl, trusted, rejection)
+            assert not rejection
     finally:
         free(descriptor)

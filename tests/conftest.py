@@ -613,6 +613,19 @@ def temp_home(tmp_path: Path):
 
 
 @pytest.fixture
+def private_backup_root():
+    """A fresh real backup root under the test's isolated home."""
+    root = _paths.get_backup_root()
+    if sys.platform == "win32":
+        from tests.win_acl import create_private_directory
+
+        create_private_directory(root)
+    else:
+        root.mkdir(parents=True, mode=0o700)
+    return root
+
+
+@pytest.fixture
 def mock_claude_config(temp_home: Path):
     """Create a mock Claude configuration file."""
     config = {
