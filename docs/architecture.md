@@ -96,7 +96,7 @@ Read next: the module docstring of `claude_locks.py`, and the docstring of `_cla
 
 A refresh token works once: after it is used, only its successor is valid. Refreshing a stored credential therefore goes through one gate, `consume_backup_grant`, which serializes refreshes per slot, re-reads the freshest copy before it posts, and always persists or stashes the successor. The auto engine uses it before activating a target, and session mode before seeding a profile.
 
-The active account is the one exception. Its expired token is refreshed in `_fetch_active_usage`, inside Claude Code's own credential lock, so a running Claude Code adopts the new token instead of colliding with it.
+Active recovery in `_fetch_active_usage` is deferred until refresh authority is implemented in ALX-1125. An expired or server-rejected active token is not consumed or restored: the live login and slot backup remain unchanged, and the fetch returns an explicit refusal. Fresh-token usage reads and attributed backup resync remain available.
 
 Read next: the docstrings of `consume_backup_grant` and `_fetch_active_usage`.
 
@@ -121,7 +121,7 @@ Read next: the module docstring of `autoswitch.py`. The rules as users see them 
 ## Rules that hold everywhere
 
 - **Lock order.** Profile ownership state lock, then cswap's lock, then Claude Code's credential lock, then its config lock. Ownership checks at mutation and publication require state before cswap. Never the other way round.
-- **No network under a lock.** A switch does only local I/O under its locks, and the usage store never holds its lock across a fetch. The single deliberate exception is the active token refresh described above: it holds ownership state, the account lock and Claude Code's credential lock so publication cannot race a backup write. Backup-token refresh posts outside the ownership and account locks.
+- **No network under ownership, account or credential locks.** A switch does only local I/O under its locks, and the usage store never holds its lock across a fetch. Active recovery is deferred until refresh authority is implemented (ALX-1125). Backup-token refresh posts outside the ownership and account locks; its per-slot consume lock still serializes grant consumption.
 - **A used refresh token's successor is never dropped.** Once the refresh is posted, the new credential is persisted or stashed, whatever else fails.
 - **A live credential enters a slot only when it is known to belong there.** Writing another account's credential into a slot destroys that slot's only refresh token.
 - **The usage store persists readings and fetch state only.** Labels such as "token expired" are derived on every pass and never written.
