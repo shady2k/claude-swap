@@ -4966,9 +4966,11 @@ class ClaudeAccountSwitcher:
         sole readable copy requires the other store to be confirmed empty.
         The selected fingerprint keys both POST and failed-write stash. Each
         write checks its own locked store observation. Identity/generation-
-        scoped stash metadata and successor bytes can prove a partial write
-        even when the selected copy already contains that successor; both
-        stores must be saved before retiring the stash. Unproven divergence
+        scoped stash metadata records both first-pass store fingerprints,
+        including confirmed emptiness. Recovery requires each copy to match
+        its recorded observation or the successor; legacy rows prove only
+        consumed/successor pairs. Both stores must be saved before retiring
+        the stash. Unproven divergence
         defers without writes or POST. Fresh usage may resync an attributed
         rotation through ``_resync_rotated_backup``.
         """
@@ -5125,8 +5127,7 @@ class ClaudeAccountSwitcher:
                     try:
                         successor = self._active_stashed_successor(
                             account_num, expected_identity, generation,
-                            consumed_fp, live_fp, backup_fp, snapshot_fp,
-                            input_allowed,
+                            consumed_fp, live_fp, backup_fp,
                         )
                     except CredentialReadError:
                         return FetchRecord(error="stash-unreadable")
@@ -5179,6 +5180,8 @@ class ClaudeAccountSwitcher:
                                 "identity": expected_identity,
                                 "loginGen": generation,
                                 "consumedFp": consumed_fp,
+                                "observedLiveFp": live_fp,
+                                "observedBackupFp": backup_fp,
                                 "fingerprint": oauth.credential_fingerprint(successor),
                             })
                             return FetchRecord(error="transient")
@@ -5209,13 +5212,14 @@ class ClaudeAccountSwitcher:
 
     def _active_stashed_successor(
         self, account_num, identity, generation, selected_fp,
-        live_fp, backup_fp, snapshot_fp, input_allowed,
+        live_fp, backup_fp,
     ):
-        """Resolve a pending active rotation, including either partial write.
+        """Resolve a pending rotation against its first-pass store observations.
 
-        A consumed-input match authorizes recovery only against the snapshot
-        or identical copies. A saved-successor match proves the partial write
-        when the other copy is the consumed input or the collected snapshot.
+        Each copy must still match its own observed fingerprint or the saved
+        successor. Explicit null observations prove an empty store; missing
+        observations in legacy rows prove only consumed/successor pairs.
+        The current collection snapshot cannot prove a first-pass state.
         Read all applicable rows before writing: conflicting successors defer.
         """
         manifest, verdict = self._store._read_stash_manifest_ex()
@@ -5228,41 +5232,41 @@ class ClaudeAccountSwitcher:
         for entry_id, meta in manifest.items():
             consumed = meta.get("consumedFp")
             saved = meta.get("fingerprint")
-            input_match = selected_fp and consumed == selected_fp
-            partial = saved and (
-                live_fp == backup_fp == saved
-                or (live_fp == saved and backup_fp in {consumed, snapshot_fp, None})
-                or (backup_fp == saved and live_fp in {consumed, snapshot_fp, None})
+            related = (
+                consumed and consumed in {selected_fp, live_fp, backup_fp}
+                or saved and saved in {live_fp, backup_fp}
+                or live_fp and meta.get("observedLiveFp") == live_fp
+                or backup_fp and meta.get("observedBackupFp") == backup_fp
             )
-            if not input_match and not partial and saved:
+            if not related and saved:
                 continue
             if not isinstance(meta.get("identity"), dict):
-                if input_match or partial:
-                    raise CredentialReadError("active successor has no identity")
-                continue
+                raise CredentialReadError("active successor has no identity")
             if (not refresh_authority.same_identity(meta["identity"], identity)
                     or meta.get("loginGen") != generation):
                 continue
             value, unreadable = self._store._read_unclaimed_credential(entry_id)
             if unreadable or not value:
-                if input_match or partial or (not saved and consumed in {live_fp, backup_fp}):
-                    raise CredentialReadError("active successor bytes unavailable")
-                continue
+                raise CredentialReadError("active successor bytes unavailable")
             fp = oauth.credential_fingerprint(value)
             if not fp or (saved and saved != fp):
                 raise CredentialReadError("active successor fingerprint mismatch")
-            # Older stash rows may omit fingerprint; their readable bytes
-            # still prove the saved-successor side of a partial write.
-            partial = (
-                live_fp == backup_fp == fp
-                or (live_fp == fp and backup_fp in {consumed, snapshot_fp, None})
-                or (backup_fp == fp and live_fp in {consumed, snapshot_fp, None})
-            )
-            if not partial and not input_match:
+            if not related and fp not in {live_fp, backup_fp}:
                 continue
-            if not partial and (not input_allowed or (
-                live_fp and live_fp not in {backup_fp, snapshot_fp}
-            )):
+            observation_keys = ("observedLiveFp", "observedBackupFp")
+            if any(key in meta for key in observation_keys):
+                proven = all(
+                    key in meta
+                    and (meta[key] is None or isinstance(meta[key], str))
+                    and current in {meta[key], fp}
+                    for key, current in zip(observation_keys, (live_fp, backup_fp))
+                )
+            else:
+                # Legacy bytes prove B/C, not an unrelated or absent copy.
+                proven = bool(consumed) and all(
+                    current in {consumed, fp} for current in (live_fp, backup_fp)
+                )
+            if not proven:
                 raise CredentialReadError("unproven active successor relationship")
             candidates[fp] = value
             entries.append(entry_id)
