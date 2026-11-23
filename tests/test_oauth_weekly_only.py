@@ -62,6 +62,7 @@ def fetch_outcome(monkeypatch):
         monkeypatch.setattr(oauth.urllib.request, "urlopen", urlopen)
         return oauth.try_fetch_usage_for_account(
             "2", "weekly@example.com", _CREDENTIALS, is_active=False,
+            refresh_via=None,
         )
 
     return fetch
@@ -289,6 +290,7 @@ def test_a_rejected_probe_with_an_unreadable_window_keeps_its_refusal(
     }})
     outcome = oauth.try_fetch_usage_for_account(
         "3", "setup@example.com", setup_token, is_active=False, header_probe=True,
+        refresh_via=None,
     )
 
     assert outcome.error is None

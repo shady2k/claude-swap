@@ -113,3 +113,21 @@ def test_completed_release_retries_contention_and_preserves_exit(tmp_path, route
         launch.send("release")
         assert launch.finish() == 7
         assert stand.free()
+
+
+@pytest.mark.parametrize("route", ["session", "transparent"])
+def test_f36_setup_token_same_default_identity_is_admitted(tmp_path, route):
+    with AdmissionStand(tmp_path, route) as stand:
+        assert stand.launch("setup-identity", mode="setup-identity").finish() == 0
+        before = {name: value for name, value in stand.snapshot().items() if name.startswith("credentials/")}
+        launch = stand.launch("setup-launch")
+        if route == "session":
+            launch.event("probe")
+        launch.event("launch")
+        launch.event("live")
+        launch.send("exit")
+        assert launch.finish() == 0
+        assert launch.counts()["post"] == 0
+        after = {name: value for name, value in stand.snapshot().items() if name.startswith("credentials/")}
+        assert after == before
+        assert stand.free()

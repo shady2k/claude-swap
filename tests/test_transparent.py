@@ -242,3 +242,19 @@ def test_default_login_candidate_refusal_continues_pool(installed):
     }}))
     transparent.enable(root, accept_shared_history=True, pool=["1", "2"])
     assert invoke("-p", "second candidate").returncode == 27
+
+
+@pytest.mark.parametrize("label,refresh,excluded", [
+    ("oauth", None, False),
+    ("setup-token", "refresh-grant", True),
+])
+def test_f15_setup_token_default_identity_uses_token_shape(tmp_path, monkeypatch, label, refresh, excluded):
+    from claude_swap.session import SessionManager
+
+    recipient = transparent._Recipient("1", ("same@example.test", "org", "uuid", label))
+    blob = json.dumps({"claudeAiOauth": {"accessToken": "setup-access", "refreshToken": refresh}})
+    monkeypatch.setattr(SessionManager, "_default_login_identity", lambda: recipient.identity[:2])
+    monkeypatch.setattr("claude_swap.credentials.CredentialStore._read_account_credentials", lambda self, num, email: blob)
+    monkeypatch.setattr("claude_swap.oauth.try_refresh_oauth_credentials", lambda *a, **kw: pytest.fail("implicit refresh"))
+    monkeypatch.setattr("claude_swap.oauth.fetch_usage", lambda *a, **kw: pytest.fail("implicit usage request"))
+    assert transparent._is_default_login(tmp_path, recipient) is excluded

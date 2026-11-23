@@ -7495,3 +7495,20 @@ def test_autoswitch_skips_reserved_target_before_freshening(harness):
     assert result == TickOutcome.SWITCHED
     assert [call.args[0] for call in freshen.call_args_list] == ["3"]
     assert perform.call_args.args[0] == "3"
+
+
+def test_refresh_passes_bound_credential_snapshot(harness):
+    from claude_swap.refresh_authority import CredentialSnapshot
+
+    harness.switcher._write_account_credentials("2", "b@example.com", json.dumps({"claudeAiOauth": {
+        "accessToken": "access", "refreshToken": "refresh", "expiresAt": 0,
+    }}))
+    seen = []
+    def gate(num, email, snapshot):
+        seen.append(snapshot)
+        return oauth.RefreshOutcome(str(snapshot), None)
+    with patch.object(harness.switcher, "consume_backup_grant", side_effect=gate):
+        assert harness.engine._freshen_target("2", "b@example.com") == "ok"
+    assert isinstance(seen[0], CredentialSnapshot)
+    assert seen[0].identity["email"] == "b@example.com"
+    assert seen[0].login_gen == 0

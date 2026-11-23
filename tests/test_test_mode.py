@@ -222,6 +222,7 @@ def test_f8_cold_profile_pins_auth_probe_and_launch(route, monkeypatch):
         _account_kind=lambda _: "oauth",
         _get_current_account=lambda: None,
         read_account_credentials=lambda *_: None,
+        credential_snapshot=lambda *_: "",
         _get_sequence_data=lambda: {"accounts": {"1": {
             "email": "synthetic@example.test", "uuid": "synthetic-uuid",
         }}},

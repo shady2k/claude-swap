@@ -257,7 +257,7 @@ def refresh_rotates(monkeypatch):
     real one does (bootstrap re-reads the backup afterwards)."""
     calls: list[str] = []
 
-    def fake_gate(self, account_num: str, email: str, snapshot: str):
+    def fake_gate(self, account_num: str, email: str, snapshot: str, **kwargs):
         from claude_swap import oauth as oauth_mod
         calls.append(snapshot)
         self._write_account_credentials(account_num, email, ROTATED_CREDS)
@@ -492,7 +492,7 @@ class TestBootstrap:
     ):
         monkeypatch.setattr(
             ClaudeAccountSwitcher, "consume_backup_grant",
-            lambda self, num, email, snap: oauth.RefreshOutcome(
+            lambda self, num, email, snap, **kwargs: oauth.RefreshOutcome(
                 None, "transient"
             ),
         )
@@ -587,7 +587,7 @@ class TestBootstrap:
         refresh_calls = []
         monkeypatch.setattr(
             ClaudeAccountSwitcher, "consume_backup_grant",
-            lambda self, num, email, snap: refresh_calls.append(snap)
+            lambda self, num, email, snap, **kwargs: refresh_calls.append(snap)
             or oauth.RefreshOutcome(None, "transient"),
         )
 
@@ -5174,7 +5174,7 @@ class TestBootstrapRefreshRoutesThroughGate:
         })
         gate = {}
 
-        def mock_gate(num, email, snapshot):
+        def mock_gate(num, email, snapshot, **kwargs):
             gate["args"] = (num, email)
             return oauth_mod.RefreshOutcome(fresh, None)
 
@@ -5187,11 +5187,9 @@ class TestBootstrapRefreshRoutesThroughGate:
 
         # The bypass seam: session.py no longer imports any direct refresh
         # helper, so a regression would have to call oauth's POST directly.
+        assert not hasattr(oauth_mod, "refresh_oauth_credentials")
         monkeypatch.setattr(
             "claude_swap.oauth.try_refresh_oauth_credentials", direct_post
-        )
-        monkeypatch.setattr(
-            "claude_swap.oauth.refresh_oauth_credentials", direct_post
         )
         from claude_swap.session import SessionManager
         mgr = SessionManager(s)
@@ -5227,7 +5225,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         )
 
         # The gate rotates the backup, exactly as the real one does.
-        def fake_gate(self, num, email, snapshot):
+        def fake_gate(self, num, email, snapshot, **kwargs):
             self._write_account_credentials(num, email, ROTATED_CREDS)
             return oauth.RefreshOutcome(ROTATED_CREDS, None)
 
@@ -5279,7 +5277,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
 
-        def fake_gate(self, num, email, snapshot):
+        def fake_gate(self, num, email, snapshot, **kwargs):
             self._write_account_credentials(num, email, ROTATED_CREDS)
             return oauth.RefreshOutcome(ROTATED_CREDS, None)
 
@@ -5393,7 +5391,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         )
         session_dir.mkdir(parents=True, exist_ok=True)
 
-        def gate_consumes_then_fails_to_persist(self, num, email, snapshot):
+        def gate_consumes_then_fails_to_persist(self, num, email, snapshot, **kwargs):
             # Grant spent; successor NOT written to the backup, which still
             # holds CREDS, but it DID reach the stash. Exactly the shape
             # switcher.py returns when the persist fails and the successor is
@@ -5443,7 +5441,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         monkeypatch.setattr(
             ClaudeAccountSwitcher,
             "consume_backup_grant",
-            lambda self, num, email, snap: oauth.RefreshOutcome(
+            lambda self, num, email, snap, **kwargs: oauth.RefreshOutcome(
                 ROTATED_CREDS, "transient", stashed=False
             ),
         )
@@ -5795,3 +5793,33 @@ def test_prepublication_cleanup_error_is_not_retried_by_reservation(manager, mon
                 "CLAUDE_CONFIG_DIR": record["profile"],
             })
     assert events == ["aborted"]
+
+
+def test_bootstrap_passes_snapshot_and_own_reservation(manager, auth_status_tracks_seed, monkeypatch):
+    from claude_swap.refresh_authority import CredentialSnapshot
+
+    seen = []
+    def gate(num, email, snapshot, **kwargs):
+        seen.append((snapshot, kwargs, manager._launch_reservation["launchId"]))
+        return oauth.RefreshOutcome(str(snapshot), None)
+    monkeypatch.setattr(manager.switcher, "consume_backup_grant", gate)
+    manager.setup_session("2", share=False)
+    snapshot, kwargs, launch_id = seen[0]
+    assert isinstance(snapshot, CredentialSnapshot)
+    assert snapshot.identity["email"] == ACCOUNT_EMAIL
+    assert snapshot.login_gen == 0
+    assert kwargs["launch_id"] == launch_id
+    assert kwargs["timeout"] == 30.0
+
+
+def test_f36_session_setup_token_same_default_login(manager, seeded_switcher, capture_exec, auth_status_tracks_seed, monkeypatch):
+    setup = json.dumps({"claudeAiOauth": {"accessToken": "setup-access"}})
+    seeded_switcher._write_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL, setup)
+    monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: (ACCOUNT_EMAIL, ORG_UUID))
+    monkeypatch.setattr(manager, "_default_login_signed_out", lambda: False)
+    monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", lambda *a, **k: pytest.fail("setup-token refreshed"))
+    monkeypatch.setattr(oauth, "fetch_usage", lambda *a, **k: pytest.fail("implicit usage request"))
+    with pytest.raises(_ExecCalled) as exc:
+        manager.run(ACCOUNT_NUM, [], require_session=True)
+    assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir_for(seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL))
+    assert seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL) == setup

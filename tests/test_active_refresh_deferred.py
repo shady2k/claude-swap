@@ -1,4 +1,4 @@
-"""Active usage recovery must leave credential rotation to Claude Code."""
+"""Unsafe active recovery refuses writes; authorized refresh leaves state unlocked."""
 
 from __future__ import annotations
 
@@ -101,24 +101,29 @@ def snapshot(switcher):
     }
 
 
-@pytest.mark.parametrize("shape", ["expired", "http-401", "cleared", "foreign-live"])
-def test_recovery_defers_without_post_or_durable_writes(
+@pytest.mark.parametrize("shape", ["identity-moved", "unreadable", "foreign-live"])
+def test_unsafe_recovery_does_not_post_or_write(
     active_store, local_token_server, monkeypatch, shape,
 ):
     switcher = active_store
-    collected = credential(expired=shape != "http-401")
-    backup = collected if shape != "foreign-live" else credential("synthetic-slot")
-    live = "" if shape == "cleared" else collected
-    switcher._write_account_credentials("1", EMAIL, backup)
-    switcher._write_credentials(live)
-    monkeypatch.setattr(oauth, "try_fetch_usage_for_account", lambda *a, **k: oauth.UsageOutcome(None, error="http-401"))
+    collected = credential()
+    switcher._write_account_credentials("1", EMAIL, collected)
+    switcher._write_credentials(
+        credential("synthetic-foreign") if shape == "foreign-live" else collected
+    )
+    if shape == "identity-moved":
+        monkeypatch.setattr(switcher, "_live_identity_matches", lambda *a: False)
+    if shape == "unreadable":
+        monkeypatch.setattr(switcher, "_read_account_credentials_ex", lambda *a: ("", True))
     before = snapshot(switcher)
 
+    from claude_swap.refresh_authority import CredentialSnapshot
+    collected = CredentialSnapshot(collected, {"email": EMAIL, "organizationUuid": "", "uuid": ""}, 0)
     result = switcher._fetch_active_usage("1", EMAIL, collected)
 
     assert local_token_server[0] == []
     assert snapshot(switcher) == before
-    assert result.error == "active-refresh-deferred"
+    assert result.error == ("unreadable" if shape == "unreadable" else "ownership-lost")
     assert result.sentinel is None
 
 
@@ -126,21 +131,18 @@ def test_independent_profile_reservation_completes_while_recovery_is_paused(
     active_store, local_token_server, monkeypatch,
 ):
     switcher = active_store
-    creds = credential()
+    from claude_swap.refresh_authority import CredentialSnapshot
+    creds = CredentialSnapshot(credential(), {"email": EMAIL, "organizationUuid": "", "uuid": ""}, 0)
     switcher._write_credentials(creds)
     switcher._write_account_credentials("1", EMAIL, creds)
     posts, entered, release = local_token_server
     release.clear()
-    record_type = switcher_module.FetchRecord
+    def paused_refresh(*args, **kwargs):
+        entered.set()
+        assert release.wait(10), "active refresh was never released"
+        return oauth.RefreshOutcome(credential("synthetic-successor", expired=False), None)
 
-    def paused_defer(*args, **kwargs):
-        record = record_type(*args, **kwargs)
-        if record.error == "active-refresh-deferred":
-            entered.set()
-            assert release.wait(10), "deferred recovery was never released"
-        return record
-
-    monkeypatch.setattr(switcher_module, "FetchRecord", paused_defer)
+    monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", paused_refresh)
     monkeypatch.setattr(
         oauth, "try_fetch_usage_for_account",
         lambda *a, **k: oauth.UsageOutcome(None, error="http-401"),

@@ -492,3 +492,28 @@ class TestStrikeBindingReadsFresh:
         assert row.usage.sentinel == USAGE_RELOGIN_REQUIRED
         assert cleared == []
         assert keychain.backup_calls(2) == 0
+
+class TestRefreshSnapshotBypassesDisplayCache:
+    def test_authority_snapshot_does_not_stamp_cached_bytes_with_new_generation(
+        self, temp_home: Path, block_real_keychain, keychain: _Keychain
+    ):
+        from claude_swap import refresh_authority
+        from claude_swap.locking import FileLock
+
+        s = _switcher(temp_home, block_real_keychain, 2)
+        s.accounts_snapshot(fetch=set())
+        registry_before = s.sequence_file.read_bytes()
+        # Another process's replacement publishes generation and credential
+        # before its sequence commit. Neither touches this store's read cache.
+        with FileLock(s.lock_file):
+            generation = refresh_authority.advance_login_generation(
+                s.backup_dir, _email(2), "org-2"
+            )
+            block_real_keychain.data[_backup_key(2)] = _cred("replacement")
+        assert s.sequence_file.read_bytes() == registry_before
+        before = keychain.backup_calls(2)
+        entries = s._build_accounts_info()
+        credential = next(info[5] for info in entries if str(info[0]) == "2")
+        assert credential == _cred("replacement")
+        assert credential.login_gen == generation
+        assert keychain.backup_calls(2) == before + 1

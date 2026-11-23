@@ -824,7 +824,7 @@ class AutoSwitchEngine:
             # is already being consumed by that session anyway. Manual
             # switch_to keeps its warn-and-proceed behavior; auto skips.
             return "skip-live-session"
-        creds = self.switcher.read_account_credentials(number, email)
+        creds = self.switcher.credential_snapshot(number, email)
         if not creds:
             return "transient"
         data = oauth.extract_oauth_data(creds)
@@ -840,7 +840,7 @@ class AutoSwitchEngine:
             return "ok"
         # The consume gate serializes every backup-rt POST (the recovery
         # branch in `_fetch_active_usage` is a second call site, under the
-        # same per-slot consume lock):
+        # same identity-scoped consume right):
         # it re-reads under the slot lock (our snapshot may be superseded),
         # consults the session profile for a newer generation, and persists
         # via fingerprint CAS — so a freshen racing the collector (or a

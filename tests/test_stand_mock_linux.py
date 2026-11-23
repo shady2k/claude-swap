@@ -109,3 +109,25 @@ def test_mock_proxy_rejects_unlisted_connect_authority(linux_stand):
         "records": {"connect": [], "https": [], "direct": 0, "denied_connect": 1},
         "response": None,
     }
+
+
+@pytest.mark.parametrize("scenario, requests", [
+    ("f15_setup_default", []),
+    ("f15_setup_probe", [["POST", mock.MESSAGES]]),
+    ("f15_oauth_gate", [["POST", mock.REFRESH]]),
+])
+def test_f15_refresh_and_explicit_probe_routes(linux_stand, scenario, requests):
+    result, journal = _run(
+        linux_stand, scenario, server_allowed={mock.ORIGIN}, client_allowed={mock.PROXY},
+    )
+    assert result.returncode == 0, result.stderr
+    assert journal["records"] == {
+        "connect": [mock.AUTHORITY] * len(requests), "https": requests,
+        "direct": 0, "denied_connect": 0,
+    }
+    assert journal["response"] == {"unchanged": scenario != "f15_oauth_gate"}
+    connects = [attempt for attempt in result.attempts if attempt.syscall == "connect"]
+    assert len(connects) == 2 * len(requests)
+    assert all(attempt.target == (
+        mock.PROXY if attempt.role == ("stand_mock", "client", scenario) else mock.ORIGIN
+    ) for attempt in connects)

@@ -41,7 +41,12 @@ def test_switcher_lock_requires_outer_ownership_lock():
                         policy_only = filename == "transparent.py" and function in {
                             "enable", "disable", "refresh_install", "_launch",
                         }
-                        if not owned and not policy_only:
+                        refresh_or_snapshot = filename == "switcher.py" and function in {
+                            "credential_snapshot", "consume_backup_grant",
+                            "_consume_backup_grant_locked", "_fetch_active_usage",
+                            "_build_accounts_info",
+                        }
+                        if not owned and not policy_only and not refresh_or_snapshot:
                             violations.append((filename, node.lineno))
             if isinstance(node, ast.Call) and _call_name(node).endswith("mark_running_locked"):
                 if not (owned and account):

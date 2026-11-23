@@ -458,6 +458,7 @@ def import_accounts(
 
     from claude_swap.locking import FileLock
     from claude_swap.profile_ownership import ownership_lock
+    from claude_swap.refresh_authority import advance_login_generation, ensure_identity_idle
 
     with ownership_lock(switcher.backup_dir), FileLock(switcher.lock_file):
         # Pass 2: writes. Validation is complete; remaining failures (disk I/O,
@@ -546,7 +547,11 @@ def import_accounts(
                     target_num = str(switcher._get_next_account_number())
                 outcome = "imported"
 
+            ensure_identity_idle(switcher.backup_dir, entry["email"], entry["org_uuid"])
             switcher._ensure_profile_idle_locked(target_num, entry["email"])
+            advance_login_generation(
+                switcher.backup_dir, entry["email"], entry["org_uuid"]
+            )
             switcher._write_account_credentials(
                 target_num, entry["email"], entry["creds_text"]
             )

@@ -884,7 +884,8 @@ class SessionManager:
                     "the stored login in a session profile."
                 )
             )
-        if current is not None and current == (email, org_uuid) and not signed_out:
+        if (current is not None and current == (email, org_uuid) and not signed_out
+                and self._slot_has_default_refresh_grant(account_num, email)):
             if require_session:
                 raise SessionError(
                     f"Account-{account_num} ({email}) is the active default "
@@ -1102,7 +1103,7 @@ class SessionManager:
                 num, email, _ = self.switcher.resolve_account(record["accountNum"])
                 if str(session_dir_for(self.switcher.backup_dir, num, email).resolve()) != record["profile"]:
                     raise SessionError("Account identity changed before handoff")
-                if self.switcher._get_current_account() == self.switcher.resolve_account(num)[1:] and not self._default_login_signed_out():
+                if self.switcher._get_current_account() == self.switcher.resolve_account(num)[1:] and not self._default_login_signed_out() and self._slot_has_default_refresh_grant(num, email):
                     raise SessionError("Selected account became the default login before handoff")
                 profile_ownership.mark_running_locked(
                     self.switcher.backup_dir, record["launchId"], os.getpid(),
@@ -1213,7 +1214,7 @@ class SessionManager:
                 self._verify_profile_recipient(record)
                 if self.switcher.resolve_account(identifier) != (account_num, email, org_uuid):
                     raise SessionError("Account identity changed before profile reuse")
-                if self.switcher._get_current_account() == (email, org_uuid) and not self._default_login_signed_out():
+                if self.switcher._get_current_account() == (email, org_uuid) and not self._default_login_signed_out() and self._slot_has_default_refresh_grant(account_num, email):
                     raise SessionError("Selected account became the default login before profile reuse")
                 self._sync_sharing(session_dir, share, share_history)
             return session_dir, account_num, email
@@ -1236,12 +1237,13 @@ class SessionManager:
             self._verify_profile_recipient(record)
             if self.switcher.resolve_account(identifier) != (account_num, email, org_uuid):
                 raise SessionError("Account identity changed before credential preparation")
-            if self.switcher._get_current_account() == (email, org_uuid) and not self._default_login_signed_out():
+            if self.switcher._get_current_account() == (email, org_uuid) and not self._default_login_signed_out() and self._slot_has_default_refresh_grant(account_num, email):
                 raise self._live_login_error(account_num)
-        pre_creds = self.switcher.read_account_credentials(account_num, email)
+        pre_creds = self.switcher.credential_snapshot(account_num, email)
         if pre_creds and self._has_refresh_token(pre_creds):
             outcome = self.switcher.consume_backup_grant(
-                account_num, email, pre_creds
+                account_num, email, pre_creds, timeout=30.0,
+                launch_id=self._launch_reservation["launchId"],
             )
             if outcome.error is not None and outcome.credentials:
                 # `error is None` is the gate's own "the slot is freshened
@@ -1495,6 +1497,16 @@ class SessionManager:
             f"Run 'cswap --switch-to {account_num}' so cswap treats it as the "
             f"active account, then start claude normally."
         )
+
+    def _slot_has_default_refresh_grant(self, account_num: str, email: str) -> bool:
+        """Keep default-login exclusion unless the slot is a readable setup-token."""
+        credentials, unreadable = self.switcher._read_account_credentials_ex(account_num, email)
+        if unreadable:
+            return True
+        from claude_swap import oauth
+
+        token = oauth.extract_oauth_data(credentials or "") or {}
+        return not (token.get("accessToken") and not token.get("refreshToken"))
 
     @staticmethod
     def _has_refresh_token(creds: str) -> bool:

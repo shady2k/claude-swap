@@ -156,6 +156,27 @@ def _serve():
             records["https"].append([self.command, path])
             _send_json(self)
 
+        def do_POST(self):
+            path = self.path.partition("?")[0]
+            records["https"].append([self.command, path])
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if path == REFRESH and payload.get("refresh_token") == "synthetic-refresh":
+                _send_json(self, {
+                    "access_token": "synthetic-rotated", "expires_in": 3600,
+                    "refresh_token": "synthetic-successor",
+                })
+            elif path == MESSAGES and self.headers.get("Authorization") == "Bearer synthetic-setup":
+                body = b"{}"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("anthropic-ratelimit-unified-5h-utilization", "0.21")
+                self.send_header("anthropic-ratelimit-unified-7d-utilization", "0.34")
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_error(400)
+
     class OriginServer(TCPServer):
         def get_request(self):
             sock, address = super().get_request()
@@ -516,13 +537,52 @@ def _run_direct(scenario: str, ca: Path) -> dict:
     return {"usage": usage, "refresh": refreshed.error or "rotated", "claude": json.loads(result.stdout)}
 
 
+def _run_f15(scenario: str, ca: Path) -> dict:
+    from claude_swap import oauth, paths
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    _configure_route(ca)
+    email = "f15@example.test"
+    backup = paths.get_backup_root()
+    assert backup.is_relative_to(Path(os.environ["CSWAP_STAND_ROOT"]))
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    ordinary = scenario == "f15_oauth_gate"
+    token = {"accessToken": "synthetic-access" if ordinary else "synthetic-setup",
+             "expiresAt": 1, "scopes": ["user:profile"] if ordinary else ["user:inference"]}
+    if ordinary:
+        token["refreshToken"] = "synthetic-refresh"
+    credentials = json.dumps({"claudeAiOauth": token})
+    switcher._write_json(switcher.sequence_file, {"accounts": {
+        "1": {"email": email, "organizationUuid": ""}}, "sequence": [1]})
+    switcher._store._write_account_credentials("1", email, credentials)
+    snapshot = switcher.credential_snapshot("1", email)
+    if ordinary:
+        result = switcher.consume_backup_grant("1", email, snapshot)
+        assert result.error is None, result.error
+        assert oauth.extract_oauth_data(result.credentials)["refreshToken"] == "synthetic-successor"
+    else:
+        result = oauth.try_fetch_usage_for_account(
+            "1", email, snapshot, False, refresh_via=switcher.consume_backup_grant,
+            header_probe=scenario == "f15_setup_probe",
+        )
+        assert result.error == ("setup-token" if scenario == "f15_setup_default" else None)
+    stored = switcher._read_account_credentials("1", email)
+    assert (stored == credentials) == (not ordinary)
+    if ordinary:
+        assert oauth.extract_oauth_data(stored)["refreshToken"] == "synthetic-successor"
+    return {"unchanged": stored == credentials}
+
+
 def _client_worker(scenario: str) -> int:
     from tests.stand_linux import DIRECT_SCENARIOS
 
     _check_stand()
     ca = Path(sys.stdin.readline().strip())
     response = None
-    if scenario == "positive":
+    if scenario.startswith("f15_"):
+        response = _run_f15(scenario, ca)
+    elif scenario == "positive":
         _configure_route(ca)
         response = _https_probe()
     elif scenario == "cli_positive":

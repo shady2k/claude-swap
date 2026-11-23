@@ -28,6 +28,8 @@ _REQUIRED_CONTROLS = {
     "tests/test_stand_shim_linux.py::test_f34_explicit_direct_routes[direct_success]",
     "tests/test_stand_shim_linux.py::test_f34_explicit_direct_routes[direct_refused]",
     "tests/test_stand_shim_linux.py::test_path_shim_trace_detects_external_attempt",
+    *(f"tests/test_stand_mock_linux.py::test_f15_refresh_and_explicit_probe_routes[{scenario}-requests{index}]"
+      for index, scenario in enumerate(("f15_setup_default", "f15_setup_probe", "f15_oauth_gate"))),
 }
 
 

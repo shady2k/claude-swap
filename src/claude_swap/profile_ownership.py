@@ -307,6 +307,19 @@ def check_admission_locked(backup_dir: Path, account_num: str, session_dir: Path
 def reserve_locked(
     backup_dir: Path, account_num: str, session_dir: Path, *, warming: bool = False,
 ) -> dict:
+    from claude_swap.refresh_authority import ensure_identity_idle
+
+    try:
+        sequence = json.loads((backup_dir / "sequence.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        sequence = {}
+    except (OSError, ValueError) as exc:
+        raise SessionError("Login identity cannot be read") from exc
+    identity = sequence.get("accounts", {}).get(str(account_num), {})
+    if identity.get("email"):
+        ensure_identity_idle(
+            backup_dir, identity["email"], identity.get("organizationUuid") or ""
+        )
     check_admission_locked(backup_dir, account_num, session_dir)
     launch_id = uuid.uuid4().hex
     data = {

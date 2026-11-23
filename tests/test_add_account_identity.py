@@ -138,7 +138,7 @@ def test_CONTROL_expired_credential_whose_refresh_fails_still_registers(
         "expiresAt": 1}})
 
     with patch.object(s, "_read_capture_credentials", return_value=EXPIRED), \
-         patch("claude_swap.oauth.refresh_oauth_credentials", return_value=None), \
+         patch("claude_swap.oauth.try_refresh_oauth_credentials", return_value=None), \
          patch("claude_swap.oauth.fetch_oauth_profile") as mock_fetch:
         s.add_account(slot=7, assume_yes=True)
 
@@ -393,7 +393,7 @@ def test_an_expired_credential_is_unresolvable_and_never_consumes_a_grant(
         "expiresAt": 1}})
 
     with patch.object(s, "_read_capture_credentials", return_value=EXPIRED), \
-         patch("claude_swap.oauth.refresh_oauth_credentials") as mock_refresh, \
+         patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
          patch("claude_swap.oauth.fetch_oauth_profile") as mock_fetch:
         s.add_account(slot=7, assume_yes=True)
 
@@ -478,7 +478,7 @@ def test_an_expired_FOREIGN_credential_registers_and_that_is_deliberate(
         "expiresAt": 1}})
 
     with patch.object(s, "_read_capture_credentials", return_value=EXPIRED_FOREIGN), \
-         patch("claude_swap.oauth.refresh_oauth_credentials") as mock_refresh, \
+         patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
          patch("claude_swap.oauth.fetch_oauth_profile") as mock_fetch:
         s.add_account(slot=7, assume_yes=True)
 
