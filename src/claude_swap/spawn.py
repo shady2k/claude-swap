@@ -312,6 +312,71 @@ def require_supervision() -> None:
         raise OSError("Profile tree supervision requires the default SIGCHLD handler")
 
 
+def _signal_descendants(signum: int) -> None:
+    """Signal a snapshot of proven descendants using Linux pidfds.
+
+    The dedicated subreaper owns every direct child. Walk each child's task
+    children list, pin its PID with a pidfd, and check its parent while both
+    pidfds still name live processes. A dead parent may cause an orphan to
+    move to us during traversal, so repeat discovery before delivery. Never
+    broadcast to a process group: descendants may have called setsid, and a
+    group can also contain processes we do not own. No numeric PID is used
+    for signal delivery, so exit and PID reuse cannot target a stranger.
+    """
+    import signal
+
+    root = os.getpid()
+    pinned = {root: os.pidfd_open(root)}
+    try:
+        while True:
+            added = False
+            for parent, parent_fd in list(pinned.items()):
+                try:
+                    children = []
+                    for task in Path(f"/proc/{parent}/task").iterdir():
+                        try:
+                            children.extend((task / "children").read_text().split())
+                        except (ProcessLookupError, FileNotFoundError):
+                            continue
+                except ProcessLookupError:
+                    continue
+                except FileNotFoundError:
+                    continue
+                for child in map(int, children):
+                    if child in pinned:
+                        continue
+                    fd = None
+                    try:
+                        fd = os.pidfd_open(child)
+                        # comm may contain spaces and parentheses; fields
+                        # after its closing parenthesis start with state, ppid.
+                        stat = Path(f"/proc/{child}/stat").read_text()
+                        ppid = int(stat.rsplit(")", 1)[1].split()[1])
+                        signal.pidfd_send_signal(fd, 0)
+                        signal.pidfd_send_signal(parent_fd, 0)
+                        if ppid != parent:
+                            continue
+                        pinned[child] = fd
+                        fd = None
+                        added = True
+                    except (ProcessLookupError, FileNotFoundError):
+                        continue
+                    finally:
+                        if fd is not None:
+                            os.close(fd)
+            if not added:
+                break
+        for child, fd in pinned.items():
+            if child != root:
+                try:
+                    signal.pidfd_send_signal(fd, signum)
+                except ProcessLookupError:
+                    pass
+    finally:
+        for fd in pinned.values():
+            os.close(fd)
+
+
 def supervise(handoff) -> int:
     """Run a terminal handoff and return only after every descendant exits.
 
@@ -332,23 +397,16 @@ def supervise(handoff) -> int:
     # PR_SET_CHILD_SUBREAPER. Set before forking, so even an immediate orphan
     # is adopted by this supervisor rather than escaping to init.
     if prctl(36, 1, 0, 0, 0) != 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error))
-    forwarded = (signal.SIGTERM, signal.SIGHUP)
-    # Prevent TERM/HUP from killing the supervisor between fork and handler
-    # installation. The child deliberately unblocks these before exec.
+        # The checked dedicated launcher has not forked; the tree is empty.
+        return 127
+    forwarded = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    # Block forwarding signals across fork and handler installation. The
+    # child deliberately unblocks these before exec.
     old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, forwarded)
     old_handlers = {}
-    leader_alive = True
-    pid = None
 
     def forward(signum, frame):
-        if not leader_alive or pid is None:
-            return
-        try:
-            os.kill(pid, signum)
-        except ProcessLookupError:
-            pass
+        _signal_descendants(signum)
 
     try:
         try:
@@ -366,10 +424,9 @@ def supervise(handoff) -> int:
                 os._exit(127)
             os._exit(127)
 
-        # Terminal INT/QUIT reach the child directly. TERM/HUP addressed to
-        # the supervisor must reach the child without abandoning reaping.
-        for sig in (signal.SIGINT, signal.SIGQUIT):
-            old_handlers[sig] = signal.signal(sig, signal.SIG_IGN)
+        # QUIT reaches terminal children directly. INT/TERM/HUP also reach
+        # detached descendants, including after the leader has been reaped.
+        old_handlers[signal.SIGQUIT] = signal.signal(signal.SIGQUIT, signal.SIG_IGN)
         for sig in forwarded:
             old_handlers[sig] = signal.signal(sig, forward)
         signal.pthread_sigmask(signal.SIG_UNBLOCK, forwarded)
@@ -384,7 +441,6 @@ def supervise(handoff) -> int:
                     raise OSError("Profile leader completion could not be observed")
                 return result
             if reaped == pid:
-                leader_alive = False
                 result = os.waitstatus_to_exitcode(status)
                 if result < 0:
                     result = 128 - result
