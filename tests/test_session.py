@@ -211,6 +211,14 @@ def _stub_claude_resolution(monkeypatch):
     monkeypatch.setattr(session_mod.real_claude, "resolve", lambda **kwargs: _ClaudeStub())
 
 
+@pytest.fixture(autouse=True)
+def _admitted_unit_launch(request, monkeypatch):
+    """Ordinary session unit tests exercise the implementation after admission."""
+    if request.node.name.startswith("test_unadmitted"):
+        return
+    monkeypatch.setattr(SessionManager, "_admit_profile_launch", staticmethod(lambda args: None))
+
+
 @pytest.fixture
 def manager(seeded_switcher) -> SessionManager:
     return SessionManager(seeded_switcher)
@@ -705,14 +713,14 @@ class TestBootstrap:
         self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates,
         legacy_location: bool,
     ):
-        """A second `cswap run` joining a live session must not invalidate
-        under the running claude; the marker survives for later."""
+        """A refused second launch leaves the live credential and stale marker alone."""
         session_dir, _, _ = manager.setup_session("2", share=False)
         (session_dir / ".credentials.json").write_text("live lineage")
         _mark_stale(session_dir, legacy_location)
         make_live(session_dir)
 
-        manager.setup_session("2", share=False)
+        with pytest.raises(SessionError, match="busy"):
+            manager.setup_session("2", share=False)
 
         assert (session_dir / ".credentials.json").read_text() == "live lineage"
         assert session_mod.is_session_stale(session_dir)
@@ -1969,7 +1977,7 @@ class TestGuards:
         assert block_real_keychain.get_password(service, account) is None
         assert not seeded_switcher.backup_dir.exists()
 
-    def test_switch_warns_on_live_target_but_completes(
+    def test_switch_refuses_live_target(
         self, seeded_switcher, monkeypatch, capsys
     ):
         session_dir = session_dir_for(
@@ -1980,12 +1988,11 @@ class TestGuards:
         monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
         monkeypatch.setattr(seeded_switcher, "list_accounts", lambda **kw: None)
 
-        seeded_switcher._perform_switch(ACCOUNT_NUM)
+        with pytest.raises(SessionError, match="busy"):
+            seeded_switcher._perform_switch(ACCOUNT_NUM)
 
-        out = capsys.readouterr().out
-        assert "live session-mode" in out
         data = seeded_switcher._get_sequence_data()
-        assert data["activeAccountNumber"] == int(ACCOUNT_NUM)
+        assert data["activeAccountNumber"] == 1
 
     def test_switch_refuses_live_target_whose_profile_is_ahead(
         self, seeded_switcher, monkeypatch
@@ -2001,7 +2008,7 @@ class TestGuards:
         make_live(session_dir)
         monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
 
-        with pytest.raises(SwitchError, match="rotated past the stored backup"):
+        with pytest.raises(SessionError, match="busy"):
             seeded_switcher._perform_switch(ACCOUNT_NUM)
 
         data = seeded_switcher._get_sequence_data()
@@ -4413,13 +4420,8 @@ class TestShareHistoryIsTheDefault:
         make_live(session_dir)
         capsys.readouterr()
 
-        with pytest.raises(_ExecCalled) as exc:
+        with pytest.raises(SessionError, match="busy"):
             manager.run("2", [])
-
-        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
-        out = capsys.readouterr().out
-        assert out.count("keeps its own") == 1
-        assert "then relaunch:  cswap run 2\n" in out
         assert (
             session_dir / "projects" / "-home-user-app" / "bbb.jsonl"
         ).read_text() == "profile-b\n"
@@ -4437,10 +4439,8 @@ class TestShareHistoryIsTheDefault:
                 raise PermissionError("read-only file system")
 
         monkeypatch.setattr(session_mod, "FileLock", Unopenable)
-        with pytest.raises(_ExecCalled):
+        with pytest.raises(PermissionError, match="read-only"):
             manager.run("2", [])
-
-        assert "could not be locked" in capsys.readouterr().out
         assert not (session_dir / "projects").is_symlink()
 
     def test_a_partial_sync_leaves_the_rest_of_the_manifest_alone(
@@ -5594,3 +5594,69 @@ class TestDefaultLoginSignedOut:
         monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
 
         assert manager._default_login_signed_out() is True
+
+
+@pytest.mark.parametrize("args", [[], ["--unknown-form"]])
+def test_unadmitted_run_stops_before_profile_reuse(manager, monkeypatch, args):
+    monkeypatch.setattr(session_mod.test_mode, "active", lambda: False)
+    touched = []
+    monkeypatch.setattr(manager, "_is_session_valid", lambda *a, **kw: touched.append("reuse") or True)
+    monkeypatch.setattr(manager, "_exec", lambda *a, **kw: touched.append("exec"))
+    with pytest.raises(SessionError, match="admitted|invocation"):
+        manager.run(ACCOUNT_NUM, args)
+    assert touched == []
+
+
+def test_unadmitted_setup_stops_before_profile_reuse(manager, monkeypatch):
+    monkeypatch.setattr(session_mod.test_mode, "active", lambda: False)
+    touched = []
+    monkeypatch.setattr(manager, "_is_session_valid", lambda *a, **kw: touched.append("reuse") or True)
+    with pytest.raises(SessionError, match="admitted"):
+        manager.setup_session(ACCOUNT_NUM, False)
+    assert touched == []
+
+
+@pytest.mark.parametrize("method", ["run", "setup_session"])
+def test_profile_reservation_precedes_reuse(manager, monkeypatch, method):
+    from contextlib import contextmanager
+    from claude_swap import profile_ownership
+
+    entered = []
+    def blocked(*args, **kwargs):
+        entered.append("reserve")
+        raise SessionError("profile reserved")
+    monkeypatch.setattr(profile_ownership, "reserve_locked", blocked)
+    monkeypatch.setattr(manager, "_is_session_valid", lambda *a, **kw: pytest.fail("reuse before reserve"))
+    with pytest.raises(SessionError, match="reserved"):
+        if method == "run":
+            manager.run(ACCOUNT_NUM, [])
+        else:
+            manager.setup_session(ACCOUNT_NUM, False)
+    assert entered == ["reserve"]
+
+
+def test_run_keeps_reservation_across_setup_to_exec(manager, monkeypatch):
+    from claude_swap import profile_ownership
+
+    def prepared(*args, **kwargs):
+        record = manager._launch_reservation
+        with profile_ownership.ownership_lock(manager.switcher.backup_dir):
+            assert profile_ownership.profile_busy_locked(manager.switcher.backup_dir, ACCOUNT_NUM)
+        return session_dir_for(manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL), ACCOUNT_NUM, ACCOUNT_EMAIL
+
+    def handoff(*args, **kwargs):
+        with profile_ownership.ownership_lock(manager.switcher.backup_dir):
+            assert profile_ownership.profile_busy_locked(manager.switcher.backup_dir, ACCOUNT_NUM)
+            with pytest.raises(SessionError, match="busy"):
+                profile_ownership.reserve_locked(
+                    manager.switcher.backup_dir, ACCOUNT_NUM,
+                    session_dir_for(manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL),
+                )
+        raise OSError("handoff failed")
+
+    monkeypatch.setattr(manager, "setup_session", prepared)
+    monkeypatch.setattr(manager, "_exec", handoff)
+    with pytest.raises(OSError, match="handoff failed"):
+        manager.run(ACCOUNT_NUM, [])
+    with profile_ownership.ownership_lock(manager.switcher.backup_dir):
+        assert not profile_ownership.profile_busy_locked(manager.switcher.backup_dir, ACCOUNT_NUM)

@@ -206,3 +206,20 @@ def test_disable_does_not_delete_replaced_launcher(installed):
     with pytest.raises(transparent.ConfigError, match="installed shim"):
         transparent.disable(root)
     assert launcher.read_bytes() == b"someone else's file"
+
+
+def test_busy_profile_rejects_second_transparent_launch(installed):
+    import select
+
+    root, _, _ = installed
+    transparent.enable(root, accept_shared_history=True, pool=["1"])
+    with subprocess.Popen(["claude", "-p", "wait for signal"], stdout=subprocess.PIPE) as child:
+        try:
+            assert select.select([child.stdout], [], [], 10)[0]
+            assert child.stdout.readline() == b"ready\n"
+            result = invoke("-p", "second launch")
+            assert result.returncode in (3, 4)
+            assert b"busy" in result.stderr.lower() or b"reserved" in result.stderr.lower()
+        finally:
+            child.send_signal(signal.SIGTERM)
+            child.communicate(timeout=10)

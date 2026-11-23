@@ -64,6 +64,7 @@ Everything lives under the backup root (its location per platform is in the [REA
 | `autoswitch_state.json` | `autoswitch.py` | Cooldown and quarantined accounts |
 | `mappings.json` | `mappings.py` | Directory to account |
 | `sessions/<num>-<email>/` | `session.py` | One Claude Code profile per account |
+| `profile-ownership/` | `profile_ownership.py` | External launch reservations and profile generations; never removed with a profile |
 
 ## Flows that cross modules
 
@@ -119,7 +120,7 @@ Read next: the module docstring of `autoswitch.py`. The rules as users see them 
 
 ## Rules that hold everywhere
 
-- **Lock order.** cswap's lock, then Claude Code's credential lock, then its config lock. Never the other way round.
+- **Lock order.** Profile ownership state lock, then cswap's lock, then Claude Code's credential lock, then its config lock. Ownership checks at mutation and publication require state before cswap. Never the other way round.
 - **No network under a lock.** A switch does only local I/O under its locks, and the usage store never holds its lock across a fetch. The single deliberate exception is the token refresh described above.
 - **A used refresh token's successor is never dropped.** Once the refresh is posted, the new credential is persisted or stashed, whatever else fails.
 - **A live credential enters a slot only when it is known to belong there.** Writing another account's credential into a slot destroys that slot's only refresh token.

@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from claude_swap import __version__, claude_forms, fsguard, launch_policy, paths, real_claude, test_mode
+from claude_swap import __version__, claude_forms, fsguard, launch_policy, paths, profile_ownership, real_claude, test_mode
 from claude_swap.exceptions import ClaudeSwitchError, ConfigError
 from claude_swap.fsutil import atomic_write_bytes, make_dir_link
 from claude_swap.locking import FileLock
@@ -343,6 +343,7 @@ class _Launch:
     recipient: _Recipient | None = None
     profile: Path | None = None
     outside_reason: str | None = None
+    reservation: dict | None = None
 
 
 def _profile_dir(root: Path, recipient: _Recipient, history: Path) -> Path:
@@ -435,23 +436,42 @@ def _prepare_launch(
             history = launch_policy.archive()
         # Unsafe history links are a configuration error, not a reason to
         # continue on a profile whose history would be different.
+        from claude_swap.session import session_dir_for
+        profile = session_dir_for(root, recipient.slot, recipient.identity[0])
+        record = None
         try:
+            with profile_ownership.ownership_lock(root), FileLock(paths.account_lock_path(root)):
+                current = launch_policy.accounts(root)
+                if _recipient(slot, current, members) != recipient:
+                    raise ConfigError("Recipient changed before reservation")
+                record = profile_ownership.reserve_locked(root, slot, profile)
             profile = _profile_dir(root, recipient, history)
+            test_mode.check_launch(args, profile, backup_root=root, binary=real)
+            child_args, child_env = _test_layer(directory, args, env)
+            child_env["CLAUDE_CONFIG_DIR"] = child_env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(profile)
+            if not history.exists():
+                launch_policy.archive(create=True)
+            return _Launch(real, child_args, child_env, recipient, profile, reservation=record)
         except _UnpreparedProfile as exc:
             failures.append(f"{label}: {exc}; resets unknown")
-            continue
-        test_mode.check_launch(args, profile, backup_root=root, binary=real)
-        args, env = _test_layer(directory, args, env)
-        env["CLAUDE_CONFIG_DIR"] = env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(profile)
-        if not history.exists():
-            launch_policy.archive(create=True)
-        return _Launch(real, args, env, recipient, profile)
+        finally:
+            if record is not None and sys.exc_info()[0] is not None:
+                with profile_ownership.ownership_lock(root):
+                    profile_ownership.release_locked(root, record["launchId"])
+        if record is not None:
+            with profile_ownership.ownership_lock(root):
+                profile_ownership.release_locked(root, record["launchId"])
     raise NoAvailableProfile("\n".join(failures) if failures else "No accounts in the transparent pool")
 
 
 def _publish_launch(root: Path, directory: Path, policy: dict, prepared: _Launch) -> bool:
     """Commit the selected launch while consent and the identity still match."""
-    with FileLock(paths.account_lock_path(root)), settings_lock(root):
+    with profile_ownership.ownership_lock(root), FileLock(paths.account_lock_path(root)), settings_lock(root):
+        if prepared.reservation:
+            profile_ownership.verify_reservation_locked(
+                root, prepared.reservation["launchId"],
+                expected_profile_gen=prepared.reservation["profileGen"],
+            )
         current = launch_policy.read(root)
         members = launch_policy.consent(current)
         check_transparent_history(root)
@@ -494,13 +514,43 @@ def _launch(marker: str, args: list[str], root: Path) -> None:
             check_transparent_history(root)
             accounts = launch_policy.accounts(root) if test else {}
         prepared = _prepare_launch(root, directory, marker, args, policy, accounts, test=test)
-        if _publish_launch(root, directory, policy, prepared):
-            break
+        try:
+            if _publish_launch(root, directory, policy, prepared):
+                break
+        except BaseException:
+            _release_launch(root, prepared)
+            raise
+        _release_launch(root, prepared)
     else:
         raise ConfigError("Transparent policy kept changing; retry the launch")
     if prepared.outside_reason:
         print(f"claude-swap: {_OUTSIDE}: {prepared.outside_reason}", file=sys.stderr)
-    prepared.real.handoff(prepared.args, prepared.env, job=True)
+    try:
+        if prepared.reservation:
+            with profile_ownership.ownership_lock(root), FileLock(paths.account_lock_path(root)), settings_lock(root):
+                current = launch_policy.read(root)
+                if current != policy or _recipient(
+                    prepared.recipient.slot, launch_policy.accounts(root),
+                    launch_policy.consent(current),
+                ) != prepared.recipient:
+                    raise ConfigError("Launch policy or recipient changed before handoff")
+                profile_ownership.mark_running_locked(
+                    root, prepared.reservation["launchId"], os.getpid(),
+                    expected_profile_gen=prepared.reservation["profileGen"],
+                )
+        prepared.real.handoff(prepared.args, prepared.env, job=True)
+    finally:
+        # POSIX exec keeps the same PID and never returns. Windows waits for
+        # the contained child, so its reservation survives until child exit.
+        _release_launch(root, prepared)
+
+
+def _release_launch(root: Path, prepared: _Launch) -> None:
+    if prepared.reservation:
+        with profile_ownership.ownership_lock(root):
+            current = profile_ownership.verify_reservation_locked(root, prepared.reservation["launchId"])
+            if current["state"] == "reserved":
+                profile_ownership.release_locked(root, prepared.reservation["launchId"])
 
 
 def main() -> None:

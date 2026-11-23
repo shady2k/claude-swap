@@ -1177,6 +1177,18 @@ class ClaudeAccountSwitcher:
         ]
         return sorted(rows, key=lambda r: int(r[0]))
 
+    def _ensure_profile_idle_locked(self, account_num: str, email: str) -> None:
+        """Refuse mutation of a reserved or live profile under ownership lock."""
+        from claude_swap.profile_ownership import profile_busy_locked
+
+        if profile_busy_locked(
+            self.backup_dir, account_num, self._session_dir(account_num, email)
+        ):
+            raise SessionError(
+                f"Account-{account_num} ({email}) has a busy profile. "
+                "Exit its Claude instance or wait for its launch to finish, then retry."
+            )
+
     def swap_accounts(self, first: str, second: str) -> tuple[str, str]:
         """Exchange two accounts' slot numbers (list order / numeric targets).
 
@@ -1210,7 +1222,9 @@ class ClaudeAccountSwitcher:
         # refresh persist (which take the same lock) can never interleave
         # with the relocation.
         self._refuse_session_shell()
-        with FileLock(self.lock_file):
+        from claude_swap.profile_ownership import ownership_lock
+
+        with ownership_lock(self.backup_dir), FileLock(self.lock_file):
             return self._swap_accounts_locked(first, second)
 
     def _read_backup_or_abort(self, account_num: str, email: str) -> str:
@@ -1259,6 +1273,8 @@ class ClaudeAccountSwitcher:
 
         email_a = record_a.get("email", "")
         email_b = record_b.get("email", "")
+        self._ensure_profile_idle_locked(num_a, email_a)
+        self._ensure_profile_idle_locked(num_b, email_b)
 
         # Backups and session profiles are keyed by (slot, email); relocating
         # them under a live session-mode claude would pull state out from
@@ -1660,7 +1676,9 @@ class ClaudeAccountSwitcher:
         # the mutation (via the *_locked helpers — FileLock is non-reentrant):
         # a slot number resolved outside the lock could be renumbered by a
         # concurrent swap/move and end up moving the wrong account.
-        with FileLock(self.lock_file):
+        from claude_swap.profile_ownership import ownership_lock
+
+        with ownership_lock(self.backup_dir), FileLock(self.lock_file):
             self._get_sequence_data_migrated()
 
             num_src = self._resolve_account_identifier(account)
@@ -1720,6 +1738,8 @@ class ClaudeAccountSwitcher:
                 f"Slot {target} is already occupied — retry the move"
             )
         email = record.get("email", "")
+        self._ensure_profile_idle_locked(num_src, email)
+        self._ensure_profile_idle_locked(target, email)
 
         # Relocating backups/session under a live session-mode claude would
         # pull state out from under a running process.
@@ -4738,18 +4758,27 @@ class ClaudeAccountSwitcher:
                 print(dimmed("Cancelled"))
                 return
 
-        # Remove backup files
-        self._delete_account_files(account_num, email)
+        from claude_swap.profile_ownership import ownership_lock
 
-        # Update sequence.json
-        del data["accounts"][account_num]
-        data["sequence"] = [n for n in data["sequence"] if n != int(account_num)]
-        data["lastUpdated"] = get_timestamp()
+        with ownership_lock(self.backup_dir), FileLock(self.lock_file):
+            # Confirmation can take arbitrarily long; resolve and validate again
+            # under both locks before deleting any slot material.
+            data = self._get_sequence_data() or {}
+            current_num = self._resolve_account_identifier(identifier)
+            if current_num != account_num or data.get("accounts", {}).get(account_num) != account_info:
+                raise ValidationError("Account changed during confirmation; retry removal")
+            self._ensure_profile_idle_locked(account_num, email)
+            # Remove backup files
+            self._delete_account_files(account_num, email)
 
-        self._write_json(self.sequence_file, data)
-        self._logger.info(f"Removed account {account_num}: {email}")
-        print(f"{accent('Removed')} Account-{account_num} ({email})")
+            # Update sequence.json
+            del data["accounts"][account_num]
+            data["sequence"] = [n for n in data["sequence"] if n != int(account_num)]
+            data["lastUpdated"] = get_timestamp()
 
+            self._write_json(self.sequence_file, data)
+            self._logger.info(f"Removed account {account_num}: {email}")
+            print(f"{accent('Removed')} Account-{account_num} ({email})")
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
 
     def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str, str]]:
@@ -7703,6 +7732,14 @@ class ClaudeAccountSwitcher:
         pre_data = self._get_sequence_data() or {}
         pre_account = pre_data.get("accounts", {}).get(target_account, {})
         pre_email = pre_account.get("email", "")
+        from claude_swap.profile_ownership import ownership_lock
+
+        with ownership_lock(self.backup_dir), FileLock(self.lock_file):
+            check_data = self._get_sequence_data() or {}
+            for number in {target_account, str(check_data.get("activeAccountNumber"))}:
+                record = check_data.get("accounts", {}).get(number)
+                if record:
+                    self._ensure_profile_idle_locked(number, record.get("email", ""))
         if pre_email:
             pre_org = pre_account.get("organizationUuid", "") or ""
             sessions, unreadable = scan_live_sessions(
@@ -7741,9 +7778,11 @@ class ClaudeAccountSwitcher:
                     else:
                         warnings_out.append(msg)
             else:
-                adopted = self._adopt_session_credential(
-                    target_account, pre_email, pre_org
-                )
+                with ownership_lock(self.backup_dir), FileLock(self.lock_file):
+                    self._ensure_profile_idle_locked(target_account, pre_email)
+                    adopted = self._adopt_session_credential_locked(
+                        target_account, pre_email, pre_org
+                    )
                 if adopted is None and self._session_profile_ahead(
                     target_account, pre_email, pre_org
                 ):
@@ -7785,7 +7824,7 @@ class ClaudeAccountSwitcher:
         # ~/.claude.json.lock likewise keeps the oauthAccount splice from
         # interleaving with Claude Code's own config writes. Everything under
         # here is local I/O — no network while locks are held.
-        with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+        with ownership_lock(self.backup_dir), FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None
@@ -7797,6 +7836,11 @@ class ClaudeAccountSwitcher:
                 current_account = self._find_account_slot(
                     data, current_email, current_org_uuid
                 )
+
+            for number in {target_account, current_account, str(active_account)}:
+                record = data.get("accounts", {}).get(number)
+                if record:
+                    self._ensure_profile_idle_locked(number, record.get("email", ""))
 
             config_path = self._get_claude_config_path()
 

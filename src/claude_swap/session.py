@@ -57,11 +57,12 @@ import subprocess
 import sys
 import time
 import unicodedata
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from claude_swap import macos_keychain, real_claude, test_mode
+from claude_swap import claude_forms, macos_keychain, profile_ownership, real_claude, test_mode
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
@@ -750,6 +751,38 @@ class SessionManager:
     # -- launch ----------------------------------------------------------
 
     def run(
+        self, identifier: str, claude_args: list[str], share: bool = True,
+        share_history: bool | None = None, require_session: bool = False,
+        *, binary: real_claude.RealClaude | None = None,
+    ) -> NoReturn:
+        self._admit_profile_launch(claude_args)
+        with self._reserve_profile(identifier):
+            self._run_reserved(identifier, claude_args, share, share_history,
+                               require_session, binary=binary)
+
+    @contextmanager
+    def _reserve_profile(self, identifier: str):
+        if getattr(self, "_launch_reservation", None) is not None:
+            yield self._launch_reservation
+            return
+        root = self.switcher.backup_dir
+        num, email, org = self.switcher.resolve_account(identifier)
+        profile = session_dir_for(root, num, email)
+        with profile_ownership.ownership_lock(root), FileLock(self.switcher.lock_file):
+            if self.switcher.resolve_account(identifier) != (num, email, org):
+                raise SessionError("Account identity changed before profile reservation")
+            record = profile_ownership.reserve_locked(root, num, profile, warming=True)
+        self._launch_reservation = record
+        try:
+            yield record
+        finally:
+            self._launch_reservation = None
+            with profile_ownership.ownership_lock(root):
+                current = profile_ownership.verify_reservation_locked(root, record["launchId"])
+                if current["state"] == "reserved":
+                    profile_ownership.release_locked(root, record["launchId"])
+
+    def _run_reserved(
         self,
         identifier: str,
         claude_args: list[str],
@@ -773,6 +806,7 @@ class SessionManager:
         Notices on the way are printed plainly. `cswap run` sends them to
         stderr, because stdout is claude's (``cli._run_launch``).
         """
+        self._admit_profile_launch(claude_args)
         backup_root = self.switcher.backup_dir
         if test_mode.active():
             binary = test_mode.check_launch(
@@ -1027,10 +1061,35 @@ class SessionManager:
                 backup_root=self.switcher.backup_dir, binary=claude_bin,
             )
             claude_args, env = test_mode.pinned_launch(claude_args, env)
+        record = getattr(self, "_launch_reservation", None)
+        if record is not None:
+            with profile_ownership.ownership_lock(self.switcher.backup_dir), FileLock(self.switcher.lock_file):
+                num, email, _ = self.switcher.resolve_account(record["accountNum"])
+                if str(session_dir_for(self.switcher.backup_dir, num, email).resolve()) != record["profile"]:
+                    raise SessionError("Account identity changed before handoff")
+                if self.switcher._get_current_account() == self.switcher.resolve_account(num)[1:]:
+                    raise SessionError("Selected account became the default login before handoff")
+                profile_ownership.mark_running_locked(
+                    self.switcher.backup_dir, record["launchId"], os.getpid(),
+                    expected_profile_gen=record["profileGen"],
+                )
         try:
             claude_bin.handoff(claude_args, env)
         except OSError as exc:
             raise real_claude.ResolveError(f"Could not launch {claude_bin.path}: {exc}") from exc
+
+    @staticmethod
+    def _admit_profile_launch(args: list[str]) -> None:
+        """Reject unknown forms and builds before touching a stored profile.
+
+        Production builds have no admission evidence yet. Only the synthetic
+        test stand has a pinned build and routing contract.
+        """
+        form = claude_forms.classify(args)
+        if form.error or form.bypass_reason:
+            raise SessionError(f"Unsupported profile invocation: {form.error or form.bypass_reason}")
+        if not test_mode.active():
+            raise SessionError("No Claude build admitted for profile routing; use claude directly")
 
     def _ensure_not_api_key(self, account_num: str, email: str) -> None:
         """Reject API-key accounts in session mode (not supported yet).
@@ -1052,11 +1111,25 @@ class SessionManager:
         self, identifier: str, share: bool, share_history: bool | None = None,
         *, binary: real_claude.RealClaude | None = None,
     ) -> tuple[Path, str, str]:
+        """Prepare only; ``run`` keeps its outer reservation through handoff.
+
+        Calling this method alone does not authorize a later launch. Call
+        ``run`` to keep preparation and process handoff in one reservation.
+        """
+        self._admit_profile_launch([])
+        with self._reserve_profile(identifier):
+            return self._setup_reserved(identifier, share, share_history, binary=binary)
+
+    def _setup_reserved(
+        self, identifier: str, share: bool, share_history: bool | None = None,
+        *, binary: real_claude.RealClaude | None = None,
+    ) -> tuple[Path, str, str]:
         """Ensure a valid session profile exists; returns (dir, num, email).
 
         ``share_history`` is read like ``run``'s: ``None`` means
         ``run.shareHistory`` decides.
         """
+        self._admit_profile_launch([])
         share_history = self._resolve_share_history(share_history)
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Defense-in-depth: also guard here (run() guards before its fast path).
@@ -1076,9 +1149,20 @@ class SessionManager:
         # under the running claude (the marker survives for later).
         stale = is_session_stale(session_dir) and profile_is_quiescent(session_dir)
 
-        # Cheap reuse check without the lock: most launches hit this.
+        # The logical reservation excludes peers while the local auth probe
+        # runs without a physical account lock.
         if not stale and self._is_session_valid(session_dir, email, org_uuid, binary=binary):
-            self._sync_sharing(session_dir, share, share_history)
+            with profile_ownership.ownership_lock(self.switcher.backup_dir), FileLock(self.switcher.lock_file):
+                record = self._launch_reservation
+                profile_ownership.verify_reservation_locked(
+                    self.switcher.backup_dir, record["launchId"],
+                    expected_profile_gen=record["profileGen"],
+                )
+                if self.switcher.resolve_account(identifier) != (account_num, email, org_uuid):
+                    raise SessionError("Account identity changed before profile reuse")
+                if self.switcher._get_current_account() == (email, org_uuid):
+                    raise SessionError("Selected account became the default login before profile reuse")
+                self._sync_sharing(session_dir, share, share_history)
             return session_dir, account_num, email
 
         # One refresh so the profile starts with a fresh access token —
@@ -1090,6 +1174,16 @@ class SessionManager:
         # valid, and claude refreshes on its own at runtime. Setup-token
         # accounts (--add-token) have no refresh token by design — skip
         # silently instead of warning about a flow that can't happen.
+        with profile_ownership.ownership_lock(self.switcher.backup_dir), FileLock(self.switcher.lock_file):
+            record = self._launch_reservation
+            profile_ownership.verify_reservation_locked(
+                self.switcher.backup_dir, record["launchId"],
+                expected_profile_gen=record["profileGen"],
+            )
+            if self.switcher.resolve_account(identifier) != (account_num, email, org_uuid):
+                raise SessionError("Account identity changed before credential preparation")
+            if self.switcher._get_current_account() == (email, org_uuid):
+                raise self._live_login_error(account_num)
         pre_creds = self.switcher.read_account_credentials(account_num, email)
         if pre_creds and self._has_refresh_token(pre_creds):
             outcome = self.switcher.consume_backup_grant(
@@ -1155,7 +1249,16 @@ class SessionManager:
                     "continuing with the stored credentials."
                 )
 
-        with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+        with profile_ownership.ownership_lock(self.switcher.backup_dir), FileLock(
+            self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT
+        ):
+            record = self._launch_reservation
+            profile_ownership.verify_reservation_locked(
+                self.switcher.backup_dir, record["launchId"],
+                expected_profile_gen=record["profileGen"],
+            )
+            if self.switcher.resolve_account(identifier) != (account_num, email, org_uuid):
+                raise SessionError("Account identity changed during profile preparation")
             # Re-evaluate the marker under the lock, then re-check validity:
             # another `cswap run` may have bootstrapped while we waited.
             if is_session_stale(session_dir) and profile_is_quiescent(session_dir):
@@ -1186,10 +1289,16 @@ class SessionManager:
                     session_dir, account_num, email
                 ) and profile_is_quiescent(session_dir):
                     self._bootstrap(session_dir, account_num, email, org_uuid)
+                    record["profileGen"] = profile_ownership.advance_generation_locked(
+                        self.switcher.backup_dir, record["launchId"]
+                    )
                 self._sync_sharing(session_dir, share, share_history)
                 return session_dir, account_num, email
 
             self._bootstrap(session_dir, account_num, email, org_uuid)
+            record["profileGen"] = profile_ownership.advance_generation_locked(
+                self.switcher.backup_dir, record["launchId"]
+            )
             self._sync_sharing(session_dir, share, share_history)
 
             verdict = self._session_validity(session_dir, email, org_uuid, binary=binary)

@@ -142,7 +142,7 @@ The exact rules (margins, landing, polling cadence, tier handling) are in [docs/
 
 ### Run multiple accounts at the same time (session mode)
 
-Launch Claude Code as a specific account in the current terminal only — every other terminal and the VS Code extension stay on your default account, so two accounts can work in parallel.
+Launch Claude Code as a specific account in the current terminal only — every other terminal and the VS Code extension stay on your default account, so two accounts can work in parallel. Explicit account launches currently fail closed without build admission; see [profile ownership restrictions](docs/transparent.md#profile-ownership).
 
 ```bash
 cswap run 2                     # launch Claude Code as account 2, here only

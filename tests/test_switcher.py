@@ -14325,3 +14325,179 @@ class TestSalvageCopyMode:
         assert salvage.read_bytes() == config_path.read_bytes()
         assert salvage.stat().st_mode & 0o777 == 0o600
         assert not list(temp_home.glob("*.tmp"))
+
+
+class TestProfileOwnershipMutationGuards:
+    @pytest.mark.parametrize("operation,busy_slot", [
+        ("swap", "1"), ("swap", "2"), ("move", "1"),
+        ("move_occupied", "2"), ("remove", "1"),
+        ("switch", "1"), ("switch", "2"),
+    ])
+    def test_busy_slot_refuses_without_mutation(
+        self, temp_home, sample_sequence_data, monkeypatch, operation, busy_slot
+    ):
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        sample_sequence_data["accounts"][busy_slot]["disabled"] = True
+        for account in sample_sequence_data["accounts"].values():
+            account["organizationUuid"] = ""
+            account["organizationName"] = ""
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        before = switcher.sequence_file.read_bytes()
+        ownership = SimpleNamespace(
+            ownership_lock=lambda root: nullcontext(),
+            profile_busy_locked=lambda root, num, session_dir=None: num == busy_slot,
+        )
+        monkeypatch.setitem(sys.modules, "claude_swap.profile_ownership", ownership)
+        monkeypatch.setattr(switcher, "_prefetch_live_identity", lambda: {})
+        monkeypatch.setattr(switcher, "_get_current_account", lambda: None)
+        monkeypatch.setattr(switcher, "_read_target_credentials", lambda *a: pytest.fail("credential read before busy guard"))
+        with pytest.raises(SessionError, match="busy"):
+            if operation == "swap":
+                switcher.swap_accounts("1", "2")
+            elif operation == "move":
+                switcher.move_account("1", "3")
+            elif operation == "move_occupied":
+                switcher.move_account("1", "2")
+            elif operation == "remove":
+                switcher.remove_account("1", assume_yes=True)
+            else:
+                switcher._perform_switch("2", emit_output=False)
+        assert switcher.sequence_file.read_bytes() == before
+
+
+    def test_switch_rechecks_reservation_after_prescan(
+        self, temp_home, sample_sequence_data, monkeypatch
+    ):
+        from contextlib import contextmanager
+        from types import SimpleNamespace
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        for account in sample_sequence_data["accounts"].values():
+            account["organizationUuid"] = ""
+            account["organizationName"] = ""
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        before = switcher.sequence_file.read_bytes()
+        state = {"locks": 0, "held": False}
+
+        @contextmanager
+        def ownership_lock(root):
+            state["locks"] += 1
+            state["held"] = True
+            try:
+                yield
+            finally:
+                state["held"] = False
+
+        def busy(root, num, session_dir=None):
+            assert state["held"]
+            return state["locks"] >= 2 and num == "2"
+
+        monkeypatch.setitem(sys.modules, "claude_swap.profile_ownership", SimpleNamespace(
+            ownership_lock=ownership_lock, profile_busy_locked=busy,
+        ))
+        monkeypatch.setattr(switcher, "_prefetch_live_identity", lambda: {})
+        monkeypatch.setattr(switcher, "_get_current_account", lambda: None)
+        monkeypatch.setattr(switcher, "_read_target_credentials", lambda *a: pytest.fail("unguarded write path"))
+        with pytest.raises(SessionError, match="busy"):
+            switcher._perform_switch("2", emit_output=False)
+        assert switcher.sequence_file.read_bytes() == before
+
+
+    def test_real_reservation_after_switch_prescan_keeps_slot_unchanged(
+        self, temp_home, sample_sequence_data, monkeypatch
+    ):
+        from claude_swap.profile_ownership import ownership_lock, reserve_locked
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        for account in sample_sequence_data["accounts"].values():
+            account["organizationUuid"] = ""
+            account["organizationName"] = ""
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        email = sample_sequence_data["accounts"]["2"]["email"]
+        switcher._write_account_credentials("2", email, '{"accessToken":"fixture"}')
+        before = switcher.sequence_file.read_bytes()
+        creds_before = switcher._read_account_credentials("2", email)
+
+        def reserve_after_scan(*args):
+            with ownership_lock(switcher.backup_dir):
+                reserve_locked(switcher.backup_dir, "2", switcher._session_dir("2", email))
+            return [], 0
+
+        monkeypatch.setattr("claude_swap.session.scan_live_sessions", reserve_after_scan)
+        monkeypatch.setattr(switcher, "_get_current_account", lambda: None)
+        with pytest.raises(SessionError, match="busy"):
+            switcher._perform_switch("2", emit_output=False)
+        assert switcher.sequence_file.read_bytes() == before
+        assert switcher._read_account_credentials("2", email) == creds_before
+
+
+    @pytest.mark.parametrize("operation", ["swap", "move", "remove"])
+    def test_reservation_at_mutation_lock_keeps_slots_and_paths(
+        self, temp_home, sample_sequence_data, monkeypatch, operation
+    ):
+        from contextlib import contextmanager
+        from claude_swap import profile_ownership
+        from claude_swap.locking import FileLock as RealFileLock
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        for account in sample_sequence_data["accounts"].values():
+            account["organizationUuid"] = ""
+            account["organizationName"] = ""
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        for num, account in sample_sequence_data["accounts"].items():
+            email = account["email"]
+            switcher._write_account_credentials(num, email, json.dumps({"accessToken": f"fixture-{num}"}))
+            profile = switcher._session_dir(num, email)
+            profile.mkdir(parents=True)
+            (profile / "history.jsonl").write_text(f"fixture history {num}")
+        before = {
+            path.relative_to(switcher.backup_dir): path.read_bytes()
+            for path in switcher.backup_dir.rglob("*") if path.is_file()
+            and path.suffix != ".lock"
+        }
+        real_ownership_lock = profile_ownership.ownership_lock
+        events = []
+
+        @contextmanager
+        def barrier(root):
+            # The operation has completed its preliminary checks. Simulate a
+            # concurrent launcher winning ownership immediately before mutation.
+            with real_ownership_lock(root):
+                profile_ownership.reserve_locked(
+                    root, "1", switcher._session_dir("1", sample_sequence_data["accounts"]["1"]["email"])
+                )
+            with real_ownership_lock(root):
+                events.append("ownership")
+                try:
+                    yield
+                finally:
+                    events.append("ownership-release")
+
+        @contextmanager
+        def account_lock(path, *args, **kwargs):
+            assert events and events[-1] == "ownership"
+            events.append("account")
+            with RealFileLock(path, *args, **kwargs):
+                yield
+            events.append("account-release")
+
+        monkeypatch.setattr(profile_ownership, "ownership_lock", barrier)
+        monkeypatch.setattr("claude_swap.switcher.FileLock", account_lock)
+        with pytest.raises(SessionError, match="busy"):
+            if operation == "swap":
+                switcher.swap_accounts("1", "2")
+            elif operation == "move":
+                switcher.move_account("1", "3")
+            else:
+                switcher.remove_account("1", assume_yes=True)
+        assert events[:2] == ["ownership", "account"]
+        for relative, content in before.items():
+            assert (switcher.backup_dir / relative).read_bytes() == content
+        assert not switcher._session_dir("3", sample_sequence_data["accounts"]["1"]["email"]).exists()

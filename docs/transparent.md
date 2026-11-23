@@ -8,6 +8,24 @@ Only the isolated synthetic test route has a verified settings layer. No product
 
 The isolated Linux stand can opt into synthetic direct TLS with `CLAUDE_SWAP_TEST_DIRECT=<loopback>:<port>` and matching reserved HTTPS origins on that port. This does not admit a production Claude build or enable a production direct route.
 
+
+## Profile ownership
+
+Both explicit `cswap run ACCOUNT` and routed shim launches reserve the selected
+profile before reuse or preparation. Reservations and `profileGen` live under
+`profile-ownership/` outside the removable profile. Swap, move, remove, switch
+(including auto-switch), and replacement import refuse affected busy slots even
+when disabled or removed from the transparent pool.
+
+Explicit account launches also require build and invocation admission before
+reuse, including when the shim is disabled. No production build is admitted.
+Only the isolated synthetic Linux route can publish a running reservation.
+A running reservation is retained until its owner explicitly confirms complete
+termination; a PID disappearing is not evidence that successors have exited.
+Automatic completion/reclamation is not implemented. Consequently a published
+record remains busy after process exit, and non-Linux publication fails closed.
+These restrictions make this ownership implementation incomplete for normal use.
+
 ## Shared history consent
 
 The shim requires `run.shareHistory` and explicit consent to share the **whole** `projects/` archive with the pool's recipients. This includes history from the main login, `cswap run`, and accounts that are no longer in the pool. `--resume` and `--continue` use the same recipient policy as a fresh launch; the session's source account does not have to be a recipient.
