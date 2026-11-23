@@ -36,23 +36,84 @@ if mode == "leader":
     connection = channel(mode)
     assert connection.recv(1) == b"x"
     sys.exit(37)
-spawn.require_supervision()
+if not options:
+    spawn.require_supervision()
 root = Path(root)
-profile = root / "synthetic-profile"
-if "ownership" in options:
-    from claude_swap import profile_ownership as ownership
-    with ownership.ownership_lock(root):
-        record = ownership.reserve_locked(root, "1", profile)
-        ownership.mark_running_locked(root, record["launchId"], os.getpid())
 connection = channel("supervisor")
 assert connection.recv(1) == b"s"
+if options:
+    from types import SimpleNamespace
+    from claude_swap import session, transparent, profile_ownership as ownership, launch_policy
+    from claude_swap.switcher import ClaudeAccountSwitcher
+    from claude_swap.exceptions import ClaudeSwitchError
+
+    route, *failures = options
+    switcher = ClaudeAccountSwitcher()
+    assert switcher.backup_dir == root
+    profile = session.session_dir_for(root, "1", switcher.resolve_account("1")[1])
+    profile.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, CLAUDE_CONFIG_DIR=str(profile))
+    args = [__file__, "leader", port, str(root)]
+    binary = SimpleNamespace(
+        path=Path(sys.executable).resolve(),
+        handoff=lambda args, env, **kwargs: spawn.handoff(
+            str(Path(sys.executable).resolve()), args, env),
+    )
+    if failures:
+        import ctypes
+        kernel = spawn._windows_api()
+        def failed(*args):
+            ctypes.set_last_error(5)
+            return 0
+        kernel.QueryInformationJobObject = failed
+        spawn._windows_api = lambda: kernel
+    try:
+        if route == "session":
+            manager = session.SessionManager(switcher)
+            # The native stand supplies an admitted synthetic executable and
+            # a prepared profile; publication and cleanup stay in _exec.
+            manager._admit_profile_launch = lambda args: None
+            with manager._reserve_profile("1"):
+                manager._exec(binary, args, env)
+        else:
+            history = root / "synthetic-history"
+            history.mkdir(exist_ok=True)
+            (profile / "projects").mkdir(exist_ok=True)
+            recipient = transparent._Recipient(
+                "1", launch_policy.identity(switcher._get_sequence_data()["accounts"]["1"])
+            )
+            policy = {"enabled": True, "pool": ["1"], "historyZone": {
+                "scope": launch_policy.HISTORY_SCOPE,
+                "members": {"1": list(recipient.identity)},
+            }}
+            switcher._write_json(root / "transparent.json", policy)
+            # POSIX shim installation and shared-history validation are not
+            # supported on Windows. Supply their prepared result, retaining
+            # _launch, _publish_launch and both real storage locks.
+            launch_policy.archive = lambda **kwargs: history
+            transparent._profile_dir = lambda *args: profile
+            def prepare(*unused, **kwargs):
+                with ownership.ownership_lock(root), transparent.FileLock(switcher.lock_file):
+                    record = ownership.reserve_locked(root, "1", profile)
+                return transparent._Launch(binary, args, env, recipient, profile,
+                                           reservation=record)
+            transparent._prepare_launch = prepare
+            transparent._launch("synthetic", [], root)
+    except SystemExit as exc:
+        connection.sendall((json.dumps({"complete": exc.code}) + "\n").encode())
+        raise
+    except (ClaudeSwitchError, OSError):
+        if not failures:
+            raise
+        # Do not release or rewrite ownership here: an observation failure
+        # must leave the entrance's published record intact.
+        connection.sendall(b'{"unconfirmed": true}\n')
+        sys.exit(4)
+    raise AssertionError("internal launch returned without status")
 def launch():
     spawn.handoff(str(Path(sys.executable).resolve()),
                   [__file__, "leader", port, str(root)], dict(os.environ))
 result = spawn.supervise(launch)
-if "ownership" in options:
-    with ownership.ownership_lock(root):
-        ownership.release_locked(root, record["launchId"], confirmed_complete=True)
 connection.sendall((json.dumps({"complete": result}) + "\n").encode())
 sys.exit(result)
 """
@@ -85,7 +146,7 @@ def kernel():
 
 
 @contextmanager
-def _tree(tmp_path, kernel, *, ownership=False):
+def _tree(tmp_path, kernel, *, route=None, observer_failure=False):
     script = tmp_path / "synthetic_tree.py"
     script.write_text(_TREE, encoding="utf-8")
     connections = {}
@@ -96,7 +157,10 @@ def _tree(tmp_path, kernel, *, ownership=False):
         listener.settimeout(WAIT_SECONDS)
         process = subprocess.Popen(
             [sys.executable, str(script), "supervisor", str(listener.getsockname()[1]), str(tmp_path)]
-            + (["ownership"] if ownership else []),
+            + ([route] if route else [])
+            + (["observer-failure"] if observer_failure else []),
+            env={key: value for key, value in os.environ.items()
+                 if key != "CLAUDE_SWAP_TEST_MODE"},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True,
         )
         try:
@@ -141,8 +205,9 @@ def _tree(tmp_path, kernel, *, ownership=False):
 
 
 @pytest.mark.mock_stand_routing
+@pytest.mark.parametrize("route", ["session", "transparent"])
 def test_supervision_waits_for_job_empty_and_releases_ownership(
-    temp_home, sample_sequence_data, kernel,
+    temp_home, private_backup_root, sample_sequence_data, kernel, route,
 ):
     from claude_swap import profile_ownership as ownership
     from claude_swap.switcher import ClaudeAccountSwitcher
@@ -155,13 +220,16 @@ def test_supervision_waits_for_job_empty_and_releases_ownership(
     switcher._write_json(switcher.sequence_file, sample_sequence_data)
     before = switcher.sequence_file.read_bytes()
     tmp_path = switcher.backup_dir
-    with _tree(tmp_path, kernel, ownership=True) as (process, connections, handles):
+    with _tree(tmp_path, kernel, route=route) as (process, connections, handles):
         connections["leader"].sendall(b"x")
         assert kernel.WaitForSingleObject(handles["leader"], WAIT_SECONDS * 1000) == 0
         assert kernel.WaitForSingleObject(handles["grandchild"], 0) == 258
         assert kernel.WaitForSingleObject(handles["supervisor"], 0) == 258
         assert not select.select([connections["supervisor"]], [], [], 0.2)[0]
         with ownership.ownership_lock(tmp_path):
+            records = [json.loads(file.read_text())
+                       for file in (tmp_path / "profile-ownership").rglob("*.json")]
+            assert sum(record.get("state") == "running" for record in records) == 1
             assert ownership.profile_busy_locked(tmp_path, "1")
         with pytest.raises(ownership.SessionError, match="busy"):
             switcher.move_account("1", "3")
@@ -172,6 +240,9 @@ def test_supervision_waits_for_job_empty_and_releases_ownership(
         assert kernel.WaitForSingleObject(handles["grandchild"], 0) == 0
         with ownership.ownership_lock(tmp_path):
             assert not ownership.profile_busy_locked(tmp_path, "1")
+            records = [json.loads(file.read_text())
+                       for file in (tmp_path / "profile-ownership").rglob("*.json")]
+            assert not any(record.get("state") in ("reserved", "running") for record in records)
 
 
 def test_supervision_waits_for_job_empty(tmp_path, kernel):
@@ -368,7 +439,39 @@ def test_launch_or_observer_failure_cannot_confirm_completion(tmp_path, failure)
 
 @pytest.mark.parametrize("failure", [
     "InitializeProcThreadAttributeList", "UpdateProcThreadAttribute", "CreateProcessW",
-    "QueryInformationJobObject",
 ])
 def test_launch_or_observer_failure_keeps_ownership_busy(tmp_path, failure):
     _check_launch_or_observer_failure(tmp_path, failure, ownership=True)
+
+
+@pytest.mark.mock_stand_routing
+@pytest.mark.parametrize("route", ["session", "transparent"])
+def test_internal_launch_keeps_running_on_observer_failure(
+    temp_home, private_backup_root, sample_sequence_data, kernel, route,
+):
+    from claude_swap import profile_ownership as ownership
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    for account in sample_sequence_data["accounts"].values():
+        account["organizationUuid"] = ""
+        account["organizationName"] = ""
+    switcher._write_json(switcher.sequence_file, sample_sequence_data)
+    before = switcher.sequence_file.read_bytes()
+    root = switcher.backup_dir
+    with _tree(root, kernel, route=route, observer_failure=True) as (process, connections, handles):
+        connections["leader"].sendall(b"x")
+        assert kernel.WaitForSingleObject(handles["leader"], WAIT_SECONDS * 1000) == 0
+        assert _receive(connections["supervisor"]) == {"unconfirmed": True}
+        assert process.wait(timeout=WAIT_SECONDS) == 4
+        with ownership.ownership_lock(root):
+            records = [json.loads(file.read_text())
+                       for file in (root / "profile-ownership").rglob("*.json")]
+            running = [record for record in records if record.get("state") == "running"]
+            assert len(running) == 1
+            assert running[0]["accountNum"] == "1"
+            assert ownership.profile_busy_locked(root, "1")
+        with pytest.raises(ownership.SessionError, match="busy"):
+            switcher.move_account("1", "3")
+        assert switcher.sequence_file.read_bytes() == before

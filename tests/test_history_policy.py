@@ -139,10 +139,11 @@ def _invoke(*args):
 
 @pytest.fixture(autouse=True)
 def launch_boundary(monkeypatch):
-    """Exercise history policy independently of host process supervision.
+    """Keep in-process policy checks independent of host supervision.
 
-    Identity is synthetic; publication still runs the real ownership and
-    policy checks. Only the terminal boundary runs the no-network fake.
+    Linux _invoke runs the installed shim with native supervision. Other
+    hosts emulate that invocation; direct unit calls use synthetic identity
+    and handoff while retaining ownership and policy checks.
     """
     from contextlib import redirect_stderr, redirect_stdout
     from io import StringIO
@@ -202,8 +203,23 @@ def launch_boundary(monkeypatch):
 
     monkeypatch.setattr(transparent.spawn, "owned_launch", owned_launch)
     monkeypatch.setattr(real_claude.RealClaude, "handoff", handoff)
-    monkeypatch.setattr(sys.modules[__name__], "_invoke", invoke)
+    if sys.platform != "linux":
+        monkeypatch.setattr(sys.modules[__name__], "_invoke", invoke)
     return handoff
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux uses native shim supervision")
+def test_linux_invocation_uses_installed_shim(monkeypatch):
+    calls = []
+    result = subprocess.CompletedProcess(["claude", "--resume", SESSION_ID], 37, "", "")
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return result
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert _invoke("--resume", SESSION_ID) is result
+    assert calls == [["claude", "--resume", SESSION_ID]]
 
 
 def _transcript_files(projects):
@@ -483,7 +499,8 @@ def test_archive_allows_link_above_home(shim, tmp_path, monkeypatch):
         stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10,
     )
     assert enabled.returncode == 0, enabled.stderr
-    transparent.enable(paths.get_backup_root(), accept_shared_history=True)
+    if sys.platform != "linux":
+        transparent.enable(paths.get_backup_root(), accept_shared_history=True)
 
     result = _invoke("--resume", SESSION_ID)
     assert result.returncode == 0, result.stderr
