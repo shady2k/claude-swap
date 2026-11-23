@@ -82,11 +82,25 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v6
-        with:
-          python-version: '3.12'
 
-      - name: Install dependencies
-        run: uv sync --locked
+      - name: Install dependencies with a managed Python
+        # Keep the whole interpreter chain out of the runner's system Python
+        # tree. The shim rejects group-writable ancestors on any install.
+        shell: bash
+        run: |
+          umask 022
+          export UV_PYTHON_INSTALL_DIR="$(mktemp -d "$RUNNER_TEMP/cswap-python.XXXXXXXX")"
+          uv sync --locked --managed-python --python 3.12
+          .venv/bin/python -I -c '
+          import os, sys
+          from pathlib import Path
+          from claude_swap.python_chain import check_python_chain
+
+          assert Path(sys.base_prefix).resolve().is_relative_to(
+              Path(os.environ["UV_PYTHON_INSTALL_DIR"]).resolve()
+          ), "venv is not using the job-managed Python"
+          check_python_chain()
+          '
 
       - name: Run the whole suite (not only the Keychain files)
         # THE NARROW SELECTION WAS A BLIND SPOT, not a saving. Three cases
@@ -104,4 +118,4 @@ jobs:
         # and the dump aborts the worker. `timeout-minutes` is the backstop
         # that holds under either ordering.
         timeout-minutes: 15
-        run: uv run pytest -o faulthandler_timeout=600
+        run: .venv/bin/python -m pytest -o faulthandler_timeout=600
