@@ -34,6 +34,7 @@ TIMEOUT = 30  # seconds, including setup, tracing and test execution
 Role = tuple[str, ...]  # Fixed module and arguments, identified by execve.
 Target = tuple[str, int]
 DIRECT_SCENARIOS = ("direct_success", "direct_refused")
+HISTORY_SCENARIOS = ("history_success", "history_503")
 MOCK_SCENARIOS = (
     "positive", "cli_positive", "direct", "denied_connect", "shim_positive", "shim_direct",
     *DIRECT_SCENARIOS,
@@ -45,12 +46,12 @@ SHIM_REFUSALS = (
 )
 _SHIM_SPAWN_ROLES = {
     *(("stand_mock", "client", name) for name in ("shim_positive", "shim_direct", *DIRECT_SCENARIOS)),
-    *(("stand_shim", name) for name in (*SHIM_REFUSALS, "escape")),
+    *(("stand_shim", name) for name in (*SHIM_REFUSALS, "escape", *HISTORY_SCENARIOS)),
 }
 ROOT_ROLES = {
     *(("stand_mock", scenario) for scenario in (*MOCK_SCENARIOS, *MOCK_CLI_CONTROLS)),
     *(("stand_linux_control", name) for name in ("normal", "dns", "failed")),
-    *(("stand_shim", name) for name in (*SHIM_REFUSALS, "escape")),
+    *(("stand_shim", name) for name in (*SHIM_REFUSALS, "escape", *HISTORY_SCENARIOS)),
 }
 
 
@@ -66,6 +67,7 @@ def _child_roles(role: Role) -> set[Role]:
 
 WORKER_ROLES = ROOT_ROLES.union(*(_child_roles(role) for role in ROOT_ROLES))
 MOCK_SERVER_ROLES = {role for role in WORKER_ROLES if role[:2] == ("stand_mock", "serve")}
+TLS_SERVER_ROLES = MOCK_SERVER_ROLES | {("stand_shim", name) for name in HISTORY_SCENARIOS}
 
 
 class StandError(RuntimeError):
@@ -202,7 +204,7 @@ def _worker(module: str, args: list[str]) -> None:
     if role not in WORKER_ROLES:
         raise StandError("stand worker is not allowlisted")
     commands = {tuple(worker_argv(*child)) for child in _child_roles(role)}
-    openssl = openssl_path() if role in MOCK_SERVER_ROLES else None
+    openssl = openssl_path() if role in TLS_SERVER_ROLES else None
     destinations = next(
         ({tuple(target) for target in targets} for name, targets in
          json.loads(os.environ["CSWAP_STAND_DESTINATIONS"]) if tuple(name) == role),
@@ -213,11 +215,13 @@ def _worker(module: str, args: list[str]) -> None:
     supervision_used = False
     supervisor_pid = os.getpid()
     if role in _SHIM_SPAWN_ROLES:
-        from tests.stand_shim import command
+        from tests.stand_shim import command, history_start_command
 
-        shim_command = command(role[-1])
+        shim_commands = [command(role[-1])]
+        if role[-1] in HISTORY_SCENARIOS:
+            shim_commands.append(history_start_command())
     else:
-        shim_command = None
+        shim_commands = []
 
     def restrict_worker(event: str, values: tuple) -> None:
         nonlocal blocked_resolver, supervision_used
@@ -251,7 +255,7 @@ def _worker(module: str, args: list[str]) -> None:
                     raise StandError(f"stand connect destination not allowed for {role!r}")
         if event == "subprocess.Popen":
             executable, argv, _cwd, _env = values
-            if shim_command and executable == "claude" and argv == shim_command:
+            if executable == "claude" and argv in shim_commands:
                 return
             if (
                 isinstance(argv, (list, tuple)) and argv and argv[0] == executable
@@ -404,24 +408,27 @@ def _audit(
         scenario = shim_role[-1]
         shim_path = str(stand_shim.shim_path(run_dir))
         fake_path = str(stand_shim.fake_path(run_dir))
-        claude_command = stand_shim.command(scenario)
+        claude_commands = [stand_shim.command(scenario)]
+        if scenario in HISTORY_SCENARIOS:
+            claude_commands.append(stand_shim.history_start_command())
 
     def shim_transition(role: Role, line: str) -> Role | None:
         if not shim_roles or (command := _exec_command(line)) is None:
             return None
         path, argv = command
-        if role == shim_role and path == shim_path and argv == claude_command:
-            return ("path-shim",)
-        if role == ("path-shim",) and path == sys.executable and argv == [
-            sys.executable, "-I", "-m", "claude_swap.transparent",
-            f"--cswap-shim=0:{Path(shim_path).parent}", *claude_command[1:]
-        ]:
-            return ("shim-python",)
-        if role == ("shim-python",) and scenario not in SHIM_REFUSALS and (
-            path == fake_path and len(argv) >= 3 and argv[:2] == [fake_path, "--settings"] and
-            stand_shim.is_layer_path(run_dir, argv[2]) and argv[3:] == claude_command[1:]
-        ):
-            return ("shim-claude",)
+        for claude_command in claude_commands:
+            if role == shim_role and path == shim_path and argv == claude_command:
+                return ("path-shim",)
+            if role == ("path-shim",) and path == sys.executable and argv == [
+                sys.executable, "-I", "-m", "claude_swap.transparent",
+                f"--cswap-shim=0:{Path(shim_path).parent}", *claude_command[1:]
+            ]:
+                return ("shim-python",)
+            if role == ("shim-python",) and scenario not in SHIM_REFUSALS and (
+                path == fake_path and len(argv) >= 3 and argv[:2] == [fake_path, "--settings"] and
+                stand_shim.is_layer_path(run_dir, argv[2]) and argv[3:] == claude_command[1:]
+            ):
+                return ("shim-claude",)
         return None
 
     def visit(pid: int, role: Role, *, supervised_child: bool = False) -> None:
@@ -459,7 +466,7 @@ def _audit(
                 argv = _exec_argv(line) or []
                 if role == root_role and tuple(argv) in child_commands:
                     new_role = child_commands[tuple(argv)]
-                elif role in MOCK_SERVER_ROLES and argv and argv[0] == openssl:
+                elif role in TLS_SERVER_ROLES and argv and argv[0] == openssl:
                     new_role = ("openssl",)
                 elif transition := shim_transition(role, line):
                     new_role = transition

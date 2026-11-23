@@ -134,3 +134,35 @@ def test_path_shim_trace_detects_external_attempt(stand):
     assert not attempt.permitted and "ENETUNREACH" in attempt.result
     with pytest.raises(AssertionError, match="unapproved destination"):
         result.require_clean()
+
+
+@pytest.mark.parametrize("scenario", ["history_success", "history_503"])
+def test_f11_history_network_receiver(stand, scenario):
+    rejected = scenario == "history_503"
+    role = ("stand_shim", scenario)
+    result = stand.run(
+        "stand_shim", scenario, allowed={mock.ORIGIN},
+        children={("shim-claude",): {mock.PROXY}},
+        listeners={role: {mock.PROXY, mock.ORIGIN}},
+    )
+    result.require_clean()
+    assert result.returncode == 0, result.stderr
+    assert result.shim_execs == ("path-shim", "shim-python", "shim-claude") * 2
+    connects = [(a.role, a.target) for a in result.attempts if a.syscall == "connect"]
+    assert sorted(connects) == sorted([(("shim-claude",), mock.PROXY), (role, mock.ORIGIN)])
+    data = json.loads(result.stdout)
+    assert data["accepted"] == [{
+        "profile": "2", "session": SESSION_ID,
+        "history": [{"role": "user", "content": "synthetic first turn"},
+                    {"role": "assistant", "content": "synthetic first reply"}],
+        "prompt": "synthetic continuation",
+    }]
+    assert data["status"] == (503 if rejected else 200)
+    assert data["reply"] == (None if rejected else "reply from independent TLS receiver")
+    assert data["transcript"] == [
+        {"role": "user", "content": "synthetic first turn"},
+        {"role": "assistant", "content": "synthetic first reply"},
+    ] + ([] if rejected else [
+        {"role": "user", "content": "synthetic continuation"},
+        {"role": "assistant", "content": "reply from independent TLS receiver"},
+    ])
