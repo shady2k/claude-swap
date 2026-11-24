@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
+import socket
 import socketserver
 import threading
 import urllib.error
@@ -25,12 +27,14 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
 from claude_swap import account_proxy, oauth, subscription
 from claude_swap.exceptions import ValidationError
+from claude_swap.locking import FileLock
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 USAGE = {
@@ -75,6 +79,12 @@ class _Recorder(BaseHTTPRequestHandler):
                 }
             )
         if self.command == "CONNECT":
+            if server.connect is not None:
+                status, phrase = server.connect
+                self.send_response(status, phrase)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             # Answer the tunnel, then close: the client's TLS handshake fails,
             # which is all a test needs to see that the tunnel was attempted.
             self.send_response(200, "Connection Established")
@@ -97,14 +107,23 @@ class _Recorder(BaseHTTPRequestHandler):
 
 
 class LocalServer:
-    """A loopback HTTP server whose replies a test controls."""
+    """A loopback HTTP server whose replies a test controls.
 
-    def __init__(self, responder=None, address: str = "127.0.0.1"):
+    ``connect``, when given, is the ``(status, phrase)`` a CONNECT gets
+    instead of the default 200; the phrase is what the client would put in its
+    error message, so a test can prove it does not travel further.
+    """
+
+    def __init__(
+        self, responder=None, address: str = "127.0.0.1", connect=None
+    ):
         self.responder = responder or (lambda method, path: (200, {}, b"{}"))
+        self.connect = connect
         self.requests: list[dict] = []
         self.lock = threading.Lock()
         self.httpd = ThreadingHTTPServer((address, 0), _Recorder)
         self.httpd.responder = self.responder
+        self.httpd.connect = self.connect
         self.httpd.requests = self.requests
         self.httpd.lock = self.lock
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -214,6 +233,23 @@ def direct_calls(monkeypatch):
     return calls
 
 
+@pytest.fixture
+def dead_proxy():
+    """A proxy address that refuses the connection, without assuming a port.
+
+    A bound socket that never listens makes the OS refuse the connection, and
+    holding it for the test keeps anything else from taking the port. A fixed
+    number (the old port 9) only refuses if nothing on this machine happens to
+    be listening there, which would turn the test into whatever that is.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    try:
+        yield SimpleNamespace(port=sock.getsockname()[1])
+    finally:
+        sock.close()
+
+
 def _endpoints(monkeypatch, base: str) -> None:
     """Point every endpoint cswap calls at one local origin URL."""
     monkeypatch.setattr(oauth, "OAUTH_TOKEN_URL", base + "/v1/oauth/token")
@@ -280,6 +316,20 @@ class TestParse:
     def test_absent_field_is_direct(self):
         assert account_proxy.route_for({"email": "a@b"}) is None
         assert account_proxy.route_for(None) is None
+
+    def test_an_explicit_null_is_damage_not_a_cleared_setting(self):
+        """Only an ABSENT key means "direct"; ``"proxy": null`` must fail closed.
+
+        ``--unset`` removes the key, so a null on disk was hand-edited or
+        written by something that did not understand the field. Reading it as
+        "no proxy" would silently return a proxied account to a direct
+        connection — the one outcome the setting exists to forbid.
+        """
+        route = account_proxy.route_for({"email": "a@b", "proxy": None})
+        assert route is not None and route.invalid
+        assert account_proxy.describe({"proxy": None}) == (
+            "invalid (the stored value is not a URL)"
+        )
 
     def test_a_stored_value_that_does_not_parse_blocks_instead_of_going_direct(self):
         route = account_proxy.route_for(
@@ -354,12 +404,51 @@ class TestRouteTransport:
         assert err.value.kind == account_proxy.PROXY_REDIRECT
 
     def test_an_unreachable_proxy_raises_without_a_direct_attempt(
-        self, direct_calls
+        self, dead_proxy, direct_calls
     ):
-        route = account_proxy.parse("http://127.0.0.1:9")
+        route = account_proxy.parse(f"http://127.0.0.1:{dead_proxy.port}")
         with pytest.raises(urllib.error.URLError):
             route.open(urllib.request.Request("http://origin.invalid/x"))
         assert direct_calls == []
+
+    @pytest.mark.parametrize(
+        "reply, kind",
+        [
+            ((407, "Authentication required"), account_proxy.PROXY_AUTH),
+            ((302, "See https://elsewhere.invalid/"), account_proxy.PROXY_REDIRECT),
+            ((307, "Temporary redirect"), account_proxy.PROXY_REDIRECT),
+            ((502, "Bad gateway"), None),
+        ],
+    )
+    def test_a_refused_connect_tunnel_keeps_the_code_and_drops_the_phrase(
+        self, reply, kind
+    ):
+        """http.client reports a refused CONNECT as ``OSError``, not HTTPError.
+
+        Its message carries the proxy's own status phrase, which can name a
+        credential. The route must classify 407/3xx like the plain-HTTP case
+        and must never repeat that phrase in a message a caller can log.
+        """
+        phrase = reply[1]
+        with LocalServer(connect=reply) as proxy:
+            route = account_proxy.parse(proxy.url)
+            request = urllib.request.Request(
+                "https://api.anthropic.com/api/oauth/usage",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            if kind is None:
+                with pytest.raises(urllib.error.URLError) as err:
+                    route.open(request)
+                assert "the proxy refused the CONNECT tunnel (HTTP 502)" in str(
+                    err.value
+                )
+            else:
+                with pytest.raises(account_proxy.ProxyRouteError) as err:
+                    route.open(request)
+                assert err.value.kind == kind
+            assert proxy.paths("CONNECT") == ["api.anthropic.com:443"]
+            assert phrase not in str(err.value)
+            assert "sk-secret" not in str(err.value)
 
     @pytest.mark.parametrize("name", ["NO_PROXY", "no_proxy"])
     def test_no_proxy_does_not_bypass_the_route(
@@ -438,6 +527,65 @@ class TestSettingLifecycle:
         assert "1" not in data["accounts"]
         assert "proxy" not in json.dumps(data)
 
+    def test_the_proxy_commands_hold_the_account_lock(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """Resolve → read → write is one step under the lock switch/swap take.
+
+        The probe re-acquires the lock from inside the suspected span: flock
+        is per open file description, so a second acquisition fails exactly
+        while the span holds it. Deterministic, no threads and no timing.
+        """
+        s = _switcher(sample_sequence_data)
+        held: list[bool] = []
+
+        def probe(original):
+            def wrapped(*args, **kwargs):
+                handle = FileLock(s.lock_file, timeout=0.05)
+                held.append(handle.acquire())
+                handle.release()
+                return original(*args, **kwargs)
+            return wrapped
+
+        writes: list[bool] = []
+        real_write = ClaudeAccountSwitcher._write_json
+
+        def write_probe(self, path, data):
+            if path == self.sequence_file:
+                handle = FileLock(self.lock_file, timeout=0.05)
+                writes.append(handle.acquire())
+                handle.release()
+            return real_write(self, path, data)
+
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "_resolve_for_policy_write",
+            probe(ClaudeAccountSwitcher._resolve_for_policy_write),
+        )
+        monkeypatch.setattr(ClaudeAccountSwitcher, "_write_json", write_probe)
+
+        s.set_account_proxy("1", "http://127.0.0.1:3128")
+        s.clear_account_proxy("1")
+
+        assert held == [False, False]       # resolved under the lock
+        assert writes and not any(writes)   # and every write made under it
+
+    def test_an_explicit_null_stored_value_fails_closed(
+        self, temp_home: Path, sample_sequence_data: dict, proxy, origin,
+        direct_calls, monkeypatch,
+    ):
+        _endpoints(monkeypatch, origin.url)
+        s = _switcher(sample_sequence_data)
+        data = s._get_sequence_data()
+        data["accounts"]["1"]["proxy"] = None
+        s._write_json(s.sequence_file, data)
+
+        record = s._fetch_account_usage(_info(s, 1, CREDS_OK))
+
+        assert record.error == account_proxy.PROXY_INVALID
+        assert record.struck_fp is None  # the token was never judged
+        assert proxy.requests == [] and origin.requests == []
+        assert direct_calls == []
+
     def test_readding_the_same_account_keeps_its_proxy(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
@@ -481,8 +629,17 @@ class TestSettingLifecycle:
 # --- the switcher: routing a request ----------------------------------------
 
 
-def _info(num: int, creds: str, *, active: bool = False):
-    return (num, "test@example.com", "", "", active, creds, "")
+def _info(s: ClaudeAccountSwitcher, num: int, creds: str, *, active: bool = False):
+    """One account's read snapshot, built the way ``_build_accounts_info`` does.
+
+    The route comes from the registry, so a test that sets a proxy before
+    calling this gets the pinned route the switcher itself would have taken.
+    """
+    account = (s._get_sequence_data() or {}).get("accounts", {}).get(str(num), {})
+    return (
+        num, account.get("email", "test@example.com"), "", "", active, creds, "",
+        account_proxy.route_for(account),
+    )
 
 
 class TestRouting:
@@ -500,7 +657,7 @@ class TestRouting:
         s.set_account_proxy("1", f"http://user:pw@{proxy.url.split('//')[1]}")
         s._write_account_credentials("1", "test@example.com", CREDS_EXPIRED)
 
-        record = s._fetch_account_usage(_info(1, CREDS_EXPIRED))
+        record = s._fetch_account_usage(_info(s, 1, CREDS_EXPIRED))
 
         assert record.error is None
         assert record.usage["five_hour"]["pct"] == 10.0
@@ -519,7 +676,7 @@ class TestRouting:
         """The control: no proxy set means the unchanged, direct path."""
         _endpoints(monkeypatch, origin.url)
         s = _switcher(sample_sequence_data)
-        record = s._fetch_account_usage(_info(1, CREDS_OK))
+        record = s._fetch_account_usage(_info(s, 1, CREDS_OK))
         assert record.error == "network"
         assert len(direct_calls) == 1
         assert proxy.requests == [] and origin.requests == []
@@ -533,8 +690,8 @@ class TestRouting:
             s = _switcher(sample_sequence_data)
             s.set_account_proxy("1", first.url)
             s.set_account_proxy("2", second.url)
-            assert s._fetch_account_usage(_info(1, CREDS_OK)).error is None
-            assert s._fetch_account_usage(_info(2, CREDS_OK)).error is None
+            assert s._fetch_account_usage(_info(s, 1, CREDS_OK)).error is None
+            assert s._fetch_account_usage(_info(s, 2, CREDS_OK)).error is None
             assert first.paths("GET") == [origin.url + "/api/oauth/usage"]
             assert second.paths("GET") == [origin.url + "/api/oauth/usage"]
         assert origin.requests == [] and direct_calls == []
@@ -550,7 +707,7 @@ class TestRouting:
             _endpoints(monkeypatch, origin.url)
             s = _switcher(sample_sequence_data)
             s.set_account_proxy("1", proxy.url)
-            record = s._fetch_account_usage(_info(1, CREDS_OK))
+            record = s._fetch_account_usage(_info(s, 1, CREDS_OK))
         assert record.error == account_proxy.PROXY_AUTH
         assert record.struck_fp is None  # the token was never judged
         assert origin.requests == [] and direct_calls == []
@@ -564,20 +721,52 @@ class TestRouting:
             _endpoints(monkeypatch, origin.url)
             s = _switcher(sample_sequence_data)
             s.set_account_proxy("1", proxy.url)
-            record = s._fetch_account_usage(_info(1, CREDS_OK))
+            record = s._fetch_account_usage(_info(s, 1, CREDS_OK))
         assert record.error == account_proxy.PROXY_REDIRECT
         assert origin.requests == [] and direct_calls == []
 
     def test_an_unreachable_proxy_fails_without_a_direct_connection(
-        self, temp_home: Path, sample_sequence_data: dict, origin,
+        self, temp_home: Path, sample_sequence_data: dict, origin, dead_proxy,
         direct_calls, monkeypatch,
     ):
         _endpoints(monkeypatch, origin.url)
         s = _switcher(sample_sequence_data)
-        s.set_account_proxy("1", "http://127.0.0.1:9")
-        record = s._fetch_account_usage(_info(1, CREDS_OK))
+        s.set_account_proxy("1", f"http://127.0.0.1:{dead_proxy.port}")
+        record = s._fetch_account_usage(_info(s, 1, CREDS_OK))
         assert record.error == "network"
         assert origin.requests == [] and direct_calls == []
+
+    @pytest.mark.parametrize(
+        "status, kind",
+        [
+            (407, account_proxy.PROXY_AUTH),
+            (302, account_proxy.PROXY_REDIRECT),
+            (307, account_proxy.PROXY_REDIRECT),
+        ],
+    )
+    def test_a_refused_connect_tunnel_is_reported_without_its_text_in_the_log(
+        self, temp_home: Path, sample_sequence_data: dict, direct_calls,
+        monkeypatch, caplog, status, kind,
+    ):
+        """An HTTPS request is tunnelled, and its refusal never reaches a log.
+
+        The proxy's status phrase rides inside http.client's ``OSError``; the
+        route keeps only the code, so the account gets its ``proxy-*`` kind and
+        the debug line carries no text the proxy chose.
+        """
+        phrase = "Authentication required pw=topsecret"
+        with LocalServer(connect=(status, phrase)) as proxy:
+            s = _switcher(sample_sequence_data)
+            s.set_account_proxy("1", proxy.url)
+            with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+                record = s._fetch_account_usage(_info(s, 1, CREDS_OK))
+
+        assert record.error == kind
+        assert record.struck_fp is None
+        assert proxy.paths("CONNECT") == ["api.anthropic.com:443"]
+        assert "topsecret" not in caplog.text
+        assert "topsecret" not in repr(record)
+        assert direct_calls == []
 
     def test_an_unusable_stored_value_blocks_the_request(
         self, temp_home: Path, sample_sequence_data: dict, proxy, origin,
@@ -589,7 +778,7 @@ class TestRouting:
         data = s._get_sequence_data()
         data["accounts"]["1"]["proxy"] = "socks5://127.0.0.1:1080"
         s._write_json(s.sequence_file, data)
-        record = s._fetch_account_usage(_info(1, CREDS_OK))
+        record = s._fetch_account_usage(_info(s, 1, CREDS_OK))
         assert record.error == account_proxy.PROXY_INVALID
         assert proxy.requests == [] and origin.requests == [] and direct_calls == []
 
@@ -603,7 +792,9 @@ class TestRouting:
         s._write_credentials(CREDS_EXPIRED)
         s._write_account_credentials("1", "test@example.com", CREDS_EXPIRED)
 
-        record = s._fetch_active_usage("1", "test@example.com", CREDS_EXPIRED)
+        record = s._fetch_account_usage(
+            _info(s, 1, CREDS_EXPIRED, active=True)
+        )
 
         assert record.error is None
         assert record.usage["five_hour"]["pct"] == 10.0
@@ -664,6 +855,97 @@ class TestRouting:
         assert origin.requests == [] and direct_calls == []
 
 
+    def test_a_swap_after_the_snapshot_keeps_the_accounts_own_route(
+        self, temp_home: Path, sample_sequence_data: dict, proxy, origin,
+        direct_calls, monkeypatch,
+    ):
+        """The route travels with the account snapshot the token came from.
+
+        ``cswap swap 1 2`` moves the proxied account to slot 2 and puts the
+        unproxied one in slot 1. A request started from the snapshot taken
+        before the swap must still use that account's proxy — looking the
+        route up by slot number at send time would find slot 1's new owner,
+        see no proxy, and connect directly.
+        """
+        _endpoints(monkeypatch, origin.url)
+        s = _switcher(sample_sequence_data)
+        s.set_account_proxy("1", proxy.url)
+        s._write_account_credentials("1", "test@example.com", CREDS_OK)
+        info = s._build_accounts_info()[0]           # account 1: token + route
+
+        data = s._get_sequence_data()
+        data["accounts"]["1"], data["accounts"]["2"] = (
+            data["accounts"]["2"], data["accounts"]["1"],
+        )
+        s._write_json(s.sequence_file, data)
+
+        record = s._fetch_account_usage(info)
+
+        assert record.error is None
+        assert proxy.paths("GET") == [origin.url + "/api/oauth/usage"]
+        assert origin.requests == [] and direct_calls == []
+
+    @pytest.mark.no_oauth_profile_fake
+    def test_a_swap_after_the_snapshot_keeps_the_plan_reads_route(
+        self, temp_home: Path, sample_sequence_data: dict, proxy, origin,
+        direct_calls, monkeypatch,
+    ):
+        _endpoints(monkeypatch, origin.url)
+        s = _switcher(sample_sequence_data)
+        s.set_account_proxy("1", proxy.url)
+        s._write_account_credentials("1", "test@example.com", CREDS_OK)
+        info = s._build_accounts_info()[:1]
+
+        data = s._get_sequence_data()
+        data["accounts"]["1"], data["accounts"]["2"] = (
+            data["accounts"]["2"], data["accounts"]["1"],
+        )
+        s._write_json(s.sequence_file, data)
+
+        s._collect_subscription_plans(info)
+
+        assert proxy.paths("GET") == [origin.url + "/api/oauth/profile"]
+        assert origin.requests == [] and direct_calls == []
+
+    def test_a_move_between_the_gates_locked_read_and_its_post_keeps_the_route(
+        self, temp_home: Path, sample_sequence_data: dict, proxy, origin,
+        direct_calls, monkeypatch,
+    ):
+        """The backup gate's route is read under the same lock as its grant.
+
+        The swap below lands after the gate released the lock and before its
+        POST — the window the report names. Reading the route by slot number
+        there would find the new slot-1 owner (no proxy) and POST the grant
+        directly.
+        """
+        _endpoints(monkeypatch, origin.url)
+        s = _switcher(sample_sequence_data)
+        s.set_account_proxy("1", proxy.url)
+        s._write_account_credentials("1", "test@example.com", CREDS_EXPIRED)
+        info = s._build_accounts_info()[0]
+
+        real = s._live_login_holds
+        moved: list[bool] = []
+
+        def swap_then_answer(credentials):
+            if not moved:
+                moved.append(True)
+                data = s._get_sequence_data()
+                data["accounts"]["1"], data["accounts"]["2"] = (
+                    data["accounts"]["2"], data["accounts"]["1"],
+                )
+                s._write_json(s.sequence_file, data)
+            return real(credentials)
+
+        monkeypatch.setattr(s, "_live_login_holds", swap_then_answer)
+
+        record = s._fetch_account_usage(info)
+
+        assert moved == [True]
+        assert record.error is None
+        assert proxy.paths("POST") == [origin.url + "/v1/oauth/token"]
+        assert origin.requests == [] and direct_calls == []
+
     def test_status_json_shows_the_masked_proxy(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
     ):
@@ -673,6 +955,22 @@ class TestRouting:
         payload = s._build_status_payload()
         assert payload["active"]["proxy"] == "http://user:***@127.0.0.1:3128"
         assert "secret" not in json.dumps(payload)
+
+    def test_json_shows_a_damaged_setting_rather_than_hiding_it(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+    ):
+        """A null on disk is visible as invalid, not silently absent."""
+        s = _switcher(sample_sequence_data)
+        data = s._get_sequence_data()
+        data["accounts"]["1"]["proxy"] = None
+        s._write_json(s.sequence_file, data)
+        s._write_credentials(CREDS_OK)
+
+        payload = s._build_status_payload()
+
+        assert payload["active"]["proxy"] == (
+            "invalid (the stored value is not a URL)"
+        )
 
 
 # --- transfer ---------------------------------------------------------------

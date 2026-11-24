@@ -349,6 +349,8 @@ If an imported account is the one you're currently logged in as, activate the im
 
 `cswap proxy <num|email> <url>` sends every request cswap makes for that account through an HTTP proxy, with no direct fallback, and `cswap add --proxy <url>` sets one while adding. The setting follows the account through `swap`, `move` and a re-add; before rolling back to a version without proxy support, save the URLs, because that version would talk to the internet directly again. The exact rules are in [proxy.md](https://github.com/realiti4/claude-swap/blob/main/docs/proxy.md).
 
+Known risk, accepted for now: the route belongs to the slot `~/.claude.json` names. If the live login actually belongs to a *different* managed account, the ownership check cswap makes for that login travels the named slot's route — direct when that slot has no proxy. Such a login is never written into a slot whose ownership cswap could not confirm.
+
 ### Share usage readings between machines
 
 Machines that hold the same accounts can end up sharing one usage-endpoint rate limit, so their polling adds up (this is the limit on how often usage can be read, not your subscription quota). `import-usage` lets one machine poll and hand its readings to the others:

@@ -125,7 +125,7 @@ Read next: the module docstring of `autoswitch.py`. The rules as users see them 
 - **Surfaces hold no account logic.** Dashboards read through `SnapshotSource`; the engine does not print.
 - **Import direction.** `session.py` and `credentials.py` do not import `switcher.py`. `fsutil.py` imports nothing from the package. The TUI's heavy imports stay inside `tui.run`.
 - **Paths come from `paths.py`.** Do not hardcode `~/.claude`; Claude Code's own resolution has cases that differ.
-- **A request for an account travels that account's route.** Every network call in `oauth.py` and `subscription.py` takes the slot's `account_proxy` route; a slot with no proxy goes direct, and one whose proxy is set never does.
+- **A request for an account travels that account's route.** Every network call in `oauth.py` and `subscription.py` takes an `account_proxy` route; a slot with no proxy goes direct, and one whose proxy is set never does. The route comes from the same read as the credential it is used for (`AccountInfo` in `switcher.py`), so a concurrent `swap`/`move` cannot pair one account's token with another slot's route.
 
 ## Tests
 

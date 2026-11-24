@@ -650,7 +650,8 @@ def _proxy_command(argv: list[str]) -> None:
             "cswap makes for that account then goes through it, and never "
             "directly: if the proxy is unreachable, asks for credentials it "
             "rejects, or the stored value is unusable, the request fails "
-            "instead of falling back."
+            "instead of falling back. The rules are in `docs/proxy.md` and "
+            "the module docstring of `account_proxy`."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -680,7 +681,15 @@ Only http:// proxies are supported; HTTPS tunnels through them (CONNECT).
         "--unset", action="store_true", help="Remove the account's proxy"
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    args = parser.parse_args(argv)
+    # ``parse_known_args``: argparse's own "unrecognized arguments: <values>"
+    # would echo a mistyped second URL — credentials included — into stderr,
+    # and this command is the one that takes an argument carrying a password.
+    args, extra = parser.parse_known_args(argv)
+    if extra:
+        parser.error(
+            "unexpected extra argument (a proxy URL is given once; values "
+            "are not echoed)"
+        )
 
     if args.unset and args.url:
         parser.error("--unset does not take a URL argument")

@@ -23,6 +23,7 @@ from claude_swap.exceptions import (
 from claude_swap.fsutil import atomic_write_text
 from claude_swap.json_output import SCHEMA_VERSION as JSON_SCHEMA_VERSION
 from claude_swap.json_output import usage_from_json
+from claude_swap.locking import FileLock
 from claude_swap.models import Platform, get_timestamp, normalize_alias
 from claude_swap.oauth import credential_fingerprint
 
@@ -608,36 +609,35 @@ def import_accounts(
         # The export never carries a proxy, so an import must not clear the
         # one this machine holds for the same account: that setting describes
         # THIS host's route, and the credentials being replaced do not change
-        # it. ``target_num`` holds this account only — an occupied slot with
-        # another identity is never reused — so the value read here belongs to
-        # the account being imported.
-        local_proxy = (
-            (data.get("accounts", {}).get(target_num) or {}).get(
-                account_proxy.FIELD
-            )
-        )
-
-        data.setdefault("accounts", {})
-        data.setdefault("sequence", [])
-        new_record = {
-            "email": entry["email"],
-            "uuid": entry["uuid"],
-            "organizationUuid": entry["org_uuid"],
-            "organizationName": entry["org_name"],
-            "added": entry["added"],
-        }
-        if entry["kind"] == "api_key":
-            new_record["kind"] = "api_key"
-        if entry.get("alias"):
-            new_record["alias"] = entry["alias"]
-        if local_proxy is not None:
-            new_record[account_proxy.FIELD] = local_proxy
-        data["accounts"][target_num] = new_record
-        if int(target_num) not in data["sequence"]:
-            data["sequence"].append(int(target_num))
-            data["sequence"].sort()
-        data["lastUpdated"] = get_timestamp()
-        switcher._write_json(switcher.sequence_file, data)
+        # it. Read under the account lock from a fresh registry, for two
+        # reasons: another command's proxy write must survive this whole-file
+        # write, and the value is copied by KEY PRESENCE — an explicit null is
+        # damage this import carries over (so it keeps failing closed) rather
+        # than being read as "no proxy set".
+        with FileLock(switcher.lock_file):
+            data = switcher._get_sequence_data_migrated() or data
+            previous = (data.get("accounts") or {}).get(target_num) or {}
+            data.setdefault("accounts", {})
+            data.setdefault("sequence", [])
+            new_record = {
+                "email": entry["email"],
+                "uuid": entry["uuid"],
+                "organizationUuid": entry["org_uuid"],
+                "organizationName": entry["org_name"],
+                "added": entry["added"],
+            }
+            if entry["kind"] == "api_key":
+                new_record["kind"] = "api_key"
+            if entry.get("alias"):
+                new_record["alias"] = entry["alias"]
+            if account_proxy.FIELD in previous:
+                new_record[account_proxy.FIELD] = previous[account_proxy.FIELD]
+            data["accounts"][target_num] = new_record
+            if int(target_num) not in data["sequence"]:
+                data["sequence"].append(int(target_num))
+                data["sequence"].sort()
+            data["lastUpdated"] = get_timestamp()
+            switcher._write_json(switcher.sequence_file, data)
 
         if is_envelope_active:
             resolved_active_slot = target_num
@@ -679,15 +679,18 @@ def import_accounts(
     # *resolved* slot of the envelope's active account — not the envelope's
     # raw slot number, which may already be occupied locally by an unrelated
     # account. If the user already has an active selection locally, leave it.
-    final = switcher._get_sequence_data()
-    if (
-        final is not None
-        and final.get("activeAccountNumber") in (None, 0)
-        and resolved_active_slot is not None
-    ):
-        final["activeAccountNumber"] = int(resolved_active_slot)
-        final["lastUpdated"] = get_timestamp()
-        switcher._write_json(switcher.sequence_file, final)
+    # Read and write under the account lock, so this whole-file write cannot
+    # republish a registry a concurrent `proxy`/`switch` just changed.
+    with FileLock(switcher.lock_file):
+        final = switcher._get_sequence_data()
+        if (
+            final is not None
+            and final.get("activeAccountNumber") in (None, 0)
+            and resolved_active_slot is not None
+        ):
+            final["activeAccountNumber"] = int(resolved_active_slot)
+            final["lastUpdated"] = get_timestamp()
+            switcher._write_json(switcher.sequence_file, final)
 
     # "replaced" gets its own count — the user must be able to distinguish
     # "I forced this" from "cswap healed this". Appended only when it

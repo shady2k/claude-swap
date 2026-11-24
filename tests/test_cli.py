@@ -2329,6 +2329,28 @@ class TestProxyCommand:
         assert exc.value.code == 1
         assert "root" in capsys.readouterr().err
 
+    def test_a_stray_second_argument_is_not_echoed(self, temp_home, capsys):
+        """A mistyped second URL can carry a password; argparse would print it."""
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._proxy_command([
+                    "2", "http://user:secret@127.0.0.1:3128",
+                    "http://user:other-secret@127.0.0.1:3129",
+                ])
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "secret" not in err and "3129" not in err
+        assert "unexpected extra argument" in err
+
+    def test_an_unknown_flag_is_not_echoed_either(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._proxy_command(["2", "--http://user:secret@host"])
+        assert exc.value.code == 2
+        assert "secret" not in capsys.readouterr().err
+
     def test_proxy_dispatched_from_main(self, temp_home):
         with patch("claude_swap.cli._proxy_command") as proxy_fn, \
              patch.object(sys, "argv",

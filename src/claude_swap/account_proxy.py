@@ -33,7 +33,10 @@ rewrites ``host``/``selector`` to an absolute URL for an ``http`` one;
 origin's headers into the ``CONNECT`` headers, so the header never reaches
 the origin. Both halves are exercised in ``tests/test_account_proxy.py``
 against a local proxy: an absolute-form ``http://`` request and a ``CONNECT``
-tunnel.
+tunnel. A refused tunnel (407, a redirect) reaches ``open`` as a ``URLError``
+carrying http.client's own phrase, and is re-raised as the same
+``ProxyRouteError`` kinds with that phrase dropped — it is the proxy's text
+and may name a credential.
 
 The stored value keeps the password in ``sequence.json`` (mode 0600, written
 atomically by the switcher), because cswap has to present it. It is masked
@@ -190,6 +193,54 @@ class ProxyRoute:
                     "the request",
                 ) from None
             raise
+        except urllib.error.URLError as e:
+            # An ``https`` request travels a CONNECT tunnel, and http.client
+            # reports a refusal of that tunnel as ``OSError("Tunnel
+            # connection failed: <code> <phrase>")`` — urllib wraps it in
+            # ``URLError``, so the HTTPError handler above never sees it
+            # (measured on CPython 3.12-3.14). The phrase is the proxy's own
+            # text and can name a credential, so only the code survives this
+            # boundary; the rest of the message is ours.
+            status = _tunnel_status(e.reason)
+            if status is None:
+                raise
+            if status == "407":
+                raise ProxyRouteError(
+                    PROXY_AUTH,
+                    "the proxy rejected the credentials in its URL "
+                    "(HTTP 407 to CONNECT)",
+                ) from None
+            if status.isdigit() and 300 <= int(status) < 400:
+                raise ProxyRouteError(
+                    PROXY_REDIRECT,
+                    f"the proxy answered HTTP {status} to CONNECT instead of "
+                    "opening the tunnel",
+                ) from None
+            raise urllib.error.URLError(
+                f"the proxy refused the CONNECT tunnel (HTTP {status})"
+                if status.isdigit()
+                else "the proxy refused the CONNECT tunnel"
+            ) from None
+
+
+_TUNNEL_REFUSED = "Tunnel connection failed: "
+
+
+def _tunnel_status(reason: object) -> str | None:
+    """The status of a refused CONNECT tunnel, from http.client's message.
+
+    ``HTTPConnection._tunnel`` raises ``OSError`` whose message is "Tunnel
+    connection failed: <code> <phrase>" for every reply other than 200, and
+    only the leading code is kept: the phrase is the proxy's text, which this
+    module never repeats. Anything else — a refused connection, a timeout —
+    is not a tunnel reply and returns None.
+    """
+    if not isinstance(reason, OSError):
+        return None
+    text = str(reason)
+    if not text.startswith(_TUNNEL_REFUSED):
+        return None
+    return text[len(_TUNNEL_REFUSED):].split(" ", 1)[0]
 
 
 def parse(text: str) -> ProxyRoute:
@@ -206,10 +257,11 @@ def parse(text: str) -> ProxyRoute:
         raise ProxyUrlError(
             "a proxy URL must include a scheme, e.g. http://host:3128"
         )
-    scheme = raw.split("://", 1)[0].lower()
-    if scheme != "http":
+    if raw.split("://", 1)[0].lower() != "http":
+        # Static: whatever precedes ``://`` may be a mistyped scheme with a
+        # credential in it, and this text reaches the log and the JSON.
         raise ProxyUrlError(
-            f"only http:// proxies are supported, not {scheme}://"
+            "only http:// proxies are supported (the URL's scheme must be http)"
         )
     try:
         parts = urllib.parse.urlsplit(raw)
@@ -258,9 +310,14 @@ def route_for(record: Mapping | None) -> ProxyRoute | None:
     """
     if not isinstance(record, Mapping):
         return None
-    raw = record.get(FIELD)
-    if raw is None:
+    if FIELD not in record:
+        # Absent is the only shape that means "direct": it is how every
+        # account behaved before this setting existed, and how ``--unset``
+        # leaves a record. An explicit JSON ``null`` is damage — a hand edit
+        # or a writer that did not know the field — and must not read as a
+        # cleared setting, which would send the account direct.
         return None
+    raw = record[FIELD]
     if not isinstance(raw, str) or not raw.strip():
         return unusable("the stored value is not a URL")
     try:

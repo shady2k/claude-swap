@@ -522,7 +522,7 @@ def switcher(temp_home):
 
 
 def _info(num, email, org, active, creds):
-    return (num, email, "Org", org, active, creds, "")
+    return (num, email, "Org", org, active, creds, "", None)
 
 
 class TestCollector:

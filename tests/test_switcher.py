@@ -790,7 +790,7 @@ class TestFetchAccountUsageSessionProfile:
     """
 
     def _info(self, backup_creds: str) -> tuple:
-        return (2, "test@example.com", "Org", "org-uuid", False, backup_creds, "")
+        return (2, "test@example.com", "Org", "org-uuid", False, backup_creds, "", None)
 
     def test_fresh_session_credentials_fetch_read_only(self, temp_home: Path):
         """Profile creds are used with is_active=True (no refresh, no persist)."""
@@ -1289,7 +1289,7 @@ class TestSetupTokenHeaderProbeWiring:
     }})
 
     def _info(self) -> tuple:
-        return (3, "setup-token-3@token.local", "", "", False, self.CREDS, "")
+        return (3, "setup-token-3@token.local", "", "", False, self.CREDS, "", None)
 
     def test_setting_reaches_the_fetch_and_reloads_on_change(self, temp_home: Path):
         switcher = ClaudeAccountSwitcher()
@@ -1398,7 +1398,9 @@ class TestSetupTokenHeaderProbeWiring:
                 return ok
             raise refused
 
-        info = (3, "setup-token-3@token.local", "", "", active, self.CREDS, "")
+        info = (
+            3, "setup-token-3@token.local", "", "", active, self.CREDS, "", None,
+        )
         with patch.object(switcher, "_live_session_pids", return_value=[]), \
              patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
             first = switcher._collect_usage_entries([info])["3"]
@@ -1542,7 +1544,7 @@ class TestFetchAccountUsageFromAnotherProfile:
         with patch("claude_swap.oauth.try_refresh_oauth_credentials") as refresh, \
              patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
             record = switcher._fetch_account_usage(
-                (1, "test@example.com", "", "", False, expired, "")
+                (1, "test@example.com", "", "", False, expired, "", None)
             )
 
         refresh.assert_not_called()
@@ -1558,7 +1560,7 @@ class TestFetchAccountUsageFromAnotherProfile:
         with patch("claude_swap.oauth.try_fetch_usage_for_account",
                    return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})) as mock_fetch:
             record = switcher._fetch_account_usage(
-                (3, "idle@example.com", "", "", False, expired, "")
+                (3, "idle@example.com", "", "", False, expired, "", None)
             )
 
         assert record.usage == {"five_hour": {"pct": 5}}
@@ -1985,7 +1987,7 @@ class TestListAccountsUsage:
 
         with patch("claude_swap.oauth.build_token_status", return_value="oauth: fresh, refresh token yes") as build:
             lines = switcher._token_status_lines(
-                (1, "active@example.com", "", "", True, "active-creds", "")
+                (1, "active@example.com", "", "", True, "active-creds", "", None)
             )
 
         assert lines == ["active profile: fresh, refresh token yes"]
@@ -1997,7 +1999,7 @@ class TestListAccountsUsage:
         with patch("claude_swap.session.read_session_credentials") as read_session, \
              patch("claude_swap.oauth.build_token_status") as build:
             lines = switcher._token_status_lines(
-                (2, "key@example.com", "", "", False, "sk-ant-api03-test", "")
+                (2, "key@example.com", "", "", False, "sk-ant-api03-test", "", None)
             )
 
         assert lines == []
@@ -2017,7 +2019,7 @@ class TestListAccountsUsage:
              patch("claude_swap.session.session_identity_drifted", return_value=False) as drifted, \
              patch("claude_swap.oauth.build_token_status", side_effect=build_status) as build:
             lines = switcher._token_status_lines(
-                (2, "inactive@example.com", "", "org-2", False, "backup-creds", "")
+                (2, "inactive@example.com", "", "org-2", False, "backup-creds", "", None)
             )
 
         assert lines == [
@@ -2038,7 +2040,7 @@ class TestListAccountsUsage:
                  return_value="oauth: expired, refresh token yes",
              ) as build:
             lines = switcher._token_status_lines(
-                (2, "inactive@example.com", "", "org-2", False, "backup-creds", "")
+                (2, "inactive@example.com", "", "org-2", False, "backup-creds", "", None)
             )
 
         assert lines == [
@@ -2059,7 +2061,7 @@ class TestListAccountsUsage:
                  return_value="oauth: fresh, refresh token yes",
              ) as build:
             lines = switcher._token_status_lines(
-                (2, "inactive@example.com", "", "org-2", False, "backup-creds", "")
+                (2, "inactive@example.com", "", "org-2", False, "backup-creds", "", None)
             )
 
         assert lines == ["stored backup: fresh, refresh token yes"]
@@ -2081,7 +2083,7 @@ class TestListAccountsUsage:
              patch.object(switcher, "_write_credentials") as write_live, \
              patch.object(switcher, "_write_account_credentials") as write_backup:
             switcher._token_status_lines(
-                (2, "inactive@example.com", "", "org-2", False, "backup-creds", "")
+                (2, "inactive@example.com", "", "org-2", False, "backup-creds", "", None)
             )
 
         refresh.assert_not_called()
@@ -3755,7 +3757,7 @@ class TestActiveAccountRefresh:
         """The owned+expired static sentinel is gone: the collect pass reaches
         the fetch path, which refreshes and returns usage."""
         switcher = self._switcher(sample_sequence_data)
-        info = (1, "test@example.com", "", "", True, self._EXPIRED, "")
+        info = (1, "test@example.com", "", "", True, self._EXPIRED, "", None)
 
         with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
              patch.object(
@@ -4957,7 +4959,7 @@ class TestDeadTokenQuarantine:
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         self._make_dead(switcher)
-        info = [(2, "test@example.com", "Org", "", False, self._dead_creds(), "")]
+        info = [(2, "test@example.com", "Org", "", False, self._dead_creds(), "", None)]
 
         with patch("claude_swap.oauth.try_fetch_usage_for_account") as fetch:
             entries = switcher._collect_usage_entries(info)
@@ -4973,7 +4975,7 @@ class TestDeadTokenQuarantine:
         from claude_swap.usage_store import FetchRecord
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
-        info = [(2, "test@example.com", "Org", "", False, self._dead_creds(), "")]
+        info = [(2, "test@example.com", "Org", "", False, self._dead_creds(), "", None)]
 
         with patch.object(
             switcher, "_run_usage_fetches",
@@ -5026,7 +5028,7 @@ class TestDeadTokenQuarantine:
             "accessToken": "at", "refreshToken": "rt",
             "expiresAt": (now + 86400) * 1000,
         }})
-        info = [(2, "test@example.com", "Org", "", False, live, "")]
+        info = [(2, "test@example.com", "Org", "", False, live, "", None)]
         ident = {"2": ("test@example.com", "")}
         store.record({"2": FetchRecord(usage={
             "five_hour": {"pct": 25.0, "resets_at": iso(100 * 3600.0)},
@@ -8824,8 +8826,8 @@ class TestDuplicateAccountDetection:
             "accessToken": "sk", "refreshToken": "rt-shared",
         }})
         info = [
-            (1, "account1@example.com", "", "", True, same, ""),
-            (2, "account2@example.com", "", "", False, same, ""),
+            (1, "account1@example.com", "", "", True, same, "", None),
+            (2, "account2@example.com", "", "", False, same, "", None),
         ]
         warnings = switcher._duplicate_account_warnings(info)
         assert len(warnings) == 1
@@ -8837,8 +8839,8 @@ class TestDuplicateAccountDetection:
         sample_sequence_data["accounts"]["2"]["uuid"] = "uuid-1"
         switcher = self._switcher(temp_home, sample_sequence_data)
         info = [
-            (1, "account1@example.com", "", "", True, "creds-a", ""),
-            (2, "account2@example.com", "", "", False, "creds-b", ""),
+            (1, "account1@example.com", "", "", True, "creds-a", "", None),
+            (2, "account2@example.com", "", "", False, "creds-b", "", None),
         ]
         warnings = switcher._duplicate_account_warnings(info)
         assert len(warnings) == 1
@@ -8852,8 +8854,8 @@ class TestDuplicateAccountDetection:
         sample_sequence_data["accounts"]["2"]["uuid"] = ""
         switcher = self._switcher(temp_home, sample_sequence_data)
         info = [
-            (1, "setup-token-1@token.local", "", "", True, "creds-a", ""),
-            (2, "setup-token-2@token.local", "", "", False, "creds-b", ""),
+            (1, "setup-token-1@token.local", "", "", True, "creds-a", "", None),
+            (2, "setup-token-2@token.local", "", "", False, "creds-b", "", None),
         ]
         assert switcher._duplicate_account_warnings(info) == []
 
@@ -8863,9 +8865,9 @@ class TestDuplicateAccountDetection:
         switcher = self._switcher(temp_home, sample_sequence_data)
         info = [
             (1, "account1@example.com", "", "", True,
-             json.dumps({"claudeAiOauth": {"refreshToken": "rt-1"}}), ""),
+             json.dumps({"claudeAiOauth": {"refreshToken": "rt-1"}}), "", None),
             (2, "account2@example.com", "", "", False,
-             json.dumps({"claudeAiOauth": {"refreshToken": "rt-2"}}), ""),
+             json.dumps({"claudeAiOauth": {"refreshToken": "rt-2"}}), "", None),
         ]
         assert switcher._duplicate_account_warnings(info) == []
 
@@ -8884,7 +8886,7 @@ class TestLockstepUsageDetection:
     @staticmethod
     def _info(n=2):
         return [
-            (i, f"account{i}@example.com", "", "", i == 1, f"creds-{i}", "")
+            (i, f"account{i}@example.com", "", "", i == 1, f"creds-{i}", "", None)
             for i in range(1, n + 1)
         ]
 
@@ -10791,7 +10793,7 @@ class TestBackupUnreadableDisplay:
         )
         # idle slot (is_active=False), empty creds, keychain pinned unusable
         s._store._read_account_credentials_ex("2", "b@example.com")  # pins cache
-        info = (2, "b@example.com", "", "", False, "", "")
+        info = (2, "b@example.com", "", "", False, "", "", None)
         assert s._static_usage_sentinel(info) == USAGE_KEYCHAIN_UNAVAILABLE
 
     def test_idle_slot_absent_backup_still_no_credentials(
@@ -10801,7 +10803,7 @@ class TestBackupUnreadableDisplay:
         s = ClaudeAccountSwitcher()
         s.platform = Platform.MACOS
         s._setup_directories()
-        info = (2, "b@example.com", "", "", False, "", "")
+        info = (2, "b@example.com", "", "", False, "", "", None)
         assert s._static_usage_sentinel(info) == USAGE_NO_CREDENTIALS
 
     # -- I-1: the active-slot branch collapses the same tri-state on Linux --
@@ -10833,7 +10835,7 @@ class TestBackupUnreadableDisplay:
         # CONTROL: readable -> no sentinel (a real credential to fetch).
         active = s._store._read_active_credentials()
         s._record_active_verdict(active)
-        info_ok = (1, "a@example.com", "", "", True, active.value or "", "")
+        info_ok = (1, "a@example.com", "", "", True, active.value or "", "", None)
         assert s._static_usage_sentinel(info_ok) is None, "control broken"
 
         # PROBE: the read FAILS -> keychain unavailable, not "no credentials"
@@ -10862,7 +10864,7 @@ class TestBackupUnreadableDisplay:
             "premise: Linux never sets this True"
         )
         s._record_active_verdict(active_bad)
-        info_bad = (1, "a@example.com", "", "", True, active_bad.value or "", "")
+        info_bad = (1, "a@example.com", "", "", True, active_bad.value or "", "", None)
         assert s._static_usage_sentinel(info_bad) == USAGE_KEYCHAIN_UNAVAILABLE
 
 
@@ -11693,7 +11695,7 @@ class TestInactiveRefreshRoutesThroughGate:
              patch.object(s, "_live_session_pids", return_value=[]), \
              patch("claude_swap.oauth.request_usage_data",
                    return_value={"five_hour": {"utilization": 5}}):
-            info = (2, "b@example.com", "", "", False, expired, "")
+            info = (2, "b@example.com", "", "", False, expired, "", None)
             record = s._fetch_account_usage(info)
 
         assert gate["args"] == ("2", "b@example.com")
@@ -11726,7 +11728,7 @@ class TestInactiveRefreshRoutesThroughGate:
         with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post, \
              patch.object(s, "_live_session_pids", return_value=[]), \
              patch("claude_swap.oauth.request_usage_data") as usage:
-            info = (2, "b@example.com", "", "", False, expired, "")
+            info = (2, "b@example.com", "", "", False, expired, "", None)
             record = s._fetch_account_usage(info)
 
         post.assert_not_called()
@@ -11767,7 +11769,7 @@ class TestStrikeUnbindsInCollector:
                               struck_fp=oauth.credential_fingerprint(dead))},
             identities, claims,
         )
-        info = [(2, "b@example.com", "", "", False, dead, "")]
+        info = [(2, "b@example.com", "", "", False, dead, "", None)]
         entries = s._collect_usage_entries(info, fetch=set())
         assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
         # replace the credential (fresh lineage) — quarantine must lift
@@ -11775,7 +11777,7 @@ class TestStrikeUnbindsInCollector:
             "claudeAiOauth": {"accessToken": "b", "refreshToken": "rt-new",
                               "expiresAt": 1000}})
         s._write_account_credentials("2", "b@example.com", fresh)
-        info = [(2, "b@example.com", "", "", False, fresh, "")]
+        info = [(2, "b@example.com", "", "", False, fresh, "", None)]
         entries = s._collect_usage_entries(info, fetch=set())
         assert entries["2"].sentinel != USAGE_RELOGIN_REQUIRED
 
@@ -12184,7 +12186,7 @@ class TestHealedStrikeUnblocksFetching:
         fresh = json.dumps({
             "claudeAiOauth": {"accessToken": "b", "refreshToken": "rt-new",
                               "expiresAt": 1000}})
-        info = [(2, "b@example.com", "", "", False, fresh, "")]
+        info = [(2, "b@example.com", "", "", False, fresh, "", None)]
         s._collect_usage_entries(info, fetch=set())
         # strike row cleared → account fetch-eligible again
         entry = store.entries(identities, [])["2"]
@@ -13668,7 +13670,7 @@ class TestUnreadableBackupIsNotAbsent:
         entry = s._usage_store.entries(identities, [])["1"]
         assert entry.token_dead(), "the row must be struck to begin with"
 
-        info = [(1, "b@example.com", "", "", True, live, "")]
+        info = [(1, "b@example.com", "", "", True, live, "", None)]
         assert s._entry_token_dead(entry, "1", "b@example.com", live, True), (
             "with a readable backup the backup-bound strike holds"
         )
@@ -14237,7 +14239,7 @@ class TestPollPolicyInputsCarryTheWeeklyLine:
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         switcher._poll_inputs_override = (85.0, 97.0, ("Fable",))
-        info = {"2": (2, "test@example.com", "Org", "", True, "", "")}
+        info = {"2": (2, "test@example.com", "Org", "", True, "", "", None)}
         record = FetchRecord(usage={"five_hour": {"pct": 5.0}, "seven_day": {"pct": 93.0}})
         with patch.object(
             poll_policy, "plan_after_fetch", return_value=(1.0, 2.0)
