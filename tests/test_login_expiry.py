@@ -23,6 +23,9 @@ from claude_swap.usage_store import UsageEntry
 
 from tests.test_tui import FakeSwitcher, fake_engine, make_account, make_app, make_entry
 
+
+pytestmark = pytest.mark.mock_stand_routing
+
 NOW = 1_000_000.0
 DAY = 86400
 DUE = 5 * DAY + 12 * 3600 + 30  # "5d 12h" (with 30 s for the render to happen in)
@@ -287,6 +290,22 @@ async def _dashboard(tmp_path, accounts, size):
 
 
 class TestDashboardFit:
+    @pytest.fixture(autouse=True)
+    def fixed_clock(self, monkeypatch):
+        from tests import test_tui
+
+        # Freeze both reset timestamps in the snapshots and the render clock.
+        now = datetime(2026, 1, 15, 12, tzinfo=timezone.utc)
+
+        class FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now.astimezone(tz) if tz is not None else now.astimezone().replace(tzinfo=None)
+
+        monkeypatch.setattr(test_tui, "datetime", FixedDatetime)
+        monkeypatch.setattr(oauth, "datetime", FixedDatetime)
+        monkeypatch.setattr(time, "time", lambda: now.timestamp())
+
     @pytest.mark.asyncio
     async def test_fresh_logins_render_exactly_as_without_the_field(self, tmp_path):
         # The mixed case that once wrapped: the rows must be the ones a

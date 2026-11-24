@@ -57,6 +57,9 @@ from claude_swap.session import (
 from claude_swap.settings import set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 
+
+pytestmark = pytest.mark.mock_stand_routing
+
 ACCOUNT_EMAIL = "account2@example.com"
 ACCOUNT_NUM = "2"
 ORG_UUID = "org-uuid-2"
@@ -190,8 +193,40 @@ def seeded_switcher(temp_home: Path, macos_platform) -> ClaudeAccountSwitcher:
     return switcher
 
 
+class _ClaudeStub:
+    path = "/fake/bin/claude"
+
+    def run(self, args, **kwargs):
+        from claude_swap import spawn
+
+        return spawn.run([self.path, *args], **kwargs)
+
+
+def _not_found(**kwargs):
+    raise session_mod.real_claude.ResolveError("not found on PATH")
+
+
+@pytest.fixture(autouse=True)
+def _stub_claude_resolution(monkeypatch):
+    monkeypatch.setattr(session_mod.real_claude, "resolve", lambda **kwargs: _ClaudeStub())
+
+
+@pytest.fixture(autouse=True)
+def _admitted_unit_launch(request, monkeypatch):
+    """Ordinary session unit tests exercise the implementation after admission."""
+    if request.node.name.startswith("test_unadmitted"):
+        return
+    monkeypatch.setattr(SessionManager, "_admit_profile_launch", staticmethod(lambda args: None))
+
+
 @pytest.fixture
-def manager(seeded_switcher) -> SessionManager:
+def manager(seeded_switcher, monkeypatch) -> SessionManager:
+    """Session semantics use known identity, not host process-reader support."""
+    from claude_swap import profile_ownership
+
+    monkeypatch.setattr(profile_ownership, "_process_identity", lambda pid:
+        profile_ownership._ProcessIdentity(
+            "present", profile_ownership._PosixStart(str(pid)), "linux"))
     return SessionManager(seeded_switcher)
 
 
@@ -654,6 +689,22 @@ class TestBootstrap:
         assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
         assert not session_mod.is_session_stale(session_dir)
 
+    def test_stale_setup_without_refresh_keeps_owned_generation(
+        self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates, monkeypatch,
+    ):
+        profile, _, _ = manager.setup_session("2", share=False)
+        _mark_stale(profile)
+        monkeypatch.setattr(manager, "_has_refresh_token", lambda _: False)
+        manager.setup_session("2", share=False)
+        assert not session_mod.is_session_stale(profile)
+        from claude_swap import profile_ownership
+        record = manager._launch_reservation
+        with profile_ownership.ownership_lock(manager.switcher.backup_dir):
+            profile_ownership.verify_reservation_locked(
+                manager.switcher.backup_dir, record["launchId"],
+                expected_profile_gen=record["profileGen"],
+            )
+
     def test_stale_marker_plus_probe_timeout_still_rebootstraps(
         self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates,
         monkeypatch,
@@ -684,14 +735,14 @@ class TestBootstrap:
         self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates,
         legacy_location: bool,
     ):
-        """A second `cswap run` joining a live session must not invalidate
-        under the running claude; the marker survives for later."""
+        """Unknown legacy ownership leaves credentials and the stale marker alone."""
         session_dir, _, _ = manager.setup_session("2", share=False)
         (session_dir / ".credentials.json").write_text("live lineage")
         _mark_stale(session_dir, legacy_location)
         make_live(session_dir)
 
-        manager.setup_session("2", share=False)
+        with pytest.raises(SessionError, match="legacy ownership"):
+            manager.setup_session("2", share=False)
 
         assert (session_dir / ".credentials.json").read_text() == "live lineage"
         assert session_mod.is_session_stale(session_dir)
@@ -907,14 +958,10 @@ class TestIsSessionValid:
     def test_invokes_pathext_resolved_launcher(
         self, manager, tmp_path, monkeypatch, valid_payload
     ):
-        """The probe must call the resolved launcher, not bare "claude".
-
-        On Windows `claude` is a `.cmd` shim that a bare "claude" won't
-        resolve, so validation would always fail. Use shutil.which instead.
-        """
+        """The probe must call the resolved launcher, not bare "claude"."""
         tmp_path.mkdir(exist_ok=True)
         resolved = "/fake/bin/claude.CMD"
-        monkeypatch.setattr(session_mod.shutil, "which", lambda name: resolved)
+        monkeypatch.setattr(_ClaudeStub, "path", resolved)
         seen_argv = {}
 
         def capture_run(argv, *a, **k):
@@ -934,7 +981,7 @@ class TestIsSessionValid:
 
 
 @pytest.fixture
-def share_setup(temp_home: Path, seeded_switcher):
+def share_setup(temp_home: Path, seeded_switcher, manager):
     """Source items in ~/.claude and an existing (seeded-enough) session dir."""
     source = temp_home / ".claude"
     (source / "settings.json").write_text("{}")
@@ -944,7 +991,7 @@ def share_setup(temp_home: Path, seeded_switcher):
 
     session_dir = session_dir_for(seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
     session_dir.mkdir(parents=True)
-    return source, session_dir, SessionManager(seeded_switcher)
+    return source, session_dir, manager
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlink mode is POSIX-only")
@@ -1598,31 +1645,34 @@ class _ExecCalled(Exception):
 
 @pytest.fixture
 def capture_exec(monkeypatch):
-    # Patch the handoff at the _exec() seam rather than the primitive beneath
-    # it: _exec() dispatches to os.execvpe on POSIX but subprocess.run on
-    # Windows, and patching subprocess.run here would also swallow the
-    # `claude auth status` probe that some of these tests stub separately.
+    # Leave the separate auth status probe fixture in control of probe results.
     def fake_exec(self, claude_bin, claude_args, env):
-        raise _ExecCalled(claude_bin, [claude_bin, *claude_args], env)
+        raise _ExecCalled(claude_bin.path, [claude_bin.path, *claude_args], env)
 
     monkeypatch.setattr(session_mod.SessionManager, "_exec", fake_exec)
-    monkeypatch.setattr(
-        session_mod.shutil, "which", lambda name: f"/fake/bin/{name}"
-    )
 
 
 class TestRun:
     def test_claude_not_on_path(self, manager, monkeypatch):
-        monkeypatch.setattr(session_mod.shutil, "which", lambda name: None)
+        monkeypatch.setattr(session_mod.real_claude, "resolve", _not_found)
         with pytest.raises(SessionError, match="not found on PATH"):
             manager.run("2", [])
 
     def test_exec_env_and_forwarded_args(
-        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates, monkeypatch
     ):
+        calls = []
+
+        def resolve(**kwargs):
+            calls.append(kwargs["backup_root"])
+            return _ClaudeStub()
+
+        monkeypatch.setattr(session_mod.real_claude, "resolve", resolve)
         with pytest.raises(_ExecCalled) as exc:
             manager.run("2", ["--resume", "--model", "x"])
 
+        assert calls == [manager.switcher.backup_dir]
+        assert auth_status_tracks_seed
         call = exc.value
         assert call.binary == "/fake/bin/claude"
         assert call.argv == ["/fake/bin/claude", "--resume", "--model", "x"]
@@ -1852,43 +1902,20 @@ class TestRun:
         assert exc.value.env["ANTHROPIC_API_KEY"] == "sk-ant-key"
 
     def test_exec_default_claude_not_on_path(self, manager, monkeypatch):
-        monkeypatch.setattr(session_mod.shutil, "which", lambda name: None)
+        monkeypatch.setattr(session_mod.real_claude, "resolve", _not_found)
         with pytest.raises(SessionError, match="not found on PATH"):
             manager.exec_default([])
 
 
 class TestExec:
-    """The _exec() terminal handoff dispatches per-platform (runs on any host)."""
+    def test_session_hands_off_to_the_resolved_binary(self, manager):
+        def handoff(args, env):
+            raise _ExecCalled("real", args, env)
 
-    def test_posix_replaces_process_with_execvpe(self, manager, monkeypatch):
-        def fake_execvpe(binary, argv, env):
-            # os.execvpe never returns; raising models that (and lets _exec's
-            # "unreachable" guard stay unhit, as it would be in real life).
-            raise _ExecCalled(binary, argv, env)
-
-        monkeypatch.setattr(session_mod.sys, "platform", "linux")
-        monkeypatch.setattr(session_mod.os, "execvpe", fake_execvpe)
+        child = SimpleNamespace(handoff=handoff)
         with pytest.raises(_ExecCalled) as exc:
-            manager._exec("/bin/claude", ["--resume"], {"A": "B"})
-        assert (exc.value.binary, exc.value.argv, exc.value.env) == (
-            "/bin/claude",
-            ["/bin/claude", "--resume"],
-            {"A": "B"},
-        )
-
-    def test_windows_runs_subprocess_and_mirrors_exit_code(self, manager, monkeypatch):
-        seen = {}
-
-        def fake_run(argv, env=None, **kwargs):
-            seen["call"] = (argv, env)
-            return SimpleNamespace(returncode=7)
-
-        monkeypatch.setattr(session_mod.sys, "platform", "win32")
-        monkeypatch.setattr(session_mod.subprocess, "run", fake_run)
-        with pytest.raises(SystemExit) as exc:
-            manager._exec("/bin/claude", ["--resume"], {"A": "B"})
-        assert exc.value.code == 7
-        assert seen["call"] == (["/bin/claude", "--resume"], {"A": "B"})
+            manager._exec(child, ["--resume"], {"A": "B"})
+        assert (exc.value.argv, exc.value.env) == (["--resume"], {"A": "B"})
 
 
 # ---------------------------------------------------------------------------
@@ -1970,9 +1997,10 @@ class TestGuards:
         seeded_switcher.purge()
 
         assert block_real_keychain.get_password(service, account) is None
-        assert not seeded_switcher.backup_dir.exists()
+        assert not session_dir.exists()
+        assert (seeded_switcher.backup_dir / "profile-ownership").is_dir()
 
-    def test_switch_warns_on_live_target_but_completes(
+    def test_switch_refuses_live_target(
         self, seeded_switcher, monkeypatch, capsys
     ):
         session_dir = session_dir_for(
@@ -1983,12 +2011,11 @@ class TestGuards:
         monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
         monkeypatch.setattr(seeded_switcher, "list_accounts", lambda **kw: None)
 
-        seeded_switcher._perform_switch(ACCOUNT_NUM)
+        with pytest.raises(SessionError, match="busy"):
+            seeded_switcher._perform_switch(ACCOUNT_NUM)
 
-        out = capsys.readouterr().out
-        assert "live session-mode" in out
         data = seeded_switcher._get_sequence_data()
-        assert data["activeAccountNumber"] == int(ACCOUNT_NUM)
+        assert data["activeAccountNumber"] == 1
 
     def test_switch_refuses_live_target_whose_profile_is_ahead(
         self, seeded_switcher, monkeypatch
@@ -2004,7 +2031,7 @@ class TestGuards:
         make_live(session_dir)
         monkeypatch.setattr(seeded_switcher, "_get_current_account", lambda: None)
 
-        with pytest.raises(SwitchError, match="rotated past the stored backup"):
+        with pytest.raises(SessionError, match="busy"):
             seeded_switcher._perform_switch(ACCOUNT_NUM)
 
         data = seeded_switcher._get_sequence_data()
@@ -3719,10 +3746,6 @@ class TestShareHistoryWindows:
 
     def test_run_accepts_the_flag(self, win_history, monkeypatch):
         source, session_dir, mgr = win_history
-        monkeypatch.setattr(
-            session_mod.shutil, "which", lambda _name: "/usr/bin/claude"
-        )
-
         def past_the_resolver(_identifier):
             raise RuntimeError("resolved: the launch goes on")
 
@@ -4119,7 +4142,7 @@ class TestShareHistoryDecision:
         manager.switcher.platform = Platform.WINDOWS
         handed_over = []
 
-        def setup_session(identifier, share, share_history=None):
+        def setup_session(identifier, share, share_history=None, *, binary=None):
             handed_over.append(share_history)
             raise SessionError("stop here")
 
@@ -4420,13 +4443,8 @@ class TestShareHistoryIsTheDefault:
         make_live(session_dir)
         capsys.readouterr()
 
-        with pytest.raises(_ExecCalled) as exc:
+        with pytest.raises(SessionError, match="legacy ownership"):
             manager.run("2", [])
-
-        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
-        out = capsys.readouterr().out
-        assert out.count("keeps its own") == 1
-        assert "then relaunch:  cswap run 2\n" in out
         assert (
             session_dir / "projects" / "-home-user-app" / "bbb.jsonl"
         ).read_text() == "profile-b\n"
@@ -4444,10 +4462,8 @@ class TestShareHistoryIsTheDefault:
                 raise PermissionError("read-only file system")
 
         monkeypatch.setattr(session_mod, "FileLock", Unopenable)
-        with pytest.raises(_ExecCalled):
+        with pytest.raises(PermissionError, match="read-only"):
             manager.run("2", [])
-
-        assert "could not be locked" in capsys.readouterr().out
         assert not (session_dir / "projects").is_symlink()
 
     def test_a_partial_sync_leaves_the_rest_of_the_manifest_alone(
@@ -5230,7 +5246,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         # hits — on a profile seeded BEFORE our rotation.
         calls = {"n": 0}
 
-        def peer_bootstraps_while_we_wait(self, sdir, email, org_uuid):
+        def peer_bootstraps_while_we_wait(self, sdir, email, org_uuid, *, binary=None):
             calls["n"] += 1
             if calls["n"] == 1:
                 return False  # pre-lock: nothing there yet
@@ -5279,7 +5295,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
 
         calls = {"n": 0}
 
-        def peer_bootstraps_while_we_wait(self, sdir, email, org_uuid):
+        def peer_bootstraps_while_we_wait(self, sdir, email, org_uuid, *, binary=None):
             calls["n"] += 1
             if calls["n"] == 1:
                 return False
@@ -5601,3 +5617,219 @@ class TestDefaultLoginSignedOut:
         monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
 
         assert manager._default_login_signed_out() is True
+
+
+@pytest.mark.parametrize("args", [[], ["--unknown-form"]])
+def test_unadmitted_run_stops_before_profile_reuse(manager, monkeypatch, args):
+    monkeypatch.setattr(session_mod.test_mode, "active", lambda: False)
+    touched = []
+    monkeypatch.setattr(manager, "_is_session_valid", lambda *a, **kw: touched.append("reuse") or True)
+    monkeypatch.setattr(manager, "_exec", lambda *a, **kw: touched.append("exec"))
+    with pytest.raises(SessionError, match="admitted|invocation"):
+        manager.run(ACCOUNT_NUM, args)
+    assert touched == []
+
+
+def test_unadmitted_setup_stops_before_profile_reuse(manager, monkeypatch):
+    monkeypatch.setattr(session_mod.test_mode, "active", lambda: False)
+    touched = []
+    monkeypatch.setattr(manager, "_is_session_valid", lambda *a, **kw: touched.append("reuse") or True)
+    with pytest.raises(SessionError, match="admitted"):
+        manager.setup_session(ACCOUNT_NUM, False)
+    assert touched == []
+
+
+@pytest.mark.parametrize("method", ["run", "setup_session"])
+def test_profile_reservation_precedes_reuse(manager, monkeypatch, method):
+    from contextlib import contextmanager
+    from claude_swap import profile_ownership
+
+    entered = []
+    def blocked(*args, **kwargs):
+        entered.append("reserve")
+        raise SessionError("profile reserved")
+    monkeypatch.setattr(profile_ownership, "reserve_locked", blocked)
+    monkeypatch.setattr(manager, "_is_session_valid", lambda *a, **kw: pytest.fail("reuse before reserve"))
+    with pytest.raises(SessionError, match="reserved"):
+        if method == "run":
+            manager.run(ACCOUNT_NUM, [])
+        else:
+            manager.setup_session(ACCOUNT_NUM, False)
+    assert entered == ["reserve"]
+
+
+def test_run_keeps_reservation_across_setup_to_exec(manager, monkeypatch):
+    from claude_swap import profile_ownership
+
+    def prepared(*args, **kwargs):
+        record = manager._launch_reservation
+        with profile_ownership.ownership_lock(manager.switcher.backup_dir):
+            assert profile_ownership.profile_busy_locked(manager.switcher.backup_dir, ACCOUNT_NUM)
+        return session_dir_for(manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL), ACCOUNT_NUM, ACCOUNT_EMAIL
+
+    def handoff(*args, **kwargs):
+        with profile_ownership.ownership_lock(manager.switcher.backup_dir):
+            assert profile_ownership.profile_busy_locked(manager.switcher.backup_dir, ACCOUNT_NUM)
+            peer = profile_ownership.reserve_locked(
+                manager.switcher.backup_dir, ACCOUNT_NUM,
+                session_dir_for(manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL),
+            )
+            assert peer["launchId"] != manager._launch_reservation["launchId"]
+            profile_ownership.release_locked(manager.switcher.backup_dir, peer["launchId"])
+        raise OSError("handoff failed")
+
+    monkeypatch.setattr(manager, "setup_session", prepared)
+    monkeypatch.setattr(manager, "_exec", handoff)
+    with pytest.raises(OSError, match="handoff failed"):
+        manager.run(ACCOUNT_NUM, [])
+    with profile_ownership.ownership_lock(manager.switcher.backup_dir):
+        assert not profile_ownership.profile_busy_locked(manager.switcher.backup_dir, ACCOUNT_NUM)
+
+
+class TestLaunchReservation:
+    @pytest.mark.parametrize("windows_key", [False, True], ids=["native", "WindowsCase"])
+    def test_setup_keeps_reservation_until_external_handoff(
+        self, manager, auth_status_tracks_seed, refresh_rotates, monkeypatch, windows_key
+    ):
+        from claude_swap import profile_ownership
+
+        if windows_key:
+            original_directory = session_mod.session_dir_for
+            monkeypatch.setattr(session_mod, "session_dir_for", lambda *args:
+                original_directory(*args).with_name("CaseProfile"))
+            path_adapter = SimpleNamespace(**{**vars(os.path), "normcase": str.lower})
+            monkeypatch.setattr(profile_ownership, "os", SimpleNamespace(
+                **{**vars(os), "path": path_adapter}))
+        profile, num, _ = manager.setup_session("2", share=False)
+        record = manager._launch_reservation
+        assert record is not None
+        with profile_ownership.ownership_lock(manager.switcher.backup_dir):
+            current = profile_ownership.verify_reservation_locked(
+                manager.switcher.backup_dir, record["launchId"]
+            )
+        assert current["state"] == "reserved"
+        assert current["profile"] == profile_ownership.profile_key(profile)
+
+    def test_default_fast_path_does_not_need_profile_admission(
+        self, manager, capture_exec, monkeypatch
+    ):
+        monkeypatch.setattr(manager.switcher, "_get_current_account",
+                            lambda: (ACCOUNT_EMAIL, ORG_UUID))
+        monkeypatch.setattr(manager, "_admit_profile_launch",
+                            lambda args: pytest.fail("profile admission on default route"))
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [])
+
+
+    @pytest.mark.parametrize("args", [["--teleport", "session-id"], ["--remote", "session-id"]])
+    def test_unadmitted_transferring_form_refused_before_warm_reuse_or_post(
+        self, manager, monkeypatch, args
+    ):
+        # No shim is installed; direct run must reject before inspecting the
+        # reusable profile, refreshing its backup, or handing over a process.
+        monkeypatch.setattr(manager, "_is_session_valid",
+                            lambda *a, **k: pytest.fail("profile reuse"))
+        monkeypatch.setattr(manager.switcher, "consume_backup_grant",
+                            lambda *a, **k: pytest.fail("refresh POST"))
+        monkeypatch.setattr(manager, "_exec",
+                            lambda *a, **k: pytest.fail("Claude launch"))
+        profile = session_dir_for(manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+        profile.mkdir(parents=True)
+        marker = profile / "untouched"
+        marker.write_text("warm")
+        with pytest.raises(SessionError, match="Unsupported profile invocation"):
+            manager.run("2", args)
+        assert marker.read_text() == "warm"
+
+
+    def test_external_handoff_supervises_and_releases_only_after_completion(
+        self, manager, monkeypatch
+    ):
+        from claude_swap import profile_ownership
+
+        events = []
+        monkeypatch.setattr(profile_ownership, "_process_identity", lambda pid:
+            profile_ownership._ProcessIdentity(
+                "present", profile_ownership._PosixStart(str(pid)), "linux"))
+        monkeypatch.setattr(session_mod.spawn, "require_supervision", lambda: events.append("require"))
+        def owned_launch(callback, *, publish, release, abort):
+            session_mod.spawn.require_supervision()
+            publish()
+            record = manager._launch_reservation
+            with profile_ownership.ownership_lock(manager.switcher.backup_dir):
+                current = profile_ownership.verify_reservation_locked(
+                    manager.switcher.backup_dir, record["launchId"]
+                )
+            assert current["state"] == "running"
+            events.append("supervise")
+            release()
+            return 27
+        monkeypatch.setattr(session_mod.spawn, "owned_launch", owned_launch)
+        with manager._reserve_profile("2", retain=True):
+            pass
+        record = manager._launch_reservation
+        with pytest.raises(SystemExit) as result:
+            manager._exec(_ClaudeStub(), ["-p", "hello"], env={
+                "CLAUDE_CONFIG_DIR": record["profile"],
+            })
+        assert result.value.code == 27
+        assert events == ["require", "supervise"]
+        assert manager._launch_reservation is None
+        with profile_ownership.ownership_lock(manager.switcher.backup_dir):
+            assert not profile_ownership.profile_busy_locked(
+                manager.switcher.backup_dir, "2"
+            )
+
+
+    def test_external_handoff_cannot_redirect_reserved_profile(self, manager, monkeypatch):
+        monkeypatch.setattr(session_mod.spawn, "require_supervision", lambda: None)
+        monkeypatch.setattr(session_mod.spawn, "owned_launch",
+                            lambda *a, **kw: pytest.fail("redirected launch"))
+        with manager._reserve_profile("2", retain=True):
+            pass
+        with pytest.raises(SessionError, match="profile.*handoff"):
+            manager._exec(_ClaudeStub(), ["-p", "hello"], env={"CLAUDE_CONFIG_DIR": "/other"})
+
+
+def test_unsupported_supervision_preserves_profile_before_target(manager, monkeypatch):
+    from claude_swap import profile_ownership
+
+    profile = session_dir_for(manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+    profile.mkdir(parents=True)
+    marker = profile / "untouched"
+    marker.write_bytes(b"synthetic warm profile")
+    monkeypatch.setattr(session_mod.spawn, "sys", SimpleNamespace(platform="darwin", stderr=sys.stderr))
+    monkeypatch.setattr(profile_ownership, "_process_identity", lambda pid:
+        profile_ownership._ProcessIdentity(
+            "present", profile_ownership._PosixStart(str(pid)), "darwin"))
+    monkeypatch.setattr(_ClaudeStub, "handoff",
+                        lambda *a, **kw: pytest.fail("target started"), raising=False)
+    with pytest.raises(session_mod.real_claude.ResolveError, match="supervision is unsupported"):
+        with manager._reserve_profile(ACCOUNT_NUM):
+            manager._exec(_ClaudeStub(), ["-p", "hello"], env={"CLAUDE_CONFIG_DIR": str(profile)})
+    assert marker.read_bytes() == b"synthetic warm profile"
+    with profile_ownership.ownership_lock(manager.switcher.backup_dir):
+        assert not profile_ownership.profile_busy_locked(manager.switcher.backup_dir, ACCOUNT_NUM)
+
+
+def test_prepublication_cleanup_error_is_not_retried_by_reservation(manager, monkeypatch):
+    from claude_swap import profile_ownership
+
+    events = []
+    def refused():
+        raise OSError("synthetic pidfd unavailable")
+    def release_aborted(*args):
+        events.append("aborted")
+        raise OSError("synthetic release I/O error")
+    def second_cleanup(*args):
+        events.append("outer-cleanup")
+    monkeypatch.setattr(session_mod.spawn, "require_supervision", refused)
+    monkeypatch.setattr(profile_ownership, "release_aborted", release_aborted)
+    monkeypatch.setattr(profile_ownership, "release_locked", second_cleanup)
+    with pytest.raises(session_mod.real_claude.ResolveError, match="release I/O error"):
+        with manager._reserve_profile("2"):
+            record = manager._launch_reservation
+            manager._exec(_ClaudeStub(), ["-p", "hello"], env={
+                "CLAUDE_CONFIG_DIR": record["profile"],
+            })
+    assert events == ["aborted"]

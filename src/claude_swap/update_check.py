@@ -12,6 +12,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from claude_swap import spawn
 from claude_swap.cache import CACHE_DIR, MISSING, read_cache, write_cache
 
 CACHE_PATH = CACHE_DIR / "update_check.json"
@@ -158,7 +159,7 @@ def _uv_latest_version(current_version: str, cooldown: _Cooldown | None) -> str 
         cmd += ["--exclude-newer", cooldown.value]
     env = {k: v for k, v in os.environ.items() if k != "UV_EXCLUDE_NEWER"}
     try:
-        result = subprocess.run(
+        result = spawn.run(
             cmd,
             capture_output=True,
             text=True,
@@ -324,7 +325,7 @@ def _installed_version_on_disk() -> str | None:
         "print(m.version('claude-swap'))"
     )
     try:
-        result = subprocess.run(
+        result = spawn.run(
             [sys.executable, "-c", code],
             capture_output=True,
             text=True,
@@ -380,7 +381,7 @@ def _installed_identity_on_disk() -> dict | None:
         "print(json.dumps(install_identity()))"
     )
     try:
-        result = subprocess.run(
+        result = spawn.run(
             [sys.executable, "-c", code],
             capture_output=True,
             text=True,
@@ -474,7 +475,7 @@ def run_self_upgrade(current_version: str | None = None) -> int:
         return 1
 
     try:
-        result = subprocess.run(cmd, check=False)
+        result = spawn.run(cmd, check=False)
     except FileNotFoundError:
         error(
             f"Detected {method} install but `{cmd[0]}` is not on PATH. "

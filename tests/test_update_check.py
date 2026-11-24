@@ -260,7 +260,7 @@ class TestDetectInstallMethod:
 
 class TestCheckForUpdateMessage:
     @patch("claude_swap.update_check.sys.platform", "linux")
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     def test_detected_method_non_windows_suggests_cswap_upgrade(
         self, mock_run, tmp_path, monkeypatch
     ):
@@ -349,7 +349,7 @@ class TestUvInstall(_UvInstall):
     `cswap upgrade` only to read "Nothing to upgrade"."""
 
     @patch("claude_swap.update_check.urllib.request.urlopen")
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     def test_asks_uv_with_the_receipt_span(self, mock_run, mock_urlopen, tmp_path):
         self._write_receipt(
             tmp_path, 'exclude-newer = "2026-01-01T00:00:00Z"\nexclude-newer-span = "P14D"'
@@ -366,7 +366,7 @@ class TestUvInstall(_UvInstall):
         assert cmd[-2:] == ["--exclude-newer", "P14D"]
         mock_urlopen.assert_not_called()
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     def test_absolute_cutoff_without_span(self, mock_run, tmp_path):
         self._write_receipt(tmp_path, 'exclude-newer = "2026-01-01T00:00:00Z"')
         mock_run.return_value = _uv_pip_list([])
@@ -375,7 +375,7 @@ class TestUvInstall(_UvInstall):
 
         assert self._uv_command(mock_run)[-2:] == ["--exclude-newer", "2026-01-01T00:00:00Z"]
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     def test_env_var_overrides_receipt_and_is_passed_explicitly(
         self, mock_run, tmp_path, monkeypatch
     ):
@@ -388,7 +388,7 @@ class TestUvInstall(_UvInstall):
         assert self._uv_command(mock_run)[-2:] == ["--exclude-newer", "1 week"]
         assert "UV_EXCLUDE_NEWER" not in mock_run.call_args.kwargs["env"]
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     def test_asks_uv_from_the_tool_directory(self, mock_run, tmp_path):
         # uv reads the uv.toml of whatever project the shell is in, and a
         # project's own exclude-newer would hide releases that `uv tool
@@ -399,7 +399,7 @@ class TestUvInstall(_UvInstall):
 
         assert mock_run.call_args.kwargs["cwd"] == str(tmp_path)
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     def test_no_cooldown_passes_no_cutoff(self, mock_run, tmp_path):
         mock_run.return_value = _uv_pip_list(_OUTDATED)
 
@@ -408,7 +408,7 @@ class TestUvInstall(_UvInstall):
         assert result is not None
         assert "--exclude-newer" not in self._uv_command(mock_run)
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     def test_nothing_outdated_is_quiet_and_cached(self, mock_run, tmp_path):
         mock_run.return_value = _uv_pip_list(
             [{"name": "platformdirs", "latest_version": "4.13.5"}]
@@ -419,7 +419,7 @@ class TestUvInstall(_UvInstall):
         assert cache["data"] == "0.27.2"
 
     @patch("claude_swap.update_check.urllib.request.urlopen")
-    @patch("claude_swap.update_check.subprocess.run", side_effect=FileNotFoundError)
+    @patch("claude_swap.update_check.spawn.run", side_effect=FileNotFoundError)
     def test_uv_missing_without_cooldown_asks_pypi(self, mock_run, mock_urlopen, tmp_path):
         # `cswap auto --once` under cron or launchd runs without uv on PATH.
         # Nothing hides releases from this install, so PyPI's answer is the
@@ -434,7 +434,7 @@ class TestUvInstall(_UvInstall):
         cache = json.loads((tmp_path / "cache.json").read_text())
         assert cache["data"] == "0.28.0"
 
-    @patch("claude_swap.update_check.subprocess.run", side_effect=FileNotFoundError)
+    @patch("claude_swap.update_check.spawn.run", side_effect=FileNotFoundError)
     def test_uv_missing_with_cooldown_is_quiet_and_retried(self, mock_run, tmp_path):
         # PyPI would advertise the release the cooldown hides, so the run
         # stays quiet. Caching that for a day would silence the interactive
@@ -448,7 +448,7 @@ class TestUvInstall(_UvInstall):
         mock_run.return_value = _uv_pip_list(_OUTDATED)
         assert check_for_update("0.27.2") is not None
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     def test_uv_network_failure_with_cooldown_backs_off_for_an_hour(self, mock_run, tmp_path):
         # Only a missing uv retries immediately. A timeout or a failed
         # resolve under a cooldown would otherwise cost every following
@@ -469,14 +469,14 @@ class TestUvInstall(_UvInstall):
         assert mock_run.call_count == 2
 
     @patch("claude_swap.update_check.urllib.request.urlopen")
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     def test_uv_failure_without_cooldown_asks_pypi(self, mock_run, mock_urlopen, tmp_path):
         mock_run.side_effect = subprocess.CalledProcessError(2, "uv")
         mock_urlopen.return_value = _make_pypi_response("0.28.0")
 
         assert check_for_update("0.27.2") is not None
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     def test_uv_and_pypi_both_failing_is_quiet_and_cached(self, mock_run, tmp_path):
         mock_run.side_effect = subprocess.CalledProcessError(2, "uv")
 
@@ -484,7 +484,7 @@ class TestUvInstall(_UvInstall):
         cache = json.loads((tmp_path / "cache.json").read_text())
         assert cache["data"] is None
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     def test_fresh_cache_skips_uv(self, mock_run, tmp_path):
         _write_cache(tmp_path / "cache.json", "0.28.0")
 
@@ -493,7 +493,7 @@ class TestUvInstall(_UvInstall):
         assert result is not None
         mock_run.assert_not_called()
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     def test_cache_in_an_unknown_shape_is_refetched(self, mock_run, tmp_path):
         _write_cache(tmp_path / "cache.json", {"latest": "0.28.0"})
         mock_run.return_value = _uv_pip_list(_OUTDATED)
@@ -501,7 +501,7 @@ class TestUvInstall(_UvInstall):
         assert check_for_update("0.27.2") is not None
         mock_run.assert_called_once()
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     @patch("claude_swap.update_check.urllib.request.urlopen")
     def test_pipx_install_asks_pypi(self, mock_urlopen, mock_run, monkeypatch):
         monkeypatch.setattr("claude_swap.update_check._detect_install_method", lambda: "pipx")
@@ -517,7 +517,7 @@ class TestHeldBackReleaseNotice(_UvInstall):
     `cswap upgrade` asks uv what it would install without the cooldown and
     explains the second case itself."""
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     def test_held_back_release_is_explained(self, mock_run, tmp_path):
         self._write_receipt(tmp_path, 'exclude-newer-span = "P14D"')
         mock_run.return_value = _uv_pip_list(_OUTDATED)
@@ -532,7 +532,7 @@ class TestHeldBackReleaseNotice(_UvInstall):
         assert "uv tool install" not in notice
         assert "--exclude-newer" not in self._uv_command(mock_run)
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     def test_absolute_cutoff_is_restored_verbatim(self, mock_run, tmp_path):
         self._write_receipt(tmp_path, 'exclude-newer = "2026-01-01T00:00:00Z"')
         mock_run.return_value = _uv_pip_list(_OUTDATED)
@@ -542,7 +542,7 @@ class TestHeldBackReleaseNotice(_UvInstall):
         assert notice is not None
         assert "--exclude-newer 2026-01-01T00:00:00Z" in notice
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     def test_receipt_value_with_shell_characters_gets_no_restore_line(self, mock_run, tmp_path):
         # uv validates what it writes, but the value is pasted into a shell
         # unquoted, so anything outside a duration or timestamp stays out.
@@ -556,7 +556,7 @@ class TestHeldBackReleaseNotice(_UvInstall):
         assert "To restore the cooldown" not in notice
         assert "echo" not in notice.split("To take it now")[1]
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     def test_env_var_source_is_overridden_by_the_flag(self, mock_run, tmp_path, monkeypatch):
         # The command line flag wins over UV_EXCLUDE_NEWER for that one run,
         # and the variable keeps applying to later upgrades, so there is
@@ -573,19 +573,19 @@ class TestHeldBackReleaseNotice(_UvInstall):
         assert "unset" not in notice
         assert "To restore the cooldown" not in notice
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     def test_no_cooldown_means_no_notice_and_no_uv_call(self, mock_run):
         assert held_back_release_notice("0.27.2") is None
         mock_run.assert_not_called()
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     def test_nothing_newer_is_quiet(self, mock_run, tmp_path):
         self._write_receipt(tmp_path, 'exclude-newer-span = "P14D"')
         mock_run.return_value = _uv_pip_list([])
 
         assert held_back_release_notice("0.27.2") is None
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     def test_final_release_is_not_told_about_a_prerelease(self, mock_run, tmp_path):
         self._write_receipt(tmp_path, 'exclude-newer-span = "P14D"')
         mock_run.return_value = _uv_pip_list(
@@ -594,13 +594,13 @@ class TestHeldBackReleaseNotice(_UvInstall):
 
         assert held_back_release_notice("0.27.2") is None
 
-    @patch("claude_swap.update_check.subprocess.run", side_effect=FileNotFoundError)
+    @patch("claude_swap.update_check.spawn.run", side_effect=FileNotFoundError)
     def test_uv_failure_is_quiet(self, mock_run, tmp_path):
         self._write_receipt(tmp_path, 'exclude-newer-span = "P14D"')
 
         assert held_back_release_notice("0.27.2") is None
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     @patch("claude_swap.update_check._installed_version_on_disk", return_value="0.28.0")
     def test_cswap_upgrade_prints_notice_after_uv(
         self, mock_on_disk, mock_run, tmp_path, capsys
@@ -620,7 +620,7 @@ class TestHeldBackReleaseNotice(_UvInstall):
         assert upgrade == ["uv", "tool", "upgrade", "claude-swap"]
         assert listing[:4] == ["uv", "pip", "list", "--outdated"]
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     def test_failed_uv_upgrade_gets_no_notice(self, mock_run, tmp_path, capsys):
         self._write_receipt(tmp_path, 'exclude-newer-span = "P14D"')
         mock_run.return_value = MagicMock(returncode=2)
@@ -630,7 +630,7 @@ class TestHeldBackReleaseNotice(_UvInstall):
         assert "is on PyPI" not in capsys.readouterr().out
         mock_run.assert_called_once()
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     @patch("claude_swap.update_check._installed_version_on_disk", return_value=None)
     def test_pipx_install_gets_no_notice(
         self, mock_on_disk, mock_run, tmp_path, monkeypatch, capsys
@@ -644,7 +644,7 @@ class TestHeldBackReleaseNotice(_UvInstall):
         assert "is on PyPI" not in capsys.readouterr().out
         mock_run.assert_called_once()
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     def test_windows_prints_notice_with_the_command(
         self, mock_run, tmp_path, monkeypatch, capsys
     ):
@@ -662,7 +662,7 @@ class TestHeldBackReleaseNotice(_UvInstall):
 
 @patch("claude_swap.update_check.sys.platform", "linux")
 class TestRunSelfUpgrade:
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     @patch("claude_swap.update_check._installed_version_on_disk", return_value=None)
     @patch("claude_swap.update_check._detect_install_method", return_value="uv")
     def test_uv_invokes_uv_tool_upgrade(self, mock_detect, mock_on_disk, mock_run):
@@ -673,7 +673,7 @@ class TestRunSelfUpgrade:
             ["uv", "tool", "upgrade", "claude-swap"], check=False
         )
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     @patch("claude_swap.update_check._installed_version_on_disk", return_value=None)
     @patch("claude_swap.update_check._detect_install_method", return_value="pipx")
     def test_pipx_invokes_pipx_upgrade(self, mock_detect, mock_on_disk, mock_run):
@@ -684,14 +684,14 @@ class TestRunSelfUpgrade:
             ["pipx", "upgrade", "claude-swap"], check=False
         )
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     @patch("claude_swap.update_check._detect_install_method", return_value="uv")
     def test_propagates_nonzero_exit_code(self, mock_detect, mock_run):
         mock_run.return_value = MagicMock(returncode=2)
 
         assert run_self_upgrade() == 2
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     @patch("claude_swap.update_check._detect_install_method", return_value=None)
     def test_unknown_method_returns_1_and_prints_instructions(
         self, mock_detect, mock_run, capsys
@@ -704,7 +704,7 @@ class TestRunSelfUpgrade:
         assert "pip install --upgrade claude-swap" in err
 
     @patch(
-        "claude_swap.update_check.subprocess.run", side_effect=FileNotFoundError
+        "claude_swap.update_check.spawn.run", side_effect=FileNotFoundError
     )
     @patch("claude_swap.update_check._detect_install_method", return_value="uv")
     def test_filenotfound_returns_1(self, mock_detect, mock_run, capsys):
@@ -720,7 +720,7 @@ class TestRunSelfUpgradeReport:
     anything (#491). Verification is best effort: it never masks the
     upgrade's own exit status."""
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     @patch("claude_swap.update_check._detect_install_method", return_value="uv")
     def test_reports_successful_upgrade(self, mock_detect, mock_run, capsys):
         mock_run.return_value = MagicMock(returncode=0)
@@ -730,7 +730,7 @@ class TestRunSelfUpgradeReport:
             assert run_self_upgrade("0.27.2") == 0
         assert "claude-swap upgraded: 0.27.2 -> 0.28.0" in capsys.readouterr().out
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     @patch("claude_swap.update_check._detect_install_method", return_value="uv")
     def test_reports_unchanged_upgrade(self, mock_detect, mock_run, capsys):
         mock_run.return_value = MagicMock(returncode=0)
@@ -740,7 +740,7 @@ class TestRunSelfUpgradeReport:
             assert run_self_upgrade("0.27.2") == 0
         assert "claude-swap is still at 0.27.2" in capsys.readouterr().out
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     @patch("claude_swap.update_check._detect_install_method", return_value="uv")
     def test_no_result_line_when_verification_fails(self, mock_detect, mock_run, capsys):
         mock_run.return_value = MagicMock(returncode=0)
@@ -752,7 +752,7 @@ class TestRunSelfUpgradeReport:
         assert "upgraded:" not in out
         assert "is still at" not in out
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     @patch("claude_swap.update_check._detect_install_method", return_value="uv")
     def test_no_result_line_when_verification_times_out(self, mock_detect, mock_run, capsys):
         # The verification subprocess.run times out; _installed_version_on_disk
@@ -768,7 +768,7 @@ class TestRunSelfUpgradeReport:
         assert "upgraded:" not in out
         assert "is still at" not in out
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     @patch("claude_swap.update_check._detect_install_method", return_value="uv")
     def test_failed_upgrade_reports_nothing(self, mock_detect, mock_run, capsys):
         mock_run.return_value = MagicMock(returncode=2)
@@ -783,7 +783,7 @@ class TestRunSelfUpgradeWindows:
     """On Windows the running .exe is locked, so we never upgrade in place --
     we print the command for the user to run themselves and exit 1."""
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     @patch("claude_swap.update_check._detect_install_method", return_value="uv")
     def test_uv_prints_command_and_does_not_run(self, mock_detect, mock_run, capsys):
         assert run_self_upgrade() == 1
@@ -791,7 +791,7 @@ class TestRunSelfUpgradeWindows:
         out = capsys.readouterr().out
         assert "uv tool upgrade claude-swap" in out
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     @patch("claude_swap.update_check._detect_install_method", return_value="pipx")
     def test_pipx_prints_command_and_does_not_run(self, mock_detect, mock_run, capsys):
         assert run_self_upgrade() == 1
@@ -799,7 +799,7 @@ class TestRunSelfUpgradeWindows:
         out = capsys.readouterr().out
         assert "pipx upgrade claude-swap" in out
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     @patch("claude_swap.update_check._detect_install_method", return_value=None)
     def test_unknown_method_hits_generic_fallback(self, mock_detect, mock_run, capsys):
         assert run_self_upgrade() == 1
@@ -921,7 +921,7 @@ class TestUpgradeRestartsARunningMenuBar:
         captured = capsys.readouterr()
         assert "not restarted" in captured.out + captured.err
 
-    @patch("claude_swap.update_check.subprocess.run")
+    @patch("claude_swap.update_check.spawn.run")
     @patch("claude_swap.update_check._detect_install_method", return_value="uv")
     def test_run_self_upgrade_wires_the_restart_in(self, mock_detect, mock_run, monkeypatch, capsys):
         from claude_swap import update_check

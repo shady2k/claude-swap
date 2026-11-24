@@ -39,6 +39,9 @@ from claude_swap.session import SessionManager
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.transfer import export_accounts, import_accounts
 
+
+pytestmark = pytest.mark.mock_stand_routing
+
 API_KEY = "sk-ant-api03-" + "a1b2c3d4e5" * 4  # 53 chars
 OTHER_KEY = "sk-ant-api03-" + "z9y8x7w6v5" * 4
 # The Console also issues identity-backed keys under other family prefixes — a
@@ -366,7 +369,7 @@ class TestSessionGuard:
 
     def test_run_rejects_before_exec(self, temp_home: Path, monkeypatch):
         mgr = SessionManager(self._seed_api_key_account())
-        monkeypatch.setattr(session_mod.shutil, "which", lambda name: "/fake/claude")
+        monkeypatch.setattr(session_mod.real_claude, "resolve", lambda **kwargs: object())
         with pytest.raises(SessionError, match="does not support API-key accounts"):
             mgr.run("2", [], share=True)
 

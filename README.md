@@ -142,7 +142,7 @@ The exact rules (margins, landing, polling cadence, tier handling) are in [docs/
 
 ### Run multiple accounts at the same time (session mode)
 
-Launch Claude Code as a specific account in the current terminal only — every other terminal and the VS Code extension stay on your default account, so two accounts can work in parallel.
+Launch Claude Code as a specific account in the current terminal only — every other terminal and the VS Code extension stay on your default account, so two accounts can work in parallel. Explicit account launches currently fail closed without build admission; see [profile ownership restrictions](docs/transparent.md#profile-ownership).
 
 ```bash
 cswap run 2                     # launch Claude Code as account 2, here only
@@ -166,6 +166,11 @@ Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP ser
 - **Scripting.** cswap writes its own launch notices to stderr, so stdout carries only what claude prints: `cswap run 2 -- -p "…" --output-format json | jq` works.
 
 </details>
+
+On POSIX, `cswap run` rejects Claude installations whose path includes directories writable by the group or others.
+On Windows, `cswap run` and its auth probe use the legacy PATH lookup without strict path-chain checks, and the shim remains disabled pending PR1.
+
+On POSIX, the [experimental PATH shim](docs/transparent.md) can intercept ordinary `claude` in the isolated test stand. No production build has been admitted for profile routing.
 
 <details>
 <summary>Map accounts to directories — auto-pick per repo</summary>
