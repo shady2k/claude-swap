@@ -19,6 +19,9 @@ import pytest
 from claude_swap import json_output, subscription
 from claude_swap.models import AccountSnapshot
 
+
+pytestmark = pytest.mark.mock_stand_routing
+
 ACTIVE_MAX = {
     "tier": "default_claude_max_20x",
     "billingType": "stripe_subscription",

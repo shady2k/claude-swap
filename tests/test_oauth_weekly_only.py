@@ -27,6 +27,9 @@ from claude_swap.tui.widgets import usage_rows
 from claude_swap.usage_store import FetchRecord, UsageStore
 from tests.test_autoswitch import EngineHarness, _usage
 
+
+pytestmark = pytest.mark.mock_stand_routing
+
 _OMITTED = object()
 _LABELS = {"five_hour": "5h", "seven_day": "7d"}
 _JSON_KEYS = {"five_hour": "fiveHour", "seven_day": "sevenDay"}

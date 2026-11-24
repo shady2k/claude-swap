@@ -49,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import oauth, poll_policy
+from claude_swap import oauth, poll_policy, profile_ownership
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.lines import BindingWindow, binding_window, line_room, window_line
@@ -1579,6 +1579,12 @@ class AutoSwitchEngine:
         systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
+            with profile_ownership.ownership_lock(self.switcher.backup_dir):
+                if profile_ownership.profile_busy_locked(
+                    self.switcher.backup_dir, num,
+                    self.switcher._session_dir(num, email),
+                ):
+                    continue
             if trigger == "consume-first" or (priority_mode and num in oauth_candidates):
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent

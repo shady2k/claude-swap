@@ -14,7 +14,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from claude_swap import macos_keychain
+from claude_swap import macos_keychain, profile_ownership
 
 from claude_swap.exceptions import (
     AccountNotFoundError,
@@ -85,6 +85,7 @@ from claude_swap.printer import (
     yellowed,
 )
 from claude_swap.paths import (
+    account_lock_path,
     get_backup_root,
     get_credentials_path,
     get_default_claude_config_home,
@@ -257,6 +258,10 @@ _DEMOTING_STASH_REASONS = (
 )
 
 ERROR_NOTES = {
+    "active-refresh-deferred": (
+        "active credential recovery is deferred until refresh authority is "
+        "available — use Claude Code to renew the login"
+    ),
     "store-unmirrored": (
         "CLAUDE_SECURESTORAGE_CONFIG_DIR set — unset it or run from a "
         "normal shell"
@@ -453,7 +458,7 @@ class ClaudeAccountSwitcher:
         self.sequence_file = self.backup_dir / "sequence.json"
         self.configs_dir = self.backup_dir / "configs"
         self.credentials_dir = self.backup_dir / "credentials"
-        self.lock_file = self.backup_dir / ".lock"
+        self.lock_file = account_lock_path(self.backup_dir)
         self._logger = setup_logging(self.backup_dir, debug=debug)
         self._usage_store = UsageStore(self.backup_dir / "cache")
         # (settings mtime, (threshold, weekly_threshold, models)) — see
@@ -918,18 +923,24 @@ class ClaudeAccountSwitcher:
         worse than the drift caveat — but gets a stale marker so setup_session
         re-bootstraps it once it is no longer live.
         """
-        if self._live_session_pids(account_num, email):
-            from claude_swap.session import mark_session_stale
-
-            if not mark_session_stale(self._session_dir(account_num, email)):
-                self._logger.error(
-                    "Account %s's backup credentials changed but its live "
-                    "session profile could not be marked stale; it may keep "
-                    "serving the superseded generation once it exits.",
-                    account_num,
+        with profile_ownership.ownership_lock(self.backup_dir):
+            if self._live_session_pids(account_num, email) or profile_ownership.profile_busy_locked(
+                self.backup_dir, account_num, self._session_dir(account_num, email)
+            ):
+                profile_ownership.invalidate_generation_locked(
+                    self.backup_dir, self._session_dir(account_num, email)
                 )
-        else:
-            self._invalidate_session_credentials(account_num, email)
+                from claude_swap.session import mark_session_stale
+
+                if not mark_session_stale(self._session_dir(account_num, email)):
+                    self._logger.error(
+                        "Account %s's backup credentials changed but its live "
+                        "session profile could not be marked stale; it may keep "
+                        "serving the superseded generation once it exits.",
+                        account_num,
+                    )
+            else:
+                self._invalidate_session_credentials(account_num, email)
 
     def _read_account_credentials(
         self, account_num: str, email: str, *, cached: bool = False
@@ -970,29 +981,30 @@ class ClaudeAccountSwitcher:
         ``Exception`` disarmed exactly that guard for every write routing
         through here.
         """
-        self._store._write_account_credentials(account_num, email, credentials)
-        try:
-            self._post_backup_write(account_num, email)
-        except OSError:
-            from claude_swap.session import mark_session_stale
+        with profile_ownership.ownership_lock(self.backup_dir):
+            self._store._write_account_credentials(account_num, email, credentials)
+            try:
+                self._post_backup_write(account_num, email)
+            except OSError:
+                from claude_swap.session import mark_session_stale
 
-            if mark_session_stale(self._session_dir(account_num, email)):
-                self._logger.warning(
-                    "Stored account %s's credential but could not invalidate "
-                    "its session profile; marked it stale so the next run "
-                    "re-bootstraps.", account_num, exc_info=True,
-                )
-            else:
-                # Nothing recorded the superseded profile: the marker is what
-                # forces the re-bootstrap, and the local reuse check cannot
-                # see a revoked-but-unexpired token. Say so at ERROR rather
-                # than let a silent warning imply the fallback worked.
-                self._logger.error(
-                    "Stored account %s's credential but could NOT invalidate "
-                    "its session profile OR mark it stale; the profile may "
-                    "keep serving the superseded generation until its token "
-                    "expires.", account_num, exc_info=True,
-                )
+                if mark_session_stale(self._session_dir(account_num, email)):
+                    self._logger.warning(
+                        "Stored account %s's credential but could not invalidate "
+                        "its session profile; marked it stale so the next run "
+                        "re-bootstraps.", account_num, exc_info=True,
+                    )
+                else:
+                    # Nothing recorded the superseded profile: the marker is what
+                    # forces the re-bootstrap, and the local reuse check cannot
+                    # see a revoked-but-unexpired token. Say so at ERROR rather
+                    # than let a silent warning imply the fallback worked.
+                    self._logger.error(
+                        "Stored account %s's credential but could NOT invalidate "
+                        "its session profile OR mark it stale; the profile may "
+                        "keep serving the superseded generation until its token "
+                        "expires.", account_num, exc_info=True,
+                    )
 
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
         self._store._delete_account_credentials(account_num, email)
@@ -1176,6 +1188,21 @@ class ClaudeAccountSwitcher:
         ]
         return sorted(rows, key=lambda r: int(r[0]))
 
+    def _ensure_profile_idle_locked(self, account_num: str, email: str) -> None:
+        """Refuse mutation of a reserved or live profile under ownership lock."""
+        from claude_swap.profile_ownership import profile_busy_locked
+
+        if profile_busy_locked(
+            self.backup_dir, account_num, self._session_dir(account_num, email)
+        ):
+            raise SessionError(
+                f"Account-{account_num} ({email}) has a busy profile: live or uncertain ownership. "
+                "Wait for its launch and all descendants to finish. Supervisor death "
+                "does not clear running ownership, and retrying does not release it. "
+                "Prior-boot ownership is ignored only when trusted machine identity "
+                "matches and the boot ID differs."
+            )
+
     def swap_accounts(self, first: str, second: str) -> tuple[str, str]:
         """Exchange two accounts' slot numbers (list order / numeric targets).
 
@@ -1209,7 +1236,9 @@ class ClaudeAccountSwitcher:
         # refresh persist (which take the same lock) can never interleave
         # with the relocation.
         self._refuse_session_shell()
-        with FileLock(self.lock_file):
+        from claude_swap.profile_ownership import ownership_lock
+
+        with ownership_lock(self.backup_dir), FileLock(self.lock_file):
             return self._swap_accounts_locked(first, second)
 
     def _read_backup_or_abort(self, account_num: str, email: str) -> str:
@@ -1258,6 +1287,8 @@ class ClaudeAccountSwitcher:
 
         email_a = record_a.get("email", "")
         email_b = record_b.get("email", "")
+        self._ensure_profile_idle_locked(num_a, email_a)
+        self._ensure_profile_idle_locked(num_b, email_b)
 
         # Backups and session profiles are keyed by (slot, email); relocating
         # them under a live session-mode claude would pull state out from
@@ -1659,7 +1690,9 @@ class ClaudeAccountSwitcher:
         # the mutation (via the *_locked helpers — FileLock is non-reentrant):
         # a slot number resolved outside the lock could be renumbered by a
         # concurrent swap/move and end up moving the wrong account.
-        with FileLock(self.lock_file):
+        from claude_swap.profile_ownership import ownership_lock
+
+        with ownership_lock(self.backup_dir), FileLock(self.lock_file):
             self._get_sequence_data_migrated()
 
             num_src = self._resolve_account_identifier(account)
@@ -1719,6 +1752,8 @@ class ClaudeAccountSwitcher:
                 f"Slot {target} is already occupied — retry the move"
             )
         email = record.get("email", "")
+        self._ensure_profile_idle_locked(num_src, email)
+        self._ensure_profile_idle_locked(target, email)
 
         # Relocating backups/session under a live session-mode claude would
         # pull state out from under a running process.
@@ -2444,7 +2479,7 @@ class ClaudeAccountSwitcher:
         the persist callback ``_fetch_account_usage`` uses. The caller must NOT
         hold ``self.lock_file`` (FileLock is non-reentrant).
         """
-        with FileLock(self.lock_file):
+        with profile_ownership.ownership_lock(self.backup_dir), FileLock(self.lock_file):
             self._write_account_credentials(account_num, email, credentials)
 
     def account_identity(self, account_num: str) -> dict:
@@ -2500,13 +2535,8 @@ class ClaudeAccountSwitcher:
     ) -> "oauth.RefreshOutcome":
         """The gate through which a backup refresh token is consumed.
 
-        Not the only site that POSTs one: ``_fetch_active_usage``'s recovery
-        branch can POST the slot's backup grant too, when the live bytes moved
-        or were cleared. It is not an escape — it takes this same per-slot
-        *consume lock*, in this same order, and its own comment at that site
-        records why. What is single here is the SERIALIZATION, not the call
-        site, and saying "the single place" instead sends the next reader
-        looking for a violation rather than for the second lock holder.
+        Active usage recovery does not consume a grant; it defers until
+        refresh authority is implemented.
 
         A refresh token is one-time-use, so the POST must consume the
         provably-freshest copy of the slot's grant — never a caller's
@@ -2595,7 +2625,7 @@ class ClaudeAccountSwitcher:
         )
 
         try:
-            with FileLock(self.lock_file):
+            with profile_ownership.ownership_lock(self.backup_dir), FileLock(self.lock_file):
                 current, unreadable = self._read_account_credentials_ex(
                     account_num, email
                 )
@@ -2835,7 +2865,7 @@ class ClaudeAccountSwitcher:
         outcome_creds = result.credentials
         try:
             try:
-                with FileLock(self.lock_file):
+                with profile_ownership.ownership_lock(self.backup_dir), FileLock(self.lock_file):
                     store_now, store_unreadable = (
                         self._read_account_credentials_ex(account_num, email)
                     )
@@ -3314,6 +3344,8 @@ class ClaudeAccountSwitcher:
                 f"{session_dir / 'sessions'} and remove or repair them, then "
                 f"retry {action}."
             )
+        with profile_ownership.ownership_lock(self.backup_dir):
+            self._ensure_profile_idle_locked(account_num, email)
 
     def _invalidate_session_credentials(self, account_num: str, email: str) -> None:
         """Drop a session profile's credential material, keeping its history.
@@ -3323,20 +3355,22 @@ class ClaudeAccountSwitcher:
         projects/history survive. Used when backup credentials change under
         an existing profile (e.g. --import --force).
         """
-        from claude_swap.session import (
-            clear_session_stale,
-            delete_macos_keychain_entry,
-        )
+        with profile_ownership.ownership_lock(self.backup_dir):
+            from claude_swap.session import (
+                clear_session_stale,
+                delete_macos_keychain_entry,
+            )
 
-        session_dir = self._session_dir(account_num, email)
-        if not session_dir.exists():
-            return
-        delete_macos_keychain_entry(session_dir)
-        (session_dir / ".credentials.json").unlink(missing_ok=True)
-        clear_session_stale(session_dir)
-        self._logger.info(
-            f"Invalidated session credentials for account {account_num}"
-        )
+            session_dir = self._session_dir(account_num, email)
+            profile_ownership.invalidate_generation_locked(self.backup_dir, session_dir)
+            if not session_dir.exists():
+                return
+            delete_macos_keychain_entry(session_dir)
+            (session_dir / ".credentials.json").unlink(missing_ok=True)
+            clear_session_stale(session_dir)
+            self._logger.info(
+                f"Invalidated session credentials for account {account_num}"
+            )
 
     def _session_profile_ahead(
         self, account_num: str, email: str, org_uuid: str
@@ -3432,7 +3466,7 @@ class ClaudeAccountSwitcher:
           Checked after the generation test, so a profile provably on the
           backup's generation still answers False with its identity gone.
         """
-        with FileLock(self.lock_file):
+        with profile_ownership.ownership_lock(self.backup_dir), FileLock(self.lock_file):
             return self._adopt_session_credential_locked(account_num, email, org_uuid)
 
     def _adopt_session_credential_locked(
@@ -3506,46 +3540,48 @@ class ClaudeAccountSwitcher:
         it: clear it explicitly, or the next profile created for this same
         slot+email inherits a re-bootstrap flag nothing set for it.
         """
-        from claude_swap.session import (
-            clear_session_stale,
-            delete_macos_keychain_entry,
-        )
-
-        session_dir = self._session_dir(account_num, email)
-        # NOT under an `exists()` guard. swap and move relocate the profile
-        # with `os.replace` and only then prune the old slot key, so by the
-        # time this runs the old dir is exactly what no longer exists -- and
-        # the keychain entry does not follow a relocated dir, because its
-        # service name hashes the path. Guarding the delete on the dir left
-        # that entry, holding the account's rotated tokens, at a name no
-        # command names again: `purge` builds its list from the profile dirs
-        # that still exist, so it never reaches it either.
-        delete_macos_keychain_entry(session_dir)
-        if session_dir.exists():
-            shutil.rmtree(session_dir, ignore_errors=True)
-        # NOT under that `if`. The marker lives OUTSIDE the dir, so it
-        # outlives it: `purge` removes profile dirs (`iterdir()` + `is_dir()`)
-        # and leaves the dot-file beside them by design. Early-returning on
-        # the missing dir left that marker for the next profile in this slot,
-        # which then re-bootstraps on a flag nothing set for it.
-        cleared = clear_session_stale(session_dir)
-        if session_dir.exists() or not cleared:
-            # Both removals tolerate a denied dir, which is right -- the
-            # caller has already deleted the credentials and must reach the
-            # roster write. But it arrives there with the profile still on
-            # disk, so an INFO saying it was removed is the only record, and
-            # it is wrong. The surviving stale marker also makes the next
-            # run's stale arm re-fire on this slot forever.
-            self._logger.warning(
-                "Could not fully remove account %s's session profile at %s; "
-                "credentials are gone but the profile dir and/or its stale "
-                "marker survive (check permissions on it and its parent).",
-                account_num, session_dir,
+        with profile_ownership.ownership_lock(self.backup_dir):
+            from claude_swap.session import (
+                clear_session_stale,
+                delete_macos_keychain_entry,
             )
-            return
-        self._logger.info(
-            f"Removed session profile for account {account_num} at {session_dir}"
-        )
+
+            session_dir = self._session_dir(account_num, email)
+            profile_ownership.invalidate_generation_locked(self.backup_dir, session_dir)
+            # NOT under an `exists()` guard. swap and move relocate the profile
+            # with `os.replace` and only then prune the old slot key, so by the
+            # time this runs the old dir is exactly what no longer exists -- and
+            # the keychain entry does not follow a relocated dir, because its
+            # service name hashes the path. Guarding the delete on the dir left
+            # that entry, holding the account's rotated tokens, at a name no
+            # command names again: `purge` builds its list from the profile dirs
+            # that still exist, so it never reaches it either.
+            delete_macos_keychain_entry(session_dir)
+            if session_dir.exists():
+                shutil.rmtree(session_dir, ignore_errors=True)
+            # NOT under that `if`. The marker lives OUTSIDE the dir, so it
+            # outlives it: `purge` removes profile dirs (`iterdir()` + `is_dir()`)
+            # and leaves the dot-file beside them by design. Early-returning on
+            # the missing dir left that marker for the next profile in this slot,
+            # which then re-bootstraps on a flag nothing set for it.
+            cleared = clear_session_stale(session_dir)
+            if session_dir.exists() or not cleared:
+                # Both removals tolerate a denied dir, which is right -- the
+                # caller has already deleted the credentials and must reach the
+                # roster write. But it arrives there with the profile still on
+                # disk, so an INFO saying it was removed is the only record, and
+                # it is wrong. The surviving stale marker also makes the next
+                # run's stale arm re-fire on this slot forever.
+                self._logger.warning(
+                    "Could not fully remove account %s's session profile at %s; "
+                    "credentials are gone but the profile dir and/or its stale "
+                    "marker survive (check permissions on it and its parent).",
+                    account_num, session_dir,
+                )
+                return
+            self._logger.info(
+                f"Removed session profile for account {account_num} at {session_dir}"
+            )
 
     def _init_sequence_file(self) -> None:
         """Initialize sequence.json if it doesn't exist."""
@@ -4342,6 +4378,10 @@ class ClaudeAccountSwitcher:
                     f"Alias '{alias}' is already used by account {conflict}"
                 )
 
+        planned_accounts = (data if slot is not None else self._get_sequence_data()).get("accounts", {})
+        expected_target = planned_accounts.get(account_num)
+        expected_source = planned_accounts.get(migrate_from) if migrate_from else None
+
         # Read new account credentials BEFORE any destructive operations
         current_creds = self._read_capture_credentials()
         if current_creds is None:
@@ -4382,52 +4422,64 @@ class ClaudeAccountSwitcher:
 
         self._reject_identity_drift_since_verify(identity)
 
-        # Now safe to perform destructive cleanup (new account data is in memory)
-        if displace_slot:
-            d_num, d_email, d_org = displace_slot
-            self._delete_account_files(d_num, d_email)
+        with profile_ownership.ownership_lock(self.backup_dir), FileLock(self.lock_file):
+            current_accounts = self._get_sequence_data().get("accounts", {})
+            if current_accounts.get(account_num) != expected_target or (
+                migrate_from and current_accounts.get(migrate_from) != expected_source
+            ):
+                raise ValidationError("Account changed while preparing add; retry")
+            if displace_slot or expected_target is None:
+                self._ensure_profile_idle_locked(
+                    account_num, (expected_target or {}).get("email", "")
+                )
+            if migrate_from:
+                self._ensure_profile_idle_locked(migrate_from, expected_source["email"])
+            # Now safe to perform destructive cleanup (new account data is in memory)
+            if displace_slot:
+                d_num, d_email, d_org = displace_slot
+                self._delete_account_files(d_num, d_email)
+                data = self._get_sequence_data()
+                if int(d_num) in data["sequence"]:
+                    data["sequence"].remove(int(d_num))
+                del data["accounts"][d_num]
+                self._write_json(self.sequence_file, data)
+                self._prune_mappings(d_email, d_org)
+
+            if migrate_from:
+                data = self._get_sequence_data()
+                old_email = data["accounts"][migrate_from].get("email", "")
+                self._delete_account_files(migrate_from, old_email)
+                if int(migrate_from) in data["sequence"]:
+                    data["sequence"].remove(int(migrate_from))
+                del data["accounts"][migrate_from]
+                self._write_json(self.sequence_file, data)
+
+            # Store backups
+            self._write_account_credentials(account_num, current_email, current_creds)
+            self._write_account_config(account_num, current_email, current_config)
+            self._usage_store.clear_dead_token(
+                [account_num], {account_num: (current_email, organization_uuid)}
+            )
+
+            # Update sequence.json
             data = self._get_sequence_data()
-            if int(d_num) in data["sequence"]:
-                data["sequence"].remove(int(d_num))
-            del data["accounts"][d_num]
+            data["accounts"][account_num] = {
+                "email": current_email,
+                "uuid": account_uuid,
+                "organizationUuid": organization_uuid,
+                "organizationName": organization_name,
+                "added": get_timestamp(),
+            }
+            if alias is not None:
+                carried["alias"] = alias  # an explicit --alias wins over the carried one
+            data["accounts"][account_num].update(carried)
+            if int(account_num) not in data["sequence"]:
+                data["sequence"].append(int(account_num))
+                data["sequence"].sort()
+            data["activeAccountNumber"] = int(account_num)
+            data["lastUpdated"] = get_timestamp()
+
             self._write_json(self.sequence_file, data)
-            self._prune_mappings(d_email, d_org)
-
-        if migrate_from:
-            data = self._get_sequence_data()
-            old_email = data["accounts"][migrate_from].get("email", "")
-            self._delete_account_files(migrate_from, old_email)
-            if int(migrate_from) in data["sequence"]:
-                data["sequence"].remove(int(migrate_from))
-            del data["accounts"][migrate_from]
-            self._write_json(self.sequence_file, data)
-
-        # Store backups
-        self._write_account_credentials(account_num, current_email, current_creds)
-        self._write_account_config(account_num, current_email, current_config)
-        self._usage_store.clear_dead_token(
-            [account_num], {account_num: (current_email, organization_uuid)}
-        )
-
-        # Update sequence.json
-        data = self._get_sequence_data()
-        data["accounts"][account_num] = {
-            "email": current_email,
-            "uuid": account_uuid,
-            "organizationUuid": organization_uuid,
-            "organizationName": organization_name,
-            "added": get_timestamp(),
-        }
-        if alias is not None:
-            carried["alias"] = alias  # an explicit --alias wins over the carried one
-        data["accounts"][account_num].update(carried)
-        if int(account_num) not in data["sequence"]:
-            data["sequence"].append(int(account_num))
-            data["sequence"].sort()
-        data["activeAccountNumber"] = int(account_num)
-        data["lastUpdated"] = get_timestamp()
-
-        self._write_json(self.sequence_file, data)
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
         if migrate_from:
@@ -4609,51 +4661,67 @@ class ClaudeAccountSwitcher:
             if migrate_from:
                 carried.update(self._carried_settings(data["accounts"][migrate_from]))
 
-        if displace_slot:
-            d_num, d_email, d_org = displace_slot
-            self._delete_account_files(d_num, d_email)
+        planned_accounts = (data if slot is not None else self._get_sequence_data()).get("accounts", {})
+        expected_target = planned_accounts.get(account_num)
+        expected_source = planned_accounts.get(migrate_from) if migrate_from else None
+
+        with profile_ownership.ownership_lock(self.backup_dir), FileLock(self.lock_file):
+            current_accounts = self._get_sequence_data().get("accounts", {})
+            if current_accounts.get(account_num) != expected_target or (
+                migrate_from and current_accounts.get(migrate_from) != expected_source
+            ):
+                raise ValidationError("Account changed while preparing add; retry")
+            if displace_slot or expected_target is None:
+                self._ensure_profile_idle_locked(
+                    account_num, (expected_target or {}).get("email", "")
+                )
+            if migrate_from:
+                self._ensure_profile_idle_locked(migrate_from, expected_source["email"])
+            if displace_slot:
+                d_num, d_email, d_org = displace_slot
+                self._delete_account_files(d_num, d_email)
+                data = self._get_sequence_data()
+                if int(d_num) in data["sequence"]:
+                    data["sequence"].remove(int(d_num))
+                del data["accounts"][d_num]
+                self._write_json(self.sequence_file, data)
+                self._prune_mappings(d_email, d_org)
+
+            if migrate_from:
+                data = self._get_sequence_data()
+                old_email = data["accounts"][migrate_from].get("email", "")
+                self._delete_account_files(migrate_from, old_email)
+                if int(migrate_from) in data["sequence"]:
+                    data["sequence"].remove(int(migrate_from))
+                del data["accounts"][migrate_from]
+                self._write_json(self.sequence_file, data)
+
+            self._write_account_credentials(account_num, email, credentials)
+            self._write_account_config(account_num, email, config)
+            # Reusing/overwriting a slot with a fresh credential lifts any dead-token
+            # quarantine carried by that slot's prior lineage (mirrors ``add_account``).
+            self._usage_store.clear_dead_token(
+                [account_num], {account_num: (email, "")}
+            )
+
             data = self._get_sequence_data()
-            if int(d_num) in data["sequence"]:
-                data["sequence"].remove(int(d_num))
-            del data["accounts"][d_num]
+            record = {
+                "email": email,
+                "uuid": "",
+                "organizationUuid": "",
+                "organizationName": "",
+                "added": get_timestamp(),
+            }
+            if is_api_key:
+                record["kind"] = "api_key"
+            record.update(carried)
+            data["accounts"][account_num] = record
+            if int(account_num) not in data["sequence"]:
+                data["sequence"].append(int(account_num))
+                data["sequence"].sort()
+            data["lastUpdated"] = get_timestamp()
+
             self._write_json(self.sequence_file, data)
-            self._prune_mappings(d_email, d_org)
-
-        if migrate_from:
-            data = self._get_sequence_data()
-            old_email = data["accounts"][migrate_from].get("email", "")
-            self._delete_account_files(migrate_from, old_email)
-            if int(migrate_from) in data["sequence"]:
-                data["sequence"].remove(int(migrate_from))
-            del data["accounts"][migrate_from]
-            self._write_json(self.sequence_file, data)
-
-        self._write_account_credentials(account_num, email, credentials)
-        self._write_account_config(account_num, email, config)
-        # Reusing/overwriting a slot with a fresh credential lifts any dead-token
-        # quarantine carried by that slot's prior lineage (mirrors ``add_account``).
-        self._usage_store.clear_dead_token(
-            [account_num], {account_num: (email, "")}
-        )
-
-        data = self._get_sequence_data()
-        record = {
-            "email": email,
-            "uuid": "",
-            "organizationUuid": "",
-            "organizationName": "",
-            "added": get_timestamp(),
-        }
-        if is_api_key:
-            record["kind"] = "api_key"
-        record.update(carried)
-        data["accounts"][account_num] = record
-        if int(account_num) not in data["sequence"]:
-            data["sequence"].append(int(account_num))
-            data["sequence"].sort()
-        data["lastUpdated"] = get_timestamp()
-
-        self._write_json(self.sequence_file, data)
         source_label = "API key" if is_api_key else "token"
         self._logger.info(f"Added account {account_num} from {source_label}: {email}")
         if migrate_from:
@@ -4737,18 +4805,27 @@ class ClaudeAccountSwitcher:
                 print(dimmed("Cancelled"))
                 return
 
-        # Remove backup files
-        self._delete_account_files(account_num, email)
+        from claude_swap.profile_ownership import ownership_lock
 
-        # Update sequence.json
-        del data["accounts"][account_num]
-        data["sequence"] = [n for n in data["sequence"] if n != int(account_num)]
-        data["lastUpdated"] = get_timestamp()
+        with ownership_lock(self.backup_dir), FileLock(self.lock_file):
+            # Confirmation can take arbitrarily long; resolve and validate again
+            # under both locks before deleting any slot material.
+            data = self._get_sequence_data() or {}
+            current_num = self._resolve_account_identifier(identifier)
+            if current_num != account_num or data.get("accounts", {}).get(account_num) != account_info:
+                raise ValidationError("Account changed during confirmation; retry removal")
+            self._ensure_profile_idle_locked(account_num, email)
+            # Remove backup files
+            self._delete_account_files(account_num, email)
 
-        self._write_json(self.sequence_file, data)
-        self._logger.info(f"Removed account {account_num}: {email}")
-        print(f"{accent('Removed')} Account-{account_num} ({email})")
+            # Update sequence.json
+            del data["accounts"][account_num]
+            data["sequence"] = [n for n in data["sequence"] if n != int(account_num)]
+            data["lastUpdated"] = get_timestamp()
 
+            self._write_json(self.sequence_file, data)
+            self._logger.info(f"Removed account {account_num}: {email}")
+            print(f"{accent('Removed')} Account-{account_num} ({email})")
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
 
     def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str, str]]:
@@ -4804,68 +4881,17 @@ class ClaudeAccountSwitcher:
         org_uuid: str = "",
         last_usage: dict | None = None,
     ) -> FetchRecord:
-        """Usage fetch for the active/default account, refreshing an expired
-        token under Claude Code's own lock protocol.
+        """Read active usage without consuming its refresh token.
 
-        Claude Code 2.1.218 is built to *adopt* an externally rotated
-        credential rather than collide with it: its refresh takes the
-        ``.oauth_refresh.lock`` + legacy ``.claude.lock`` pair, re-reads the
-        store under the lock, and skips the network call when the token
-        already changed (race-resolved); its 401 path re-reads the store
-        before forcing re-auth. So a rotation performed under those same
-        locks — re-check, POST, persist, release, all inside — is serialized
-        against a live Claude Code and then adopted by it. An owner being
-        present is therefore no longer a reason to leave an expired token
-        dead (the old behavior stranded idle machines: the owner never
-        refreshed, and the dead token 401'd the identity probe, cascading
-        into ``unresolved`` switch bounces).
-
-        Two invariants:
-
-        - **Provenance (issue #117)**: a live credential is only CONSUMED
-          (its grant POSTed) or WRITTEN into the slot backup when its
-          lineage is attributed to the slot — backup-lineage match, a
-          profile-oracle verdict from the fresh pass (see
-          ``_resync_rotated_backup``), or a refresh POST of our own (memoed
-          in ``_probe_verdicts``). Unattributable live bytes are never
-          consumed or persisted — but when they are *dead* (expired) and
-          the slot's own backup still holds a usable credential, the backup
-          is restored to the live store: the backup is by definition the
-          slot's credential, so no foreign lineage can be poisoned by it
-          (measured field case: a stale cross-machine sync landing an
-          already-superseded credential).
-        - **Never discard a consumed generation**: once the refresh grant is
-          POSTed, the successor is persisted unconditionally (active store +
-          slot backup; backup even survives a failing live write). A consumed
-          generation left as the live credential is the account-death shape —
-          the token endpoint rejects its reuse (verified: invalid_grant on
-          re-presentation, siblings unaffected).
+        Expired and server-rejected credentials defer recovery until refresh
+        authority is implemented. Neither the live login nor its
+        slot backup is restored or rotated on that path. Fresh usage may still
+        resync an attributed rotation through ``_resync_rotated_backup``.
         """
         oauth_data = oauth.extract_oauth_data(creds)
         if not oauth_data or not oauth_data.get("accessToken"):
             return FetchRecord(sentinel=USAGE_NO_CREDENTIALS)
 
-        # Every defer before the grant is consumed routes through this: a
-        # genuinely expired token earns the sentinel, but a locally-valid
-        # server-401'd one (force_refresh set) must surface its 401 record —
-        # the store then paces retries with backoff/strike accounting instead
-        # of "token expired" mislabeling an unexpired token.
-        def _defer(record: "FetchRecord | None") -> "FetchRecord":
-            return record or FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
-
-        # The CONSUME LOCK, taken in the gate's own order (consume -> global).
-        # This path can POST the slot's BACKUP refresh token — refresh_input
-        # becomes `backup` when the live bytes moved or were cleared — so it
-        # is a second backup-token POST outside consume_backup_grant, and the
-        # gate's mutual exclusion was not total. Measured: with
-        # .consume-N.lock held by another process, this still POSTed.
-        #
-        # The interleaving it closes: is_active is decided once per collect
-        # pass, so a pass that started before a `cswap switch` routes slot N
-        # through the gate while a later pass treats N as active and arrives
-        # here. The gate releases the global lock across its POST by design,
-        # so this path could take it, read the same lineage and POST it too —
-        # one wins, the loser gets invalid_grant and strikes a live account.
         force_refresh: FetchRecord | None = None
         if not oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
             outcome = oauth.try_fetch_usage_for_account(
@@ -4876,13 +4902,9 @@ class ClaudeAccountSwitcher:
                 if outcome.usage is not None:
                     # The server just accepted this credential. If its
                     # lineage differs from the slot backup, CC rotated during
-                    # normal use and nothing resynced the backup
-                    # (rotation-before-collection): the backup holds the
-                    # consumed predecessor, and at the next expiry the
-                    # recovery branch would POST that dead grant —
-                    # invalid_grant, and a healthy slot quarantined. Resync
-                    # now, under the same guards as the adopt branch — but
-                    # never from a DEGRADED read: the keychain-fallback
+                    # normal use and nothing resynced the backup. Resync
+                    # the attributed successor, but never from a DEGRADED
+                    # read: the keychain-fallback
                     # plaintext may itself be the consumed predecessor
                     # (still server-valid for its access-token tail), and
                     # writing it would clobber a fresher backup. Serving is
@@ -4912,34 +4934,16 @@ class ClaudeAccountSwitcher:
                     error=outcome.error,
                     retry_after_s=outcome.retry_after_s,
                 )
-            # A locally-valid token the server rejects: revoked out-of-band
-            # (measured: a sibling machine rotating a synced lineage kills
-            # the predecessor access token before its expiresAt) or clock
-            # skew. Mirror CC's own 401 reaction — refresh — instead of
-            # letting the store's failure backoff loop a dead token for
-            # hours until it expires locally. Kept as the fallback record:
-            # when no recovery path exists the 401 must reach the store as
-            # an ERROR (backoff, strike accounting), not a "token expired"
-            # sentinel mislabeling an unexpired token.
+            # Preserve the server rejection for the specific degraded-read
+            # guard below; otherwise return the explicit recovery deferral.
             force_refresh = FetchRecord(
                 error=outcome.error, retry_after_s=outcome.retry_after_s,
             )
 
-        # Expired (or server-rejected). Before any recovery that would
-        # CONSUME a refresh token: a degraded read (the OAuth Keychain
-        # failed and a fallback covered it) may be serving a stale
-        # generation — on macOS Claude Code rotates keychain-only, so the
-        # plaintext file and the slot backup can both hold the consumed
-        # predecessor and AGREE with each other. POSTing that rt would
-        # yield invalid_grant and a false dead-token strike on a live
-        # account (measured field incident). Adopt/serve stays allowed
-        # above; consumption is refused until the keychain reads again —
-        # CC refreshes on its own next use, exactly the pre-#167 shape.
+        # A degraded Keychain read may expose a stale plaintext predecessor.
+        # Keep that specific refusal rather than suggesting recovery can run.
         if self._active_read_degraded:
-            return _defer(
-                force_refresh
-                or FetchRecord(sentinel=USAGE_KEYCHAIN_UNAVAILABLE)
-            )
+            return force_refresh or FetchRecord(sentinel=USAGE_KEYCHAIN_UNAVAILABLE)
 
         # Store-resolution parity (M4), same refusal as the consume gate:
         # with CLAUDE_SECURESTORAGE_CONFIG_DIR set, CC reads/writes a
@@ -4960,442 +4964,10 @@ class ClaudeAccountSwitcher:
             )
             return FetchRecord(error="store-unmirrored")
 
-        # Attribution against the slot's
-        # stored backup decides HOW to recover, never whether to give up
-        # outright: attributable live → refresh it; unattributable live but
-        # usable backup → restore the backup (the slot's own credential —
-        # the stranded-live and stale-sync shapes both heal here).
-        backup = self._read_account_credentials(account_num, email)
-        backup_fp = oauth.credential_fingerprint(backup)
-        backup_oauth = oauth.extract_oauth_data(backup)
-        backup_usable = bool(
-            backup_oauth
-            and backup_oauth.get("accessToken")
-            and backup_oauth.get("refreshToken")
-        )
-        attributable = creds == backup or (
-            oauth.credential_fingerprint(creds) == backup_fp
-        )
-        if not attributable and not backup_usable:
-            # Nothing safe to consume and nothing to restore from. Warn once
-            # per condition, not per collect pass.
-            if (account_num, email, "unattributable") not in self._provenance_warned:
-                self._provenance_warned.add((account_num, email, "unattributable"))
-                self._logger.warning(
-                    "Active credential does not match Account-%s's stored "
-                    "backup and the backup is unusable; cannot refresh "
-                    "(provenance unknown).",
-                    account_num,
-                )
-            return _defer(force_refresh)
-        self._provenance_warned.discard((account_num, email, "unattributable"))
-
-        # Claude Code's own sequence: locks → re-read → decide → POST →
-        # persist unconditionally → release. A concurrently refreshing CC is
-        # serialized here and adopts our rotation on its next locked re-read.
-        try:
-            # Lock order matches the switch path (switch_to): cswap's own
-            # account lock first, then Claude Code's. FileLock excludes
-            # concurrent swap/move relocations (their docstring relies on
-            # usage-refresh persists taking this lock); the CC pair excludes
-            # a concurrently refreshing Claude Code. Nothing inside
-            # re-acquires FileLock, so the a07c767 non-reentrancy hazard
-            # does not apply.
-            # The config lock is NOT taken here: CC holds only the
-            # credential locks across its POST, and the config lock guards a
-            # local ~/.claude.json RMW with a ~10s retry budget on CC's side
-            # — holding it through a slow POST could exhaust a concurrent CC
-            # config save's retries. It is narrowed to the live-store write
-            # below (the one step that can touch ~/.claude.json).
-            with (
-                FileLock(self.credentials_dir / f".consume-{account_num}.lock"),
-                FileLock(self.lock_file),
-                claude_credentials_lock(),
-            ):
-                live = self._read_credentials()
-                if live is None:
-                    # Read ERROR (locked keychain, unreadable store) — not
-                    # absence. The store may hold a newer credential we
-                    # cannot see; guessing here could consume a superseded
-                    # grant. Defer to the next pass.
-                    return _defer(force_refresh)
-                live_oauth = oauth.extract_oauth_data(live) if live else None
-                # Under-lock TOCTOU guards. A `cswap switch` or `/login`
-                # completing between the pre-lock attribution and lock
-                # acquisition replaces the live credential (and the config
-                # identity). Two independent checks, because rotation and
-                # switching move different markers:
-                # - identity (config oauthAccount, email AND organization —
-                #   two managed slots may share an email across orgs): a
-                #   switch/login changes it; a CC token rotation does not.
-                #   Mismatch → the live store now belongs to another account
-                #   — nothing here is ours to adopt, consume, or overwrite.
-                #   Runs even when the live blob is empty or non-OAuth
-                #   (live_oauth None): a switch to an API-key account landing
-                #   in the gap leaves exactly that shape. An empty live WITH
-                #   our identity (CC cleared the credential) still passes —
-                #   that is a recovery case.
-                # - lineage (refresh-token fingerprint): decides whether the
-                #   live bytes may be CONSUMED or must be replaced from the
-                #   backup.
-                if not self._live_identity_matches(email, org_uuid):
-                    return _defer(force_refresh)
-                if (
-                    live_oauth
-                    and live != creds
-                    # A CC invalid_grant wipe empties the token fields in
-                    # place but keeps metadata (observed on 2.1.181), and an
-                    # external writer can land an accessToken-only blob —
-                    # either way a "non-expired" look without a full token
-                    # pair must not be adopted (the resync would replace the
-                    # backup's only refresh token).
-                    and live_oauth.get("accessToken")
-                    and live_oauth.get("refreshToken")
-                    and not oauth.is_oauth_token_expired(
-                        live_oauth.get("expiresAt")
-                    )
-                ):
-                    # Someone (a live CC) already rotated it — adopt, consume
-                    # nothing. Mirrors CC's race-resolved path. Resync the
-                    # slot backup so the rotated lineage stays attributable
-                    # at the NEXT expiry — but only when the lineage is
-                    # attributable NOW (backup lineage, or an oracle/memo
-                    # verdict): a foreign fresh credential under a stale
-                    # config satisfies every local condition here, and
-                    # writing it would destroy the slot's refresh token. An
-                    # unverified lineage is adopted for usage only (network
-                    # is forbidden under these locks); the next collect pass
-                    # reads it fresh and the oracle-checked resync heals the
-                    # backup one pass late.
-                    live_verdict = self._probe_verdicts.get(
-                        self._lineage_key(
-                            account_num, email,
-                            oauth.credential_fingerprint(live) or "",
-                        )
-                    )
-                    if live_verdict is False:
-                        # Known-foreign: don't adopt, don't serve usage
-                        # mislabeled as this slot's. The foreign sentinel
-                        # (not a defer) so autoswitch fails over instead of
-                        # idle-holding — the switch is what repairs the
-                        # drift.
-                        return FetchRecord(
-                            sentinel=USAGE_FOREIGN_CREDENTIAL
-                        )
-                    working = live
-                    if live_verdict or (
-                        oauth.credential_fingerprint(live) == backup_fp
-                    ):
-                        try:
-                            self._write_account_credentials(
-                                account_num, email, live
-                            )
-                        except Exception:
-                            self._logger.warning(
-                                "Backup resync after adopting a rotated "
-                                "credential failed for account %s; the next "
-                                "expiry may refuse to refresh until a "
-                                "switch resyncs it.", account_num,
-                            )
-                    else:
-                        self._logger.debug(
-                            "Adopted a rotated live credential for account "
-                            "%s without a lineage verdict; backup resync "
-                            "deferred to the next fresh pass's oracle "
-                            "check.", account_num,
-                        )
-                else:
-                    # Pick the credential whose grant may be consumed:
-                    # - live, when its lineage matches the backup (rotated /
-                    #   drifted bytes of this slot);
-                    # - the backup itself, when the live bytes moved to a
-                    #   foreign-but-dead lineage or were cleared (restore);
-                    # - what the collector read, as the last resort.
-                    # Foreign live bytes that appeared only mid-flight (live
-                    # differs from what the collector read AND from the
-                    # backup lineage) mean an actor is mutating the store
-                    # right now — defer rather than fight it.
-                    restore_source = None
-                    posted = False
-                    if live_oauth is not None and (
-                        oauth.credential_fingerprint(live) == backup_fp
-                    ):
-                        # Live is the slot's own lineage (possibly drifted) —
-                        # its bytes are the freshest copy of the grant.
-                        refresh_input = (
-                            live if live_oauth.get("refreshToken") else
-                            (backup if backup_usable else creds)
-                        )
-                    elif not live:
-                        # CC cleared the live store — recover from the
-                        # backup's grant.
-                        refresh_input = backup if backup_usable else creds
-                    elif live == creds:
-                        # Nothing moved since the collector read, but the
-                        # bytes don't match the backup's lineage. The
-                        # generation ordering (expiresAt moves forward on
-                        # every rotation) SELECTS a candidate, but only an
-                        # ownership verdict LICENSES consuming it:
-                        # - backup newer → live is a stranded consumed
-                        #   generation or a stale external sync; the backup
-                        #   is the slot's real credential — restore or
-                        #   refresh from it, never POST the dead live grant.
-                        # - live newer AND this process attributed the
-                        #   lineage (own refresh POST, or a fresh-pass
-                        #   oracle match whose backup write failed) — POST
-                        #   live, the valid successor.
-                        # - live newer but unattributed → could equally be a
-                        #   foreign credential under a stale config; POSTing
-                        #   would consume another machine's grant. Defer to
-                        #   CC's next use (pre-#167 behavior for this shape
-                        #   — the slept-through-rotation and cross-process
-                        #   drift subcases give up auto-heal by design).
-                        live_exp = (live_oauth or {}).get("expiresAt") or 0
-                        backup_exp = (
-                            backup_oauth.get("expiresAt") or 0
-                            if backup_oauth else 0
-                        )
-                        if (
-                            live_oauth
-                            and live_oauth.get("refreshToken")
-                            and live_exp > backup_exp
-                        ):
-                            if self._probe_verdicts.get(
-                                self._lineage_key(
-                                    account_num, email,
-                                    oauth.credential_fingerprint(live) or "",
-                                )
-                            ):
-                                refresh_input = live
-                            else:
-                                key = (account_num, email,
-                                       "expiry-unattributed")
-                                if key not in self._provenance_warned:
-                                    self._provenance_warned.add(key)
-                                    self._logger.warning(
-                                        "Live credential is newer than "
-                                        "Account-%s's backup but its "
-                                        "ownership is unverified; refresh "
-                                        "deferred to Claude Code's next "
-                                        "use.", account_num,
-                                    )
-                                return _defer(force_refresh)
-                        else:
-                            refresh_input = backup if backup_usable else creds
-                    else:
-                        # Live moved mid-flight to bytes that are neither
-                        # what the collector read nor the backup's lineage —
-                        # another actor is mutating the store; defer.
-                        return _defer(force_refresh)
-                    input_oauth = oauth.extract_oauth_data(refresh_input)
-                    if (
-                        refresh_input == backup
-                        and backup_usable
-                        and not force_refresh
-                        and input_oauth
-                        and not oauth.is_oauth_token_expired(
-                            input_oauth.get("expiresAt")
-                        )
-                    ):
-                        # The backup already holds a live, non-expired
-                        # credential (a prior locked refresh persisted it but
-                        # the live write failed, stranding the live store on
-                        # the consumed generation). Restore it — no POST, no
-                        # generation consumed.
-                        restore_source = backup
-                        working = backup
-                    else:
-                        # The POST runs while holding the account FileLock
-                        # (contended by `cswap switch` with a 10s acquire
-                        # budget) and CC's credential locks. Bound it well
-                        # inside that budget so a slow network can't make a
-                        # concurrent switch's acquire expire — the switch
-                        # then waits out the tail instead of erroring.
-                        # Bracketed in the log like the gate's POST (see
-                        # ``_consume_backup_grant_locked``).
-                        self._logger.info(
-                            "Refresh starting for account %s (%s).",
-                            account_num,
-                            _fingerprint_head(
-                                oauth.credential_fingerprint(refresh_input)
-                            ),
-                        )
-                        result = oauth.try_refresh_oauth_credentials(
-                            refresh_input, timeout_s=6.0
-                        )
-                        if result.error is not None or not result.credentials:
-                            self._logger.info(
-                                "Refresh for account %s ended without a "
-                                "successor (%s).",
-                                account_num, result.error or "empty reply",
-                            )
-                        if result.error in (
-                            "invalid_grant", "no_refresh_token"
-                        ) or (
-                            result.error is None and not result.credentials
-                        ):
-                            # Permanently unrefreshable: dead lineage or a
-                            # credential with no refresh token at all.
-                            # Demotion check before condemning: re-read the
-                            # SOURCE the POSTed bytes came from — a lineage
-                            # that moved while our POST was in flight means
-                            # we consumed a superseded copy (a writer raced
-                            # us), which is evidence about OUR bytes, not
-                            # the slot. Compare like with like: live-sourced
-                            # input against the live store, backup-sourced
-                            # input against the backup (comparing a backup
-                            # input to the live store reads "moved" on every
-                            # pass by construction — a permanent false
-                            # negative that would keep a dead lineage out
-                            # of quarantine forever). Record transient; the
-                            # next pass consumes the newer lineage. (#121
-                            # discipline: local reads only, no network,
-                            # failure degrades to today.)
-                            try:
-                                if refresh_input == backup:
-                                    source_now = (
-                                        self._read_account_credentials(
-                                            account_num, email
-                                        )
-                                    )
-                                else:
-                                    source_now = (
-                                        self._read_credentials() or ""
-                                    )
-                                moved = (
-                                    bool(source_now)
-                                    and oauth.credential_fingerprint(
-                                        source_now
-                                    )
-                                    != oauth.credential_fingerprint(
-                                        refresh_input
-                                    )
-                                )
-                            except Exception:
-                                moved = False
-                            if moved:
-                                return FetchRecord(error="refresh-failed")
-                            # Surface as an ERROR so the store advances auth
-                            # strikes, applies backoff, and the quarantine
-                            # scan flips the account to "re-login needed" —
-                            # a bare sentinel is a no-op to the store and
-                            # would re-POST every pass. The strike binds to
-                            # the consumed generation's fingerprint.
-                            return FetchRecord(
-                                error=result.error or "invalid_grant",
-                                struck_fp=oauth.credential_fingerprint(
-                                    refresh_input
-                                ),
-                            )
-                        if result.error is not None:
-                            # Transient (network) failure: backoff via store.
-                            return FetchRecord(error="refresh-failed")
-                        working = result.credentials
-                        posted = True
-                        # Our own POST produced this lineage — self-attributed,
-                        # no oracle needed. The verdict is what lets the next
-                        # expiry consume it if the backup write below fails.
-                        self._probe_verdicts[
-                            self._lineage_key(
-                                account_num, email,
-                                oauth.credential_fingerprint(working or "")
-                                or "",
-                            )
-                        ] = True
-                        self._provenance_warned.discard(
-                            (account_num, email, "expiry-unattributed")
-                        )
-                    # The credential must reach the stores — after a POST the
-                    # grant is consumed and the successor MUST survive in at
-                    # least one of them. Attempt both; tolerate either
-                    # failing alone. (For a restore, the backup already holds
-                    # it; only the live store needs the write.)
-                    backup_ok = live_ok = True
-                    if restore_source is None:
-                        try:
-                            self._write_account_credentials(
-                                account_num, email, working
-                            )
-                        except Exception:
-                            backup_ok = False
-                            self._logger.warning(
-                                "Backup write failed after a consumed "
-                                "refresh for account %s; attempting the "
-                                "active store.",
-                                account_num,
-                            )
-                    try:
-                        # _write_credentials can touch ~/.claude.json (via
-                        # _clear_managed_key) — the config lock covers just
-                        # this write. A timeout here is a live-write failure
-                        # (the grant is already consumed), not a defer.
-                        # A successor built from the backup (or the
-                        # collector's read) carries that snapshot's shared
-                        # fields (mcpOAuth, ...); the live store's are current.
-                        live_write = working
-                        if refresh_input != live:
-                            live_write = self._prepare_credentials_for_activation(
-                                working, live
-                            )
-                        with claude_config_lock():
-                            self._write_credentials(live_write)  # active store — CC reads this
-                    except Exception:
-                        live_ok = False
-                        self._logger.warning(
-                            "Active-store write failed after a %s for "
-                            "account %s%s.",
-                            "backup restore" if restore_source is not None
-                            else "consumed refresh",
-                            account_num,
-                            "" if backup_ok
-                            else "; the rotated credential was NOT persisted "
-                                 "anywhere — re-login may be required",
-                        )
-                    if posted and (backup_ok or live_ok):
-                        # A failed write of either store has its own warning
-                        # above; this line says the successor exists on disk.
-                        self._logger.info(
-                            "Refresh for account %s saved its successor (%s).",
-                            account_num,
-                            _fingerprint_head(
-                                oauth.credential_fingerprint(working)
-                            ),
-                        )
-                    if not live_ok:
-                        # Live still holds the dead token — don't serve
-                        # usage for a credential CC can't currently use.
-                        return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
-        except LockError:
-            # A live holder — Claude Code mid-refresh (ClaudeCodeLockTimeout)
-            # or another cswap operation holding the account FileLock. Either
-            # way the credential is being handled; try again next tick rather
-            # than steal, wait unboundedly, or raise through the never-raises
-            # fetch contract.
-            self._logger.info(
-                "Credential locks held elsewhere; deferring the "
-                "active-token refresh for account %s to the next pass.",
-                account_num,
-            )
-            return _defer(force_refresh)
-        except Exception:
-            # _fetch_account_usage promises never to raise into the collect
-            # pass (a raising worker would kill the whole pass for every
-            # account). Config/lock-file I/O errors land here.
-            self._logger.warning(
-                "Active-token refresh for account %s failed unexpectedly; "
-                "deferring to the next pass.", account_num, exc_info=True,
-            )
-            return _defer(force_refresh)
-
-        outcome = oauth.try_fetch_usage_for_account(
-            account_num, email, working, is_active=True,
-            **self._probe_options(last_usage),
-        )
-        return FetchRecord(
-            usage=outcome.usage,
-            error=outcome.error,
-            retry_after_s=outcome.retry_after_s,
-        )
+        # No authority to consume or restore the active login yet. In
+        # particular, do not hold ownership/account/credential locks across
+        # a refresh POST until refresh authority is available.
+        return FetchRecord(error="active-refresh-deferred")
 
     def _resync_rotated_backup(
         self, account_num: str, email: str, org_uuid: str, creds: str
@@ -5406,10 +4978,9 @@ class ClaudeAccountSwitcher:
         just accepted. When that credential's lineage differs from the slot
         backup, Claude Code rotated during normal use and nothing resynced
         the backup (rotation-before-collection): the backup still holds the
-        consumed predecessor, and the next expiry's recovery branch would
-        POST that dead grant — invalid_grant on a healthy slot. This is the
-        adopt-branch resync extended to a rotation that already completed:
-        same identity re-check, same full-token-pair guard, same locks.
+        consumed predecessor. Resync keeps the stored login on the attributed
+        successor for later activation, with an identity re-check and a
+        full-token-pair guard under the storage locks.
 
         The config identity alone cannot attribute the drifted bytes: a
         foreign credential can occupy the live store while ``~/.claude.json``
@@ -5424,8 +4995,7 @@ class ClaudeAccountSwitcher:
         lineage so a persistent drift state doesn't re-probe every pass.
 
         Best-effort: any failure (lock contention, read error, identity
-        moved, oracle unreachable) just leaves the backup stale — the
-        recovery branch consumes nothing it cannot attribute. Never raises.
+        moved, oracle unreachable) just leaves the backup stale. Never raises.
         """
         try:
             creds_oauth = oauth.extract_oauth_data(creds)
@@ -5489,6 +5059,7 @@ class ClaudeAccountSwitcher:
                     return
                 self._provenance_warned.discard((account_num, email, "resync"))
             with (
+                profile_ownership.ownership_lock(self.backup_dir),
                 FileLock(self.lock_file),
                 claude_credentials_lock(),
             ):
@@ -5588,9 +5159,7 @@ class ClaudeAccountSwitcher:
         stored reading (see ``_probe_options``)."""
         num, email, _, org_uuid, is_active, creds, _alias = account_info
 
-        # The active/default account owns the live credential — route it
-        # through the locked-refresh path (refreshes an expired token under
-        # Claude Code's own lock protocol, owner or not).
+        # Active usage never consumes the live login's refresh token.
         if is_active:
             return self._fetch_active_usage(
                 str(num), email, creds, org_uuid, last_usage
@@ -7702,6 +7271,14 @@ class ClaudeAccountSwitcher:
         pre_data = self._get_sequence_data() or {}
         pre_account = pre_data.get("accounts", {}).get(target_account, {})
         pre_email = pre_account.get("email", "")
+        from claude_swap.profile_ownership import ownership_lock
+
+        with ownership_lock(self.backup_dir), FileLock(self.lock_file):
+            check_data = self._get_sequence_data() or {}
+            for number in {target_account, str(check_data.get("activeAccountNumber"))}:
+                record = check_data.get("accounts", {}).get(number)
+                if record:
+                    self._ensure_profile_idle_locked(number, record.get("email", ""))
         if pre_email:
             pre_org = pre_account.get("organizationUuid", "") or ""
             sessions, unreadable = scan_live_sessions(
@@ -7740,9 +7317,11 @@ class ClaudeAccountSwitcher:
                     else:
                         warnings_out.append(msg)
             else:
-                adopted = self._adopt_session_credential(
-                    target_account, pre_email, pre_org
-                )
+                with ownership_lock(self.backup_dir), FileLock(self.lock_file):
+                    self._ensure_profile_idle_locked(target_account, pre_email)
+                    adopted = self._adopt_session_credential_locked(
+                        target_account, pre_email, pre_org
+                    )
                 if adopted is None and self._session_profile_ahead(
                     target_account, pre_email, pre_org
                 ):
@@ -7784,7 +7363,7 @@ class ClaudeAccountSwitcher:
         # ~/.claude.json.lock likewise keeps the oauthAccount splice from
         # interleaving with Claude Code's own config writes. Everything under
         # here is local I/O — no network while locks are held.
-        with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+        with ownership_lock(self.backup_dir), FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None
@@ -7796,6 +7375,11 @@ class ClaudeAccountSwitcher:
                 current_account = self._find_account_slot(
                     data, current_email, current_org_uuid
                 )
+
+            for number in {target_account, current_account, str(active_account)}:
+                record = data.get("accounts", {}).get(number)
+                if record:
+                    self._ensure_profile_idle_locked(number, record.get("email", ""))
 
             config_path = self._get_claude_config_path()
 
@@ -8362,9 +7946,11 @@ class ClaudeAccountSwitcher:
         - Any stale legacy ~/.claude-swap-backup directory left around from
           before the XDG migration
 
-        One file is left on purpose: ``session.MIGRATION_LOCK`` in ``~/.claude``,
-        an empty lock file. Deleting a lock another launch may be holding lets
-        a third one take a fresh copy of it at the same time.
+        Ownership records and generation tombstones remain under
+        ``profile-ownership/``. The account lock and
+        ``session.MIGRATION_LOCK`` in ``~/.claude`` remain too: deleting a
+        lock another launch may hold lets a third launch lock a different
+        inode at the same time.
         """
         self._refuse_session_shell()
         legacy = get_legacy_backup_root()
@@ -8453,79 +8039,97 @@ class ClaudeAccountSwitcher:
             print(dimmed("Cancelled"))
             return
 
-        removed_items = []
+        with profile_ownership.ownership_lock(self.backup_dir), FileLock(self.lock_file):
+            # Recheck after confirmation, including reservations whose profile
+            # directory has not been created yet. Generation tombstones survive.
+            profile_ownership.invalidate_all_generations_locked(self.backup_dir)
+            sessions_root = self.backup_dir / "sessions"
+            session_dirs = [d for d in sessions_root.iterdir() if d.is_dir()] if sessions_root.is_dir() else []
+            for profile in session_dirs:
+                live, unreadable = scan_live_sessions(profile)
+                if live or unreadable:
+                    raise SessionError("A profile is busy or ownership is unknown; purge refused")
+                profile_ownership.invalidate_generation_locked(self.backup_dir, profile)
+            removed_items = []
 
-        # Remove credentials. On macOS backups may be in the Keychain and/or .enc
-        # files (auto-fallback), so clean both; Linux/WSL/Windows are file-only.
-        data = self._get_sequence_data()
-        if data:
-            for account_num, account_info in data.get("accounts", {}).items():
-                email = account_info.get("email", "")
-                nums = [account_num]
-                if str(account_num) != "None":
-                    nums.append("None")
-                usernames = [f"account-{num}-{email}" for num in nums]
+            # Remove credentials. On macOS backups may be in the Keychain and/or .enc
+            # files (auto-fallback), so clean both; Linux/WSL/Windows are file-only.
+            data = self._get_sequence_data()
+            if data:
+                for account_num, account_info in data.get("accounts", {}).items():
+                    email = account_info.get("email", "")
+                    nums = [account_num]
+                    if str(account_num) != "None":
+                        nums.append("None")
+                    usernames = [f"account-{num}-{email}" for num in nums]
 
-                # .enc files (Linux/WSL/Windows always; macOS fallback copies).
-                for num in nums:
-                    cred_file = self.credentials_dir / f".creds-{num}-{email}.enc"
-                    try:
-                        if cred_file.exists():
-                            cred_file.unlink()
-                            removed_items.append(f"Credential file: {cred_file.name}")
-                    except Exception:
-                        pass  # Ignore errors during purge
-
-                # macOS Keychain items via `security` (current macOS backend).
-                if self.platform == Platform.MACOS:
-                    for username in usernames:
+                    # .enc files (Linux/WSL/Windows always; macOS fallback copies).
+                    for num in nums:
+                        cred_file = self.credentials_dir / f".creds-{num}-{email}.enc"
                         try:
-                            macos_keychain.delete_password(SECURITY_SERVICE, username)
-                            removed_items.append(f"Credential: {username}")
+                            if cred_file.exists():
+                                cred_file.unlink()
+                                removed_items.append(f"Credential file: {cred_file.name}")
                         except Exception:
                             pass  # Ignore errors during purge
 
-                # Items the legacy ``keyring`` library stored (service
-                # ``claude-code``) that the keyring → security migration left
-                # behind: its keyring-less fallback in 0.23–0.30 copied without
-                # deleting, a delete can fail, and an ambiguous account-None is
-                # never attributed. Best-effort through ``security`` (deleting
-                # another app's item never prompts). Checked attribute-only first
-                # so the summary lists only items that were there. Windows
-                # Credential Manager entries from before 0.11 are out of reach
-                # without the keyring library; Linux/WSL never used one.
-                if self.platform == Platform.MACOS:
-                    for username in usernames:
-                        try:
-                            if macos_keychain.item_exists(KEYRING_SERVICE, username):
-                                macos_keychain.delete_password(KEYRING_SERVICE, username)
-                                removed_items.append(
-                                    f"Legacy keyring credential: {username}"
-                                )
-                        except Exception:
-                            pass  # Ignore errors during purge
+                    # macOS Keychain items via `security` (current macOS backend).
+                    if self.platform == Platform.MACOS:
+                        for username in usernames:
+                            try:
+                                macos_keychain.delete_password(SECURITY_SERVICE, username)
+                                removed_items.append(f"Credential: {username}")
+                            except Exception:
+                                pass  # Ignore errors during purge
 
-        # Session-profile keychain entries must go BEFORE the backup dir:
-        # the hashed service names are derived from the dir paths and can't
-        # be recomputed once the directories are deleted.
-        if session_dirs:
-            from claude_swap.session import delete_macos_keychain_entry
+                    # Items the legacy ``keyring`` library stored (service
+                    # ``claude-code``) that the keyring → security migration left
+                    # behind: its keyring-less fallback in 0.23–0.30 copied without
+                    # deleting, a delete can fail, and an ambiguous account-None is
+                    # never attributed. Best-effort through ``security`` (deleting
+                    # another app's item never prompts). Checked attribute-only first
+                    # so the summary lists only items that were there. Windows
+                    # Credential Manager entries from before 0.11 are out of reach
+                    # without the keyring library; Linux/WSL never used one.
+                    if self.platform == Platform.MACOS:
+                        for username in usernames:
+                            try:
+                                if macos_keychain.item_exists(KEYRING_SERVICE, username):
+                                    macos_keychain.delete_password(KEYRING_SERVICE, username)
+                                    removed_items.append(
+                                        f"Legacy keyring credential: {username}"
+                                    )
+                            except Exception:
+                                pass  # Ignore errors during purge
 
-            for d in session_dirs:
-                delete_macos_keychain_entry(d)
-            removed_items.append(
-                f"Session profiles: {', '.join(d.name for d in session_dirs)}"
-            )
+            # Session-profile keychain entries must go BEFORE the backup dir:
+            # the hashed service names are derived from the dir paths and can't
+            # be recomputed once the directories are deleted.
+            if session_dirs:
+                from claude_swap.session import delete_macos_keychain_entry
 
-        # Remove backup directory
-        if self.backup_dir.exists():
-            # Close log handlers before deleting (required on Windows)
-            for handler in self._logger.handlers[:]:
-                handler.close()
-                self._logger.removeHandler(handler)
+                for d in session_dirs:
+                    delete_macos_keychain_entry(d)
+                removed_items.append(
+                    f"Session profiles: {', '.join(d.name for d in session_dirs)}"
+                )
 
-            shutil.rmtree(self.backup_dir)
-            removed_items.append(f"Directory: {self.backup_dir}")
+            # Remove backup directory
+            if self.backup_dir.exists():
+                # Close log handlers before deleting (required on Windows)
+                for handler in self._logger.handlers[:]:
+                    handler.close()
+                    self._logger.removeHandler(handler)
+
+                # Ownership and generations survive profile deletion and purge.
+                for child in self.backup_dir.iterdir():
+                    if child.name in ("profile-ownership", self.lock_file.name):
+                        continue
+                    if child.is_dir() and not child.is_symlink():
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink()
+                removed_items.append(f"Data directory contents: {self.backup_dir}")
 
         # Also clean a stale legacy directory if it somehow still exists
         # (e.g. a partial pre-migration state, or files re-created after init).

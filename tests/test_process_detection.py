@@ -546,6 +546,49 @@ class TestScanSessions:
         destructive step on it permanently."""
         assert scan_sessions(tmp_path) == ([], 0)
 
+    @pytest.mark.skipif(sys.platform != "linux", reason="Linux process start ticks")
+    def test_successor_published_between_enumeration_and_pid_read(self, tmp_path, monkeypatch):
+        from claude_swap import process_detection
+        from tests.test_profile_successor_stand import successor_transfer
+
+        real_alive = process_detection.is_pid_alive
+        with successor_transfer(tmp_path) as (original, successor, transfer, trace):
+            transferred = False
+
+            def alive(pid):
+                nonlocal transferred
+                if pid == original and not transferred:
+                    transferred = True
+                    transfer()
+                trace.append(f"pid-read:{pid}")
+                return real_alive(pid)
+
+            monkeypatch.setattr(process_detection, "is_pid_alive", alive)
+            sessions, unreadable = process_detection.scan_sessions(tmp_path)
+            assert sessions or unreadable, trace
+            assert trace[:5] == [
+                "original-published", "enumeration-complete", "successor-published",
+                "original-exiting", "original-reaped-before-pid-read",
+            ]
+            assert real_alive(successor)
+
+    def test_final_enumeration_failure_counts_as_unknown(self, tmp_path, monkeypatch):
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        real_iterdir = Path.iterdir
+        enumerations = 0
+
+        def iterdir(path):
+            nonlocal enumerations
+            if path == sessions_dir:
+                enumerations += 1
+                if enumerations == 2:
+                    raise PermissionError("final enumeration denied")
+            return real_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", iterdir)
+        assert scan_sessions(tmp_path) == ([], 1)
+
     def test_record_name_casing_follows_the_platform_like_glob_did(self, tmp_path):
         """The listing used to be `glob("*.json")`, which is case-insensitive
         on Windows and case-sensitive elsewhere; the `iterdir` filter must

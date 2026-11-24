@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import launch_agent, oauth, pace
+from claude_swap import launch_agent, oauth, pace, spawn
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.fsutil import atomic_write_text
 from claude_swap.printer import warning
@@ -1301,10 +1301,9 @@ def run(switcher) -> int:
                 self.refresh_async()
 
         def on_open_log(self, _sender):
-            import subprocess
             # Reveal the log in Finder (-R); if it doesn't exist yet, open the dir.
             target = log_path if log_path.exists() else log_path.parent
-            subprocess.run(["open", "-R", str(target)], check=False)
+            spawn.run(["open", "-R", str(target)], check=False)
 
         def on_refresh_creds(self, _sender):
             if self.switcher._get_current_account() is None:

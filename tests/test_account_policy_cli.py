@@ -29,6 +29,9 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 from tests.test_account_policy_store import PolicyStoreBase
 
 
+pytestmark = pytest.mark.mock_stand_routing
+
+
 class PolicyCliBase(PolicyStoreBase):
     """`PolicyStoreBase`'s synthetic fleet, driven through the CLI surface."""
 

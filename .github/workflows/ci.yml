@@ -27,6 +27,31 @@ jobs:
       - name: Run tests
         run: uv run pytest
 
+      - name: Install isolated stand tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iproute2 openssl strace util-linux
+
+      - name: Run isolated Linux stand and shim latency check
+        # Use a fresh runner-owned source and venv with permissions accepted
+        # by the shim. The stand uses sudo only to set up its namespaces.
+        run: |
+          set -o pipefail
+          umask 022
+          stand=$(mktemp -d /tmp/cswap-stand.XXXXXXXX)
+          trap 'rm -rf -- "$stand"' EXIT
+          mkdir "$stand/source"
+          git -c tar.umask=0022 archive HEAD | tar -x -C "$stand/source"
+          cd "$stand/source"
+          UV_CACHE_DIR="$stand/cache" UV_PYTHON_INSTALL_DIR="$stand/python" \
+            uv sync --locked --managed-python --python 3.12
+          CSWAP_TEST_SHIM_LATENCY=1 .venv/bin/python -m pytest -n 0 -s -q \
+            tests/test_transparent.py::test_f4_only_shim_and_explicit_shim_refuse_without_recursion
+          CSWAP_TEST_STAND=1 CSWAP_TEST_STAND_REQUIRED=1 CSWAP_STAND_SUDO=1 \
+            CSWAP_STAND_RUN_AS="$(id -u):$(id -g)" \
+            .venv/bin/python -m pytest -n 0 -vv -p tests.required_stand \
+              tests/test_stand_linux.py tests/test_stand_mock_linux.py tests/test_stand_shim_linux.py
+
   test-windows:
     runs-on: windows-latest
 
@@ -41,10 +66,23 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
+      - name: Check legacy executable identity on the venv Python
+        run: uv run python -m tests.win_handoff_diagnostic
+
+      - name: Diagnose policy lookup in an isolated Windows profile
+        run: uv run python -m tests.win_config_diagnostic
+
+      - name: Prepare inherited token-profile control HOME
+        run: uv run python -m tests.win_profile_home prepare
+
       - name: Run tests
         # Includes the TUI tests: the Textual TUI (unlike the old curses one)
         # runs on stock Windows, and this job is the proof.
-        run: uv run pytest
+        run: uv run pytest -rs
+
+      - name: Remove token-profile control HOME
+        if: always()
+        run: uv run python -m tests.win_profile_home cleanup
 
   # The id stays `macos-keychain` although the job now runs everything: it is
   # the name branch protection matches on, and renaming it silently drops the
@@ -57,11 +95,28 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v6
-        with:
-          python-version: '3.12'
 
-      - name: Install dependencies
-        run: uv sync --locked
+      - name: Install dependencies with a managed Python
+        # Keep the whole interpreter chain out of the runner's system Python
+        # tree. The shim rejects group-writable ancestors on any install.
+        shell: bash
+        run: |
+          umask 022
+          export UV_PYTHON_INSTALL_DIR="$(mktemp -d "$RUNNER_TEMP/cswap-python.XXXXXXXX")"
+          uv sync --locked --managed-python --python 3.12
+          .venv/bin/python -I -c '
+          import os, sys
+          from pathlib import Path
+          from claude_swap.python_chain import check_python_chain
+
+          assert Path(sys.base_prefix).resolve().is_relative_to(
+              Path(os.environ["UV_PYTHON_INSTALL_DIR"]).resolve()
+          ), "venv is not using the job-managed Python"
+          check_python_chain()
+          '
+
+      - name: Diagnose audited startup on the managed Python
+        run: .venv/bin/python -m tests.stand_startup_diagnostic
 
       - name: Run the whole suite (not only the Keychain files)
         # THE NARROW SELECTION WAS A BLIND SPOT, not a saving. Three cases
@@ -79,4 +134,4 @@ jobs:
         # and the dump aborts the worker. `timeout-minutes` is the backstop
         # that holds under either ordering.
         timeout-minutes: 15
-        run: uv run pytest -o faulthandler_timeout=600
+        run: .venv/bin/python -m pytest -rs -o faulthandler_timeout=600
