@@ -1,7 +1,7 @@
 """Tests for the wrapper .app that gives the menu bar a bundle identifier.
 
 Everything is built from fake interpreters inside ``tmp_path`` with a fake
-``/Applications``; ``os.execv`` is patched so no test ever replaces the pytest
+``/Applications``; ``spawn.handoff`` is patched so no test ever replaces the pytest
 process.
 """
 
@@ -202,19 +202,19 @@ def test_maybe_reexec_execs_the_same_command_inside_the_bundle(tmp_path: Path):
     ), patch.object(
         app_bundle, "build", lambda b: real_build(b, executable=exe, prefix=prefix, applications=apps)
     ), patch.object(app_bundle, "interpreter_error", return_value=None), patch.object(
-        app_bundle.os, "execv", lambda p, a: calls.append((p, a))
+        app_bundle.spawn, "handoff", lambda p, a, env: calls.append((p, a))
     ), patch.object(sys, "argv", ["/x/bin/cswap", "menubar"]):
         app_bundle.maybe_reexec(backup)
 
     python = str(apps / app_bundle.BUNDLE_DIRNAME / "Contents" / "MacOS" / "python")
-    assert calls == [(python, [python, "-m", "claude_swap", "menubar"])]
+    assert calls == [(python, ["-m", "claude_swap", "menubar"])]
 
 
 def test_maybe_reexec_falls_back_when_the_bundle_cannot_be_built(tmp_path: Path, capsys):
     calls: list = []
     with patch.object(app_bundle, "reexec_reason", return_value=None), patch.object(
         app_bundle, "build", side_effect=OSError("disk full")
-    ), patch.object(app_bundle.os, "execv", lambda p, a: calls.append((p, a))):
+    ), patch.object(app_bundle.spawn, "handoff", lambda p, a, env: calls.append((p, a))):
         reason = app_bundle.maybe_reexec(tmp_path / "data")
 
     assert calls == []
@@ -230,7 +230,7 @@ def test_maybe_reexec_falls_back_when_the_bundled_interpreter_cannot_start(
         app_bundle, "build", return_value=tmp_path / "python"
     ), patch.object(
         app_bundle, "interpreter_error", return_value="dyld: libpython3.13.dylib not found"
-    ), patch.object(app_bundle.os, "execv", lambda p, a: calls.append((p, a))):
+    ), patch.object(app_bundle.spawn, "handoff", lambda p, a, env: calls.append((p, a))):
         reason = app_bundle.maybe_reexec(tmp_path / "data")
 
     assert calls == []
@@ -242,7 +242,7 @@ def test_maybe_reexec_falls_back_when_execv_fails(tmp_path: Path, capsys):
     with patch.object(app_bundle, "reexec_reason", return_value=None), patch.object(
         app_bundle, "build", return_value=tmp_path / "python"
     ), patch.object(app_bundle, "interpreter_error", return_value=None), patch.object(
-        app_bundle.os, "execv", side_effect=OSError("Permission denied")
+        app_bundle.spawn, "handoff", side_effect=OSError("Permission denied")
     ):
         reason = app_bundle.maybe_reexec(tmp_path / "data")
 

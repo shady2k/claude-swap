@@ -13,6 +13,9 @@ import pytest
 from claude_swap import oauth
 
 
+pytestmark = pytest.mark.mock_stand_routing
+
+
 class TestExtractAccessToken:
     """Test extract_access_token."""
 

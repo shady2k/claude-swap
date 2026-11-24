@@ -1527,7 +1527,7 @@ class TestImportSessionInvalidation:
         assert not (session_dir / ".credentials.json").exists()
         assert (session_dir / ".claude.json").exists()
 
-    def test_force_overwrite_warns_but_keeps_live_session(
+    def test_force_overwrite_refuses_and_keeps_live_session(
         self, temp_home: Path, capsys
     ):
         import os as _os
@@ -1546,14 +1546,13 @@ class TestImportSessionInvalidation:
         )
         (session_dir / ".credentials.json").write_text("pre-import creds")
 
-        import_accounts(s, str(out), force=True)
+        from claude_swap.exceptions import SessionError
 
-        captured = capsys.readouterr()
-        assert "live" in captured.err
-        # Live session untouched; import itself still completed.
+        before = s._read_account_credentials("1", "alice@example.com")
+        with pytest.raises(SessionError, match="busy"):
+            import_accounts(s, str(out), force=True)
         assert (session_dir / ".credentials.json").read_text() == "pre-import creds"
-        alice = s._read_account_credentials("1", "alice@example.com")
-        assert json.loads(alice)["_marker"] == "NEW"
+        assert s._read_account_credentials("1", "alice@example.com") == before
 
 
 class TestImportClearsDeadTokenQuarantine:
@@ -1901,12 +1900,10 @@ class TestImportClearsDeadTokenQuarantine:
         creds = s._read_account_credentials("2", "bob@example.com")
         assert json.loads(creds)["_marker"] == "bob@example.com"
 
-    def test_plain_import_heal_warns_about_live_session(
+    def test_plain_import_heal_refuses_live_session(
         self, temp_home: Path, capsys
     ):
-        """The heal path rewrites stored creds like --force does, so it must
-        hit the same live-session warning: a running session-mode instance
-        keeps its own credential copy until restarted via `cswap run`."""
+        """Automatic dead-token replacement cannot overwrite a busy slot."""
         import os as _os
 
         from claude_swap.session import session_dir_for
@@ -1927,14 +1924,14 @@ class TestImportClearsDeadTokenQuarantine:
         )
         (session_dir / ".credentials.json").write_text("pre-import creds")
 
-        import_accounts(s, str(out), force=False)
+        from claude_swap.exceptions import SessionError
 
-        err = capsys.readouterr().err
-        assert "live" in err
-        assert "Replaced bob@example.com" in err
-        # Live session untouched; the heal itself still completed.
+        before = s._read_account_credentials("2", "bob@example.com")
+        with pytest.raises(SessionError, match="busy"):
+            import_accounts(s, str(out), force=False)
         assert (session_dir / ".credentials.json").read_text() == "pre-import creds"
-        assert not s._usage_store.entries(ident)["2"].token_dead()
+        assert s._read_account_credentials("2", "bob@example.com") == before
+        assert s._usage_store.entries(ident)["2"].token_dead()
 
     def test_fresh_slot_import_creates_no_quarantine(self, temp_home: Path):
         """Importing into a brand-new slot clears nothing real (no prior row);
@@ -2273,3 +2270,107 @@ class TestImportUsage:
                 s, temp_home, _usage_document(_usage_row("alice@example.com"), bad)
             )
         assert not s._usage_store.path.exists()
+
+
+class TestImportProfileOwnershipGuard:
+    @pytest.mark.parametrize("force", [True, False])
+    def test_busy_existing_slot_refuses_force_and_dead_token_replacement(
+        self, temp_home, monkeypatch, force
+    ):
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+        from claude_swap.exceptions import SessionError
+
+        switcher = _linux_switcher(temp_home)
+        _seed_account(switcher, 1, "alice@example.com")
+        source = temp_home / "import.json"
+        export_accounts(switcher, str(source))
+        data = switcher._get_sequence_data()
+        data["accounts"]["1"]["disabled"] = True
+        switcher._write_json(switcher.sequence_file, data)
+        before = switcher.sequence_file.read_bytes()
+        creds_before = switcher._read_account_credentials("1", "alice@example.com")
+        ownership = SimpleNamespace(
+            ownership_lock=lambda root: nullcontext(),
+            profile_busy_locked=lambda root, num, session_dir=None: num == "1",
+        )
+        monkeypatch.setitem(sys.modules, "claude_swap.profile_ownership", ownership)
+        monkeypatch.setattr(switcher, "_slot_token_dead", lambda *a: True)
+        with pytest.raises(SessionError, match="busy"):
+            import_accounts(switcher, str(source), force=force)
+        assert switcher.sequence_file.read_bytes() == before
+        assert switcher._read_account_credentials("1", "alice@example.com") == creds_before
+
+
+    def test_real_reservation_after_validation_refuses_import(self, temp_home, monkeypatch):
+        from claude_swap.exceptions import SessionError
+        from claude_swap.profile_ownership import reserve_locked
+
+        switcher = _linux_switcher(temp_home)
+        _seed_account(switcher, 1, "alice@example.com")
+        source = temp_home / "import.json"
+        export_accounts(switcher, str(source))
+        before = switcher.sequence_file.read_bytes()
+        creds_before = switcher._read_account_credentials("1", "alice@example.com")
+        setup = switcher._setup_directories
+
+        def reserve_after_validation():
+            setup()
+            # Import holds the ownership lock for its write pass.
+            reserve_locked(switcher.backup_dir, "1", switcher._session_dir("1", "alice@example.com"))
+
+        monkeypatch.setattr(switcher, "_setup_directories", reserve_after_validation)
+        with pytest.raises(SessionError, match="busy"):
+            import_accounts(switcher, str(source), force=True)
+        assert switcher.sequence_file.read_bytes() == before
+        assert switcher._read_account_credentials("1", "alice@example.com") == creds_before
+
+
+def test_force_import_checks_ownership_under_state_then_account_lock(temp_home, monkeypatch):
+    from contextlib import contextmanager
+    from claude_swap import profile_ownership, locking
+
+    manager = _linux_switcher(temp_home)
+    _seed_account(manager, 1, "synthetic@example.com")
+    source = temp_home / "synthetic-export.json"
+    export_accounts(manager, str(source))
+    real_state = profile_ownership.ownership_lock
+    real_account = locking.FileLock
+    held = []
+    checks = []
+
+    @contextmanager
+    def state(*args):
+        with real_state(*args):
+            held.append("state")
+            try:
+                yield
+            finally:
+                held.pop()
+
+    @contextmanager
+    def account(path, *args, **kwargs):
+        if path == manager.lock_file:
+            assert held and held[0] == "state"
+            held.append("account")
+            try:
+                with real_account(path, *args, **kwargs):
+                    yield
+            finally:
+                held.pop()
+        else:
+            with real_account(path, *args, **kwargs):
+                yield
+
+    original_check = manager._ensure_profile_idle_locked
+
+    def check(*args):
+        assert held == ["state", "account"]
+        checks.append(args)
+        original_check(*args)
+
+    monkeypatch.setattr(profile_ownership, "ownership_lock", state)
+    monkeypatch.setattr(locking, "FileLock", account)
+    monkeypatch.setattr(manager, "_ensure_profile_idle_locked", check)
+    import_accounts(manager, str(source), force=True)
+    assert checks == [("1", "synthetic@example.com")]

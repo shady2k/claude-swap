@@ -7479,3 +7479,19 @@ class TestHeaderProbeReadings:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
+
+
+def test_autoswitch_skips_reserved_target_before_freshening(harness):
+    from claude_swap import profile_ownership
+
+    h = harness
+    with profile_ownership.ownership_lock(h.switcher.backup_dir):
+        profile_ownership.reserve_locked(
+            h.switcher.backup_dir, "2", h.switcher._session_dir("2", "b@example.com")
+        )
+    with patch.object(h.engine, "_freshen_target", return_value="ok") as freshen, \
+         patch.object(h.engine, "_perform", return_value=TickOutcome.SWITCHED) as perform:
+        result = h.tick_with_usage({"1": _usage(99), "2": _usage(5), "3": _usage(20)})
+    assert result == TickOutcome.SWITCHED
+    assert [call.args[0] for call in freshen.call_args_list] == ["3"]
+    assert perform.call_args.args[0] == "3"

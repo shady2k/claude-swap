@@ -32,7 +32,8 @@ It works on the same files and Keychain items Claude Code uses, and takes Claude
 - `credentials.py`: `CredentialStore`, which decides Keychain or file and reads and writes both. `macos_keychain.py` wraps the `security` tool.
 - `paths.py`: resolves Claude Code's config and credential paths the way Claude Code does, and the backup root.
 - `claude_locks.py`: Claude Code's lock protocol. `locking.py`: cswap's own `FileLock`.
-- `process_detection.py`: finds running Claude Code instances. `spawn.py`: runs helper processes without `fork()`.
+- `process_detection.py`: finds running Claude Code instances. `spawn.py`: owns subprocess creation and terminal handoff.
+- `transparent.py`: installs the PATH shim and applies launch policy without running CLI migrations. `launch_policy.py` owns the shared-history consent and recipient pool. `claude_forms.py` classifies arguments. `real_claude.py` resolves the original Claude Code for the shim and session launches, including auth probes. `fsguard.py` and `python_chain.py` check the executable chains.
 - `fsutil.py`: atomic writes and link helpers. It imports nothing from the package.
 
 ## Finding things in `switcher.py`
@@ -63,6 +64,7 @@ Everything lives under the backup root (its location per platform is in the [REA
 | `autoswitch_state.json` | `autoswitch.py` | Cooldown and quarantined accounts |
 | `mappings.json` | `mappings.py` | Directory to account |
 | `sessions/<num>-<email>/` | `session.py` | One Claude Code profile per account |
+| `profile-ownership/` | `profile_ownership.py` | External launch reservations and profile generations; never removed with a profile |
 
 ## Flows that cross modules
 
@@ -94,17 +96,21 @@ Read next: the module docstring of `claude_locks.py`, and the docstring of `_cla
 
 A refresh token works once: after it is used, only its successor is valid. Refreshing a stored credential therefore goes through one gate, `consume_backup_grant`, which serializes refreshes per slot, re-reads the freshest copy before it posts, and always persists or stashes the successor. The auto engine uses it before activating a target, and session mode before seeding a profile.
 
-The active account is the one exception. Its expired token is refreshed in `_fetch_active_usage`, inside Claude Code's own credential lock, so a running Claude Code adopts the new token instead of colliding with it.
+Active recovery in `_fetch_active_usage` is deferred until refresh authority is implemented. An expired or server-rejected active token is not consumed or restored: the live login and slot backup remain unchanged, and the fetch returns an explicit refusal. Fresh-token usage reads and attributed backup resync remain available.
 
 Read next: the docstrings of `consume_backup_grant` and `_fetch_active_usage`.
 
 ### Session mode
 
-`cswap run` calls `SessionManager.run`. `setup_session` creates or reuses the account's profile directory, seeds it with the slot's credential, and links the user's settings and history from `~/.claude` into it. Claude Code is then started with `CLAUDE_CONFIG_DIR` pointing at the profile, which leaves the default login untouched.
+`cswap run` calls `SessionManager.run`. `setup_session` creates or reuses the account's profile directory, seeds it with the slot's credential, and links the user's settings and history from `~/.claude` into it. Claude Code is then started with `CLAUDE_CONFIG_DIR` pointing at the profile, which leaves the default login untouched. Both session and routed transparent launches exclude the default-login account at reservation and publication, then publish through `profile_ownership.mark_running_locked` under ownership state → account locks. Multiple reservations can prepare one profile; running readers forbid profile overwrite or deletion, while generation changes invalidate competing preparations. On admitted Linux and Windows launches, `spawn.owned_launch` protects signals from before publication through cleanup, probes supervision support, and waits for all descendants before `profile_ownership.release_completed` retries ownership-lock contention and releases only that launch record. A supervisor failure leaves completion unconfirmed. A trustworthy same-machine boot ID change also proves completion of an old tree.
 
 If the account is already the active default login, it starts plain `claude` instead, because two copies of one credential drift apart.
 
 Read next: the module docstring of `session.py`.
+
+### Transparent launch
+
+The PATH shim checks the shared-history policy, prepares a candidate without holding the account lock, then confirms the current policy and recipient under the account lock before recording the launch. Network and process handoff are outside that lock. See [the PATH shim reference](transparent.md) for consent and revocation.
 
 ### Auto-switch
 
@@ -114,8 +120,8 @@ Read next: the module docstring of `autoswitch.py`. The rules as users see them 
 
 ## Rules that hold everywhere
 
-- **Lock order.** cswap's lock, then Claude Code's credential lock, then its config lock. Never the other way round.
-- **No network under a lock.** A switch does only local I/O under its locks, and the usage store never holds its lock across a fetch. The single deliberate exception is the token refresh described above.
+- **Lock order.** Profile ownership state lock, then cswap's lock, then Claude Code's credential lock, then its config lock. Ownership checks at mutation and publication require state before cswap. Never the other way round.
+- **No network under ownership, account or credential locks.** A switch does only local I/O under its locks, and the usage store never holds its lock across a fetch. Active recovery is deferred until refresh authority is implemented. Backup-token refresh posts outside the ownership and account locks; its per-slot consume lock still serializes grant consumption.
 - **A used refresh token's successor is never dropped.** Once the refresh is posted, the new credential is persisted or stashed, whatever else fails.
 - **A live credential enters a slot only when it is known to belong there.** Writing another account's credential into a slot destroys that slot's only refresh token.
 - **The usage store persists readings and fetch state only.** Labels such as "token expired" are derived on every pass and never written.

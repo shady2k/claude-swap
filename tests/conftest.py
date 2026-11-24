@@ -21,6 +21,7 @@ import pytest
 
 from claude_swap import macos_keychain as _macos_keychain
 from claude_swap import paths as _paths
+from claude_swap import test_mode as _test_mode
 
 
 class RealStoreWriteBlocked(BaseException):
@@ -62,9 +63,10 @@ class RealStoreWriteBlocked(BaseException):
 
 
 def _freeze_real_store_specs() -> tuple[tuple[Path, bool], ...]:
-    """Snapshot the REAL (non-test) account-store roots EXACTLY ONCE, here,
-    at conftest import time — before any fixture has ever touched
-    ``$HOME``/``CLAUDE_CONFIG_DIR``/``XDG_DATA_HOME``.
+    """Snapshot account-store roots for the current HOME and overrides.
+
+    At conftest import, capture the real store before changing HOME, then
+    capture the idle test store. Per-test fixture homes are not protected.
 
     This snapshot, not a live re-resolution, is what the audit hook always
     compares candidate write targets against. Re-resolving ``claude_swap.
@@ -207,10 +209,28 @@ def _freeze_real_store_specs() -> tuple[tuple[Path, bool], ...]:
 
 
 _REAL_STORE_SPECS = _freeze_real_store_specs()
-# Frozen alongside _REAL_STORE_SPECS, at the same moment — see
-# _derive_real_store_hints for why this must be a snapshot passed in
-# explicitly rather than a live Path.home() call at hint-derivation time.
 _HOME_AT_FREEZE_TIME = Path.home()
+
+# Install before collection and before xdist starts its workers. The
+# per-test fixtures still provide separate homes, but neither collection nor
+# a thread or child that outlives a test should fall back to the user's HOME.
+_session_dir = tempfile.TemporaryDirectory(prefix="cswap-pytest-")
+_session_home = Path(_session_dir.name) / "cswap-idle-home"
+_session_home.mkdir()
+os.environ.update(HOME=str(_session_home), USERPROFILE=str(_session_home))
+for _key in tuple(os.environ):
+    if (
+        _key.upper() in _test_mode._ROUTE_KEYS
+        or _key.startswith(("CLAUDE_SWAP_TEST_", "CLAUDE_CODE_", "ANTHROPIC_"))
+        or _key in {
+            "CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "CLAUDE_SWAP_BYPASS",
+            "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME",
+        }
+    ):
+        os.environ.pop(_key, None)
+os.environ[_test_mode.MODE] = "1"
+# The idle home should also reject account-store writes outside test fixtures.
+_REAL_STORE_SPECS = tuple(dict.fromkeys((*_REAL_STORE_SPECS, *_freeze_real_store_specs())))
 
 
 def _derive_real_store_hints(
@@ -477,12 +497,6 @@ def _isolate_real_home(request, tmp_path_factory, monkeypatch):
     to a throwaway dir unless the test already uses ``temp_home`` (which sets its
     own). Runs first (autouse, before the keychain guard and other fixtures).
 
-    Exempt the ``tmp_keychain`` fixture too: the macOS-CI integration tests that
-    use it drive the real ``security`` CLI (``default-keychain`` /
-    ``list-keychains``), which needs the real ``$HOME`` to locate
-    ``~/Library/Keychains``. An isolated ``$HOME`` makes those commands fail. The
-    fixture itself swaps the default keychain to a throwaway one and restores it.
-
     Always neutralize ``CLAUDE_CONFIG_DIR`` and ``XDG_DATA_HOME`` (even for
     ``temp_home`` tests): both bypass ``$HOME`` in path resolution
     (``paths.get_global_config_path``/``get_backup_root``), so a developer with
@@ -507,13 +521,24 @@ def _isolate_real_home(request, tmp_path_factory, monkeypatch):
     )
     if "temp_home" in request.fixturenames:
         return  # temp_home provides its own isolated home
-    if "tmp_keychain" in request.fixturenames:
-        return  # real-keychain integration tests need the real $HOME
     safe_home = tmp_path_factory.mktemp("isolated_home")
     (safe_home / ".claude").mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HOME", str(safe_home))
     monkeypatch.setenv("USERPROFILE", str(safe_home))
     monkeypatch.setattr("pathlib.Path.home", lambda: safe_home)
+
+
+@pytest.fixture(autouse=True)
+def _mock_stand_routing_for_unit_tests(request, monkeypatch):
+    """Test normal behavior behind the existing network and storage guards.
+
+    Marked tests exercise CLI dispatch, session behavior or HTTP request
+    construction with fakes. Keep the mode enabled in the environment so the
+    in-process mock cannot affect any program they spawn.
+    """
+    if request.node.get_closest_marker("mock_stand_routing"):
+        monkeypatch.setattr(_test_mode, "active", lambda: False)
+        monkeypatch.setattr("claude_swap.update_check.check_for_update", lambda _: None)
 
 
 @pytest.fixture(autouse=True)
@@ -585,6 +610,19 @@ def temp_home(tmp_path: Path):
         # Also patch Path.home() directly for cross-platform compatibility
         with patch("pathlib.Path.home", return_value=home):
             yield home
+
+
+@pytest.fixture
+def private_backup_root():
+    """A fresh real backup root under the test's isolated home."""
+    root = _paths.get_backup_root()
+    if sys.platform == "win32":
+        from tests.win_acl import create_private_directory
+
+        create_private_directory(root)
+    else:
+        root.mkdir(parents=True, mode=0o700)
+    return root
 
 
 @pytest.fixture
@@ -746,6 +784,30 @@ def _loopback_only_getaddrinfo(host, *args, **kwargs):
 
 
 socket.getaddrinfo = _loopback_only_getaddrinfo
+
+
+class NonLocalConnectBlocked(BaseException):
+    """A test attempted a direct connection outside loopback."""
+
+
+def _loopback_connect_audit(event, args):
+    # Direct socket clients bypass both urlopen and Python's getaddrinfo.
+    # Keep this installed even after a marked test's routing mock unwinds.
+    if event != "socket.connect":
+        return
+    sock, address = args
+    if sock.family == getattr(socket, "AF_UNIX", None):
+        return
+    if sock.family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            if ipaddress.ip_address(address[0]).is_loopback:
+                return
+        except ValueError:
+            pass
+    raise NonLocalConnectBlocked("non-loopback socket.connect blocked under test")
+
+
+sys.addaudithook(_loopback_connect_audit)
 
 
 def _unreachable_urlopen(*args, **kwargs):
