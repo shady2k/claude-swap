@@ -5,14 +5,22 @@ from __future__ import annotations
 
 import os
 import socket
-import urllib.error
 import urllib.request
 from unittest.mock import patch
 
 import pytest
 
-from claude_swap import oauth
+from claude_swap import oauth, test_mode
+from tests.conftest import NonLocalConnectBlocked
 from tests.test_cli import _subprocess_env
+
+
+@pytest.mark.mock_stand_routing
+@pytest.mark.parametrize("method", ["connect", "connect_ex"])
+def test_nonlocal_direct_connect_is_blocked_with_mocked_routing(method):
+    assert not test_mode.active()
+    with socket.socket() as client, pytest.raises(NonLocalConnectBlocked):
+        getattr(client, method)(("192.0.2.1", 443))
 
 
 def test_non_loopback_lookup_is_blocked_loopback_still_resolves():
@@ -49,6 +57,6 @@ def test_the_suite_never_reaches_the_vendors_usage_api(monkeypatch):
         raise OSError("lookup refused")
 
     monkeypatch.setattr("socket.getaddrinfo", refuse)
-    with pytest.raises(urllib.error.URLError):
+    with pytest.raises(test_mode.TestModeConfigError, match=test_mode.ENDPOINT):
         oauth.request_usage_data("sk-x")
     assert lookups == []

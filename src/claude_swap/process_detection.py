@@ -246,7 +246,10 @@ def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], 
       as "nobody there" runs them underneath a live instance.
 
     So the count is returned rather than swallowed, and ``list_sessions``
-    below is the scan-shaped view that drops it.
+    below is the scan-shaped view that drops it. A changed record set at the
+    end also contributes one unknown: a successor can publish after enumeration
+    while its predecessor exits before the PID read. This detects that transfer,
+    not arbitrary launches after the final enumeration.
 
     ``iterdir``, NOT ``glob`` behind an ``is_dir`` check: both of those
     suppress the ``OSError`` they hit, so a sessions directory that cannot be
@@ -310,6 +313,16 @@ def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], 
         ) as exc:
             unreadable += 1
             logger.debug("Skipping session file %s: %s", path, exc)
+    # A legacy session can publish its successor after the first enumeration
+    # and exit before its own PID is read. An empty result from that mixed
+    # view does not establish absence. Refuse mutation when the record set
+    # changed; this is not a guarantee against launches after the final read.
+    try:
+        current = {p for p in sessions_dir.iterdir() if p.match("*.json")}
+        if current != set(paths):
+            unreadable += 1
+    except OSError:
+        unreadable += 1
     return sessions, unreadable
 
 

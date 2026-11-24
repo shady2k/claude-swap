@@ -273,8 +273,9 @@ class FetchRecord:
 class UsageEntry:
     """Read model of one account's usage state at collect time.
 
-    ``sentinel`` is the collector's live overlay (never persisted); all other
-    fields mirror the stored row, except ``age_s`` (the age of ``last_good``)
+    ``sentinel`` and ``recovery_error`` are live collector overlays (never
+    persisted); all other fields mirror the stored row, except ``age_s``
+    (the age of ``last_good``)
     and ``trust_extended``, both computed at snapshot time.
     """
 
@@ -314,6 +315,7 @@ class UsageEntry:
     # import-usage``) keeps every collector off this slot. Appended for the
     # same positional compatibility as ``claim_until``.
     held_until: float | None = None
+    recovery_error: str | None = None
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl

@@ -18,6 +18,7 @@ from claude_swap.settings import (
     atomic_write_json,
     AutoSwitchSettings,
     RunSettings,
+    TransparentSettings,
     UiSettings,
     UnrecognizedKey,
     UpdateSettings,
@@ -335,6 +336,7 @@ class TestSettingSpecs:
             "autoswitch": AutoSwitchSettings(),
             "ui": UiSettings(),
             "run": RunSettings(),
+            "transparent": TransparentSettings(),
             "updates": UpdateSettings(),
             "usage": UsageSettings(),
         }

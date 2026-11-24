@@ -142,7 +142,7 @@ The exact rules (margins, landing, polling cadence, tier handling) are in [docs/
 
 ### Run multiple accounts at the same time (session mode)
 
-Launch Claude Code as a specific account in the current terminal only — every other terminal and the VS Code extension stay on your default account, so two accounts can work in parallel.
+Launch Claude Code as a specific account in the current terminal only — every other terminal and the VS Code extension stay on your default account, so two accounts can work in parallel. Explicit account launches currently fail closed without build admission; see [profile ownership restrictions](docs/transparent.md#profile-ownership).
 
 ```bash
 cswap run 2                     # launch Claude Code as account 2, here only
@@ -166,6 +166,11 @@ Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP ser
 - **Scripting.** cswap writes its own launch notices to stderr, so stdout carries only what claude prints: `cswap run 2 -- -p "…" --output-format json | jq` works.
 
 </details>
+
+On POSIX, `cswap run` rejects Claude installations whose path includes directories writable by the group or others.
+On Windows, `cswap run` and its auth probe use the legacy PATH lookup without strict path-chain checks, and the shim remains disabled pending PR1.
+
+On POSIX, the [experimental PATH shim](docs/transparent.md) can intercept ordinary `claude` in the isolated test stand. No production build has been admitted for profile routing.
 
 <details>
 <summary>Map accounts to directories — auto-pick per repo</summary>
@@ -202,6 +207,8 @@ cswap add
 
 This will update the stored credentials without creating a duplicate.
 
+If refresh reports unproven copies or stash uncertainty, cswap defers without rewriting live or backup credentials; list, TUI, and auto-switch keep recovery guidance beside prior usage. Follow the applicable steps in [credential recovery](docs/auto-switch.md#credential-recovery); unproven copies do not require purging a stash entry.
+
 If the refresh token itself has died (auto-switch quarantines and reports such an account), log in with it and re-run `cswap add --slot N`, or replace its stored credentials from a known-good export: a plain `cswap import backup.cswap` replaces dead-token slots on its own (a stale export can carry an already-superseded token).
 
 ### Other commands
@@ -230,7 +237,7 @@ cswap alias                     # List all aliases
 cswap move 2 1                  # Assign an account to a slot (relocates to an empty slot, swaps if taken)
 cswap swap 2 3                  # Exchange two accounts' slot numbers
 cswap unclaimed                 # List stashed credential entries (slot + why they were stashed)
-cswap unclaimed --purge ID      # Drop one (deletes its bytes; recover with /login + `cswap add`)
+cswap unclaimed --purge ID      # After inspection/recovery, delete a blocking entry and its bytes
 cswap tui                       # Interactive dashboard (also: bare `cswap`)
 cswap watch                     # Dashboard, opened on the live watch page
 cswap upgrade                   # Upgrade claude-swap to the latest version

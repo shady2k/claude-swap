@@ -19,17 +19,15 @@ from claude_swap.printer import warning
 from claude_swap.settings import set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 
-# src layout: ensure subprocess can find claude_swap
-_SRC_DIR = str(Path(__file__).resolve().parent.parent / "src")
 
-# A throwaway HOME for subprocesses. The in-process autouse Keychain/HOME guards
-# do NOT reach child processes, so a spawned ``python -m claude_swap`` would
-# otherwise resolve to the developer's real ``~/.claude-swap-backup`` and run the
-# data migration against real accounts (touching the real Keychain on macOS). An empty,
-# isolated HOME has no ``sequence.json`` → the migration skips before any Keychain
-# access, and no ``.claude.json`` → no account to read.
-# Allocated under pytest's basetemp so its own retention reclaims it, rather
-# than a sweep at exit that a signal-killed worker never reaches.
+pytestmark = pytest.mark.mock_stand_routing
+
+# Import the test bootstrap and checked-out source in each CLI unit child.
+_ROOT = Path(__file__).resolve().parent.parent
+_UNIT_CLI = [sys.executable, "-m", "tests.cli_unit_child"]
+
+# Ordinary CLI tests use a separate empty HOME unless they seed their own.
+# The subprocess bootstrap also denies Keychain and network access.
 _ISOLATED_HOME: str | None = None
 
 
@@ -40,7 +38,7 @@ def _isolated_subprocess_home(tmp_path_factory):
 
 
 def _subprocess_env(**extra: str) -> dict[str, str]:
-    """Build env dict with PYTHONPATH pointing at src/ and an isolated HOME.
+    """Build env dict with the test bootstrap and an isolated HOME.
 
     HOME/USERPROFILE default to a throwaway dir so the spawned CLI never touches
     the developer's real backup dir or Keychain; callers may still override HOME
@@ -48,7 +46,7 @@ def _subprocess_env(**extra: str) -> dict[str, str]:
     USERPROFILE mirrors it unless the caller set USERPROFILE too.
     """
     env = {**os.environ, **extra}
-    env["PYTHONPATH"] = _SRC_DIR + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(map(str, (_ROOT, _ROOT / "src")))
     if "HOME" not in extra:
         # Falling through here would point the child at the real HOME.
         assert _ISOLATED_HOME is not None, "_isolated_subprocess_home did not run"
@@ -56,16 +54,11 @@ def _subprocess_env(**extra: str) -> dict[str, str]:
         env["USERPROFILE"] = _ISOLATED_HOME
     elif "USERPROFILE" not in extra:
         env["USERPROFILE"] = extra["HOME"]
-    # CLAUDE_CONFIG_DIR / XDG_DATA_HOME bypass HOME in path resolution, so a
-    # developer with either exported would otherwise point the spawned CLI back
-    # at real config/backup paths (and on macOS, the real Keychain). Drop them
-    # unless a caller set them deliberately.
-    for var in ("CLAUDE_CONFIG_DIR", "XDG_DATA_HOME"):
+    # These variables can bypass HOME in credential path resolution.
+    for var in ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "XDG_DATA_HOME"):
         if var not in extra:
             env.pop(var, None)
-    # A child is outside conftest.py's in-process socket guard, and `cli.main`
-    # reaches `check_for_update` -> `urlopen(PYPI_URL)` on most invocations.
-    # Route it through a dead loopback proxy that no_proxy can't bypass.
+    # Keep a dead loopback proxy as a second barrier for the ordinary CLI child.
     for var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
         if var not in extra:
             env[var] = "http://127.0.0.1:1"
@@ -81,7 +74,7 @@ class TestCLI:
     def test_version_flag(self):
         """Test --version flag."""
         result = subprocess.run(
-            [sys.executable, "-m", "claude_swap", "--version"],
+            [*_UNIT_CLI, "--version"],
             capture_output=True,
             text=True,
             env=_subprocess_env(),
@@ -92,7 +85,7 @@ class TestCLI:
     def test_help_flag(self):
         """Test --help flag."""
         result = subprocess.run(
-            [sys.executable, "-m", "claude_swap", "--help"],
+            [*_UNIT_CLI, "--help"],
             capture_output=True,
             text=True,
             env=_subprocess_env(),
@@ -117,7 +110,7 @@ class TestCLI:
     def test_no_args_shows_error(self):
         """Test that running without args (non-TTY) shows a clean no-command error."""
         result = subprocess.run(
-            [sys.executable, "-m", "claude_swap"],
+            _UNIT_CLI,
             capture_output=True,
             text=True,
             env=_subprocess_env(),
@@ -131,7 +124,7 @@ class TestCLI:
     def test_mutually_exclusive_args(self):
         """Test that mutually exclusive args are enforced."""
         result = subprocess.run(
-            [sys.executable, "-m", "claude_swap", "--list", "--status"],
+            [*_UNIT_CLI, "--list", "--status"],
             capture_output=True,
             text=True,
             env=_subprocess_env(),
@@ -142,7 +135,7 @@ class TestCLI:
     def test_debug_flag_accepted(self):
         """Test that --debug flag is accepted."""
         result = subprocess.run(
-            [sys.executable, "-m", "claude_swap", "--debug", "--status"],
+            [*_UNIT_CLI, "--debug", "--status"],
             capture_output=True,
             text=True,
             env=_subprocess_env(),
@@ -284,7 +277,7 @@ class TestCLI:
     def test_slot_flag_in_help(self):
         """--slot should appear in help output."""
         result = subprocess.run(
-            [sys.executable, "-m", "claude_swap", "--help"],
+            [*_UNIT_CLI, "--help"],
             capture_output=True,
             text=True,
             env=_subprocess_env(),
@@ -340,9 +333,7 @@ class TestCLI:
         """--export and --import cannot be combined."""
         result = subprocess.run(
             [
-                sys.executable,
-                "-m",
-                "claude_swap",
+                *_UNIT_CLI,
                 "--export",
                 "/tmp/x",
                 "--import",
@@ -358,7 +349,7 @@ class TestCLI:
     def test_export_in_help(self):
         """The export/import subcommands should appear in help output."""
         result = subprocess.run(
-            [sys.executable, "-m", "claude_swap", "--help"],
+            [*_UNIT_CLI, "--help"],
             capture_output=True,
             text=True,
             env=_subprocess_env(),
@@ -419,7 +410,7 @@ class TestCLI:
     def test_upgrade_in_help(self):
         """The upgrade subcommand should appear in help output."""
         result = subprocess.run(
-            [sys.executable, "-m", "claude_swap", "--help"],
+            [*_UNIT_CLI, "--help"],
             capture_output=True,
             text=True,
             env=_subprocess_env(),
@@ -1180,7 +1171,7 @@ class TestCLICommands:
     def test_status_no_account(self, temp_home: Path):
         """Test status command with no account."""
         result = subprocess.run(
-            [sys.executable, "-m", "claude_swap", "--status"],
+            [*_UNIT_CLI, "--status"],
             capture_output=True,
             text=True,
             env=_subprocess_env(HOME=str(temp_home)),
@@ -1191,7 +1182,7 @@ class TestCLICommands:
     def test_list_no_accounts(self, temp_home: Path):
         """Test list command with no accounts."""
         result = subprocess.run(
-            [sys.executable, "-m", "claude_swap", "--list"],
+            [*_UNIT_CLI, "--list"],
             capture_output=True,
             text=True,
             input="n\n",  # Answer 'n' to first-run prompt
@@ -1263,7 +1254,7 @@ class TestCLICommands:
     def test_add_token_in_help(self):
         """The add-token subcommand and the still-visible --email modifier appear."""
         result = subprocess.run(
-            [sys.executable, "-m", "claude_swap", "--help"],
+            [*_UNIT_CLI, "--help"],
             capture_output=True,
             text=True,
             env=_subprocess_env(),
@@ -1374,7 +1365,7 @@ class TestRunCommand:
 
     def test_main_help_mentions_run(self):
         result = subprocess.run(
-            [sys.executable, "-m", "claude_swap", "--help"],
+            [*_UNIT_CLI, "--help"],
             capture_output=True,
             text=True,
             env=_subprocess_env(),
@@ -1383,7 +1374,7 @@ class TestRunCommand:
 
     def test_main_help_mentions_alias(self):
         result = subprocess.run(
-            [sys.executable, "-m", "claude_swap", "--help"],
+            [*_UNIT_CLI, "--help"],
             capture_output=True,
             text=True,
             env=_subprocess_env(),
@@ -1417,6 +1408,30 @@ class TestRunCommand:
 
         assert excinfo.value.code == 1
         assert "boom" in capsys.readouterr().err
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX directory permissions")
+    def test_run_reports_first_rejected_claude(self, monkeypatch, capsys):
+        # An unusable directory without Claude should not hide the first hit.
+        empty, first, second = (self.backup_dir / name for name in ("empty", "first", "second"))
+        for directory in (empty, first, second):
+            directory.mkdir()
+            if directory != empty:
+                candidate = directory / "claude"
+                candidate.write_text("#!/bin/sh\nexit 0\n")
+                candidate.chmod(0o700)
+            directory.chmod(0o775)
+        monkeypatch.setenv("PATH", os.pathsep.join(map(str, (empty, first, second))))
+        with patch("claude_swap.cli.ClaudeAccountSwitcher",
+                   return_value=MagicMock(backup_dir=self.backup_dir)), \
+             patch.object(sys, "argv", ["cswap", "run", "1"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 4
+        stderr = capsys.readouterr().err
+        assert str(first / "claude") in stderr
+        assert "Writable by group or others" in stderr
+        assert str(second / "claude") not in stderr
+        assert "not found" not in stderr
 
     def test_whatever_the_launch_prints_goes_to_stderr(self, capsys):
         """Stdout is claude's. A notice from anywhere on the way to the
@@ -1464,8 +1479,11 @@ class TestRunCommand:
             from types import SimpleNamespace
             from unittest.mock import patch
 
-            from claude_swap import cli
+            from claude_swap import cli, real_claude
+            from tests.cli_unit_child import install
 
+            install()
+            resolve = real_claude.resolve
             switcher = SimpleNamespace(
                 backup_dir=Path.cwd(),
                 _logger=None,
@@ -1475,7 +1493,7 @@ class TestRunCommand:
             argv = ["cswap", "run", "--", sys.argv[1], "--output-format", "stream-json"]
             # Python stands in for claude; the handoff itself is the real one.
             with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=switcher), \\
-                 patch("claude_swap.session.shutil.which", return_value=sys.executable), \\
+                 patch("claude_swap.session.real_claude.resolve", lambda **kw: resolve(configured_path=sys.executable, **kw)), \\
                  patch.object(sys, "argv", argv):
                 cli.main()
         """)
@@ -1494,9 +1512,7 @@ class TestRunCommand:
         )
 
         assert result.returncode == 0, result.stderr
-        assert [json.loads(line) for line in result.stdout.splitlines()] == [
-            {"args": ["--output-format", "stream-json"]}
-        ]
+        assert result.stdout == json.dumps({"args": ["--output-format", "stream-json"]}) + "\n"
         assert "No account mapped" in result.stderr
 
 
@@ -1607,7 +1623,7 @@ class TestSubcommandAliases:
     def test_help_subcommand_prints_help(self):
         """`cswap help` exits 0 and prints help (with subcommand docs)."""
         result = subprocess.run(
-            [sys.executable, "-m", "claude_swap", "help"],
+            [*_UNIT_CLI, "help"],
             capture_output=True,
             text=True,
             env=_subprocess_env(),
@@ -1859,7 +1875,7 @@ class TestAutoCommand:
 
     def test_main_help_mentions_auto(self):
         result = subprocess.run(
-            [sys.executable, "-m", "claude_swap", "--help"],
+            [*_UNIT_CLI, "--help"],
             capture_output=True,
             text=True,
             env=_subprocess_env(),

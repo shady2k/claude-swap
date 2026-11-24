@@ -32,6 +32,9 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 from tests.test_account_policy_store import PolicyStoreBase
 from tests.test_autoswitch import EngineHarness, _usage
 
+
+pytestmark = pytest.mark.mock_stand_routing
+
 _EMAILS = {1: "a@example.com", 2: "b@example.com", 3: "c@example.com"}
 
 

@@ -1882,7 +1882,7 @@ class CredentialStore:
           repair is ``_write_stash_manifest`` renaming the bad file aside, and
           that runs only on a manifest WRITE, which deferring prevents. The
           adopt scan therefore decides by whether any entry bytes are actually
-          at risk (see ``_stash_entry_files_exist``), and the mutator proceeds
+          at risk (see ``_stash_snapshot``), and the mutator proceeds
           so the set-aside can happen at all.
         - ``"ok"`` — includes a genuinely absent manifest; no rows and nothing
           to protect read the same to every caller.
@@ -1924,42 +1924,6 @@ class CredentialStore:
             return {}, "corrupt"
         return entries, "ok"
 
-    def _stash_entry_files_exist(self) -> bool:
-        """Is there any stashed credential's BYTES on disk?
-
-        Asked only when the manifest is corrupt, to tell "the mapping is gone
-        and there is nothing it could have mapped" from "the mapping is gone
-        and a consumed generation's only copy is sitting right here". The
-        entry files are named independently of the manifest, so they answer
-        even when it cannot.
-
-        Unknowable answers TRUE: a directory we cannot list is not evidence
-        that nothing is at risk, and the caller uses this to decide whether to
-        spend a grant.
-
-        ``iterdir``, NOT ``glob``. ``Path.glob`` SUPPRESSES directory-scan
-        ``OSError``s, so the guard's except arm never ran: measured on 3.14.6,
-        a searchable-but-unlistable credentials dir (mode 0o311) returned
-        ``[]`` with a real orphan sitting right there — the manifest and the
-        entry bytes stay readable through the searchable dir, so corrupt+
-        orphans read as corrupt+empty and the gate POSTed the spent grant.
-        ``iterdir`` raises on the same state. The same interpreter-suppression
-        trap as ``Path.exists()``, third appearance in this file.
-
-        A MISSING directory is the one ``OSError`` that answers False: no
-        credentials dir means provably nothing was ever stashed.
-        """
-        try:
-            for entry in self._host.credentials_dir.iterdir():
-                name = entry.name
-                if name.startswith(".unclaimed-") and name.endswith(".enc"):
-                    return True
-        except FileNotFoundError:
-            return False
-        except OSError:
-            return True
-        return False
-
     def _read_stash_manifest(self) -> dict:
         return self._read_stash_manifest_ex()[0]
 
@@ -1990,6 +1954,47 @@ class CredentialStore:
                         f"Could not preserve corrupt unclaimed manifest: {e}"
                     )
         atomic_write_json(path, {"schemaVersion": 1, "entries": entries})
+
+    def _stash_manifest_lock(self, *, timeout: float = 10.0):
+        """The final lock in the credential lock order.
+
+        Writers and removals wait up to ten seconds to avoid unpublished
+        successors; read-only snapshots use a shorter two-second budget.
+        """
+        from claude_swap.locking import FileLock
+
+        return FileLock(self._stash_manifest_path().with_suffix(".lock"), timeout=timeout)
+
+    def _stash_snapshot(self) -> tuple[dict, set[str], str]:
+        """Read manifest and orphan IDs without observing publication gaps.
+
+        The verdict describes the manifest or a failed directory read; orphan
+        IDs are separate so unpublished files do not hide corrupt metadata.
+        The lock is released before adoption or any other account mutation.
+        Contention is distinct from failed storage: a busy writer only needs
+        another pass, while an unreadable snapshot cannot establish lineage.
+        """
+        from claude_swap.exceptions import LockError
+
+        try:
+            with self._stash_manifest_lock(timeout=2.0):
+                entries, verdict = self._read_stash_manifest_ex()
+                try:
+                    entry_ids = {
+                        entry.name[len(".unclaimed-"):-len(".enc")]
+                        for entry in self._host.credentials_dir.iterdir()
+                        if entry.name.startswith(".unclaimed-")
+                        and entry.name.endswith(".enc")
+                    }
+                except FileNotFoundError:
+                    entry_ids = set()
+                except OSError:
+                    return entries, set(), "unreadable"
+                return entries, entry_ids.difference(entries), verdict
+        except LockError:
+            return {}, set(), "busy"
+        except OSError:
+            return {}, set(), "unreadable"
 
     def _mutate_stash_manifest(self, mutate) -> None:
         """Apply ``mutate(entries)`` to the manifest as one atomic step.
@@ -2022,34 +2027,20 @@ class CredentialStore:
         a slot that is in fact freshened and make the caller re-POST a spent
         generation. ``_retire_stash_entry`` therefore swallows and logs.
         """
-        from claude_swap.locking import FileLock
+        with self._stash_manifest_lock():
+            self._mutate_stash_manifest_locked(mutate)
 
-        self._host.credentials_dir.mkdir(parents=True, exist_ok=True)
-        with FileLock(self._stash_manifest_path().with_suffix(".lock")):
-            entries, verdict = self._read_stash_manifest_ex()
-            if verdict == "unreadable":
-                # Reading an unreadable-but-VALID manifest as `{}` does not
-                # merely miss rows. ``_write_stash_manifest`` below finds the
-                # same file unparseable, renames the healthy manifest aside,
-                # and writes a fresh one holding only this mutation's row —
-                # orphaning every previously mapped successor in one step,
-                # in exactly the correlated setting where a stash is being
-                # written because storage already misbehaved.
-                #
-                # Raising suits both callers: a failed STASH must be loud (a
-                # successful one is the licence to overwrite the live store),
-                # and a failed RETIRE is already swallowed by
-                # ``_retire_stash_entry``.
-                #
-                # CORRUPT deliberately falls through: the set-aside below is
-                # the only repair, and it can only happen on a write.
-                raise CredentialReadError(
-                    "the unclaimed manifest is unreadable; refusing to rewrite "
-                    "it from an empty read, which would orphan every stashed "
-                    "successor it maps"
-                )
-            mutate(entries)
-            self._write_stash_manifest(entries)
+    def _mutate_stash_manifest_locked(self, mutate) -> None:
+        """Rewrite the manifest while the caller holds its non-reentrant lock."""
+        entries, verdict = self._read_stash_manifest_ex()
+        if verdict == "unreadable":
+            raise CredentialReadError(
+                "the unclaimed manifest is unreadable; refusing to rewrite "
+                "it from an empty read, which would orphan every stashed "
+                "successor it maps"
+            )
+        mutate(entries)
+        self._write_stash_manifest(entries)
 
     def _write_unclaimed_credential(self, credentials: str, context: dict) -> str:
         """Stash a credential of unknown provenance. Returns the entry id.
@@ -2069,12 +2060,37 @@ class CredentialStore:
         # same second — append-only means no write may ever land on an
         # existing id.
         entry_id = f"{ts}-{digest}-{secrets.token_hex(3)}"
-        self._atomic_b64_write(self._stash_entry_path(entry_id), credentials)
         row = {
             "createdAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             **context,
         }
-        self._mutate_stash_manifest(lambda entries: entries.update({entry_id: row}))
+        lock = self._stash_manifest_lock()
+        try:
+            lock.__enter__()
+        except BaseException:
+            # A consumed successor must survive even when lock storage,
+            # contention or interruption prevents publication.
+            self._atomic_b64_write(self._stash_entry_path(entry_id), credentials)
+            self._host._logger.warning(
+                "Stash publication failed for account %s, entry %s; "
+                "credential bytes preserved.", context.get("configSlot", "unknown"),
+                entry_id,
+            )
+            raise
+        try:
+            self._atomic_b64_write(self._stash_entry_path(entry_id), credentials)
+            self._mutate_stash_manifest_locked(
+                lambda entries: entries.update({entry_id: row})
+            )
+        except BaseException:
+            self._host._logger.warning(
+                "Stash publication failed for account %s, entry %s; "
+                "credential bytes preserved.", context.get("configSlot", "unknown"),
+                entry_id,
+            )
+            raise
+        finally:
+            lock.release()
         return entry_id
 
     def _list_unclaimed_credentials(self) -> dict[str, dict]:
@@ -2095,10 +2111,10 @@ class CredentialStore:
         ``_read_account_credentials_ex``. ``unreadable`` is True when the
         entry file EXISTS but its bytes could not be read (locked
         Keychain-adjacent volume, mid-unmount, transient EIO/permissions).
-        A stash entry exists only because a prior gate pass already
-        consumed a grant and could not persist the successor -- the entry
-        is the SOLE copy of that generation, so the caller must not treat
-        a transient read failure as "nothing to adopt".
+        A pending-rotation entry may be the sole copy of a consumed
+        grant's successor. Switch safety copies also live here, so callers
+        classify manifest metadata before attempting adoption. A transient
+        read failure is not evidence that a pending successor is absent.
 
         A genuinely ABSENT entry, or one that exists but is CORRUPT
         (undecodable base64 -- its bytes are unrecoverable, not merely
@@ -2129,10 +2145,13 @@ class CredentialStore:
 
     def _remove_unclaimed_credential(self, entry_id: str) -> None:
         """Delete a stash entry (bytes + manifest row) after it was adopted."""
-        try:
-            self._stash_entry_path(entry_id).unlink(missing_ok=True)
-        except OSError as e:
-            self._host._logger.warning(
-                f"Failed to remove unclaimed credential {entry_id}: {e}"
+        with self._stash_manifest_lock():
+            try:
+                self._stash_entry_path(entry_id).unlink(missing_ok=True)
+            except OSError as e:
+                self._host._logger.warning(
+                    f"Failed to remove unclaimed credential {entry_id}: {e}"
+                )
+            self._mutate_stash_manifest_locked(
+                lambda entries: entries.pop(entry_id, None)
             )
-        self._mutate_stash_manifest(lambda entries: entries.pop(entry_id, None))

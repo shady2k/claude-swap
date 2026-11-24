@@ -53,7 +53,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from claude_swap import oauth
+from claude_swap import oauth, test_mode
 from claude_swap.locking import FileLock
 from claude_swap.settings import atomic_write_json
 
@@ -130,7 +130,7 @@ def fetch_plan(access_token: str, timeout: float = 5.0) -> PlanFetch:
     held, the same rule as every other network call here.
     """
     req = urllib.request.Request(
-        PROFILE_URL,
+        test_mode.service_url(PROFILE_URL),
         headers={
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
@@ -138,7 +138,7 @@ def fetch_plan(access_token: str, timeout: float = 5.0) -> PlanFetch:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with test_mode.open_service(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode())
     except Exception as e:  # noqa: BLE001 — display-only; never let it surface
         _logger.debug("Plan fetch failed: %r", e)

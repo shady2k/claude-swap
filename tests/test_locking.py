@@ -364,3 +364,76 @@ class TestTheClampSurvivesWeakeningNotOnlyDeletion:
         finally:
             holder.release()
 
+
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+def test_permanent_lock_error_raises_immediately_and_closes_file(tmp_path, monkeypatch, platform):
+    import errno
+    from types import SimpleNamespace
+
+    lock = FileLock(tmp_path / ".lock", timeout=10)
+    descriptors, attempts, sleeps = [], [], []
+    real_open = open
+    failure = OSError(errno.EIO, "synthetic lock I/O error")
+
+    def tracked_open(*args, **kwargs):
+        descriptor = real_open(*args, **kwargs)
+        descriptors.append(descriptor)
+        return descriptor
+
+    def fail(*args):
+        attempts.append(args)
+        raise failure
+
+    clock = iter([0.0, 11.0])
+    monkeypatch.setattr(locking, "open", tracked_open, raising=False)
+    monkeypatch.setattr(locking, "sys", SimpleNamespace(platform=platform))
+    monkeypatch.setattr(locking, "time", SimpleNamespace(
+        monotonic=lambda: next(clock), sleep=sleeps.append,
+    ))
+    if platform == "win32":
+        monkeypatch.setattr(locking, "msvcrt", SimpleNamespace(locking=fail, LK_NBLCK=1), raising=False)
+    else:
+        monkeypatch.setattr(locking, "fcntl", SimpleNamespace(flock=fail, LOCK_EX=2, LOCK_NB=4), raising=False)
+
+    with pytest.raises(OSError) as caught:
+        lock.acquire()
+    assert caught.value is failure
+    assert len(attempts) == 1
+    assert not sleeps
+    assert descriptors[0].closed
+    assert lock._lock_file is None
+    assert not lock._locked
+
+
+@pytest.mark.parametrize("platform,error", [
+    ("linux", "EACCES"), ("linux", "EAGAIN"), ("linux", "EWOULDBLOCK"),
+    ("win32", "EACCES"), ("win32", "EAGAIN"), ("win32", "EDEADLK"),
+])
+def test_contention_errnos_retry_until_timeout(tmp_path, monkeypatch, platform, error):
+    import errno
+    from types import SimpleNamespace
+
+    lock = FileLock(tmp_path / ".lock", timeout=1)
+    attempts, sleeps, descriptors = [], [], []
+
+    def contend(*args):
+        attempts.append(args)
+        descriptors.append(lock._lock_file)
+        raise OSError(getattr(errno, error), "synthetic contention")
+
+    clock = iter([0.0, 0.0, 0.0, 2.0])
+    monkeypatch.setattr(locking, "sys", SimpleNamespace(platform=platform))
+    monkeypatch.setattr(locking, "time", SimpleNamespace(
+        monotonic=lambda: next(clock), sleep=sleeps.append,
+    ))
+    if platform == "win32":
+        monkeypatch.setattr(locking, "msvcrt", SimpleNamespace(locking=contend, LK_NBLCK=1), raising=False)
+    else:
+        monkeypatch.setattr(locking, "fcntl", SimpleNamespace(flock=contend, LOCK_EX=2, LOCK_NB=4), raising=False)
+
+    assert lock.acquire() is False
+    assert len(attempts) == 2
+    assert sleeps == [0.1]
+    assert all(descriptor.closed for descriptor in descriptors)
+    assert lock._lock_file is None
+    assert not lock._locked

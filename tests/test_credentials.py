@@ -661,3 +661,122 @@ class TestSecureStorageOverride:
         store = CredentialStore(_Host(tmp_path / "backups"))
         assert store._read_active_credentials().value == SECURE_PROFILE_CREDS
         assert seen == [keychain_service_name(str(secure))]
+
+
+class TestStashPublication:
+    def test_snapshot_has_shorter_lock_budget(self, tmp_path, monkeypatch):
+        from claude_swap.locking import FileLock
+
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        budgets = []
+
+        def unavailable(lock, timeout=None):
+            budgets.append(lock.timeout)
+            return False
+
+        monkeypatch.setattr(FileLock, "acquire", unavailable)
+        assert store._stash_snapshot() == ({}, set(), "busy")
+        assert budgets == [2.0]
+        assert store._stash_manifest_lock().timeout == 10.0
+
+    @pytest.mark.parametrize("operation", ["publish", "remove"])
+    def test_mutation_waits_more_than_two_seconds_for_manifest_lock(
+        self, tmp_path, monkeypatch, operation,
+    ):
+        from threading import Event, Thread, current_thread
+        from claude_swap.locking import FileLock
+
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        entry_id = store._write_unclaimed_credential(TARGET_SLOT_CREDS, {"configSlot": "4"})
+        attempting = Event()
+        finished = Event()
+        errors = []
+        results = []
+        acquire = FileLock.acquire
+
+        def acquire_observed(lock, *args, **kwargs):
+            if current_thread().name == "stash-writer":
+                attempting.set()
+            return acquire(lock, *args, **kwargs)
+
+        def mutate():
+            try:
+                if operation == "publish":
+                    results.append(store._write_unclaimed_credential(
+                        ROTATED_BY_CLAUDE_CREDS, {"configSlot": "4"},
+                    ))
+                else:
+                    store._remove_unclaimed_credential(entry_id)
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                finished.set()
+
+        monkeypatch.setattr(FileLock, "acquire", acquire_observed)
+        with store._stash_manifest_lock():
+            writer = Thread(target=mutate, name="stash-writer")
+            writer.start()
+            assert attempting.wait(2)
+            assert not finished.wait(2.2), "mutation used the snapshot timeout"
+        writer.join(5)
+        assert not writer.is_alive()
+        assert not errors
+        entries, orphans, verdict = store._stash_snapshot()
+        assert verdict == "ok"
+        assert not orphans
+        if operation == "publish":
+            assert results[0] in entries
+            assert store._read_unclaimed_credential(results[0]) == (ROTATED_BY_CLAUDE_CREDS, False)
+        else:
+            assert entry_id not in entries
+            assert not store._stash_entry_path(entry_id).exists()
+
+    @pytest.mark.parametrize("failure", [KeyboardInterrupt, SystemExit, OSError])
+    def test_interrupted_lock_wait_preserves_successor_and_logs_id_and_slot(
+        self, tmp_path, monkeypatch, caplog, failure,
+    ):
+        from claude_swap.locking import FileLock
+
+        store = CredentialStore(_Host(tmp_path / "backups"))
+
+        def interrupted(lock, timeout=None):
+            raise failure("synthetic failure")
+
+        monkeypatch.setattr(FileLock, "acquire", interrupted)
+        with pytest.raises(failure):
+            store._write_unclaimed_credential(TARGET_SLOT_CREDS, {"configSlot": "4"})
+        entries = store._list_unclaimed_credentials()
+        assert len(entries) == 1
+        entry_id = next(iter(entries))
+        assert store._read_unclaimed_credential(entry_id) == (TARGET_SLOT_CREDS, False)
+        assert store._read_stash_manifest() == {}
+        assert entry_id in caplog.text
+        assert "account 4" in caplog.text
+        assert "sk-target-slot" not in caplog.text
+        assert "rt-target-slot" not in caplog.text
+
+    @pytest.mark.parametrize("failure", [KeyboardInterrupt, SystemExit, OSError])
+    def test_interrupted_manifest_update_preserves_successor_and_logs_id_and_slot(
+        self, tmp_path, monkeypatch, caplog, failure,
+    ):
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        interruption = failure("synthetic failure")
+
+        def interrupted(mutate):
+            raise interruption
+
+        monkeypatch.setattr(store, "_mutate_stash_manifest_locked", interrupted)
+        with pytest.raises(failure) as raised:
+            store._write_unclaimed_credential(TARGET_SLOT_CREDS, {"configSlot": "4"})
+        assert raised.value is interruption
+        entries = store._list_unclaimed_credentials()
+        assert len(entries) == 1
+        entry_id = next(iter(entries))
+        assert store._read_unclaimed_credential(entry_id) == (TARGET_SLOT_CREDS, False)
+        assert store._read_stash_manifest() == {}
+        assert entry_id in caplog.text
+        assert "account 4" in caplog.text
+        assert "sk-target-slot" not in caplog.text
+        assert "rt-target-slot" not in caplog.text
+        with store._stash_manifest_lock(timeout=0.1):
+            pass

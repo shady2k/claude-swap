@@ -59,6 +59,7 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 
+from claude_swap import spawn
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.fsutil import atomic_write_bytes
 
@@ -199,7 +200,7 @@ def _parse_etime(text: str) -> float | None:
 def _process_age_seconds(pid: int) -> float | None:
     """Seconds since ``pid`` started, or None when ``ps`` cannot say."""
     try:
-        proc = subprocess.run(
+        proc = spawn.run(
             ["ps", "-p", str(pid), "-o", "etime="],
             capture_output=True,
             text=True,
@@ -358,7 +359,7 @@ def _load_plist(path: Path) -> dict | None:
 
 def _launchctl(*args: str) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(
+        return spawn.run(
             ["launchctl", *args],
             capture_output=True,
             text=True,
@@ -455,7 +456,7 @@ def _btm_disallowed(label: str = LABEL) -> bool:
     root for it — counts as "not switched off".
     """
     try:
-        proc = subprocess.run(
+        proc = spawn.run(
             ["sfltool", "dumpbtm"],
             capture_output=True,
             text=True,

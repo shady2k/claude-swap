@@ -13,6 +13,9 @@ import pytest
 from claude_swap import oauth
 
 
+pytestmark = pytest.mark.mock_stand_routing
+
+
 class TestExtractAccessToken:
     """Test extract_access_token."""
 
@@ -450,7 +453,9 @@ class TestRefreshOAuthCredentials:
             return mock_response
 
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
-            refreshed = oauth.refresh_oauth_credentials(self._make_credentials())
+            refreshed = oauth.try_refresh_oauth_credentials(
+                self._make_credentials()
+            ).credentials
 
         assert refreshed is not None
         assert seen_body["grant_type"] == "refresh_token"
@@ -707,10 +712,11 @@ class TestTryRefreshOAuthCredentials:
         outcome = oauth.try_refresh_oauth_credentials("not json")
         assert outcome.error == "transient"
 
-    def test_wrapper_returns_none_on_failure(self):
+    def test_failed_refresh_has_no_credentials(self):
         err = self._http_error(400, b'{"error": "invalid_grant"}')
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
-            assert oauth.refresh_oauth_credentials(self._make_credentials()) is None
+            outcome = oauth.try_refresh_oauth_credentials(self._make_credentials())
+            assert outcome.credentials is None
 
 
 class TestBuildTokenStatus:
@@ -752,6 +758,16 @@ class TestBuildTokenStatus:
 
 class TestFetchUsageForAccount:
     """Test refresh-aware usage fetches for managed accounts."""
+
+    @staticmethod
+    def _refresh_via(persist):
+        """A test gate owns grant consumption and persistence."""
+        def gate(number, email, credentials):
+            outcome = oauth.try_refresh_oauth_credentials(credentials)
+            if outcome.credentials:
+                persist(number, email, outcome.credentials)
+            return outcome
+        return gate
 
     @staticmethod
     def _make_credentials(access="old-access", refresh="old-refresh",
@@ -816,6 +832,7 @@ class TestFetchUsageForAccount:
             result = oauth.fetch_usage_for_account(
                 "1", "test@example.com", credentials,
                 is_active=False,
+                refresh_via=self._refresh_via(persist_mock),
                 persist_credentials=persist_mock,
             )
 
@@ -860,6 +877,7 @@ class TestFetchUsageForAccount:
             result = oauth.fetch_usage_for_account(
                 "2", "test@example.com", credentials,
                 is_active=False,
+                refresh_via=self._refresh_via(persist_mock),
                 persist_credentials=persist_mock,
             )
 
@@ -883,9 +901,10 @@ class TestFetchUsageForAccount:
             raise AssertionError(f"Unexpected URL: {req.full_url}")
 
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen), \
-             patch("claude_swap.oauth.refresh_oauth_credentials") as refresh_mock:
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as refresh_mock:
             result = oauth.fetch_usage_for_account(
                 "1", "test@example.com", credentials,
+                refresh_via=None,
                 is_active=False,
             )
 
@@ -913,6 +932,9 @@ class TestFetchUsageForAccount:
             result = oauth.fetch_usage_for_account(
                 "1", "test@example.com", credentials,
                 is_active=False,
+                refresh_via=lambda _num, _email, creds: (
+                    oauth.try_refresh_oauth_credentials(creds)
+                ),
             )
 
         assert result is None
@@ -949,6 +971,7 @@ class TestFetchUsageForAccount:
             result = oauth.fetch_usage_for_account(
                 "1", "test@example.com", credentials,
                 is_active=False,
+                refresh_via=self._refresh_via(persist_mock),
                 persist_credentials=persist_mock,
             )
 
@@ -984,6 +1007,7 @@ class TestFetchUsageForAccount:
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
             result = oauth.fetch_usage_for_account(
                 "1", "test@example.com", credentials,
+                refresh_via=None,
                 is_active=True,
                 persist_credentials=persist_mock,
             )
@@ -1012,6 +1036,7 @@ class TestFetchUsageForAccount:
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
             result = oauth.fetch_usage_for_account(
                 "1", "test@example.com", credentials,
+                refresh_via=None,
                 is_active=True,
                 persist_credentials=persist_mock,
             )
@@ -1184,6 +1209,7 @@ class TestTryFetchUsageOutcome:
         with patch("claude_swap.oauth.urllib.request.urlopen", return_value=resp):
             outcome = oauth.try_fetch_usage_for_account(
                 "1", "a@b.c", self._make_credentials(), is_active=False,
+                refresh_via=None,
             )
         assert outcome.error is None
         assert outcome.usage["five_hour"]["pct"] == 12.0
@@ -1203,6 +1229,7 @@ class TestTryFetchUsageOutcome:
         ):
             outcome = oauth.try_fetch_usage_for_account(
                 "1", "a@b.c", self._make_credentials(), is_active=False,
+                refresh_via=None,
             )
         assert outcome.usage is None
         assert outcome.error == "http-429"
@@ -1237,6 +1264,7 @@ class TestTryFetchUsageOutcome:
         ):
             outcome = oauth.try_fetch_usage_for_account(
                 "1", "a@b.c", self._make_credentials(), is_active=False,
+                refresh_via=None,
             )
         assert outcome.retry_after_s == 0.0
         line = next(
@@ -1255,12 +1283,14 @@ class TestTryFetchUsageOutcome:
         ):
             outcome = oauth.try_fetch_usage_for_account(
                 "1", "a@b.c", self._make_credentials(), is_active=False,
+                refresh_via=None,
             )
         assert outcome.error == "timeout"
 
     def test_no_access_token_outcome(self):
         outcome = oauth.try_fetch_usage_for_account(
             "1", "a@b.c", json.dumps({"claudeAiOauth": {}}), is_active=False,
+                refresh_via=None,
         )
         assert outcome.error == "no-access-token"
 
@@ -1408,6 +1438,7 @@ class TestSetupTokenHeaderProbe:
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
             return oauth.try_fetch_usage_for_account(
                 "3", "a@b.c", creds or self._creds(),
+                refresh_via=None,
                 is_active=kw.pop("is_active", False),
                 header_probe=header_probe, **kw,
             )
@@ -2008,6 +2039,9 @@ class TestInvalidGrantPropagation:
              patch("claude_swap.oauth.request_usage_data") as usage:
             outcome = oauth.try_fetch_usage_for_account(
                 "1", "a@b.c", self._expired_credentials(), is_active=False,
+                refresh_via=lambda _num, _email, creds: (
+                    oauth.try_refresh_oauth_credentials(creds)
+                ),
             )
         assert outcome.error == "invalid_grant"
         usage.assert_not_called()  # no pointless 401/429 on a lost cause
@@ -2023,6 +2057,9 @@ class TestInvalidGrantPropagation:
                    return_value=oauth.RefreshOutcome(None, "invalid_grant")):
             outcome = oauth.try_fetch_usage_for_account(
                 "1", "a@b.c", self._valid_credentials(), is_active=False,
+                refresh_via=lambda _num, _email, creds: (
+                    oauth.try_refresh_oauth_credentials(creds)
+                ),
             )
         assert outcome.error == "invalid_grant"
 
@@ -2037,6 +2074,9 @@ class TestInvalidGrantPropagation:
                    return_value=oauth.RefreshOutcome(None, "transient")):
             outcome = oauth.try_fetch_usage_for_account(
                 "1", "a@b.c", self._valid_credentials(), is_active=False,
+                refresh_via=lambda _num, _email, creds: (
+                    oauth.try_refresh_oauth_credentials(creds)
+                ),
             )
         assert outcome.error == "refresh-failed"
 

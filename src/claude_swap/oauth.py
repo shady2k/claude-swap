@@ -15,6 +15,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from claude_swap import test_mode
 from claude_swap.printer import warning as print_warning
 
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
@@ -294,7 +295,7 @@ def try_refresh_oauth_credentials(
         }).encode()
 
         req = urllib.request.Request(
-            OAUTH_TOKEN_URL,
+            test_mode.service_url(OAUTH_TOKEN_URL),
             data=body,
             headers={
                 "Content-Type": "application/json",
@@ -302,7 +303,7 @@ def try_refresh_oauth_credentials(
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        with test_mode.open_service(req, timeout=timeout_s) as resp:
             resp_data = json.loads(resp.read().decode())
 
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -444,11 +445,6 @@ def _parse_token_account(resp_data: dict) -> dict | None:
     }
 
 
-def refresh_oauth_credentials(credentials: str) -> str | None:
-    """Refresh an OAuth access token; None on any failure (see RefreshOutcome)."""
-    return try_refresh_oauth_credentials(credentials).credentials
-
-
 def fetch_oauth_profile(access_token: str) -> dict | None:
     """Resolve an OAuth access token to its account identity, or None.
 
@@ -466,7 +462,7 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
     evidence is sufficient for each decision. Must not be called while any
     credential/config lock is held (network under locks is forbidden).
     """
-    url = "https://api.anthropic.com/api/oauth/profile"
+    url = test_mode.service_url("https://api.anthropic.com/api/oauth/profile")
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
@@ -474,7 +470,7 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
     }
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with test_mode.open_service(req, timeout=5) as resp:
             data = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         if e.code == 401:
@@ -583,14 +579,14 @@ def fresh_reset_strings(window: dict) -> tuple[str, str] | None:
 
 def request_usage_data(access_token: str) -> dict:
     """Request raw utilization data from the Anthropic usage API."""
-    url = "https://api.anthropic.com/api/oauth/usage"
+    url = test_mode.service_url("https://api.anthropic.com/api/oauth/usage")
     headers = {
         "Authorization": f"Bearer {access_token}",
         "anthropic-beta": OAUTH_BETA_HEADER,
         "User-Agent": "claude-swap/1.0",
     }
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=5) as resp:
+    with test_mode.open_service(req, timeout=5) as resp:
         return json.loads(resp.read().decode())
 
 
@@ -741,7 +737,7 @@ def request_usage_via_probe(access_token: str) -> dict:
     with its Retry-After.
     """
     try:
-        with urllib.request.urlopen(
+        with test_mode.open_service(
             _probe_request(access_token, USAGE_PROBE_MODEL), timeout=10
         ) as resp:
             return parse_unified_ratelimit_headers(resp.headers)
@@ -776,7 +772,7 @@ def _probe_request(access_token: str, model: str) -> urllib.request.Request:
         "User-Agent": "claude-swap/1.0",
     }
     return urllib.request.Request(
-        USAGE_PROBE_URL, data=body, headers=headers, method="POST"
+        test_mode.service_url(USAGE_PROBE_URL), data=body, headers=headers, method="POST"
     )
 
 
@@ -864,7 +860,7 @@ def _probe_scoped_limit(
     access to the model, a network error) says nothing about it: None.
     """
     try:
-        with urllib.request.urlopen(
+        with test_mode.open_service(
             _probe_request(access_token, model), timeout=10
         ) as resp:
             return _scoped_limit_from_headers(resp.headers, prefix, None, now)
@@ -1366,7 +1362,8 @@ def fetch_usage(access_token: str) -> dict | None:
 # a grant the live login also holds; the retry would be declined the same way.
 _DETERMINISTIC_REFRESH_ERRORS = (
     "store-unmirrored", "invalid_client", "consume-busy", "stash-unreadable",
-    "live-login",
+    "live-login", "ownership-lost", "profile-busy", "credential-unproven",
+    "superseded", "unreadable",
 )
 
 
@@ -1376,19 +1373,17 @@ def try_fetch_usage_for_account(
     credentials: str,
     is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
-    refresh_via: Callable[[str, str, str], RefreshOutcome] | None = None,
+    *,
+    refresh_via: Callable[[str, str, str], RefreshOutcome] | None,
     header_probe: bool = False,
     scoped_probe: bool = False,
     last_usage: dict | None = None,
 ) -> UsageOutcome:
-    """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
+    """Fetch usage, using only the explicitly supplied refresh authority.
 
-    Active accounts are never refreshed — Claude Code owns those credentials.
-    ``refresh_via(account_num, email, snapshot)`` supersedes the direct POST
-    when given: the switcher passes its consume gate, which re-reads the
-    freshest copy under the slot lock, persists via fingerprint CAS, and
-    never consumes a superseded snapshot. ``persist_credentials`` is then
-    unused for the refresh (the gate persists internally).
+    ``refresh_via=None`` is read-only, including on expiry and HTTP 401.
+    A supplied gate owns refresh persistence; this layer never posts a grant.
+    Active accounts are not refreshed here. ``persist_credentials`` is unused.
 
     A setup-token credential (see :func:`is_setup_token`) never reaches the
     usage endpoint, which cannot answer its inference-only scope. With
@@ -1416,17 +1411,15 @@ def try_fetch_usage_for_account(
 
     if (
         not is_active
+        and refresh_via is not None
         and oauth.get("refreshToken")
         and is_oauth_token_expired(oauth.get("expiresAt"))
     ):
-        if refresh_via is not None:
-            refresh = refresh_via(account_num, email, working_credentials)
-        else:
-            refresh = try_refresh_oauth_credentials(working_credentials)
+        refresh = refresh_via(account_num, email, working_credentials)
+        if refresh.error == "stash-unreadable":
+            return UsageOutcome(None, error=refresh.error)
         if refresh.credentials:
             working_credentials = refresh.credentials
-            if refresh_via is None:
-                _persist(persist_credentials, account_num, email, working_credentials)
             oauth = extract_oauth_data(working_credentials) or oauth
             access_token = oauth.get("accessToken") or access_token
         elif refresh.error in ("invalid_grant", "no_refresh_token"):
@@ -1436,8 +1429,7 @@ def try_fetch_usage_for_account(
             # cause): report the permanent failure distinctly so the store
             # can quarantine the account. The strike binds to the bytes the
             # gate actually POSTed (it may have substituted a fresher
-            # re-read for our snapshot) — fall back to the snapshot's
-            # fingerprint only for the direct-POST path.
+            # re-read for our snapshot).
             return UsageOutcome(
                 None, error=refresh.error,
                 struck_fp=(
@@ -1463,6 +1455,7 @@ def try_fetch_usage_for_account(
         if (
             e.code != 401
             or is_active
+            or refresh_via is None
             or not oauth
             or not oauth.get("refreshToken")
         ):
@@ -1474,10 +1467,9 @@ def try_fetch_usage_for_account(
         # is permanently dead — surface it distinctly (not the generic
         # "refresh-failed") so the store can quarantine instead of retrying a
         # dead token forever.
-        if refresh_via is not None:
-            refresh = refresh_via(account_num, email, working_credentials)
-        else:
-            refresh = try_refresh_oauth_credentials(working_credentials)
+        refresh = refresh_via(account_num, email, working_credentials)
+        if refresh.error == "stash-unreadable":
+            return UsageOutcome(None, error=refresh.error)
         if not refresh.credentials:
             _log_usage_failure(context, e, kind)
             dead = refresh.error in ("invalid_grant", "no_refresh_token")
@@ -1497,8 +1489,6 @@ def try_fetch_usage_for_account(
             )
 
         working_credentials = refresh.credentials
-        if refresh_via is None:
-            _persist(persist_credentials, account_num, email, working_credentials)
         refreshed_oauth = extract_oauth_data(working_credentials)
         new_token = refreshed_oauth.get("accessToken") if refreshed_oauth else None
         if not new_token:
@@ -1523,10 +1513,13 @@ def fetch_usage_for_account(
     credentials: str,
     is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
+    *,
+    refresh_via: Callable[[str, str, str], RefreshOutcome] | None,
 ) -> dict | None:
     """Usage dict or None (see try_fetch_usage_for_account for the cause)."""
     return try_fetch_usage_for_account(
-        account_num, email, credentials, is_active, persist_credentials
+        account_num, email, credentials, is_active, persist_credentials,
+        refresh_via=refresh_via,
     ).usage
 
 
