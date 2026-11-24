@@ -557,7 +557,10 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
     if request.node.get_closest_marker("no_oauth_profile_fake"):
         yield
         return
-    monkeypatch.setattr("claude_swap.oauth.fetch_oauth_profile", lambda token: None)
+    monkeypatch.setattr(
+        "claude_swap.oauth.fetch_oauth_profile",
+        lambda token, *args, **kwargs: None,
+    )
     # Same endpoint, same rule: the plan collector runs on every `list` and
     # TUI snapshot, and test credentials carry an access token with no
     # `expiresAt`, which reads as valid — so it would otherwise go live too.

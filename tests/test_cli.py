@@ -2229,6 +2229,140 @@ class TestAliasCommand:
         data = ClaudeAccountSwitcher()._get_sequence_data()
         assert data["accounts"]["1"]["alias"] == "dev"
 
+class TestProxyCommand:
+    """`cswap proxy` — set/unset/list an account's HTTP proxy."""
+
+    def _seeded_switcher_env(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["accounts"]["2"] = {
+            "email": "work@co.com",
+            "uuid": "u2",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [2]
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    def test_set_proxy_by_number_masks_the_password(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._proxy_command(["2", "http://user:secret@127.0.0.1:3128"])
+
+        out = capsys.readouterr().out
+        assert "secret" not in out
+        assert "127.0.0.1:3128" in out
+        data = ClaudeAccountSwitcher()._get_sequence_data()
+        assert data["accounts"]["2"]["proxy"] == (
+            "http://user:secret@127.0.0.1:3128"
+        )
+
+    def test_set_proxy_by_email(self, temp_home):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._proxy_command(["work@co.com", "http://127.0.0.1:3128"])
+        data = ClaudeAccountSwitcher()._get_sequence_data()
+        assert data["accounts"]["2"]["proxy"] == "http://127.0.0.1:3128"
+
+    def test_unset_proxy(self, temp_home, capsys):
+        switcher = self._seeded_switcher_env(temp_home)
+        switcher.set_account_proxy("2", "http://127.0.0.1:3128")
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._proxy_command(["2", "--unset"])
+        assert "Cleared" in capsys.readouterr().out
+        assert "proxy" not in ClaudeAccountSwitcher()._get_sequence_data()[
+            "accounts"
+        ]["2"]
+
+    def test_list_proxies(self, temp_home, capsys):
+        switcher = self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._proxy_command([])
+        assert "No account proxies set" in capsys.readouterr().out
+
+        switcher.set_account_proxy("2", "http://user:secret@127.0.0.1:3128")
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._proxy_command([])
+        out = capsys.readouterr().out
+        assert "127.0.0.1:3128" in out and "work@co.com" in out
+        assert "secret" not in out
+
+    def test_an_unusable_proxy_is_refused_and_changes_nothing(
+        self, temp_home, capsys,
+    ):
+        switcher = self._seeded_switcher_env(temp_home)
+        before = switcher.sequence_file.read_bytes()
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._proxy_command(["2", "https://user:secret@127.0.0.1:3128"])
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "only http://" in err
+        assert "secret" not in err
+        assert switcher.sequence_file.read_bytes() == before
+
+    def test_a_url_without_unset_and_unset_with_a_url_are_usage_errors(
+        self, temp_home, capsys,
+    ):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._proxy_command(["2"])
+        assert exc.value.code == 2
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._proxy_command(["2", "--unset", "http://127.0.0.1:3128"])
+        assert exc.value.code == 2
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="root guard is POSIX-only")
+    def test_proxy_refuses_root(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=0, create=True), \
+             patch.object(ClaudeAccountSwitcher, "_is_running_in_container",
+                          return_value=False):
+            with pytest.raises(SystemExit) as exc:
+                cli._proxy_command(["2", "http://127.0.0.1:3128"])
+        assert exc.value.code == 1
+        assert "root" in capsys.readouterr().err
+
+    def test_proxy_dispatched_from_main(self, temp_home):
+        with patch("claude_swap.cli._proxy_command") as proxy_fn, \
+             patch.object(sys, "argv",
+                          ["claude-swap", "proxy", "2", "http://127.0.0.1:3128"]):
+            cli.main()
+        proxy_fn.assert_called_once_with(["2", "http://127.0.0.1:3128"])
+
+    def test_add_with_proxy_flag(self, temp_home, mock_claude_config, capsys):
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        with patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(ClaudeAccountSwitcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(fake_creds, False)), \
+             patch.object(ClaudeAccountSwitcher, "_write_account_credentials"), \
+             patch.object(sys, "argv",
+                          ["claude-swap", "add", "--proxy",
+                           "http://user:secret@127.0.0.1:3128"]):
+            cli.main()
+
+        data = ClaudeAccountSwitcher()._get_sequence_data()
+        assert data["accounts"]["1"]["proxy"] == (
+            "http://user:secret@127.0.0.1:3128"
+        )
+
+    def test_proxy_flag_without_add_errors(self, temp_home, capsys):
+        with patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv",
+                          ["claude-swap", "list", "--proxy",
+                           "http://127.0.0.1:3128"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 2
+        assert "--proxy can only be used with 'add'" in capsys.readouterr().err
+
+
     def test_alias_flag_without_add_errors(self, temp_home, capsys):
         with patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "list", "--alias", "dev"]):

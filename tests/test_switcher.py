@@ -7702,8 +7702,9 @@ class TestProvenanceGuard:
     def _run_switch(self, switcher, resolver=None, quiet=True):
         with patch.object(switcher, "list_accounts"), patch(
             "claude_swap.oauth.fetch_oauth_profile",
-            side_effect=(lambda token: resolver) if resolver is not None
-            else (lambda token: None),
+            side_effect=(lambda token, *a, **k: resolver)
+            if resolver is not None
+            else (lambda token, *a, **k: None),
         ):
             return switcher._perform_switch("2", emit_output=not quiet)
 

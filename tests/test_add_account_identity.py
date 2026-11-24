@@ -528,7 +528,7 @@ def test_a_login_landing_during_the_guards_network_window_is_refused(
     s = _switcher(temp_home, mock_claude_config, "ax@example.com")
     cfg = s._get_claude_config_path()
 
-    def login_lands(token):
+    def login_lands(token, *args, **kwargs):
         # A different account signs in while the profile lookup is in flight.
         cfg.write_text(json.dumps({"oauthAccount": {
             "emailAddress": "someone-else@example.com", "organizationUuid": "",
@@ -567,7 +567,7 @@ def test_a_refresh_landing_in_the_guards_window_is_refused(
 
     live = {"v": creds("OLD")}
 
-    def rotates_during_lookup(token):
+    def rotates_during_lookup(token, *args, **kwargs):
         live["v"] = creds("NEW")
         return {"uuid": "u-ax", "email": "ax@example.com",
                 "organizationUuid": ""}
@@ -660,7 +660,7 @@ def test_the_refresh_in_place_path_also_refuses_a_login_in_the_window(
 
     cfg = s._get_claude_config_path()
 
-    def login_lands(token):
+    def login_lands(token, *args, **kwargs):
         cfg.write_text(json.dumps({"oauthAccount": {
             "emailAddress": "someone-else@example.com", "organizationUuid": "",
             "accountUuid": "u-other"}}), encoding="utf-8")
@@ -771,7 +771,7 @@ def test_a_config_torn_mid_rewrite_in_that_window_is_refused_not_a_crash(
     s = _switcher(temp_home, mock_claude_config, "ax@example.com")
     cfg = s._get_claude_config_path()
 
-    def tears_during_lookup(token):
+    def tears_during_lookup(token, *args, **kwargs):
         # Claude Code is part-way through replacing the file.
         cfg.write_text('{"oauthAccount": {"emailAddr', encoding="utf-8")
         return {"uuid": "u-ax", "email": "ax@example.com",

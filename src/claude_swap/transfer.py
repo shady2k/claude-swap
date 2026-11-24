@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from claude_swap import __version__
+from claude_swap import __version__, account_proxy
 from claude_swap.credentials import looks_like_api_key
 from claude_swap.exceptions import (
     ConfigError,
@@ -154,6 +154,30 @@ def _slim_credentials(creds_obj: dict) -> dict:
     return {"claudeAiOauth": creds_obj["claudeAiOauth"]}
 
 
+def _remind_about_proxies(
+    accounts_map: dict[str, Any], numbers: list[int]
+) -> None:
+    """Tell the operator which exported accounts had a proxy (masked).
+
+    The export itself carries none, so the target machine's requests would go
+    direct unless someone configures it. Printed for both destinations,
+    including stdout-as-JSON, because stderr is not the payload.
+    """
+    rows = [
+        (str(num), account_proxy.describe(accounts_map.get(str(num))))
+        for num in numbers
+    ]
+    rows = [(num, described) for num, described in rows if described]
+    if not rows:
+        return
+    listed = "; ".join(f"Account-{num} ({described})" for num, described in rows)
+    _eprint(
+        f"Note: {listed} use{'s' if len(rows) == 1 else ''} a proxy, which is "
+        "not exported. On the target machine, set it there with: "
+        "cswap proxy <num> <url>"
+    )
+
+
 def export_accounts(
     switcher: ClaudeAccountSwitcher,
     destination: str,
@@ -170,6 +194,12 @@ def export_accounts(
             entire credential object per account (same-PC backup). Default
             False writes only oauthAccount and the account's own
             claudeAiOauth login.
+
+    An account's proxy is never exported, in either mode: the URL can carry a
+    password, the target machine may not reach that proxy, and an import that
+    silently restored one would send another machine's requests through it. The
+    reminder printed to stderr names the accounts that had one so the target
+    can be configured deliberately (``cswap proxy <num> <url>``).
 
     Raises:
         TransferError: malformed/missing data, unknown account.
@@ -299,11 +329,15 @@ def export_accounts(
         sys.stdout.write(serialized)
         sys.stdout.write("\n")
         sys.stdout.flush()
+        _remind_about_proxies(
+            accounts_map, [a["number"] for a in accounts_payload]
+        )
         return
 
     out_path = Path(destination).expanduser()
     _atomic_write_file(out_path, serialized + "\n")
     _eprint(f"Exported {len(accounts_payload)} account(s) to {out_path}")
+    _remind_about_proxies(accounts_map, [a["number"] for a in accounts_payload])
 
 
 def import_accounts(
@@ -571,6 +605,18 @@ def import_accounts(
             [target_num], {target_num: (entry["email"], entry["org_uuid"])}
         )
 
+        # The export never carries a proxy, so an import must not clear the
+        # one this machine holds for the same account: that setting describes
+        # THIS host's route, and the credentials being replaced do not change
+        # it. ``target_num`` holds this account only — an occupied slot with
+        # another identity is never reused — so the value read here belongs to
+        # the account being imported.
+        local_proxy = (
+            (data.get("accounts", {}).get(target_num) or {}).get(
+                account_proxy.FIELD
+            )
+        )
+
         data.setdefault("accounts", {})
         data.setdefault("sequence", [])
         new_record = {
@@ -584,6 +630,8 @@ def import_accounts(
             new_record["kind"] = "api_key"
         if entry.get("alias"):
             new_record["alias"] = entry["alias"]
+        if local_proxy is not None:
+            new_record[account_proxy.FIELD] = local_proxy
         data["accounts"][target_num] = new_record
         if int(target_num) not in data["sequence"]:
             data["sequence"].append(int(target_num))

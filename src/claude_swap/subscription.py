@@ -53,7 +53,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from claude_swap import oauth
+from claude_swap import account_proxy, oauth
 from claude_swap.locking import FileLock
 from claude_swap.settings import atomic_write_json
 
@@ -121,13 +121,20 @@ class PlanFetch:
     retry_after_s: float | None = None
 
 
-def fetch_plan(access_token: str, timeout: float = 5.0) -> PlanFetch:
+def fetch_plan(
+    access_token: str,
+    timeout: float = 5.0,
+    route: account_proxy.ProxyRoute | None = None,
+) -> PlanFetch:
     """Read the plan fields of ``/api/oauth/profile``.
 
     Requires a non-empty ``rate_limit_tier``, the field every label derives
     from; a response without one is treated as no answer rather than as a plan
     with nothing in it. Must not be called while a credential or config lock is
     held, the same rule as every other network call here.
+
+    ``route`` is the slot's proxy (see ``account_proxy``); a route failure is
+    an ordinary failed read, retried after the usual backoff.
     """
     req = urllib.request.Request(
         PROFILE_URL,
@@ -138,7 +145,7 @@ def fetch_plan(access_token: str, timeout: float = 5.0) -> PlanFetch:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with account_proxy.send(req, timeout, route) as resp:
             data = json.loads(resp.read().decode())
     except Exception as e:  # noqa: BLE001 — display-only; never let it surface
         _logger.debug("Plan fetch failed: %r", e)

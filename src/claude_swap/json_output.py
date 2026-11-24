@@ -401,6 +401,7 @@ def account_row(
     policy: AccountPolicy = AccountPolicy(),
     login_expires_at: str | None = None,
     subscription_plan: dict | None = None,
+    proxy: str = "",
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
     backoff only; a lapsed one is the caller's to withhold."""
@@ -435,6 +436,11 @@ def account_row(
     # (see ``subscription``); a slot never fetched emits no key at all.
     if subscription_plan:
         row["plan"] = subscription_plan_fields(subscription_plan)
+    # Additive field: the account's proxy, password masked (see
+    # ``account_proxy.describe``). An account without one emits no key, so a
+    # fleet that never uses a proxy produces rows byte-identical to before.
+    if proxy:
+        row["proxy"] = proxy
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:

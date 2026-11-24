@@ -25,7 +25,7 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import oauth, pace, subscription
+from claude_swap import account_proxy, oauth, pace, subscription
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -289,6 +289,18 @@ ERROR_NOTES = {
     "setup-token": (
         "setup-tokens cannot read the usage endpoint — "
         "`cswap config set usage.headerProbe true` reads it from a 1-token request"
+    ),
+    account_proxy.PROXY_AUTH: (
+        "the account's proxy refused its URL credentials (HTTP 407) — "
+        "correct them with `cswap proxy <num> <url>`"
+    ),
+    account_proxy.PROXY_REDIRECT: (
+        "the account's proxy redirected instead of forwarding, and a redirect "
+        "would leave the proxy — check the proxy URL"
+    ),
+    account_proxy.PROXY_INVALID: (
+        "the account's stored proxy cannot be used — set it again with "
+        "`cswap proxy <num> <url>`, or clear it with --unset to go direct"
     ),
 }
 
@@ -1176,6 +1188,95 @@ class ClaudeAccountSwitcher:
         ]
         return sorted(rows, key=lambda r: int(r[0]))
 
+    def set_account_proxy(self, identifier: str, url: str) -> tuple[str, str]:
+        """Attach an HTTP proxy to one account, or replace the one it has.
+
+        From here on every request cswap makes *for this account* — usage,
+        token refresh and its retries, the profile read, the plan read — goes
+        through that proxy or not at all (see ``account_proxy``). Other
+        accounts and ``update_check`` are unaffected: a proxy is a property of
+        the account, never a global setting.
+
+        The URL is validated and stored normalized (see
+        :func:`account_proxy.parse`); a rejected value raises before any write,
+        so ``sequence.json`` stays untouched. Returns
+        ``(account_num, masked_url)`` — the stored value keeps its password,
+        the returned one never does.
+
+        Raises:
+            AccountNotFoundError: identifier doesn't match any account.
+            ValidationError: the URL cannot be used as an HTTP proxy.
+        """
+        self._refuse_session_shell()
+        try:
+            route = account_proxy.parse(url)
+        except account_proxy.ProxyUrlError as e:
+            raise ValidationError(str(e)) from e
+
+        account_num, email, data, record = self._resolve_for_policy_write(identifier)
+        stored = route.text()
+        if record.get(account_proxy.FIELD) != stored:
+            record[account_proxy.FIELD] = stored
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+            # Masked: this line lands in the log file.
+            self._logger.info(
+                f"Set proxy {route.display()} for account {account_num}: {email}"
+            )
+        return account_num, route.display()
+
+    def clear_account_proxy(self, identifier: str) -> str:
+        """Remove one account's proxy, returning its requests to a direct connection.
+
+        Idempotent, like :meth:`unset_alias`: an account that already has none
+        is not an error. Returns the account number.
+        """
+        self._refuse_session_shell()
+        account_num, email, data, record = self._resolve_for_policy_write(identifier)
+        if account_proxy.FIELD in record:
+            del record[account_proxy.FIELD]
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+            self._logger.info(f"Cleared proxy for account {account_num}: {email}")
+        return account_num
+
+    def list_account_proxies(self) -> list[tuple[str, str, str]]:
+        """Every set proxy as ``(account_num, masked_url, email)``, slot order."""
+        data = self._get_sequence_data_migrated()
+        accounts = (data or {}).get("accounts", {})
+        rows = []
+        for num, acc in accounts.items():
+            described = account_proxy.describe(acc)
+            if described is not None:
+                rows.append((num, described, acc.get("email", "")))
+        return sorted(rows, key=lambda r: int(r[0]))
+
+    def _account_route(
+        self, account_num: str
+    ) -> "account_proxy.ProxyRoute | None":
+        """The pinned proxy route of one slot; ``None`` when it has no proxy.
+
+        Read from ``sequence.json`` for every request rather than cached: the
+        setting can change between two passes, and a request must follow the
+        value in force when it is sent. A record that cannot be read yields an
+        *unusable* route rather than a direct one — with the setting unknown, a
+        direct connection is the one outcome a proxied account forbids — and
+        that is also why this never raises into the fetch path, whose contract
+        is to report a failure and not to unwind the collect pass.
+        """
+        try:
+            data = self._get_sequence_data() or {}
+        except Exception:
+            self._logger.warning(
+                "Could not read the slot record while routing account %s's "
+                "request; refusing to connect without knowing its proxy.",
+                account_num, exc_info=True,
+            )
+            return account_proxy.unusable("the slot record could not be read")
+        return account_proxy.route_for(
+            data.get("accounts", {}).get(str(account_num))
+        )
+
     def swap_accounts(self, first: str, second: str) -> tuple[str, str]:
         """Exchange two accounts' slot numbers (list order / numeric targets).
 
@@ -1976,7 +2077,9 @@ class ClaudeAccountSwitcher:
             if token is None:
                 continue
             started_at = store.clock()
-            fetched = subscription.fetch_plan(token)
+            fetched = subscription.fetch_plan(
+                token, route=self._account_route(str(num))
+            )
             slot_uuid = (accounts.get(str(num), {}).get("uuid") or "").strip()
             if fetched.plan is not None and subscription.matches_slot(
                 fetched, slot_uuid, org_uuid
@@ -2151,7 +2254,12 @@ class ClaudeAccountSwitcher:
     #: rewrites from the new credential. ``add_account`` and
     #: ``add_account_from_token`` rebuild a ``--slot`` record wholesale and
     #: carry exactly these across; a new per-account setting belongs here.
-    USER_ACCOUNT_SETTINGS: tuple[str, ...] = ("alias", "disabled", "threshold", "priority")
+    #: ``proxy`` is here for the same reason as the rest: the proxy belongs to
+    #: the account, so swapping or moving a slot keeps it (the records move
+    #: whole), and a re-login into the same slot keeps it too.
+    USER_ACCOUNT_SETTINGS: tuple[str, ...] = (
+        "alias", "disabled", "threshold", "priority", "proxy",
+    )
 
     @classmethod
     def _carried_settings(cls, record: dict | None) -> dict:
@@ -2798,7 +2906,9 @@ class ClaudeAccountSwitcher:
             "Refresh starting for account %s (%s).",
             account_num, _fingerprint_head(consumed_fp),
         )
-        result = oauth.try_refresh_oauth_credentials(refresh_input)
+        result = oauth.try_refresh_oauth_credentials(
+            refresh_input, route=self._account_route(account_num)
+        )
         if result.error is not None or not result.credentials:
             self._logger.info(
                 "Refresh for account %s ended without a successor (%s).",
@@ -3825,7 +3935,8 @@ class ClaudeAccountSwitcher:
         )
 
     def _reject_foreign_credential_capture(
-        self, creds: str, email: str, org_uuid: str, account_uuid: str
+        self, creds: str, email: str, org_uuid: str, account_uuid: str,
+        route: "account_proxy.ProxyRoute | None" = None,
     ) -> str:
         """Guard for ``add_account``: the stored token must be THIS account's.
 
@@ -3858,6 +3969,13 @@ class ClaudeAccountSwitcher:
         only live copy of that lineage. Detecting an expired FOREIGN
         credential is real and belongs on that machinery, not here; the field
         incident's shape is a live token, which this still catches.
+
+        The lookup travels the route the account will use: the explicit
+        ``--proxy`` of this ``cswap add``, or the proxy already stored on the
+        slot it lands in (see ``account_proxy``). A proxied account therefore
+        never has its ownership checked over a direct connection; when that
+        route fails the answer is UNRESOLVABLE, which the advisory contract
+        below already covers.
 
         ADVISORY, in the same direction the oracle is everywhere else: a
         ``None`` answer means UNRESOLVABLE (offline, 401, schema drift), never
@@ -3906,7 +4024,7 @@ class ClaudeAccountSwitcher:
             # spent generation, and on the refusal path would discard the only
             # live copy of that lineage.
             return unverified("the access token is expired")
-        profile = oauth.fetch_oauth_profile(token)
+        profile = oauth.fetch_oauth_profile(token, route=route)
         if not profile:
             return unverified("the identity lookup did not resolve")
         # Uuid first, like ``_resolved_matches_slot_identity``: uuids are
@@ -4164,6 +4282,7 @@ class ClaudeAccountSwitcher:
         slot: int | None = None,
         assume_yes: bool = False,
         alias: str | None = None,
+        proxy: str | None = None,
     ) -> None:
         """Add current account to managed accounts.
 
@@ -4180,6 +4299,10 @@ class ClaudeAccountSwitcher:
                   confirmation UI, e.g. the TUI, confirm before calling).
             alias: Optional short display alias to set on this account.
                   When omitted, an existing alias on the slot is preserved.
+            proxy: Optional ``http://`` proxy URL for this account
+                  (``--proxy``). Validated before anything is read or sent.
+                  When omitted, the proxy already stored on the slot holding
+                  this account is kept.
         """
         self._refuse_session_shell()
         self._setup_directories()
@@ -4190,6 +4313,13 @@ class ClaudeAccountSwitcher:
             try:
                 alias = normalize_alias(alias)
             except ValueError as e:
+                raise ValidationError(str(e)) from e
+
+        explicit_route: "account_proxy.ProxyRoute | None" = None
+        if proxy is not None:
+            try:
+                explicit_route = account_proxy.parse(proxy)
+            except account_proxy.ProxyUrlError as e:
                 raise ValidationError(str(e)) from e
 
         identity = self._get_current_identity_triple()
@@ -4219,6 +4349,7 @@ class ClaudeAccountSwitcher:
             current_creds = self._reject_foreign_credential_capture(
                 current_creds, current_email, current_org_uuid,
                 current_account_uuid,
+                route=explicit_route or self._account_route(account_num),
             )
             self._reject_credential_drift_since_verify(current_creds)
 
@@ -4251,6 +4382,10 @@ class ClaudeAccountSwitcher:
 
             if alias is not None:
                 seq["accounts"][account_num]["alias"] = alias
+            if explicit_route is not None:
+                seq["accounts"][account_num][account_proxy.FIELD] = (
+                    explicit_route.text()
+                )
 
             seq["activeAccountNumber"] = int(account_num)
             seq["lastUpdated"] = get_timestamp()
@@ -4350,7 +4485,8 @@ class ClaudeAccountSwitcher:
             raise CredentialReadError("No credentials found for current account")
         self._reject_live_api_key_capture(current_creds)
         current_creds = self._reject_foreign_credential_capture(
-            current_creds, current_email, current_org_uuid, current_account_uuid
+            current_creds, current_email, current_org_uuid, current_account_uuid,
+            route=explicit_route or account_proxy.route_for(carried),
         )
         self._reject_credential_drift_since_verify(current_creds)
 
@@ -4420,6 +4556,8 @@ class ClaudeAccountSwitcher:
         }
         if alias is not None:
             carried["alias"] = alias  # an explicit --alias wins over the carried one
+        if explicit_route is not None:
+            carried[account_proxy.FIELD] = explicit_route.text()
         data["accounts"][account_num].update(carried)
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))
@@ -4870,6 +5008,7 @@ class ClaudeAccountSwitcher:
         if not oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
             outcome = oauth.try_fetch_usage_for_account(
                 account_num, email, creds, is_active=True,
+                route=self._account_route(account_num),
                 **self._probe_options(last_usage),
             )
             if outcome.error != "http-401":
@@ -5221,7 +5360,8 @@ class ClaudeAccountSwitcher:
                             ),
                         )
                         result = oauth.try_refresh_oauth_credentials(
-                            refresh_input, timeout_s=6.0
+                            refresh_input, timeout_s=6.0,
+                            route=self._account_route(account_num),
                         )
                         if result.error is not None or not result.credentials:
                             self._logger.info(
@@ -5389,6 +5529,7 @@ class ClaudeAccountSwitcher:
 
         outcome = oauth.try_fetch_usage_for_account(
             account_num, email, working, is_active=True,
+            route=self._account_route(account_num),
             **self._probe_options(last_usage),
         )
         return FetchRecord(
@@ -5449,7 +5590,8 @@ class ClaudeAccountSwitcher:
                 return  # known-foreign lineage; already warned
             if verdict is not True:
                 resolved = oauth.fetch_oauth_profile(
-                    oauth.extract_access_token(creds) or ""
+                    oauth.extract_access_token(creds) or "",
+                    route=self._account_route(account_num),
                 )
                 if resolved is None:
                     self._logger.debug(
@@ -5698,6 +5840,7 @@ class ClaudeAccountSwitcher:
             str(num), email, creds,
             is_active=False,
             refresh_via=self.consume_backup_grant,
+            route=self._account_route(str(num)),
             **self._probe_options(last_usage),
         )
         return FetchRecord(
@@ -5727,6 +5870,7 @@ class ClaudeAccountSwitcher:
             return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
         outcome = oauth.try_fetch_usage_for_account(
             num, email, creds, is_active=True,
+            route=self._account_route(num),
             **self._probe_options(last_usage),
         )
         if outcome.error == "http-401":
@@ -6340,6 +6484,9 @@ class ClaudeAccountSwitcher:
                     policy=self._policy_from_data(seq_data, str(num)),
                     login_expires_at=oauth.login_expires_at_iso(creds),
                     subscription_plan=(plans or {}).get(str(num)),
+                    proxy=account_proxy.describe(
+                        (seq_data.get("accounts") or {}).get(str(num))
+                    ) or "",
                 )
             )
         payload = {
@@ -6525,6 +6672,9 @@ class ClaudeAccountSwitcher:
         }
         if alias:
             active["alias"] = alias
+        proxy = account_proxy.describe(acct)
+        if proxy:
+            active["proxy"] = proxy
         if usage is not None:
             active.update(usage_freshness_fields(entry.fetched_at, entry.age_s))
         else:
@@ -7246,6 +7396,16 @@ class ClaudeAccountSwitcher:
         Returns ``{"live": str|None, "resolved": dict|None}``. ``resolved`` is
         only trustworthy while the live bytes haven't moved — the under-lock
         classifier re-checks byte equality before using it.
+
+        The request travels the proxy of the slot ``~/.claude.json`` names, and
+        that is the account the answer is about — the route, like the slot, is
+        chosen by that file. The residual case is a live credential that
+        actually belongs to a DIFFERENT slot which has its own proxy: the
+        lookup then goes over this slot's route (direct when this slot has no
+        proxy), and a mismatch it reports is still resolved against the slots'
+        own identities before any write. Nothing is written into a slot on the
+        strength of this call alone — ``_classify_outgoing_credential`` decides
+        that under the locks.
         """
         result: dict = {"live": None, "resolved": None}
         try:
@@ -7273,7 +7433,9 @@ class ClaudeAccountSwitcher:
         if not access_token:
             return result  # raw API key / garbled JSON — nothing to resolve
         try:
-            result["resolved"] = oauth.fetch_oauth_profile(access_token)
+            result["resolved"] = oauth.fetch_oauth_profile(
+                access_token, route=self._account_route(slot)
+            )
         except Exception as e:
             # fetch_oauth_profile swallows its own failures; this belt keeps
             # the invariant structural — the oracle is advisory and must
