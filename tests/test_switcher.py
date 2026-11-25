@@ -15645,7 +15645,7 @@ class TestTheLaunchRoute:
         )
 
         assert login is not None
-        assert not switcher.default_login_still_holds(login)
+        assert not switcher.default_login_still_holds(login.identity, login.slot)
 
     def test_a_snapshot_stops_holding_when_the_slot_moves(
         self, temp_home: Path, sample_sequence_data: dict
@@ -15659,17 +15659,17 @@ class TestTheLaunchRoute:
         switcher.swap_accounts("1", "2")
 
         assert login is not None
-        assert not switcher.default_login_still_holds(login)
+        assert not switcher.default_login_still_holds(login.identity, login.slot)
 
     def test_no_login_stays_pinned_until_one_appears(
         self, temp_home: Path, sample_sequence_data: dict
     ):
         """A login that appears during the probes is a change too."""
         switcher = self._switcher(sample_sequence_data)
-        assert switcher.default_login_still_holds(None)
+        assert switcher.default_login_still_holds(None, None)
 
         get_global_config_path().write_text(
             json.dumps({"oauthAccount": {"emailAddress": "account2@example.com"}})
         )
 
-        assert not switcher.default_login_still_holds(None)
+        assert not switcher.default_login_still_holds(None, None)

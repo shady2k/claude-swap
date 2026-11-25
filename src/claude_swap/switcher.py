@@ -1442,9 +1442,19 @@ class ClaudeAccountSwitcher:
         return DefaultLogin(identity, account_num, route, expectation)
 
     def default_login_still_holds(
-        self, login: "DefaultLogin | None", *, primary_profile: bool = False
+        self,
+        identity: tuple[str, str] | None,
+        slot: str | None,
+        *,
+        primary_profile: bool = False,
     ) -> bool:
-        """Whether ``login`` is still the default login and still holds its slot.
+        """Whether ``identity`` is still the default login and ``slot`` its slot.
+
+        The pair is what a launch captured earlier: the ``DefaultLogin``
+        snapshot of ``session.SessionManager.exec_default``, or the account
+        ``SessionManager.run`` resolved for its plain-claude fast path. They
+        are passed field by field so a caller holding only those two answers
+        needs no snapshot type — ``session.py`` does not import this module.
 
         The check a launch makes after its network checks and before it starts
         claude: those take seconds with no lock held, so a ``switch`` can
@@ -1467,12 +1477,11 @@ class ClaudeAccountSwitcher:
         """
         try:
             with FileLock(self.lock_file):
-                identity = self._default_login_identity(primary_profile)
-                if identity != (None if login is None else login.identity):
+                if self._default_login_identity(primary_profile) != identity:
                     return False
-                if login is None or login.slot is None:
+                if identity is None or slot is None:
                     return True
-                return self._slot_holding(*login.identity) == login.slot
+                return self._slot_holding(*identity) == slot
         except LockError:
             return False
 

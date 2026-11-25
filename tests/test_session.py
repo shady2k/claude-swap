@@ -45,7 +45,11 @@ from claude_swap.fsutil import (
 )
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
-from claude_swap.paths import get_backup_root, get_global_config_path
+from claude_swap.paths import (
+    get_backup_root,
+    get_default_global_config_path,
+    get_global_config_path,
+)
 from claude_swap.process_detection import ClaudeSession
 from claude_swap.session import (
     MCP_DISPLACED_STASH,
@@ -1738,6 +1742,14 @@ class TestRun:
             "_default_login_identity",
             staticmethod(lambda: (ACCOUNT_EMAIL, ORG_UUID)),
         )
+        # The re-check before the handoff reads the default profile itself,
+        # whatever CLAUDE_CONFIG_DIR says.
+        get_default_global_config_path().write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": ACCOUNT_EMAIL,
+                "organizationUuid": ORG_UUID,
+            },
+        }))
         with pytest.raises(_ExecCalled) as exc:
             manager.run("2", [])
 
@@ -2390,7 +2402,7 @@ class TestTheLaunchTakesTheAccountsProxy:
 
         monkeypatch.setattr(account_proxy, "probe", switch_then_probe)
 
-        with pytest.raises(SessionError, match="changed while its exit"):
+        with pytest.raises(SessionError, match="changed or could not be confirmed"):
             manager.exec_default(["--resume"], primary_profile=primary_profile)
 
     @pytest.mark.parametrize(
@@ -2410,7 +2422,7 @@ class TestTheLaunchTakesTheAccountsProxy:
 
         monkeypatch.setattr(account_proxy, "probe", swap_then_probe)
 
-        with pytest.raises(SessionError, match="changed while its exit"):
+        with pytest.raises(SessionError, match="changed or could not be confirmed"):
             manager.exec_default(["--resume"], primary_profile=primary_profile)
 
     def test_the_final_check_waits_for_a_switch_that_holds_the_lock(
@@ -2471,6 +2483,7 @@ class TestTheLaunchTakesTheAccountsProxy:
         monkeypatch.setattr(switcher_mod, "FileLock", SignallingLock)
 
         switch_errors: list[BaseException] = []
+        launch_errors: list[BaseException] = []
 
         def run_switch():
             try:
@@ -2482,7 +2495,7 @@ class TestTheLaunchTakesTheAccountsProxy:
             try:
                 manager.exec_default(["--resume"])
             except BaseException as e:  # noqa: BLE001 - reported below
-                switch_errors.append(e)
+                launch_errors.append(e)
 
         switch_thread = threading.Thread(target=run_switch, daemon=True)
         switch_thread.start()
@@ -2504,9 +2517,9 @@ class TestTheLaunchTakesTheAccountsProxy:
         # refuses before _exec, which never saw a launch either.
         launch_thread.join(10)
         assert not launch_thread.is_alive()
-        assert len(switch_errors) == 1
-        assert isinstance(switch_errors[0], SessionError)
-        assert "changed while its exit" in str(switch_errors[0])
+        assert len(launch_errors) == 1
+        assert isinstance(launch_errors[0], SessionError)
+        assert "changed or could not be confirmed" in str(launch_errors[0])
         assert executed == []
 
     def test_a_lock_that_cannot_be_taken_refuses_the_launch(
@@ -2530,8 +2543,8 @@ class TestTheLaunchTakesTheAccountsProxy:
             lambda path: real_lock(path, timeout=0.05),
         )
         try:
-            assert not switcher.default_login_still_holds(login)
-            with pytest.raises(SessionError, match="changed while its exit"):
+            assert not switcher.default_login_still_holds(login.identity, login.slot)
+            with pytest.raises(SessionError, match="changed or could not be confirmed"):
                 manager.exec_default(["--resume"])
         finally:
             held.release()
@@ -2965,7 +2978,37 @@ class TestTheLaunchChecksTheEgressExpectation:
 
         monkeypatch.setattr(account_proxy, "probe", swap_then_accept)
 
-        with pytest.raises(SessionError, match="no longer holds the slot"):
+        with pytest.raises(SessionError, match="no longer the login"):
+            manager.run("2", [])
+
+    def test_a_switch_while_the_fast_path_prepares_ends_the_launch(
+        self, manager, capture_exec, monkeypatch
+    ):
+        """A ``switch`` replaces the login itself, which the fast path runs.
+
+        The same-account fast path hands the terminal to plain claude on the
+        default login, after merging that account's history. A switch in that
+        step leaves the route and the rule with the outgoing login and the
+        incoming account's credentials live, so the re-check ends the launch
+        before ``_exec``.
+        """
+        switcher = manager.switcher
+        switcher._write_account_credentials("1", "account1@example.com", CREDS)
+        switcher._write_account_config("1", "account1@example.com", CONFIG_1)
+        _default_login_is(ACCOUNT_EMAIL, ORG_UUID)
+
+        def switch_then_share_history(self, session_dir, share_history):
+            # Activation only: the backup of the outgoing login is not what
+            # this test is about, and the live store here is a temp home's.
+            switcher.switch_to("1", force=True)
+
+        monkeypatch.setattr(
+            session_mod.SessionManager,
+            "_history_on_the_fast_path",
+            switch_then_share_history,
+        )
+
+        with pytest.raises(SessionError, match="no longer the login"):
             manager.run("2", [])
 
 

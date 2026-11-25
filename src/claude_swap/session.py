@@ -891,10 +891,11 @@ class SessionManager:
         proxy is checked with one ``CONNECT`` before any profile is created,
         seeded or probed: an unusable proxy or an exit the account did not
         promise ends the command here, with Claude Code never started. That
-        identity is checked again just before the fast path hands the terminal
-        to claude, and goes on to ``setup_session``, which makes the same check
-        on the session branch: a slot a ``swap``/``move`` gave to another
-        account during the checks ends the launch instead of running it.
+        identity and the default login it names are checked again just before
+        the fast path hands the terminal to claude, and the identity goes on to
+        ``setup_session``, which makes the same slot check on the session
+        branch: a ``switch``, ``swap`` or ``move`` during the checks ends the
+        launch instead of running it.
 
         Notices on the way are printed plainly. `cswap run` sends them to
         stderr, because stdout is claude's (``cli._run_launch``).
@@ -1002,13 +1003,20 @@ class SessionManager:
                 # Chosen for the user, so the shell's auth overrides go.
                 _warn_auth_overrides()
             # The check above may have taken seconds (a `CONNECT`, then the
-            # GeoIP chain): a `swap`/`move` since then must end the launch, not
-            # run the account that took the slot. ``setup_session`` makes the
-            # same check on the session branch.
-            if not self.switcher.account_still_holds(account_num, email, org_uuid):
+            # GeoIP chain): the login this launch would run or the slot it
+            # belongs to must still be the ones it read. A `switch` replaces
+            # the login, a `swap`/`move` gives the slot away, and a lock that
+            # could not be taken leaves either unconfirmed. ``setup_session``
+            # makes the same slot check on the session branch.
+            if not self.switcher.default_login_still_holds(
+                (email, org_uuid),
+                str(account_num),
+                primary_profile=bool(config_dir_preset),
+            ):
                 raise SessionError(
-                    f"Account-{account_num} ({email}) no longer holds the slot: "
-                    "a swap or move gave it to another account while its "
+                    f"Account-{account_num} ({email}) is no longer the login "
+                    "this launch would run, or its slot changed or could not "
+                    "be confirmed: a switch, swap or move landed while its "
                     "exit was being checked. Nothing was launched; run the "
                     "command again."
                 )
@@ -1231,14 +1239,18 @@ class SessionManager:
         self._check_egress(route, expectation, who)
         # The checks above may have taken seconds (a CONNECT, then the GeoIP
         # chain) with no lock held: the login and the slot it belonged to
-        # must still be the ones the route and the rule came from.
+        # must still be the ones the route and the rule came from. The pair
+        # is what the snapshot pinned; a login that is not a slot of ours
+        # pins only its identity (``None`` slot).
         if not self.switcher.default_login_still_holds(
-            login, primary_profile=primary_profile
+            None if login is None else login.identity,
+            None if login is None else login.slot,
+            primary_profile=primary_profile,
         ):
             raise SessionError(
-                "The default login or the slot it belongs to changed while "
-                "its exit was being checked. Nothing was launched; run the "
-                "command again."
+                "The default login or the slot it belongs to changed or "
+                "could not be confirmed while its exit was being checked. "
+                "Nothing was launched; run the command again."
             )
         self._exec(claude_bin, claude_args, env=self._launch_env(route, env))
 
