@@ -1564,7 +1564,12 @@ class TestFetchAccountUsageFromAnotherProfile:
             )
 
         assert record.usage == {"five_hour": {"pct": 5}}
-        assert mock_fetch.call_args.kwargs["refresh_via"] == switcher.consume_backup_grant
+        # The gate is pinned to the organization the snapshot attributed to
+        # the slot, so a `swap` cannot make it spend a same-email sibling's
+        # grant.
+        refresh_via = mock_fetch.call_args.kwargs["refresh_via"]
+        assert refresh_via.func == switcher.consume_backup_grant
+        assert refresh_via.keywords == {"expected_org": ""}
 
 
 class TestAdoptSessionCredential:
@@ -1941,7 +1946,7 @@ class TestListAccountsUsage:
                 refresh_via(account_num, email, credentials)
             return oauth.UsageOutcome(None)
 
-        def mock_gate(account_num, email, snapshot):
+        def mock_gate(account_num, email, snapshot, expected_org=None):
             switcher._write_account_credentials(
                 account_num, email, refreshed_creds
             )
@@ -10569,7 +10574,9 @@ class TestDegradedReadProvenance:
 
         with patch.object(s, "_read_account_credentials", return_value=stale), \
              patch("claude_swap.oauth.try_fetch_usage_for_account"):
-            s._active_account_usage("1", "test@example.com", "")
+            row = s._active_snapshot_row()
+            assert row is not None
+            s._active_account_usage(row)
 
         assert s._active_read_degraded is True, (
             "the status path leaves the degraded guard disarmed, so a stale "
@@ -11678,7 +11685,7 @@ class TestInactiveRefreshRoutesThroughGate:
         })
         gate = {}
 
-        def mock_gate(num, email, snapshot):
+        def mock_gate(num, email, snapshot, expected_org=None):
             gate["args"] = (num, email)
             s._store._write_account_credentials(num, email, fresh)
             return oauth.RefreshOutcome(fresh, None)
@@ -11827,13 +11834,13 @@ class TestStoreResolutionParity:
         creds = json.dumps({
             "claudeAiOauth": {"accessToken": "a", "refreshToken": "rt",
                               "expiresAt": 1000}})
-        s._write_account_credentials("1", "test@example.com", creds)
+        s._write_account_credentials("1", "account1@example.com", creds)
         fresh = json.dumps({
             "claudeAiOauth": {"accessToken": "b", "refreshToken": "rt2",
                               "expiresAt": 9999999999000}})
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    return_value=oauth.RefreshOutcome(fresh, None)):
-            result = s.consume_backup_grant("1", "test@example.com", creds)
+            result = s.consume_backup_grant("1", "account1@example.com", creds)
         assert result.credentials == fresh
 
     def test_a_secure_store_miss_does_not_capture_the_other_profiles_key(

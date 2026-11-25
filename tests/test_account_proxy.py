@@ -840,7 +840,7 @@ class TestRouting:
         _endpoints(monkeypatch, origin.url)
         s = _switcher(sample_sequence_data)
         s.set_account_proxy("1", proxy.url)
-        route = s._account_route("1")
+        route = account_proxy.route_for(s._get_sequence_data()["accounts"]["1"])
 
         profile = oauth.fetch_oauth_profile("sk-live", route=route)
         plan = subscription.fetch_plan("sk-live", route=route)
@@ -1026,3 +1026,151 @@ class TestTransfer:
         assert s._get_sequence_data()["accounts"]["1"]["proxy"] == (
             "http://127.0.0.1:3128"
         )
+
+
+class TestOwnershipUnderTheLock:
+    """The snapshot's owner, route and credential are one locked read.
+
+    Every slot mutation (`switch`, `swap`, `move`, the registry writers) takes
+    the account lock, so a read that holds it cannot be split: no `swap` can
+    replace the record (or the backup files keyed to it) between "who is in
+    this slot" and "what credential does this slot hold". These tests probe
+    those boundaries from inside them, the same way
+    ``test_the_proxy_commands_hold_the_account_lock`` does: flock is per open
+    file description, so a second acquisition fails exactly while the span
+    holds it.
+    """
+
+    def test_the_snapshot_holds_the_account_lock_while_it_reads(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        s = _switcher(sample_sequence_data)
+        held: list[bool] = []
+        real = ClaudeAccountSwitcher._read_account_credentials
+
+        def probe(self, *args, **kwargs):
+            handle = FileLock(self.lock_file, timeout=0.05)
+            held.append(handle.acquire())
+            handle.release()
+            return real(self, *args, **kwargs)
+
+        monkeypatch.setattr(ClaudeAccountSwitcher, "_read_account_credentials", probe)
+        s._build_accounts_info()
+
+        assert held and not any(held), (
+            "a slot's credential was read outside the account lock, so a "
+            "swap/move could land between the record and the bytes"
+        )
+
+    def test_a_lock_held_elsewhere_sends_no_request(
+        self, temp_home: Path, sample_sequence_data: dict, direct_calls,
+        monkeypatch,
+    ):
+        """Another cswap holding the lock means the owner cannot be pinned.
+
+        Rows are still shown (from stored data), but no request may leave:
+        the route is unconfirmed, and a direct guess is what a proxied
+        account forbids.
+        """
+        from claude_swap.json_output import USAGE_OWNER_CHANGED
+
+        _endpoints(monkeypatch, "http://127.0.0.1:1")
+        s = _switcher(sample_sequence_data)
+        s.set_account_proxy("1", "http://127.0.0.1:3128")
+        s._write_account_credentials("1", "test@example.com", CREDS_OK)
+
+        fetch_calls: list[str] = []
+        monkeypatch.setattr(
+            oauth, "try_fetch_usage_for_account",
+            lambda num, *a, **k: fetch_calls.append(num),
+        )
+        handle = FileLock(s.lock_file, timeout=1.0)
+        assert handle.acquire()
+        try:
+            payload = s.list_accounts(json_output=True)
+        finally:
+            handle.release()
+
+        assert fetch_calls == [] and direct_calls == []
+        by_num = {a["number"]: a for a in payload["accounts"]}
+        assert by_num[1]["usageStatus"] == "owner_changed"
+        assert USAGE_OWNER_CHANGED == "owner changed"  # the sentinel itself
+
+    def test_a_sibling_with_the_same_email_is_not_the_account(
+        self, temp_home: Path, sample_sequence_data: dict, direct_calls,
+        monkeypatch,
+    ):
+        """Two organizations share one email; only the organization identifies.
+
+        After a real `swap` the backup files are keyed by (slot, email), so the
+        slot the snapshot named can hold the sibling's bytes. The gate must
+        refuse to POST them, and nothing may be written.
+        """
+        _endpoints(monkeypatch, "http://127.0.0.1:1")
+        s = _switcher(sample_sequence_data)
+        # Same email, two organizations, as Claude Code stores them.
+        data = s._get_sequence_data()
+        data["accounts"]["1"].update(
+            {"email": "shared@example.com", "organizationUuid": "org-a"}
+        )
+        data["accounts"]["2"].update(
+            {"email": "shared@example.com", "organizationUuid": "org-b"}
+        )
+        s._write_json(s.sequence_file, data)
+        s._write_account_credentials("1", "shared@example.com", CREDS_EXPIRED)
+        s._write_account_credentials("2", "shared@example.com", CREDS_OK)
+        before = s.sequence_file.read_bytes()
+
+        posts: list[str] = []
+        monkeypatch.setattr(
+            oauth, "try_refresh_oauth_credentials",
+            lambda *a, **k: posts.append("post") or oauth.RefreshOutcome(None, "t"),
+        )
+        s.swap_accounts("1", "2")  # slot 1 now holds org-b; its bytes are keyed
+        #                                   by (slot 1, shared@example.com)
+        outcome = s.consume_backup_grant(
+            "1", "shared@example.com", CREDS_EXPIRED, expected_org="org-a"
+        )
+
+        assert outcome.error == "slot-moved"
+        assert posts == [] and direct_calls == []
+        assert s.sequence_file.read_bytes() != before  # the swap itself wrote
+        assert s._read_account_credentials("1", "shared@example.com")
+
+    def test_a_move_during_the_post_keeps_the_successor_with_its_account(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """A successor belongs to the ACCOUNT, not to the number it was spent at.
+
+        `move` takes the slot lock, so it runs exactly in the window the gate
+        leaves open — the POST, which is sent outside every lock. The write
+        target is resolved by identity afterwards.
+        """
+        s = _switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", CREDS_EXPIRED)
+        sibling_before = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-sibling", "refreshToken": "rt-sibling",
+            "expiresAt": 9999999999000,
+        }})
+        s._write_account_credentials("2", "account2@example.com", sibling_before)
+        successor = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-successor", "refreshToken": "rt-successor",
+            "expiresAt": 9999999999000,
+        }})
+
+        def refresh_then_move(*args, **kwargs):
+            s.move_account("1", "3")
+            return oauth.RefreshOutcome(successor, None)
+
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", refresh_then_move)
+        monkeypatch.setattr(s, "_live_session_pids", lambda *a, **k: [])
+
+        outcome = s.consume_backup_grant("1", "test@example.com", CREDS_EXPIRED)
+
+        assert outcome.error is None
+        saved = json.loads(s._read_account_credentials("3", "test@example.com"))
+        assert saved["claudeAiOauth"]["refreshToken"] == "rt-successor"
+        # The slot the account left holds nothing of it, and the sibling's copy
+        # is byte-identical to what it was.
+        assert s._read_account_credentials("1", "test@example.com") == ""
+        assert s._read_account_credentials("2", "account2@example.com") == sibling_before

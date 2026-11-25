@@ -15,7 +15,7 @@ Every request cswap makes *for that account*: the usage endpoint, the token refr
 
 The route is pinned to the account, not to the slot number: it is read in the same pass as the account's identity and credential (`_build_accounts_info`), and a request started before a `swap`/`move` keeps the route of the account whose token it holds. The backup-token gate reads its route under the same lock as the grant it POSTs. A change therefore applies to the next request, and no concurrent relocation can send a proxied account's token out directly.
 
-Known risk, accepted: the ownership lookup for the live login takes the route of the slot `~/.claude.json` names, so a live token that actually belongs to another proxied account is checked over the named slot's route (direct when it has none). cswap still never writes such a token into a slot it could not attribute.
+Known risk, accepted: the ownership lookup for the live login takes the route of the slot `~/.claude.json` names, so a live token that actually belongs to another proxied account is checked over the named slot's route (direct when it has none). A token the lookup proves to be another account's is never written into a slot; when ownership cannot be determined at all (offline, a malformed reply), the switch keeps its pre-proxy behavior and reserves the slot for the credential it already stores.
 
 ## Fail-closed
 

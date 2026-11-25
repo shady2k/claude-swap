@@ -629,6 +629,33 @@ Examples:
         sys.exit(130)
 
 
+def _reject_attached_values(parser: argparse.ArgumentParser, argv: list[str]) -> None:
+    """Refuse ``--flag=value`` on a flag that takes no value, without echoing it.
+
+    argparse reports that shape as ``ignored explicit argument '<value>'`` —
+    measured on CPython 3.12–3.14 — and the value is the whole URL when someone
+    types ``--unset=http://user:pass@host:port``. The commands that take a proxy
+    URL must not reproduce it, so the flag's own name is all the message names.
+    """
+    flags = {
+        option
+        for action in parser._actions
+        for option in action.option_strings
+        if action.nargs == 0
+    }
+    for token in argv:
+        if "=" not in token:
+            continue
+        name = token.split("=", 1)[0]
+        if name in flags:
+            parser.error(f"{name} takes no value (the value is not echoed)")
+
+
+def _carries_proxy(argv: list[str]) -> bool:
+    """Whether this invocation gives a proxy URL, by flag or ``--proxy=URL``."""
+    return any(a == "--proxy" or a.startswith("--proxy=") for a in argv)
+
+
 def _proxy_command(argv: list[str]) -> None:
     """Handle `cswap proxy [NUM|EMAIL] [URL] [--unset]`.
 
@@ -684,6 +711,7 @@ Only http:// proxies are supported; HTTPS tunnels through them (CONNECT).
     # ``parse_known_args``: argparse's own "unrecognized arguments: <values>"
     # would echo a mistyped second URL — credentials included — into stderr,
     # and this command is the one that takes an argument carrying a password.
+    _reject_attached_values(parser, argv)
     args, extra = parser.parse_known_args(argv)
     if extra:
         parser.error(
@@ -1916,7 +1944,22 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=argparse.SUPPRESS,
     )
 
-    args = parser.parse_args(argv)
+    if _carries_proxy(argv):
+        # ``add --proxy URL`` takes the only argument that can carry a
+        # password, and argparse's "unrecognized arguments: <values>" echoes a
+        # second URL verbatim. Same construction as `cswap proxy`: a static
+        # message, and a value attached to a boolean flag is refused before
+        # argparse formats it. Every other invocation keeps argparse's own
+        # diagnostics.
+        _reject_attached_values(parser, argv)
+        args, extra = parser.parse_known_args(argv)
+        if extra:
+            parser.error(
+                "unexpected extra argument (a proxy URL is given once; values "
+                "are not echoed)"
+            )
+    else:
+        args = parser.parse_args(argv)
 
     # No action selected: emit a clean, subcommand-oriented message rather than
     # the raw argparse "one of the arguments ... is required" (which would list

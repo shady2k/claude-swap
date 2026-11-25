@@ -589,12 +589,38 @@ def import_accounts(
                 target_num = str(switcher._get_next_account_number())
             outcome = "imported"
 
-        switcher._write_account_credentials(
-            target_num, entry["email"], entry["creds_text"]
-        )
-        switcher._write_account_config(
-            target_num, entry["email"], entry["config_text"]
-        )
+        # The slot this entry resolved to must still be this account's before
+        # any backup byte is written: a `swap` completing since that read would
+        # otherwise put these credentials under another account's (slot, email)
+        # key — two organizations can share an email — and the records would
+        # end up crossed. Writing under the same lock every slot mutation
+        # takes makes the check and the write one step; the record write below
+        # re-checks it again for the commit.
+        with FileLock(switcher.lock_file):
+            data = switcher._get_sequence_data_migrated() or data
+            occupant = (data.get("accounts") or {}).get(target_num) or {}
+            if occupant and not switcher._record_is(
+                occupant, entry["email"], entry["org_uuid"]
+            ):
+                _eprint(
+                    f"Skipped {entry['email']} (slot {target_num} changed "
+                    "owner during the import; nothing was written)"
+                )
+                skipped += 1
+                continue
+            owner_slot = switcher._find_account_slot(
+                data, entry["email"], entry["org_uuid"]
+            )
+            if owner_slot is not None and owner_slot != target_num:
+                # The account moved slots since the resolution above; its own
+                # record is where the credentials belong.
+                target_num = owner_slot
+            switcher._write_account_credentials(
+                target_num, entry["email"], entry["creds_text"]
+            )
+            switcher._write_account_config(
+                target_num, entry["email"], entry["config_text"]
+            )
         # Every successful import write introduces credential material whose
         # previous auth verdict is no longer authoritative, so lift any
         # dead-token quarantine on this slot (mirrors add_account / the
@@ -617,6 +643,20 @@ def import_accounts(
         with FileLock(switcher.lock_file):
             data = switcher._get_sequence_data_migrated() or data
             previous = (data.get("accounts") or {}).get(target_num) or {}
+            if previous and not switcher._record_is(
+                previous, entry["email"], entry["org_uuid"]
+            ):
+                # The slot changed hands between the credential write and this
+                # commit: another account's record must not be replaced, and
+                # its proxy must not be carried onto this one. The backups
+                # written above are keyed to this account's email and are
+                # left for it to adopt on its next slot.
+                _eprint(
+                    f"Skipped {entry['email']} (slot {target_num} changed "
+                    "owner during the import; its record was not written)"
+                )
+                skipped += 1
+                continue
             data.setdefault("accounts", {})
             data.setdefault("sequence", [])
             new_record = {

@@ -2343,6 +2343,41 @@ class TestProxyCommand:
         assert "secret" not in err and "3129" not in err
         assert "unexpected extra argument" in err
 
+    @pytest.mark.parametrize("flag", ["--unset", "--debug"])
+    def test_a_value_attached_to_a_boolean_flag_is_not_echoed(
+        self, temp_home, capsys, flag,
+    ):
+        """``--unset=http://user:secret@host`` is one token, and argparse's
+        "ignored explicit argument '<value>'" would print all of it."""
+        self._seeded_switcher_env(temp_home)
+        before = ClaudeAccountSwitcher().sequence_file.read_bytes()
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._proxy_command([
+                    "2", f"{flag}=http://user:secret@127.0.0.1:3128",
+                ])
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "secret" not in err
+        assert f"{flag} takes no value" in err
+        assert ClaudeAccountSwitcher().sequence_file.read_bytes() == before
+
+    def test_add_with_a_second_url_is_not_echoed(self, temp_home, capsys):
+        """The main parser is the other place a proxy URL arrives; its extra
+        positional would be echoed verbatim by argparse."""
+        with patch("os.geteuid", return_value=1000, create=True) as _:
+            with pytest.raises(SystemExit) as exc:
+                with patch.object(sys, "argv", [
+                    "claude-swap", "add", "--proxy",
+                    "http://user:secret@127.0.0.1:3128",
+                    "http://user:other-secret@127.0.0.1:3129",
+                ]):
+                    cli.main()
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "secret" not in err and "3129" not in err
+        assert "unexpected extra argument" in err
+
     def test_an_unknown_flag_is_not_echoed_either(self, temp_home, capsys):
         self._seeded_switcher_env(temp_home)
         with patch("os.geteuid", return_value=1000, create=True):

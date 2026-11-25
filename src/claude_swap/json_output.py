@@ -43,6 +43,11 @@ USAGE_RELOGIN_REQUIRED = "re-login needed"
 # (stash the foreign credential, restore the slot's backup), so autoswitch
 # should treat the active as unknown-headroom and fail over.
 USAGE_FOREIGN_CREDENTIAL = "foreign credential"
+# The account's ownership moved under a read in flight: a `switch`, `swap` or
+# `move` landed between the registry read that named the slot and the
+# credential read, so the bytes and the route may belong to different accounts.
+# No request is sent for that slot; the next pass reads a coherent snapshot.
+USAGE_OWNER_CHANGED = "owner changed"
 
 
 def _window_to_json(entry: dict) -> dict:
@@ -279,6 +284,8 @@ def usage_fields(
     ``USAGE_KEYCHAIN_UNAVAILABLE`` sentinel (active Keychain unreadable), the
     ``USAGE_FOREIGN_CREDENTIAL`` sentinel (live credential proven to belong to
     another account; usage suppressed, a switch repairs the drift), the
+    ``USAGE_OWNER_CHANGED`` sentinel (the slot's owner moved while it was being
+    read, so nothing was sent and the stored reading stands), the
     ``USAGE_NO_CREDENTIALS`` sentinel, or ``None`` (fetch failed). ``fetched_at``
     is forwarded to ``usage_to_json`` for the weekly pace fields (issue #125).
     """
@@ -294,6 +301,8 @@ def usage_fields(
         return "relogin_required", None
     if entry == USAGE_FOREIGN_CREDENTIAL:
         return "foreign_credential", None
+    if entry == USAGE_OWNER_CHANGED:
+        return "owner_changed", None
     if isinstance(entry, str):
         return "no_credentials", None
     return "unavailable", None
