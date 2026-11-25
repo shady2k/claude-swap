@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release; leave empty to only build and upload dist/ as an artifact'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # Uploading the release assets needs the default token to be able to write.
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out the tag or branch under test
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Run tests
+        run: uv run pytest
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      # Install the wheel the way a user will, from the built file rather than
+      # the source tree, in a throwaway tool directory so the runner's own
+      # environment stays untouched.
+      - name: Smoke-test the wheel
+        env:
+          UV_TOOL_DIR: ${{ runner.temp }}/uv-tool
+          UV_TOOL_BIN_DIR: ${{ runner.temp }}/uv-bin
+        run: |
+          uv tool install --force dist/*.whl
+          "$UV_TOOL_BIN_DIR/cswap" --version
+          "$UV_TOOL_BIN_DIR/cswap" run --help | grep -q -- '--auto'
+
+      # Bare file names, so `sha256sum -c SHA256SUMS` works in the directory
+      # the assets were downloaded to.
+      - name: Write checksums
+        run: (cd dist && sha256sum *.whl *.tar.gz > SHA256SUMS)
+
+      # The tag push and a manual run that names a tag both release; a manual
+      # run without one only uploads the artifacts below.
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.whl dist/*.tar.gz dist/SHA256SUMS --clobber
+          else
+            gh release create "$TAG" dist/*.whl dist/*.tar.gz dist/SHA256SUMS --title "$TAG" --generate-notes
+          fi
+
+      - name: Upload dist as a run artifact
+        if: github.event_name == 'workflow_dispatch' && inputs.tag == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
