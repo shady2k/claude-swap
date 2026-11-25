@@ -49,9 +49,12 @@ non-essential traffic off (``run.disableNonessentialTraffic`` stops cswap from
 setting that variable), and, for an account that has a proxy, that account's
 ``HTTPS_PROXY``/``HTTP_PROXY``/``ALL_PROXY``/``NO_PROXY`` in place of whatever
 the shell carried. The route is read once, before any profile work, and
-``account_proxy.probe`` refuses the launch when it cannot be used. Nothing here
-forbids a direct connection at the OS level: a program that ignores these
-variables still goes out directly (``docs/proxy.md``).
+``account_proxy.probe`` refuses the launch when it cannot be used. An account
+with an egress expectation is then measured through that same route
+(``egress.check``), still before any profile work and outside every lock: a
+mismatch, a damaged rule or an unanswerable chain refuses the launch just as
+firmly. Nothing here forbids a direct connection at the OS level: a program
+that ignores these variables still goes out directly (``docs/proxy.md``).
 
 The binary every launch hands the terminal to comes from ``find_claude``,
 which never returns claude-swap's own ``claude`` wrapper: choosing an account
@@ -75,11 +78,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from claude_swap import account_proxy, macos_keychain, spawn, wrapper
+from claude_swap import account_proxy, egress, macos_keychain, spawn, wrapper
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
     CredentialReadError,
+    EgressCheckError,
     LockError,
     SessionError,
 )
@@ -927,7 +931,16 @@ class SessionManager:
         # slot to another account during the check — the accepted "one command
         # at a time" boundary in docs/proxy.md.
         route = self.switcher.account_route(account_num, email, org_uuid)
-        self._check_proxy(route, f"Account-{account_num} ({email})")
+        who = f"Account-{account_num} ({email})"
+        self._check_proxy(route, who)
+        # The expectation is read with the same identity as the route, and
+        # checked before any profile work: a mismatch or an unanswerable
+        # GeoIP chain ends the command here, with Claude Code never started.
+        self._check_egress(
+            route,
+            self.switcher.account_expectation(account_num, email, org_uuid),
+            who,
+        )
 
         config_dir_preset = os.environ.get("CLAUDE_CONFIG_DIR")
         # Same-account fast path: never create a second credential copy
@@ -1185,9 +1198,13 @@ class SessionManager:
             # proxy with the session's stored login.
             env.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
             route = self.switcher.default_profile_login_route()
+            expectation = self.switcher.default_profile_login_expectation()
         else:
             route = self.switcher.live_login_route()
-        self._check_proxy(route, "The default login's account")
+            expectation = self.switcher.live_login_expectation()
+        who = "The default login's account"
+        self._check_proxy(route, who)
+        self._check_egress(route, expectation, who)
         self._exec(claude_bin, claude_args, env=self._launch_env(route, env))
 
     def _check_proxy(
@@ -1209,6 +1226,32 @@ class SessionManager:
             raise SessionError(
                 f"{who} has a proxy that cannot be used: {e}. "
                 "Claude Code was not started."
+            ) from None
+
+    def _check_egress(
+        self,
+        route: account_proxy.ProxyRoute | None,
+        expectation: "egress.Expectation | None",
+        who: str,
+    ) -> None:
+        """Refuse the launch when the account's exit is not what it promises.
+
+        Runs only when the account carries an expectation, so an account
+        without one causes no request and no delay (``egress.check`` returns
+        first). The request travels the account's route and nowhere else: a
+        rule with no proxy is a refusal, never a direct check. Called before
+        any profile work, any ``claude`` spawn and any token, and outside
+        every file lock. The message names the slot, the expected and measured
+        values or the per-endpoint reasons, and never the proxy URL or its
+        credentials.
+        """
+        if expectation is None:
+            return
+        try:
+            egress.check(route, expectation)
+        except EgressCheckError as e:
+            raise EgressCheckError(
+                f"{who}: {e}. Claude Code was not started."
             ) from None
 
     def _launch_env(

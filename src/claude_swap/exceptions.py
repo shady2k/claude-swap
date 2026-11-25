@@ -60,6 +60,19 @@ class ClaudeCodeLockTimeout(LockError):
     pass
 
 
+class EgressCheckError(SessionError):
+    """An account's expected exit IP/country could not be confirmed.
+
+    Raised before Claude Code starts. An explicit launch reports it and
+    stops; ``cswap run --auto`` takes it as a reason to try the next ranked
+    account. The message names the slot, the expected and measured values
+    (or why nothing could be measured), and never the proxy URL or its
+    credentials.
+    """
+
+    pass
+
+
 class AccountNotFoundError(ClaudeSwitchError):
     """Account not found."""
 

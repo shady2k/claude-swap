@@ -522,7 +522,7 @@ class TestSettingLifecycle:
         assert "pw" not in masked
 
         assert s.list_account_proxies() == [
-            ("1", "http://user:***@127.0.0.1:3128", "test@example.com")
+            ("1", "http://user:***@127.0.0.1:3128", "test@example.com", None)
         ]
 
         s.clear_account_proxy("1")

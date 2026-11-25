@@ -19,7 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from claude_swap import account_proxy
+from claude_swap import account_proxy, egress
 from claude_swap import fsutil
 from claude_swap import macos_keychain
 from claude_swap import oauth
@@ -29,6 +29,7 @@ from claude_swap.credentials import CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE
 from claude_swap.exceptions import (
     AccountNotFoundError,
     CredentialReadError,
+    EgressCheckError,
     LockError,
     SessionError,
     SwitchError,
@@ -2607,6 +2608,127 @@ class TestAnUnusableProxyStopsTheLaunch:
         assert "secret" not in text and "user" not in text
         captured = capsys.readouterr()
         assert "secret" not in captured.out + captured.err
+
+
+class TestTheLaunchChecksTheEgressExpectation:
+    """A rule on the account is checked before Claude Code, through its route.
+
+    The GeoIP chain itself is ``tests/test_egress.py``'s subject; here the
+    seam is observed: an account without a rule never reaches it, one with a
+    rule gets the account's own route, and a refusal ends the launch before
+    any profile work or ``claude auth status``.
+    """
+
+    def _rule(self, manager, proxy, **kwargs) -> None:
+        manager.switcher.update_account_proxy(
+            ACCOUNT_NUM,
+            proxy.url,
+            expect_country=kwargs.pop("country", "US"),
+            expect_ip=kwargs.pop("ip", "1.2.3.4"),
+            **kwargs,
+        )
+
+    def test_without_a_rule_nothing_is_checked(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
+        stream_proxy, monkeypatch,
+    ):
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("egress.check ran without a rule")
+
+        monkeypatch.setattr(egress, "check", forbidden)
+
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [])
+
+        # Only the pre-existing CONNECT probe reached the proxy.
+        assert [path for path, _ in stream_proxy.requests] == [
+            "api.anthropic.com:443"
+        ]
+
+    def test_the_check_gets_the_accounts_own_route(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
+        stream_proxy, monkeypatch,
+    ):
+        self._rule(manager, stream_proxy)
+        seen = []
+
+        def record(route, expectation, timeout=egress.TIMEOUT_S):
+            seen.append((route, expectation))
+            return None
+
+        monkeypatch.setattr(egress, "check", record)
+
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [])
+
+        assert len(seen) == 1
+        route, expectation = seen[0]
+        assert (route.host, route.port) == (
+            account_proxy.parse(stream_proxy.url).host,
+            account_proxy.parse(stream_proxy.url).port,
+        )
+        assert expectation.country == "US" and expectation.ip == "1.2.3.4"
+
+    def test_a_mismatch_stops_the_launch_before_the_auth_probe(
+        self, manager, capture_exec, auth_status_tracks_seed, stream_proxy,
+        monkeypatch,
+    ):
+        self._rule(manager, stream_proxy)
+
+        def refused(route, expectation, timeout=egress.TIMEOUT_S):
+            raise EgressCheckError(
+                "the exit country is DE, but US was expected. "
+                "Claude Code was not started."
+            )
+
+        monkeypatch.setattr(egress, "check", refused)
+
+        with pytest.raises(EgressCheckError) as exc:
+            manager.run("2", [])
+
+        text = str(exc.value)
+        assert "Account-2" in text and "DE" in text and "US" in text
+        assert auth_status_tracks_seed == []
+        session_dir = session_dir_for(
+            manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        assert not session_dir.exists()
+
+    def test_a_damaged_rule_refuses_without_the_chain(
+        self, manager, capture_exec, auth_status_tracks_seed, stream_proxy,
+        monkeypatch,
+    ):
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
+        data = manager.switcher._get_sequence_data()
+        data["accounts"][ACCOUNT_NUM][egress.COUNTRY_FIELD] = None
+        manager.switcher._write_json(manager.switcher.sequence_file, data)
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("the chain ran for a damaged rule")
+
+        # The real check refuses before it reads any endpoint; this proves
+        # the endpoint layer is not reached either.
+        monkeypatch.setattr(egress, "_observe", forbidden)
+
+        with pytest.raises(EgressCheckError, match="unusable"):
+            manager.run("2", [])
+        assert auth_status_tracks_seed == []
+
+    def test_the_default_login_launch_checks_its_slots_rule(
+        self, manager, capture_exec, stream_proxy, monkeypatch
+    ):
+        self._rule(manager, stream_proxy)
+        _active_default_login(monkeypatch, manager)
+
+        def refused(route, expectation, timeout=egress.TIMEOUT_S):
+            raise EgressCheckError("the exit IP is 5.6.7.8, but 1.2.3.4 was expected")
+
+        monkeypatch.setattr(egress, "check", refused)
+
+        with pytest.raises(EgressCheckError, match="default login"):
+            manager.exec_default(["--resume"])
 
 
 class TestExec:

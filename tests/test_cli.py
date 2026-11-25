@@ -1443,6 +1443,72 @@ class TestRunCommand:
         assert len(runs) == 1
         return runs[0]
 
+    def _auto_with_rejections(self, rows, rejected_slots):
+        """Dispatch `cswap run --auto` where the exit check rejects some slots."""
+        launched: list[tuple] = []
+
+        class FakeSessionManager:
+            def __init__(self, switcher):
+                pass
+
+            def run(
+                self,
+                identifier,
+                claude_args,
+                share=True,
+                share_history=None,
+                require_session=False,
+                account=None,
+            ):
+                launched.append(account)
+                if str(account[0]) in rejected_slots:
+                    from claude_swap.exceptions import EgressCheckError
+
+                    raise EgressCheckError(
+                        f"Account-{account[0]}: the exit country is DE, but US "
+                        "was expected. Claude Code was not started."
+                    )
+
+        def target(**kwargs):
+            excluded = kwargs["exclude"]
+            for row in rows:
+                if str(row[0]) not in excluded:
+                    return row, ""
+            return None, "Every launchable account was rejected."
+
+        with patch("claude_swap.session.SessionManager", FakeSessionManager), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher",
+                   return_value=MagicMock(
+                       backup_dir=self.backup_dir, auto_run_target=target,
+                   )), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "run", "--auto", "--", "-p", "hi"]):
+            try:
+                cli.main()
+            except SystemExit as exc:
+                return launched, exc.code
+        return launched, None
+
+    def test_auto_tries_the_next_candidate_after_an_egress_rejection(self, capsys):
+        rows = [self._row(1, "a@example.com"), self._row(2, "b@example.com")]
+        launched, code = self._auto_with_rejections(rows, {"1"})
+
+        assert code is None and [account[0] for account in launched] == ["1", "2"]
+        err = capsys.readouterr().err
+        assert "Account-1" in err and "DE" in err
+        assert "Trying the next account" in err
+
+    def test_auto_refuses_when_every_candidate_is_rejected(self, capsys):
+        rows = [self._row(1, "a@example.com"), self._row(2, "b@example.com")]
+        launched, code = self._auto_with_rejections(rows, {"1", "2"})
+
+        assert code == 1
+        assert [account[0] for account in launched] == ["1", "2"]
+        err = capsys.readouterr().err
+        assert "No account passed its exit check" in err
+        assert "Account-1" in err and "Account-2" in err
+        assert "Nothing was launched" in err
+
     def test_auto_launches_the_account_it_chose(self):
         calls = self._auto_dispatch(
             ["run", "--auto", "--", "--resume", "-p", "a b"],
@@ -1729,6 +1795,7 @@ class TestRunCommand:
                 _logger=None,
                 slot_for_directory=lambda cwd: (None, None),
                 live_login_route=lambda: None,
+                live_login_expectation=lambda: None,
                 _is_running_in_container=lambda: True,
             )
             argv = ["cswap", "run", "--", sys.argv[1], "--output-format", "stream-json"]
@@ -2633,7 +2700,9 @@ class TestProxyCommand:
         assert exc.value.code == 2
         err = capsys.readouterr().err
         assert "secret" not in err and "3128" not in err
-        assert "ignored explicit argument '<URL>'" in err
+        # ``--unse`` is ambiguous now that ``--unset-expect`` exists; either
+        # way argparse names only the redacted token.
+        assert "<URL>" in err
 
     def test_a_url_that_lands_on_the_identifier_is_not_echoed(
         self, temp_home, capsys,

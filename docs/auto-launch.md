@@ -52,6 +52,12 @@ reads:
   its 7d window at 100% resetting in three days is not "in 59m" because its 5h
   window at 5% resets in an hour.
 
+An account that carries an egress expectation ([proxy.md](proxy.md#egress-expectation))
+must also pass it: when the exit IP or country does not match, or no GeoIP
+service can be asked, the launch prints the slot and the reason and takes the
+next candidate in the same ranking. If every candidate is rejected that way,
+nothing is launched and the command exits non-zero.
+
 The choice is not a switch: `sequence.json` and the default login keep the
 account they had, so `cswap status`, the menu bar and auto-switching see no
 change. The launch is the ordinary session-mode one — that account's profile,

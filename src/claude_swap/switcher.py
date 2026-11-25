@@ -26,7 +26,7 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import account_proxy, oauth, pace, subscription
+from claude_swap import account_proxy, egress, oauth, pace, subscription
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -158,6 +158,20 @@ STOP_FAILURE_FILE = "stop-failure.json"
 AccountInfo = tuple[
     int, str, str, str, bool, str, str, "account_proxy.ProxyRoute | None"
 ]
+
+
+@dataclasses.dataclass(frozen=True)
+class ProxyUpdate:
+    """What one ``cswap proxy`` write left on the account.
+
+    ``proxy`` is the masked URL (``None`` when the account has none) and
+    ``expectation`` is :func:`egress.describe`'s line (``None`` without a
+    rule). Both are safe to print: the password never leaves the store.
+    """
+
+    account_num: str
+    proxy: str | None
+    expectation: str | None
 
 
 def _pace_marker(window: dict, fetched_at: float | None) -> str:
@@ -1201,6 +1215,61 @@ class ClaudeAccountSwitcher:
             )
         return account_proxy.route_for(record)
 
+    def account_expectation(
+        self, account_num: str, email: str, org_uuid: str
+    ) -> "egress.Expectation | None":
+        """The egress rule pinned to one account, or ``None`` without one.
+
+        Accepted only while the record still names this account, for the same
+        reason :meth:`account_route` is: a ``swap``/``move`` between the
+        resolution and this read yields no rule rather than a neighbour's, and
+        the launch is refused by its identity check before any profile work.
+        """
+        data = self._get_sequence_data_migrated() or {}
+        record = (data.get("accounts") or {}).get(account_num)
+        if not self._record_is(record, email, org_uuid):
+            # The record moved, so neither this account's rule nor a
+            # neighbour's can be read from the slot. There is nothing to apply
+            # here; the launch is refused by its own identity check before any
+            # profile work, and a proxied account's unusable route refuses
+            # even earlier.
+            return None
+        return egress.read(record)
+
+    def live_login_expectation(self) -> "egress.Expectation | None":
+        """The egress rule of the slot the live default login belongs to.
+
+        ``None`` when the live login names no slot: it is not an account cswap
+        manages, so no rule of its own exists to check.
+        """
+        return self._expectation_for_login(self._get_current_account())
+
+    def default_profile_login_expectation(self) -> "egress.Expectation | None":
+        """The DEFAULT profile's login egress rule, whatever the environment says.
+
+        The expectation counterpart of :meth:`default_profile_login_route`:
+        the housekeeping commands ``cswap run --auto`` starts on the primary
+        profile must be checked against that login's rule.
+        """
+        identity = self._get_current_identity_triple(
+            get_default_global_config_path()
+        )
+        return self._expectation_for_login(
+            None if identity is None else identity[:2]
+        )
+
+    def _expectation_for_login(
+        self, identity: tuple[str, str] | None
+    ) -> "egress.Expectation | None":
+        """The egress rule of the slot ``identity`` names, or ``None``."""
+        if identity is None:
+            return None
+        data = self._get_sequence_data_migrated() or {}
+        account_num = self._find_account_slot(data, *identity)
+        if account_num is None:
+            return None
+        return self.account_expectation(account_num, *identity)
+
     def live_login_route(self) -> "account_proxy.ProxyRoute | None":
         """The route of the slot the live default login belongs to.
 
@@ -1318,72 +1387,174 @@ class ClaudeAccountSwitcher:
     def set_account_proxy(self, identifier: str, url: str) -> tuple[str, str]:
         """Attach an HTTP proxy to one account, or replace the one it has.
 
-        The URL is validated before anything is read, so a rejected value
-        leaves ``sequence.json`` byte-identical. Resolving the identifier,
-        reading the record and writing the new value are one step under the
-        account lock: another writer's snapshot of this file (switch, swap,
-        a threshold change) can neither lose this setting nor have its own
-        change republished from a stale copy here.
+        A wrapper around :meth:`update_account_proxy` for the callers that only
+        set a URL; the expectation fields are left as they are. Returns
+        ``(account_num, masked_url)``.
+        """
+        update = self.update_account_proxy(identifier, url)
+        return update.account_num, update.proxy or ""
 
-        Returns ``(account_num, masked_url)`` — the stored value keeps its
-        password, the returned one never does.
+    def update_account_proxy(
+        self,
+        identifier: str,
+        url: str | None = None,
+        *,
+        expect_country: str | None = None,
+        expect_ip: str | None = None,
+        unset_expect: bool = False,
+    ) -> ProxyUpdate:
+        """Write one account's proxy and/or its egress expectation.
+
+        Every value is validated before the lock and before any write, so a
+        rejected call leaves ``sequence.json`` byte-identical. The resolve,
+        read and write span is one step under the account lock, as
+        :meth:`set_account_proxy` describes: another writer's snapshot of this
+        file can neither lose these settings nor republish a stale one.
+
+        ``url`` given replaces the proxy (an existing expectation is kept).
+        ``expect_country``/``expect_ip`` set the rule parts named, leaving the
+        other part as it was; both together replace the whole rule.
+        ``unset_expect`` removes both fields. A rule may be set without
+        repeating the URL, but only on an account that has a *usable* stored
+        proxy: a rule that no launch could ever satisfy is refused here
+        rather than stored.
+
+        Returns what is now stored, masked.
 
         Raises:
             AccountNotFoundError: identifier doesn't match any account.
-            ValidationError: the URL cannot be used as an HTTP proxy.
+            ValidationError: the URL, country or IP is unusable, the rule is
+                set on an account without a usable proxy, or the arguments
+                contradict each other.
             LockError: the account lock stayed held by another process.
         """
         self._refuse_session_shell()
-        try:
-            route = account_proxy.parse(url)
-        except account_proxy.ProxyUrlError as e:
-            raise ValidationError(str(e)) from e
+        route = None
+        if url is not None:
+            try:
+                route = account_proxy.parse(url)
+            except account_proxy.ProxyUrlError as e:
+                raise ValidationError(str(e)) from e
+        country = None
+        if expect_country is not None:
+            try:
+                country = egress.normalize_country(expect_country)
+            except egress.ExpectationError as e:
+                raise ValidationError(str(e)) from e
+        ip = None
+        if expect_ip is not None:
+            try:
+                ip = egress.normalize_ip(expect_ip)
+            except egress.ExpectationError as e:
+                raise ValidationError(str(e)) from e
+        setting_expectation = country is not None or ip is not None
+        if setting_expectation and unset_expect:
+            raise ValidationError(
+                "--unset-expect cannot be combined with an expected country "
+                "or IP"
+            )
 
         with FileLock(self.lock_file):
             account_num, email, data, record = (
                 self._resolve_for_policy_write(identifier)
             )
-            stored = route.text()
-            if record.get(account_proxy.FIELD) != stored:
-                record[account_proxy.FIELD] = stored
+            changed = False
+            if route is not None:
+                stored = route.text()
+                if record.get(account_proxy.FIELD) != stored:
+                    record[account_proxy.FIELD] = stored
+                    changed = True
+            if setting_expectation:
+                stored_route = account_proxy.route_for(record)
+                if stored_route is None or stored_route.invalid is not None:
+                    raise ValidationError(
+                        "the account has no usable proxy, so an egress "
+                        "expectation could never be checked; set one first "
+                        "with `cswap proxy <num> <url>`"
+                    )
+                if country is not None and record.get(egress.COUNTRY_FIELD) != country:
+                    record[egress.COUNTRY_FIELD] = country
+                    changed = True
+                if ip is not None and record.get(egress.IP_FIELD) != ip:
+                    record[egress.IP_FIELD] = ip
+                    changed = True
+            if unset_expect:
+                for field in egress.FIELDS:
+                    if field in record:
+                        del record[field]
+                        changed = True
+            if changed:
                 data["lastUpdated"] = get_timestamp()
                 self._write_json(self.sequence_file, data)
                 # Masked: this line lands in the log file.
                 self._logger.info(
-                    f"Set proxy {route.display()} for account {account_num}: {email}"
+                    f"Updated proxy settings on account {account_num}: {email} "
+                    f"({account_proxy.describe(record) or 'no proxy'}; "
+                    f"{egress.describe(record) or 'no expectation'})"
                 )
-        return account_num, route.display()
+        return ProxyUpdate(
+            account_num=account_num,
+            proxy=account_proxy.describe(record),
+            expectation=egress.describe(record),
+        )
 
     def clear_account_proxy(self, identifier: str) -> str:
-        """Remove one account's proxy, returning its requests to a direct connection.
+        """Remove one account's proxy and its egress expectation.
 
-        Idempotent, like :meth:`unset_alias`: an account that already has none
-        is not an error. The read and the write run under the account lock for
-        the reason :meth:`set_account_proxy` gives. Returns the account number.
+        The rule describes how that proxy's exit is reached, so it cannot
+        outlive the proxy. Idempotent, like :meth:`unset_alias`: an account
+        that already has neither is not an error. The read and the write run
+        under the account lock for the reason :meth:`update_account_proxy`
+        gives. Returns the account number.
         """
         self._refuse_session_shell()
         with FileLock(self.lock_file):
             account_num, email, data, record = (
                 self._resolve_for_policy_write(identifier)
             )
+            changed = False
             if account_proxy.FIELD in record:
                 del record[account_proxy.FIELD]
+                changed = True
+            for field in egress.FIELDS:
+                if field in record:
+                    del record[field]
+                    changed = True
+            if changed:
                 data["lastUpdated"] = get_timestamp()
                 self._write_json(self.sequence_file, data)
                 self._logger.info(
-                    f"Cleared proxy for account {account_num}: {email}"
+                    f"Cleared proxy and egress expectation for account "
+                    f"{account_num}: {email}"
                 )
         return account_num
 
-    def list_account_proxies(self) -> list[tuple[str, str, str]]:
-        """Every set proxy as ``(account_num, masked_url, email)``, slot order."""
+    def list_account_proxies(
+        self,
+    ) -> list[tuple[str, str, str, str | None]]:
+        """Every account with a proxy or an expectation, slot order.
+
+        Returns ``(account_num, masked_url, email, expectation)``. The masked
+        URL is ``"(no proxy)"`` for a record whose rule survived a hand edit
+        of the proxy field; the expectation is ``None`` when the account has
+        no rule.
+        """
         data = self._get_sequence_data_migrated()
         accounts = (data or {}).get("accounts", {})
         rows = []
         for num, acc in accounts.items():
             described = account_proxy.describe(acc)
-            if described is not None:
-                rows.append((num, described, acc.get("email", "")))
+            expected = egress.describe(acc)
+            if described is None and expected is None:
+                continue
+            rows.append(
+                (
+                    num,
+                    described if described is not None else "(no proxy)",
+                    acc.get("email", ""),
+                    expected,
+                )
+            )
         return sorted(rows, key=lambda r: int(r[0]))
 
     def swap_accounts(self, first: str, second: str) -> tuple[str, str]:
@@ -2385,11 +2556,13 @@ class ClaudeAccountSwitcher:
     #: rewrites from the new credential. ``add_account`` and
     #: ``add_account_from_token`` rebuild a ``--slot`` record wholesale and
     #: carry exactly these across; a new per-account setting belongs here.
-    #: ``proxy`` is here for the same reason as the rest: the proxy belongs to
-    #: the account, so swapping or moving a slot keeps it (the records move
-    #: whole), and a re-login into the same slot keeps it too.
+    #: ``proxy`` and its egress expectation are here for the same reason as
+    #: the rest: they belong to the account, so swapping or moving a slot
+    #: keeps them (the records move whole), and a re-login into the same slot
+    #: keeps them too.
     USER_ACCOUNT_SETTINGS: tuple[str, ...] = (
         "alias", "disabled", "threshold", "priority", "proxy",
+        egress.COUNTRY_FIELD, egress.IP_FIELD,
     )
 
     @classmethod
@@ -2403,11 +2576,18 @@ class ClaudeAccountSwitcher:
         """
         if not record:
             return {}
+        # ``proxy`` and the expectation fields are carried by key presence:
+        # an explicit ``null`` there is damage this copy must keep, so the
+        # rebuilt record keeps failing closed instead of quietly going
+        # direct or dropping the rule. A cleared threshold is the opposite:
+        # the setter pops it, and a copy must not turn its absence into a
+        # ``None``.
+        damaged_carriers = (account_proxy.FIELD, *egress.FIELDS)
         return {
             key: record[key]
             for key in cls.USER_ACCOUNT_SETTINGS
             if key in record
-            and (key == account_proxy.FIELD or record[key] is not None)
+            and (key in damaged_carriers or record[key] is not None)
         }
 
     @staticmethod
@@ -6744,9 +6924,18 @@ class ClaudeAccountSwitcher:
         return None, "stay"
 
     def auto_run_target(
-        self, models: tuple[str, ...] | None = None
+        self,
+        models: tuple[str, ...] | None = None,
+        *,
+        exclude: frozenset[str] | set[str] = frozenset(),
     ) -> tuple[AccountInfo | None, str]:
         """The account ``cswap run --auto`` launches, or why there is none.
+
+        ``exclude`` holds slot numbers already rejected by the caller. One
+        call answers the best launchable account outside that set; calling it
+        again with each rejected slot added walks the ranked candidates in
+        order, which is how ``cswap run --auto`` moves past an account whose
+        exit check failed. Ranking and tie-break are the same on every call.
 
         One ranked pass over the launchable slots (``_build_accounts_info``:
         the roster, credentials and routes of ``cswap list``'s own capture)
@@ -6797,9 +6986,12 @@ class ClaudeAccountSwitcher:
             and not record.get("disabled")
             and record.get("kind") != "api_key"
             and (row[4] or row[5])
+            and str(row[0]) not in exclude
             and self._read_account_config(str(row[0]), row[1])
         ]
         if not candidates:
+            if exclude:
+                return None, "Every launchable account was rejected."
             return None, (
                 "No managed account can be launched: every slot is disabled, "
                 "an API-key account, or has no stored credentials/config."
@@ -7109,6 +7301,7 @@ class ClaudeAccountSwitcher:
             if is_active:
                 active_num = num
             entry = entries[str(num)]
+            record = (seq_data.get("accounts") or {}).get(str(num))
             # JSON carries the decision-grade value: last-good only while it is
             # recent enough to act on (≤ STALE_OK_S), else unavailable. Showing
             # older measurements is a human-display affordance only — scripts
@@ -7129,9 +7322,8 @@ class ClaudeAccountSwitcher:
                     policy=self._policy_from_data(seq_data, str(num)),
                     login_expires_at=oauth.login_expires_at_iso(creds),
                     subscription_plan=(plans or {}).get(str(num)),
-                    proxy=account_proxy.describe(
-                        (seq_data.get("accounts") or {}).get(str(num))
-                    ) or "",
+                    proxy=account_proxy.describe(record) or "",
+                    expected=egress.json_fields(record),
                 )
             )
         payload = {
@@ -7206,6 +7398,11 @@ class ClaudeAccountSwitcher:
             login_expires_at = oauth.login_expires_at_epoch(creds)
             for line in _usage_entry_lines(entries[str(num)], login_expires_at):
                 print(f"     {line}")
+            expectation = egress.describe(
+                (seq_data.get("accounts") or {}).get(str(num))
+            )
+            if expectation:
+                print(f"     {dimmed('egress')} {muted(expectation)}")
 
             if show_token_status:
                 for line in self._token_status_lines(accounts_info[i]):
@@ -7322,11 +7519,11 @@ class ClaudeAccountSwitcher:
         # makes the route unusable for this pass, and that is a property of the
         # REQUEST, reported through `usageStatus` — the stored setting is still
         # what the account has, and must not read as a proxy error.
-        proxy = account_proxy.describe(
-            self._snapshot_records.get(str(account_num))
-        )
+        record = self._snapshot_records.get(str(account_num))
+        proxy = account_proxy.describe(record)
         if proxy:
             active["proxy"] = proxy
+        active.update(egress.json_fields(record))
         if usage is not None:
             active.update(usage_freshness_fields(entry.fetched_at, entry.age_s))
         else:
@@ -7377,6 +7574,11 @@ class ClaudeAccountSwitcher:
         entry, login_expires_at = self._active_account_usage(row)
         for line in _usage_entry_lines(entry, login_expires_at):
             print(f"  {line}")
+        expectation = egress.describe(
+            self._snapshot_records.get(str(account_num))
+        )
+        if expectation:
+            print(f"  {dimmed('Egress:')} {expectation}")
         return None
 
     def _first_run_setup(self) -> None:

@@ -17,9 +17,19 @@ The route is pinned to the account, not to the slot number: it is read in the sa
 
 Known risk, accepted: the ownership lookup for the live login takes the route of the slot `~/.claude.json` names, so a live token that actually belongs to another proxied account is checked over the named slot's route (direct when it has none). A token the lookup proves to be another account's is never written into a slot; when ownership cannot be determined at all (offline, a malformed reply), the switch keeps its pre-proxy behavior and reserves the slot for the credential it already stores.
 
+## Egress expectation
+
+`cswap proxy <num|email> --expect-country <CC> --expect-ip <IP>` sets, and `--unset-expect` clears, an optional promise about where that account's traffic leaves. Either flag alone is a rule; both may be set without repeating the URL. The country is an ISO 3166-1 alpha-2 code (input is case-insensitive and stored upper case), the IP is an IPv4 or IPv6 address (stored in canonical `ipaddress` form). Both are validated before `sequence.json` is written, and a rule on an account with no usable proxy is refused: it could never be checked, so it is not stored. `cswap proxy <num|email> --unset` removes the proxy and the rule; changing the URL keeps the rule.
+
+The rule is a field pair on the account's record, `proxy_expected_country` and `proxy_expected_ip`, written atomically (mode 0600) under the same account lock as the proxy. It follows the account on `cswap swap` and `cswap move`, survives a re-add into the same slot and an import over it, and is removed with the account. `cswap export` never carries it, like the proxy. Only absent keys mean "no rule" — a hand-edited `null`, a non-string or an unparsable value is damage, reads as `invalid (…)` in the surfaces (`proxyExpected` in `--json`) and refuses every launch closed.
+
+No rule means no request and no delay. With a rule, a launch measures the exit **before starting Claude Code and before `claude auth status`**, outside every file lock, strictly through the account's own route (`ProxyRoute.open`): no direct branch, no `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`, no `NO_PROXY`, no redirects. The chain is three public GeoIP services — `https://ipinfo.io/json`, `https://ipwho.is/` and `https://ifconfig.co/json`, 3 s each — asked in that order. A request that fails (network, timeout, HTTP 4xx/5xx, invalid JSON) or an answer without a needed field moves to the next service; the first answer carrying an expected field with a different value refuses immediately, without asking the rest, with a message naming the expected and measured values. When none answers, the refusal names each service's reason. Neither message repeats the proxy URL, its credentials or any token.
+
+The check is per launch: `cswap run <slot>`, the directory-mapping launch, the default-login launch and Claude Code's own housekeeping commands launched by `--auto` all refuse closed. `cswap run --auto` — and therefore the thin `claude` wrapper — treats a failed check as a reason to try the next ranked account: it prints the slot and the reason, then takes the next candidate; if every candidate fails, it launches nothing and exits non-zero. The account's identity is re-read when the profile is prepared, so a `swap` or `move` between the check and that step still ends the launch instead of preparing a neighbour's profile.
+
 ## Launching Claude Code
 
-A launch of a proxied account — `cswap run`, its plain-claude fast path on the default login, and `cswap run` with no account at all — is checked and dressed before Claude Code starts.
+A launch of a proxied account — `cswap run`, its plain-claude fast path on the default login, and `cswap run` with no account at all — is checked and dressed before Claude Code starts. The proxy check below and the [egress check](#egress-expectation) above come first, in that order.
 
 **The check.** One `CONNECT api.anthropic.com:443` with the URL's credentials, 5 s, no TLS handshake and no token. A 200 proves the proxy is listening, speaks the proxy protocol, accepted the credentials, and could reach that one target. It does not prove TLS survives the proxy, that the proxy allows every other host Claude Code may use, or that it stays up for the session. Everything it does not like ends the command before any Claude Code process — including the `claude auth status` probe — with a message that repeats neither the URL nor its user name: no connection, no 200, 407, a redirect, an unreachable address, a port that answers some other protocol, or a stored value that does not parse.
 
@@ -60,6 +70,9 @@ With a proxy set, none of these falls back to a direct connection:
 | the proxy answers a redirect (3xx) instead of forwarding | `proxy-redirect` |
 | the stored value cannot be parsed, or the key is present with a value that is not a URL (a hand-edited `"proxy": null` included) | `proxy-invalid` |
 | the proxy is unreachable, times out, or the certificate is refused | `network`, `timeout`, `tls-cert` |
+| the account has an egress expectation and no usable proxy, or the rule is damaged | a refusal naming the expectation |
+| the exit differs from the expectation | a refusal naming expected and measured values |
+| no GeoIP service gave a usable answer | a refusal listing each service's reason |
 
 407 and 3xx are recognised whether they answer the plain request or the `CONNECT` tunnel an HTTPS request travels; the proxy's own status phrase is dropped rather than repeated in the error or the debug log, because a proxy may put a credential in it.
 
@@ -67,11 +80,11 @@ With a proxy set, none of these falls back to a direct connection:
 
 ## Storage and transfer
 
-The setting is a field on the account's record in `sequence.json` (written atomically, mode 0600): it moves with the account on `cswap swap` and `cswap move`, survives a re-add into the same slot and an import over that slot, and is deleted with `cswap remove`. `cswap proxy` resolves, reads and writes under the same account lock as `switch` and `swap`, so neither can publish a snapshot over the other's change (one run at a time — see [Boundaries](#boundaries)).
+The setting is a field on the account's record in `sequence.json` (written atomically, mode 0600), and the [egress expectation](#egress-expectation) is two more fields beside it: both move with the account on `cswap swap` and `cswap move`, survive a re-add into the same slot and an import over that slot, and are deleted with `cswap remove`. `cswap proxy` resolves, reads and writes under the same account lock as `switch` and `swap`, so neither can publish a snapshot over the other's change (one run at a time — see [Boundaries](#boundaries)).
 
 Only an absent key means "direct" — it is what `--unset` leaves and what every account had before this setting existed. A key with a value that is not a URL, an explicit `null` included, is damage and reads as `proxy-invalid`; `cswap list --json`/`status --json` then show `"invalid (…)"` instead of hiding it. The password is stored there because cswap must present it; every surface prints the masked form (`http://user:***@host:port`), and `cswap list --json`/`status --json` carry that masked form in an additive `proxy` field.
 
-`cswap export` never carries the proxy, in either mode, and prints a masked reminder of the accounts that had one. `cswap import` keeps the proxy this machine already has for the same account.
+`cswap export` never carries the proxy or its egress expectation, in either mode, and prints a masked reminder of the accounts that had a proxy. `cswap import` keeps the proxy and the expectation this machine already has for the same account.
 
 ## Rolling back
 

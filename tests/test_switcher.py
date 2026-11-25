@@ -7141,6 +7141,37 @@ class TestAutoRunTarget:
         # A reading inside SERVE_TTL_S is current by design: no request.
         assert endpoint.calls == []
 
+    def test_excluding_a_candidate_walks_the_ranked_order(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The order is the ranking's, one candidate per call.
+
+        `cswap run --auto` rejects an account whose exit check failed by
+        calling again with that slot excluded; the next call must answer the
+        next account the same ranking would have chosen.
+        """
+        clock = _FakeClock()
+        s, endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(10),
+                "b@example.com": self._usage(20),
+                "c@example.com": self._usage(50),
+            },
+            answers={},
+        )
+        self._make_live(temp_home, "c@example.com", 3)
+
+        assert s.auto_run_target()[0][0] == 1
+        assert s.auto_run_target(exclude={"1"})[0][0] == 2
+        assert s.auto_run_target(exclude={"1", "2"})[0][0] == 3
+        row, why = s.auto_run_target(exclude={"1", "2", "3"})
+        assert row is None and "rejected" in why
+        # Every reading was current, so the walk asked the endpoint nothing.
+        assert endpoint.calls == []
+
     def test_the_live_login_is_launched_when_it_has_the_most_room(
         self, temp_home: Path, monkeypatch
     ):
