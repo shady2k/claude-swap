@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -1280,7 +1281,7 @@ class TestRunCommand:
         """An empty backup root: nothing here may depend on settings.json."""
         self.backup_dir = tmp_path
 
-    def _dispatch(self, argv: list[str], **switcher_attrs):
+    def _dispatch(self, argv: list[str], argv0: str = "claude-swap", **switcher_attrs):
         """Run cli.main() with a fake SessionManager; returns recorded calls."""
         calls = []
 
@@ -1312,7 +1313,7 @@ class TestRunCommand:
                    return_value=MagicMock(backup_dir=self.backup_dir,
                                           **switcher_attrs)), \
              patch("os.geteuid", return_value=1000, create=True), \
-             patch.object(sys, "argv", ["claude-swap", *argv]):
+             patch.object(sys, "argv", [argv0, *argv]):
             cli.main()
         return calls
 
@@ -1519,6 +1520,40 @@ class TestRunCommand:
         claude_args = self._launch(calls)[2]
         assert claude_args[0] == "--settings"
         assert claude_args[2:] == tail
+
+    def test_the_hook_runs_the_installation_that_was_invoked(self, tmp_path):
+        """Two installations on one machine, and the hook picks the right one.
+
+        `claude-swap` is the other console script `pyproject.toml` declares.
+        Launched through a virtualenv's `claude-swap` with an older `cswap`
+        earlier in PATH, the hook must run the installation that is running:
+        the older one has no `rate-limited` handler, so the mark would never be
+        recorded and the next launch could take the same account.
+        """
+        from claude_swap import launch_agent
+
+        venv_bin = tmp_path / "venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        invoked = venv_bin / "claude-swap"
+        invoked.write_text("#!/bin/sh\n")
+        old_bin = tmp_path / "old" / "bin"
+        old_bin.mkdir(parents=True)
+        older = old_bin / "cswap"
+        older.write_text("#!/bin/sh\n")
+
+        with patch.object(launch_agent.shutil, "which", return_value=str(older)):
+            calls = self._dispatch(
+                ["run", "--auto", "--", "-p", "hello there"],
+                argv0=str(invoked),
+                auto_run_target=MagicMock(
+                    side_effect=lambda **kwargs: (self._row(2), "")
+                ),
+            )
+
+        claude_args = self._launch(calls)[2]
+        settings = json.loads(claude_args[1])
+        command = settings["hooks"]["StopFailure"][0]["hooks"][0]["command"]
+        assert shlex.split(command)[0] == str(invoked)
 
     def test_the_hook_command_ignores_the_current_directory(
         self, temp_home: Path, tmp_path: Path

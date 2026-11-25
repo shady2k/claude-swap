@@ -174,6 +174,24 @@ def test_resolve_program_prefers_the_console_script(tmp_path):
         assert launch_agent.resolve_program() == [str(script)]
 
 
+def test_resolve_program_accepts_the_other_console_script(tmp_path):
+    """`claude-swap` is the same installation as `cswap` (pyproject scripts).
+
+    Called through a virtualenv's `claude-swap` with an older `cswap` earlier
+    in PATH, the hook must run this installation rather than the one PATH
+    finds.
+    """
+    invoked = tmp_path / "venv" / "bin" / "claude-swap"
+    invoked.parent.mkdir(parents=True)
+    invoked.write_text("#!/bin/sh\n")
+    older = tmp_path / "old" / "cswap"
+    older.parent.mkdir(parents=True)
+    older.write_text("#!/bin/sh\n")
+    with patch.object(launch_agent.sys, "argv", [str(invoked)]), \
+         patch.object(launch_agent.shutil, "which", return_value=str(older)):
+        assert launch_agent.resolve_program() == [str(invoked)]
+
+
 def test_resolve_program_keeps_the_symlink_and_does_not_follow_it(tmp_path):
     """`uv tool install` links ~/.local/bin/cswap into the tool's virtualenv.
 

@@ -1920,10 +1920,12 @@ class TestRun:
     ):
         """`claude mcp add` from inside a session writes the user's profile.
 
-        The session terminal exports its own profile in ``CLAUDE_CONFIG_DIR``.
-        Handing it on would record the server in a copy the next launch
-        overwrites (``_sync_sharing``), and resolving the proxy from it would
-        send the command through the session account's route.
+        The session terminal exports its own profile in ``CLAUDE_CONFIG_DIR``
+        and ``CLAUDE_SECURESTORAGE_CONFIG_DIR``. Handing them on would record
+        the server in a copy the next launch overwrites (``_sync_sharing``),
+        and resolving the proxy from it would send the command through the
+        session account's route — while Claude Code 2.1.322 still looked up
+        its stored login (file and Keychain item) through the second one.
         """
         session_profile = temp_home / ".claude" / "sessions" / "1"
         session_profile.mkdir(parents=True)
@@ -1942,6 +1944,7 @@ class TestRun:
         manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
         manager.switcher.set_account_proxy("1", dead_proxy_url)
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(session_profile))
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(session_profile))
 
         with pytest.raises(_ExecCalled) as exc:
             manager.exec_default(
@@ -1950,6 +1953,7 @@ class TestRun:
             )
 
         assert "CLAUDE_CONFIG_DIR" not in exc.value.env
+        assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in exc.value.env
         assert exc.value.env["HTTPS_PROXY"] == stream_proxy.url
         assert [path for path, _ in stream_proxy.requests] == [
             "api.anthropic.com:443"
@@ -6150,9 +6154,9 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
             manager.setup_session("2", share=False)
 
         # The slot's stored login is untouched as well.
-        assert json.loads(
-            seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
-        )["claudeAiOauth"]["refreshToken"], "test premise: the backup still holds the spent generation"
+        assert seeded_switcher.read_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL
+        ) == CREDS, "test premise: the backup still holds the spent generation"
         # The half the old assertions never covered: what landed in the
         # PROFILE. A warning that fires while the spent generation is seeded
         # anyway pins the symptom and misses the defect.

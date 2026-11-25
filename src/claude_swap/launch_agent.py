@@ -266,6 +266,12 @@ def resolve_program() -> list[str]:
     the same name as a stdlib module (``json.py``) would be imported instead
     of it.
 
+    Both console scripts ``pyproject.toml`` declares (``cswap`` and
+    ``claude-swap``) name this installation, so either one as ``argv[0]``
+    answers for it — otherwise a launch through ``claude-swap`` would embed
+    whichever ``cswap`` ``PATH`` finds, possibly an older release that cannot
+    record a rate-limit mark.
+
     The path is made absolute but deliberately NOT resolved: a `uv tool
     install` puts a symlink at ``~/.local/bin/cswap`` pointing into the tool's
     virtualenv, and resolving it would write that virtualenv-internal path
@@ -275,7 +281,7 @@ def resolve_program() -> list[str]:
     candidate = sys.argv[0] if sys.argv and sys.argv[0] else None
     if candidate is not None:
         absolute = Path(os.path.abspath(candidate))
-        if absolute.name == "cswap" and absolute.is_file():
+        if absolute.name in ("cswap", "claude-swap") and absolute.is_file():
             return [str(absolute)]
 
     which = shutil.which("cswap")

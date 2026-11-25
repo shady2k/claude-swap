@@ -7325,6 +7325,39 @@ class TestAutoRunTarget:
         # One confirmation each, in ranking order, and no third request.
         assert endpoint.calls == ["a@example.com", "b@example.com"]
 
+    def test_a_confirmed_tie_goes_to_the_first_slot_in_the_rotation(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A tie is a tie, whoever the first capture led with.
+
+        B's stale 30% used outranks A's 40%, so B is confirmed first — and it
+        comes back at 60% used, the number A already has. With the readings
+        equal, the launch goes to the slot that comes first in the rotation.
+        """
+        clock = _FakeClock()
+        s, endpoint = self._pair_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(60),
+                "b@example.com": self._usage(30),
+            },
+            answers={
+                "a@example.com": self._usage(60),
+                "b@example.com": self._usage(60),
+            },
+            age_s=200,
+            next_poll_in=600,
+        )
+
+        row, why = s.auto_run_target()
+
+        assert why == ""
+        assert row is not None and row[1] == "a@example.com"
+        # Confirmed in ranking order, once each.
+        assert endpoint.calls == ["b@example.com", "a@example.com"]
+
     def test_the_refusal_names_the_reset_the_confirmation_found(
         self, temp_home: Path, monkeypatch
     ):
@@ -7559,7 +7592,10 @@ class TestAutoRunTarget:
 
         A's confirmation cannot produce a reading, so the launch is refused —
         but the refusal must not claim A is at its limit, which is a
-        measurement nobody made.
+        measurement nobody made. The second launch meets the same account with
+        no reading at all (the store kept the failure, so A is not even a
+        confirmation candidate); that is still a re-login to make, not a
+        weekly wait.
         """
         from datetime import datetime, timedelta, timezone
 
@@ -7583,12 +7619,55 @@ class TestAutoRunTarget:
         self._expire_live_login(temp_home, s, 1, "a@example.com")
         self._token_endpoint(monkeypatch, None, "invalid_grant")
 
+        def refused() -> str:
+            row, why = s.auto_run_target()
+            assert row is None
+            assert "at its limit" not in why
+            assert "could not be read" in why
+            assert "Account(s) 1" in why
+            return why
+
+        refused()
+        clock.now += 30
+        refused()
+
+    def test_a_candidate_with_no_reading_at_all_is_not_reported_as_a_limit(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A reading that never arrived is unknown, not zero.
+
+        A is launchable but was never read (no stored reading, and its first
+        request fails); B is measured at 100% with a weekly reset. The refusal
+        says A's quota could not be read and keeps B's reset as the nearest
+        one — it does not call A spent.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        weekly = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+        clock = _FakeClock()
+        s, _endpoint = self._pair_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "b@example.com": {
+                    "five_hour": {"pct": 0.0},
+                    "seven_day": {"pct": 100.0, "resets_at": weekly},
+                },
+            },
+            answers={},
+        )
+
         row, why = s.auto_run_target()
 
         assert row is None
         assert "at its limit" not in why
         assert "could not be read" in why
         assert "Account(s) 1" in why
+        expected = oauth.reset_clock_string(
+            datetime.fromisoformat(weekly), datetime.now(timezone.utc)
+        )
+        assert f"the nearest reset is at {expected}" in why
 
     def test_an_account_over_its_limit_is_not_launched_at_zero_headroom(
         self, temp_home: Path, monkeypatch
@@ -7603,6 +7682,7 @@ class TestAutoRunTarget:
             {
                 "a@example.com": self._usage(105),
                 "b@example.com": self._usage(100),
+                "c@example.com": self._usage(100),
             },
             answers={},
         )

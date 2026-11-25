@@ -378,7 +378,8 @@ def _rate_limit_hook(tail: list[str], account: tuple[str, str, str]) -> list[str
     into a prompt instead of running it (measured on 2.1.329), so the rule is
     "looks like a subcommand" rather than a list that a later release would
     outdate. The cost is a one-word prompt (``claude hello``), which goes
-    without a mark and falls back to the launch's own confirmation.
+    without a mark; a repeat of it inside the serve window is answered from the
+    cache and may choose the same slot (``docs/auto-launch.md``).
     """
     if "--settings" in tail:
         return tail

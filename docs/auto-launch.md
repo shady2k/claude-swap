@@ -99,9 +99,13 @@ line into a prompt instead of running it (measured on 2.1.329: `claude
 --help` refuses the flag), so `cswap` reads the first argument rather than
 holding a list of command names, which would go stale. The rule is "one lowercase
 word" (`re.fullmatch(r"[a-z][a-z-]*")`), and its cost is a prompt that is
-exactly one such word: `claude hello` runs without a mark, and the confirmation
-before the launch — one extra reading, within the 180 s serve window — is what
-keeps that account from being chosen again.
+exactly one such word: `claude hello` runs without a mark, so a second
+`claude hello` can choose the account the first one chose again. The launch's
+own confirmation of the candidate's reading does not rule that out: a reading
+younger than the 180 s serve window (`poll_policy.SERVE_TTL_S`) — 20 s old
+under a 600 s poll plan, say — is served from the cache, no request is made,
+and the same ranking picks the same slot. What a repeat run relies on is
+Claude Code's mark, and a one-word prompt gets none.
 
 ## What `--auto` does not do
 

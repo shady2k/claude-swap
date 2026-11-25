@@ -1164,11 +1164,12 @@ class SessionManager:
         with.
 
         ``primary_profile`` launches on the profile the user manages, even
-        when ``CLAUDE_CONFIG_DIR`` names another one — a session's terminal.
-        `cswap run --auto` passes it for Claude Code's own housekeeping
-        commands: their writes belong in the profile the next session launch
-        syncs FROM, not in a session copy that launch overwrites
-        (``_sync_sharing``), and the proxy must be that profile's login's.
+        when ``CLAUDE_CONFIG_DIR`` or ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` name
+        another one — a session's terminal. `cswap run --auto` passes it for
+        Claude Code's own housekeeping commands: their writes belong in the
+        profile the next session launch syncs FROM, not in a session copy that
+        launch overwrites (``_sync_sharing``), and the proxy must be that
+        profile's login's.
         """
         claude_bin = find_claude()
         if not claude_bin:
@@ -1178,6 +1179,11 @@ class SessionManager:
         env = dict(os.environ)
         if primary_profile:
             env.pop("CLAUDE_CONFIG_DIR", None)
+            # Claude Code 2.1.322 resolves the credential file and its Keychain
+            # item through this variable too (``paths.get_credentials_path``),
+            # so leaving it would give the command this profile's config and
+            # proxy with the session's stored login.
+            env.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
             route = self.switcher.default_profile_login_route()
         else:
             route = self.switcher.live_login_route()

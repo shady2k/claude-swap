@@ -6762,9 +6762,10 @@ class ClaudeAccountSwitcher:
         (``oauth.account_headroom`` > 0 over the 5h and 7d windows, plus the
         ``autoswitch.model`` ones) before none, an account Claude Code has not
         just reported a rate-limit stop on before one it has
-        (:meth:`record_stop_failure`), more headroom before less, and the live
-        login before another slot at equal headroom. A reading whose access
-        token has expired ranks on its stored measurement like any other
+        (:meth:`record_stop_failure`), more headroom before less, the live
+        login before another slot at equal headroom, and the earlier slot in
+        the rotation before a later one. A reading whose access token has
+        expired ranks on its stored measurement like any other
         (``_launch_value``): the token says nothing about the quota.
 
         The candidates' readings are then confirmed one at a time, highest
@@ -6814,6 +6815,8 @@ class ClaudeAccountSwitcher:
             for row in candidates
         }
 
+        rotation = {str(row[0]): pos for pos, row in enumerate(candidates)}
+
         def rank(row: AccountInfo) -> tuple:
             room = rooms[str(row[0])]
             return (
@@ -6821,17 +6824,16 @@ class ClaudeAccountSwitcher:
                 not self._rate_limit_marked(marks, row, entries[str(row[0])]),
                 -1.0 if room is None else room,
                 row is live,
+                -rotation[str(row[0])],
             )
 
         ordered = sorted(candidates, key=rank, reverse=True)
         best: AccountInfo | None = None
-        confirmed_nums: list[str] = []
         for index, row in enumerate(ordered):
             num = str(row[0])
             if rooms[num] is None or rooms[num] <= 0:
                 continue
             confirmed = self._collect_usage_entries(infos, fetch={num})[num]
-            confirmed_nums.append(num)
             entries[num] = confirmed
             rooms[num] = _launch_headroom(confirmed, models)
             if rooms[num] is None or rooms[num] <= 0:
@@ -6840,17 +6842,22 @@ class ClaudeAccountSwitcher:
                 best = row
             # A candidate still unconfirmed may hold more than the reading it
             # was ranked on says: confirm it instead of launching on a stale
-            # order.
-            if any(rank(other) > rank(best) for other in ordered[index + 1:]):
+            # order. An unconfirmed row's rank cannot have moved since the
+            # sort, so the highest of them is the one next in ``ordered``.
+            if index + 1 < len(ordered) and rank(ordered[index + 1]) > rank(best):
                 continue
             break
         if best is not None:
             return best, ""
 
-        # A confirmation that came back without a reading is a failure of
-        # the READING (a spent refresh token, a server that keeps refusing),
-        # not a measured limit: the refusal must not claim one.
-        unread = [num for num in confirmed_nums if rooms[num] is None]
+        # A missing reading is a failure of the READING (a spent refresh
+        # token, a server that keeps refusing), not a measured limit: the
+        # refusal must not claim one. Every launchable candidate counts, not
+        # only the ones this launch tried to confirm — an account left without
+        # a reading by an earlier launch is in the same position, and
+        # "wait for the reset" would send the user to a stale refresh token's
+        # repair instead of to `cswap list`.
+        unread = [num for num, room in rooms.items() if room is None]
         if not any(room is not None for room in rooms.values()):
             return None, (
                 "No account's remaining quota could be read, so none could be "
