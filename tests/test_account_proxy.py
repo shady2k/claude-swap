@@ -236,12 +236,14 @@ def direct_calls(monkeypatch):
 
 @pytest.fixture
 def dead_proxy():
-    """A proxy address that refuses the connection, without assuming a port.
+    """A proxy address that cannot be reached, without assuming a port.
 
-    A bound socket that never listens makes the OS refuse the connection, and
-    holding it for the test keeps anything else from taking the port. A fixed
-    number (the old port 9) only refuses if nothing on this machine happens to
-    be listening there, which would turn the test into whatever that is.
+    A bound socket that never listens is unreachable: Linux refuses the
+    connection, macOS times it out (measured on the macOS CI runner with
+    CPython 3.12.10). Holding it for the test keeps anything else from taking
+    the port. A fixed number (the old port 9) only refuses if nothing on this
+    machine happens to be listening there, which would turn the test into
+    whatever that is.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
@@ -806,11 +808,18 @@ class TestRouting:
         self, temp_home: Path, sample_sequence_data: dict, origin, dead_proxy,
         direct_calls, monkeypatch,
     ):
+        """An unreachable proxy is an error, and nothing goes direct.
+
+        How the stack reports a bound socket that never listens depends on the
+        OS: Linux refuses the connection, macOS times it out. Both mean
+        nothing left the route, so either kind passes here; the kinds
+        themselves are ``tests/test_oauth.py``'s subject.
+        """
         _endpoints(monkeypatch, origin.url)
         s = _switcher(sample_sequence_data)
         s.set_account_proxy("1", f"http://127.0.0.1:{dead_proxy.port}")
         record = s._fetch_account_usage(_info(s, 1, CREDS_OK))
-        assert record.error == "network"
+        assert record.error in ("network", "timeout")
         assert origin.requests == [] and direct_calls == []
 
     @pytest.mark.parametrize(
