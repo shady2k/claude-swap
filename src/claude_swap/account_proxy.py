@@ -402,12 +402,17 @@ def probe(route: ProxyRoute, timeout: float = PROBE_TIMEOUT_S) -> None:
     "Tunnel connection failed: <code> <phrase>" — the shape
     :meth:`ProxyRoute.open` already classifies through urllib — so
     :func:`_tunnel_status` reads both and the proxy's own phrase never travels
-    on: it may name a credential.
+    on: it may name a credential. Everything else ``http.client`` raises on the
+    way to that reply is turned into one static message here: ``BadStatusLine``
+    when the port speaks another protocol carries that reply's first line, and
+    ``InvalidURL``/``UnicodeError`` when the stored address cannot be turned
+    into a connection would otherwise surface as a traceback (measured on
+    CPython 3.14).
 
     Raises:
         ProxyRouteError: the stored value is unusable, the proxy rejected the
-            credentials (407), redirected, answered with another status, or
-            could not be reached at all.
+            credentials (407), redirected, answered with another status, could
+            not be reached at all, or did not answer a proxy reply.
     """
     if route.invalid is not None:
         raise ProxyRouteError(
@@ -419,10 +424,11 @@ def probe(route: ProxyRoute, timeout: float = PROBE_TIMEOUT_S) -> None:
         if route.authorization is not None
         else {}
     )
-    connection = http.client.HTTPConnection(
-        route.host, route.port, timeout=timeout
-    )
+    connection: http.client.HTTPConnection | None = None
     try:
+        connection = http.client.HTTPConnection(
+            route.host, route.port, timeout=timeout
+        )
         connection.set_tunnel(*PROBE_TARGET, headers=headers)
         connection.connect()
     except OSError as e:
@@ -449,8 +455,18 @@ def probe(route: ProxyRoute, timeout: float = PROBE_TIMEOUT_S) -> None:
         raise ProxyRouteError(
             PROXY_UNREACHABLE, f"the proxy did not accept a connection ({e})"
         ) from None
+    except (http.client.HTTPException, UnicodeError):
+        # A reply that is not HTTP at all (another protocol listening on the
+        # port) or an address no connection can be built from. Both carry text
+        # the launch must not repeat: the bad status line *is* the proxy's
+        # answer, and the URL exception quotes the host.
+        raise ProxyRouteError(
+            PROXY_UNREACHABLE,
+            "the proxy's address or its reply is unusable",
+        ) from None
     finally:
-        connection.close()
+        if connection is not None:
+            connection.close()
 
 
 def launch_env(

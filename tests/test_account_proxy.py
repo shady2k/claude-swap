@@ -17,6 +17,7 @@ rather than the absence of a test.
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import logging
 import socket
@@ -248,6 +249,39 @@ def dead_proxy():
         yield SimpleNamespace(port=sock.getsockname()[1])
     finally:
         sock.close()
+
+
+@pytest.fixture
+def other_protocol_proxy():
+    """A port that answers a CONNECT with another protocol's greeting.
+
+    What an SSH, SMTP or TLS endpoint does when a proxy URL names its port:
+    ``http.client`` reads the first line as a status line and raises
+    ``BadStatusLine`` with that text inside.
+    """
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    banner = "SSH-2.0-OpenSSH_9.6 proxy-password-in-banner"
+
+    def answer() -> None:
+        try:
+            connection, _ = listener.accept()
+        except OSError:  # closed before the client connected
+            return
+        with connection:
+            connection.recv(4096)
+            connection.sendall(banner.encode() + b"\r\n")
+
+    thread = threading.Thread(target=answer, daemon=True)
+    thread.start()
+    try:
+        yield SimpleNamespace(
+            url=f"http://127.0.0.1:{listener.getsockname()[1]}", banner=banner
+        )
+    finally:
+        listener.close()
+        thread.join(timeout=5)
 
 
 def _endpoints(monkeypatch, base: str) -> None:
@@ -1306,6 +1340,37 @@ class TestProbe:
         with pytest.raises(account_proxy.ProxyRouteError) as err:
             account_proxy.probe(route)
         assert err.value.kind == account_proxy.PROXY_INVALID
+
+    def test_a_port_that_speaks_another_protocol(self, other_protocol_proxy):
+        """An SSH or TLS service answers with a line of its own, which
+        ``http.client`` raises as ``BadStatusLine`` carrying that line."""
+        with pytest.raises(account_proxy.ProxyRouteError) as err:
+            account_proxy.probe(account_proxy.parse(other_protocol_proxy.url))
+        assert err.value.kind == account_proxy.PROXY_UNREACHABLE
+        assert other_protocol_proxy.banner not in str(err.value)
+
+    def test_a_host_with_a_space_is_refused_without_a_traceback(self):
+        """``parse`` lets a space through; the connection cannot be built
+        (``InvalidURL`` out of the constructor) and the text it carries is
+        not what the launch prints."""
+        with pytest.raises(account_proxy.ProxyRouteError) as err:
+            account_proxy.probe(account_proxy.parse("http://127.0.0.1 :3128"))
+        assert err.value.kind == account_proxy.PROXY_UNREACHABLE
+        assert "127.0.0.1" not in str(err.value)
+
+    def test_a_name_the_socket_cannot_encode(self, monkeypatch):
+        """A host IDNA cannot encode (``a..b``) raises ``UnicodeError`` from
+        inside ``http.client`` — measured on CPython 3.14 — and its text names
+        the host. The suite's network guard answers before the socket sees the
+        name, so the failure is injected here."""
+        def unencodable(*args, **kwargs):
+            raise UnicodeError("idna", "a..b", 2, 3, "label empty")
+
+        monkeypatch.setattr(http.client, "HTTPConnection", unencodable)
+        with pytest.raises(account_proxy.ProxyRouteError) as err:
+            account_proxy.probe(account_proxy.parse("http://a..b:3128"))
+        assert err.value.kind == account_proxy.PROXY_UNREACHABLE
+        assert str(err.value) == "the proxy's address or its reply is unusable"
 
 
 class TestLaunchEnv:

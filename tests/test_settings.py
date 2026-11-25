@@ -250,16 +250,33 @@ class TestNoProxy:
         set_setting(tmp_path, "run.noProxy", " localhost, 10.0.0.0/8 ,,")
         assert load_run_settings(tmp_path).no_proxy == "localhost,10.0.0.0/8"
 
+    def test_entries_may_be_separated_by_spaces(self, tmp_path: Path):
+        """Claude Code documents the list with spaces between entries."""
+        set_setting(tmp_path, "run.noProxy", "localhost  10.0.0.0/8")
+        assert load_run_settings(tmp_path).no_proxy == "localhost,10.0.0.0/8"
+
     def test_a_star_is_refused_when_setting_it(self, tmp_path: Path):
         """``*`` bypasses the proxy for every host, which is the direct
         connection the per-account setting exists to prevent."""
         with pytest.raises(ConfigError, match="cannot contain"):
             set_setting(tmp_path, "run.noProxy", "localhost,*")
 
+    def test_a_star_separated_by_a_space_is_refused_too(self, tmp_path: Path):
+        """A space is the other separator the documented list uses, so
+        ``localhost *`` is the same list as ``localhost,*`` — and clients
+        built on ``proxy-from-env`` read it that way as well."""
+        with pytest.raises(ConfigError, match="cannot contain"):
+            set_setting(tmp_path, "run.noProxy", "localhost *")
+
+    @pytest.mark.parametrize(
+        "stored", ["*", "localhost *"], ids=["star", "star-after-a-space"]
+    )
     def test_a_star_left_in_the_file_falls_back_to_the_default(
-        self, tmp_path: Path, caplog
+        self, tmp_path: Path, caplog, stored: str
     ):
-        settings_path(tmp_path).write_text(json.dumps({"run": {"noProxy": "*"}}))
+        settings_path(tmp_path).write_text(
+            json.dumps({"run": {"noProxy": stored}})
+        )
         with caplog.at_level(logging.WARNING):
             assert load_run_settings(tmp_path).no_proxy == RunSettings().no_proxy
         assert "run.noProxy" in caplog.text

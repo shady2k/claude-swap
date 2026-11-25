@@ -45,7 +45,7 @@ profile's history with its own eyes (``_history_tree``).
 
 Every launch — a session profile, plain claude on the default login, and the
 ``claude auth status`` probe — gets its environment from ``_claude_env``:
-telemetry off, and, for an account that has a proxy, that account's
+non-essential traffic off, and, for an account that has a proxy, that account's
 ``HTTPS_PROXY``/``HTTP_PROXY``/``ALL_PROXY``/``NO_PROXY`` in place of whatever
 the shell carried. The route is read once, before any profile work, and
 ``account_proxy.probe`` refuses the launch when it cannot be used. Nothing here
@@ -735,15 +735,18 @@ def _claude_env(
     """The environment every Claude Code process cswap starts is given.
 
     ``CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`` switches off the traffic
-    Claude Code sends only for Anthropic's own analytics
-    (code.claude.com/docs/en/env-vars).
+    Claude Code sends for its own purposes (code.claude.com/docs/en/env-vars):
+    auto-updates, telemetry, error reporting, ``/feedback`` and Claude-drafted
+    feedback, release notes, the PR/MR status badges, availability checks such
+    as the fast mode check, and the feature flags it would otherwise fetch —
+    which is what makes Remote Control unavailable in these sessions. ``0``
+    does not turn that traffic back on; only unsetting the variable does.
 
     For an account with a proxy the account's own variables go in over the
     inherited ones (see ``account_proxy.launch_env``); an account without one
     keeps the proxy variables it inherited, exactly as before the setting
-    existed. The OS-level isolation the original plan had is not part of this:
-    a program that ignores these variables can still reach the internet
-    directly.
+    existed. Nothing here forbids a direct connection at the OS level: a
+    program that ignores these variables still reaches the internet directly.
     """
     env = dict(base)
     if route is not None:
@@ -817,7 +820,9 @@ class SessionManager:
         The account's proxy, if it has one, is resolved here — once, with the
         identity that names the slot — and checked with one ``CONNECT`` before
         any profile is created, seeded or probed: an unusable proxy ends the
-        command here, with Claude Code never started.
+        command here, with Claude Code never started. That identity goes on to
+        ``setup_session``, which refuses the launch when the slot no longer
+        holds it.
 
         Notices on the way are printed plainly. `cswap run` sends them to
         stderr, because stdout is claude's (``cli._run_launch``).
@@ -842,7 +847,10 @@ class SessionManager:
         # ONE route for this launch, read with the account it belongs to: the
         # environment the launch hands Claude Code and the pre-start probe
         # must both be this account's proxy, never whichever slot holds the
-        # number later (see ``account_route``).
+        # number later (see ``account_route``). The identity is also handed to
+        # setup_session, which refuses the launch when a `swap`/`move` gave the
+        # slot to another account during the check — the accepted "one command
+        # at a time" boundary in docs/proxy.md.
         route = self.switcher.account_route(account_num, email, org_uuid)
         self._check_proxy(route, f"Account-{account_num} ({email})")
 
@@ -912,7 +920,11 @@ class SessionManager:
             )
 
         session_dir, account_num, email = self.setup_session(
-            identifier, share, requested_history, route=route
+            identifier,
+            share,
+            requested_history,
+            route=route,
+            account=(account_num, email, org_uuid),
         )
 
         print(
@@ -1143,6 +1155,7 @@ class SessionManager:
         share: bool,
         share_history: bool | None = None,
         route: account_proxy.ProxyRoute | None = None,
+        account: tuple[str, str, str] | None = None,
     ) -> tuple[Path, str, str]:
         """Ensure a valid session profile exists; returns (dir, num, email).
 
@@ -1150,9 +1163,23 @@ class SessionManager:
         ``run.shareHistory`` decides. ``route`` is the account's proxy, already
         checked before this call: it goes to the ``auth status`` probe so the
         probe reaches the profile through the same route the launch will.
+
+        ``account`` is the ``(slot, email, organization)`` a launch resolved
+        and checked its proxy for. The slot is read again here, and a record
+        that no longer holds that account ends the launch before any profile
+        work: preparing the neighbour's profile under this account's route
+        would be a session the launch never selected.
         """
         share_history = self._resolve_share_history(share_history)
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+        if account is not None and (account_num, email, org_uuid) != account:
+            selected_num, selected_email, _selected_org = account
+            raise SessionError(
+                f"Account-{selected_num} ({selected_email}) changed while its "
+                "proxy was being checked: the slot now holds another account. "
+                "Nothing was prepared and Claude Code was not started; run "
+                "the command again."
+            )
         # Defense-in-depth: also guard here (run() guards before its fast path).
         self._ensure_not_api_key(account_num, email)
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
