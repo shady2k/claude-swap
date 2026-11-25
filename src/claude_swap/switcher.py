@@ -145,6 +145,10 @@ _LOCKSTEP_RESET_TOLERANCE_S = 5.0
 # an age note there would be permanent noise.
 _USAGE_AGE_NOTE_S = poll_policy.SERVE_TTL_S
 
+#: Cache file of the launch's own evidence: one stamp per account for the last
+#: ``StopFailure`` rate-limit report Claude Code made (``record_stop_failure``).
+STOP_FAILURE_FILE = "stop-failure.json"
+
 #: One account's read snapshot: ``(num, email, org_name, org_uuid, is_active,
 #: creds, alias, route)``. The route is the proxy read by the same pass as the
 #: credential and the identity, so a request made for that credential cannot
@@ -461,7 +465,23 @@ def _same_directory(left: Path, right: Path) -> bool:
         return left == right
 
 
+def _launch_value(entry: UsageEntry) -> dict | str | None:
+    """The reading a launch decides on, with an expired token read as evidence.
 
+    ``USAGE_TOKEN_EXPIRED`` is a statement about the stored access token, not
+    about the quota: the launch's own fetch path refreshes it. So the
+    measurement under it still answers "how much is left", which is what the
+    ranking and the confirmation both need. The other sentinels are verdicts
+    ON the reading (re-login needed, a fetch that failed) and stay as they are.
+    """
+    if entry.sentinel == USAGE_TOKEN_EXPIRED:
+        return dataclasses.replace(entry, sentinel=None).decision_value()
+    return entry.decision_value()
+
+
+def _launch_headroom(entry: UsageEntry, models: tuple[str, ...]) -> float | None:
+    """Remaining quota a launch ranks on, expired token or not."""
+    return oauth.account_headroom(_launch_value(entry), models)
 
 
 class ClaudeAccountSwitcher:
@@ -1141,6 +1161,21 @@ class ClaudeAccountSwitcher:
             record.get("organizationUuid", "") or "",
         )
 
+    def account_still_holds(
+        self, account_num: str, email: str, org_uuid: str
+    ) -> bool:
+        """Whether slot ``account_num`` still holds ``(email, organization)``.
+
+        The check a launch given a choice makes before it starts: a
+        ``swap``/``move`` republishes slots, and the launch must refuse rather
+        than run the account that took the number (``session.SessionManager.
+        run(account=…)``).
+        """
+        data = self._get_sequence_data() or {}
+        return self._record_is(
+            (data.get("accounts") or {}).get(str(account_num)), email, org_uuid
+        )
+
     def account_route(
         self, account_num: str, email: str, org_uuid: str
     ) -> "account_proxy.ProxyRoute | None":
@@ -1174,7 +1209,27 @@ class ClaudeAccountSwitcher:
         variables it inherited. ``cswap run`` uses this for the launch that
         runs plain claude on the default login.
         """
-        identity = self._get_current_account()
+        return self._route_for_login(self._get_current_account())
+
+    def default_profile_login_route(self) -> "account_proxy.ProxyRoute | None":
+        """The route of the DEFAULT profile's login, whatever the environment says.
+
+        ``live_login_route`` follows ``CLAUDE_CONFIG_DIR``, so run from inside a
+        session profile it answers for that profile's login. Claude Code's own
+        housekeeping commands launched by ``cswap run --auto`` run on the
+        default profile even then (``session.SessionManager.exec_default``
+        with ``primary_profile``), so their fail-closed proxy check must be the
+        default login's.
+        """
+        identity = self._get_current_identity_triple(
+            get_default_global_config_path()
+        )
+        return self._route_for_login(None if identity is None else identity[:2])
+
+    def _route_for_login(
+        self, identity: tuple[str, str] | None
+    ) -> "account_proxy.ProxyRoute | None":
+        """The route of the slot ``identity`` names, or ``None``."""
         if identity is None:
             return None
         data = self._get_sequence_data_migrated() or {}
@@ -3865,8 +3920,15 @@ class ClaudeAccountSwitcher:
         triple = self._get_current_identity_triple()
         return None if triple is None else triple[:2]
 
-    def _get_current_identity_triple(self) -> tuple[str, str, str] | None:
+    def _get_current_identity_triple(
+        self, config_path: Path | None = None
+    ) -> tuple[str, str, str] | None:
         """``(email, org_uuid, account_uuid)`` from ONE read of ``.claude.json``.
+
+        ``config_path`` overrides which profile's config is read — the default
+        one when ``CLAUDE_CONFIG_DIR`` must not decide, as in
+        :meth:`default_profile_login_route` — and defaults to the profile the
+        environment names.
 
         ``add_account`` used to read the config for its identity and again
         near the write. A ``/login`` landing in between pairs one account's
@@ -3874,7 +3936,7 @@ class ClaudeAccountSwitcher:
         ``_reject_foreign_credential_capture`` exists to close, so the guard
         must not widen it.
         """
-        config_path = self._get_claude_config_path()
+        config_path = config_path or self._get_claude_config_path()
         if not config_path.exists():
             return None
         data = self._read_json(config_path)
@@ -6680,6 +6742,236 @@ class ClaudeAccountSwitcher:
         if current_headroom <= 0:
             return None, "exhausted"
         return None, "stay"
+
+    def auto_run_target(
+        self, models: tuple[str, ...] | None = None
+    ) -> tuple[AccountInfo | None, str]:
+        """The account ``cswap run --auto`` launches, or why there is none.
+
+        One ranked pass over the launchable slots (``_build_accounts_info``:
+        the roster, credentials and routes of ``cswap list``'s own capture)
+        rather than the switch strategies' compare-with-the-live-login. A
+        launch may land on the login the terminal already has — ``cswap run``
+        then satisfies that on the default login, the same-account fast path —
+        and it never writes ``sequence.json``.
+
+        A slot is launchable when it is in rotation, not disabled, is not an
+        API-key account (``cswap run`` refuses those), and has stored
+        credentials and config — except the live login itself, whose launch is
+        plain claude on its own credential. Ranking, highest first: quota left
+        (``oauth.account_headroom`` > 0 over the 5h and 7d windows, plus the
+        ``autoswitch.model`` ones) before none, an account Claude Code has not
+        just reported a rate-limit stop on before one it has
+        (:meth:`record_stop_failure`), more headroom before less, the live
+        login before another slot at equal headroom, and the earlier slot in
+        the rotation before a later one. A reading whose access token has
+        expired ranks on its stored measurement like any other
+        (``_launch_value``): the token says nothing about the quota.
+
+        The candidates' readings are then confirmed one at a time, highest
+        ranked first — ``_collect_usage_entries(infos, fetch={candidate})``,
+        which respects the store's serve TTL, poll plan and failure backoff —
+        because a reading up to ``poll_policy.SERVE_TTL_S`` old may be the one
+        the account spent its quota after. Each confirmation replaces that
+        candidate's reading and the ordering is compared again: the launch goes
+        to the account the CONFIRMED readings give the most room, which may be
+        one the stale ordering had behind (30% used that confirms as 95% loses
+        to a reading of 60%). Each candidate is confirmed at most once.
+
+        Returns ``(row, "")``, or ``(None, message)`` naming the reason and,
+        when every account is at its limit, when the nearest one is usable
+        again — both read from the updated readings, not from the first
+        capture.
+        """
+        if models is None:
+            models = parse_model_names(load_settings(self.backup_dir).model)
+
+        infos = self._build_accounts_info()
+        if not infos:
+            return None, "No accounts are managed yet. Add one with `cswap add`."
+        records = self._snapshot_records
+        candidates = [
+            row
+            for row in infos
+            if (record := records.get(str(row[0])))
+            and not record.get("disabled")
+            and record.get("kind") != "api_key"
+            and (row[4] or row[5])
+            and self._read_account_config(str(row[0]), row[1])
+        ]
+        if not candidates:
+            return None, (
+                "No managed account can be launched: every slot is disabled, "
+                "an API-key account, or has no stored credentials/config."
+            )
+
+        entries = self._collect_usage_entries(infos)
+        marks = self._stop_failure_marks()
+        # The row the live login is, marked by the same capture (``is_active``)
+        # so the tie-break reads no second registry.
+        live = next((row for row in infos if row[4]), None)
+        rooms = {
+            str(row[0]): _launch_headroom(entries[str(row[0])], models)
+            for row in candidates
+        }
+
+        rotation = {str(row[0]): pos for pos, row in enumerate(candidates)}
+
+        def rank(row: AccountInfo) -> tuple:
+            room = rooms[str(row[0])]
+            return (
+                room is not None and room > 0,
+                not self._rate_limit_marked(marks, row, entries[str(row[0])]),
+                -1.0 if room is None else room,
+                row is live,
+                -rotation[str(row[0])],
+            )
+
+        ordered = sorted(candidates, key=rank, reverse=True)
+        best: AccountInfo | None = None
+        for index, row in enumerate(ordered):
+            num = str(row[0])
+            if rooms[num] is None or rooms[num] <= 0:
+                continue
+            confirmed = self._collect_usage_entries(infos, fetch={num})[num]
+            entries[num] = confirmed
+            rooms[num] = _launch_headroom(confirmed, models)
+            if rooms[num] is None or rooms[num] <= 0:
+                continue
+            if best is None or rank(row) > rank(best):
+                best = row
+            # A candidate still unconfirmed may hold more than the reading it
+            # was ranked on says: confirm it instead of launching on a stale
+            # order. An unconfirmed row's rank cannot have moved since the
+            # sort, so the highest of them is the one next in ``ordered``.
+            if index + 1 < len(ordered) and rank(ordered[index + 1]) > rank(best):
+                continue
+            break
+        if best is not None:
+            return best, ""
+
+        # A missing reading is a failure of the READING (a spent refresh
+        # token, a server that keeps refusing), not a measured limit: the
+        # refusal must not claim one. Every launchable candidate counts, not
+        # only the ones this launch tried to confirm — an account left without
+        # a reading by an earlier launch is in the same position, and
+        # "wait for the reset" would send the user to a stale refresh token's
+        # repair instead of to `cswap list`.
+        unread = [num for num, room in rooms.items() if room is None]
+        if not any(room is not None for room in rooms.values()):
+            return None, (
+                "No account's remaining quota could be read, so none could be "
+                "chosen. Run `cswap list` to see why, or name an account: "
+                "`cswap run NUM`."
+            )
+        nearest = self._nearest_usable_reset(candidates, entries, models)
+        if unread:
+            return None, (
+                "No account could be launched: the remaining quota could not "
+                f"be read for Account(s) {', '.join(unread)} (run `cswap list` "
+                "to see why)"
+                + (f", and {nearest}" if nearest else "")
+                + "."
+            )
+        return None, (
+            "Every managed account is at its limit"
+            + (f" ({nearest})" if nearest else "")
+            + ". Nothing was launched."
+        )
+
+    def _nearest_usable_reset(
+        self,
+        rows: list[AccountInfo],
+        entries: dict[str, UsageEntry],
+        models: tuple[str, ...],
+    ) -> str | None:
+        """``the nearest reset is at 14:20, in 41m`` for a refused launch.
+
+        ``poll_policy.limiting_reset_ts`` is when an account's *last* ≥100%
+        window resets — when the account is usable again — so a 7d window at
+        100% resetting in 72h is not reported as the hour its 5h window at 5%
+        has left. The earliest of those across the accounts is this launch's
+        next chance. A reading whose access token expired counts with its
+        stored measurement (``_launch_value``) — the same evidence the
+        ranking used.
+        """
+        from datetime import datetime, timezone
+
+        stamps = []
+        for row in rows:
+            ts = poll_policy.limiting_reset_ts(
+                _launch_value(entries[str(row[0])]), models
+            )
+            if ts is not None:
+                stamps.append(ts)
+        if not stamps:
+            return None
+        soonest = min(stamps)
+        now_utc = datetime.now(timezone.utc)
+        clock = oauth.reset_clock_string(
+            datetime.fromtimestamp(soonest, tz=timezone.utc), now_utc
+        )
+        return (
+            f"the nearest reset is at {clock}, "
+            f"in {oauth.format_countdown(soonest - now_utc.timestamp())}"
+        )
+
+    def _rate_limit_marked(
+        self,
+        marks: dict[tuple[str, str], float],
+        row: AccountInfo,
+        entry: UsageEntry,
+    ) -> bool:
+        """Whether Claude Code's last word on this account is a rate-limit stop.
+
+        True while the usage reading predates the stop (or there is none): the
+        server refused a request this reading says should have been served, so
+        the reading is provably obsolete for the choice. A reading taken at or
+        after the stamp is newer evidence and clears the mark — there is no
+        deadline to keep, which is why the mark needs no expiry.
+        """
+        at = marks.get((row[1], row[3]))
+        return at is not None and (
+            entry.fetched_at is None or entry.fetched_at < at
+        )
+
+    def record_stop_failure(self, email: str, org_uuid: str) -> None:
+        """Note that Claude Code reported a rate-limit stop on this account.
+
+        Called by the ``StopFailure`` hook ``cswap run --auto`` passes
+        (``cli._rate_limit_hook``); see ``docs/auto-launch.md``. Stored by
+        ``(email, organization)`` rather than slot, because a ``swap`` moves
+        slots and the mark belongs to the account.
+        """
+        path = self.backup_dir / "cache" / STOP_FAILURE_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with FileLock(path.with_name(f".{path.name}.lock")):
+            marks = self._stop_failure_marks()
+            # The store's clock, not ``time.time()``: the stamp is compared
+            # with the reading's ``fetchedAt``, which that clock wrote.
+            marks[(email, org_uuid or "")] = self._usage_store.clock()
+            self._write_json(path, {
+                "schemaVersion": 1,
+                "marks": [
+                    {"email": account, "organizationUuid": org, "at": at}
+                    for (account, org), at in marks.items()
+                ],
+            })
+
+    def _stop_failure_marks(self) -> dict[tuple[str, str], float]:
+        """``(email, organization) → epoch`` of the recorded rate-limit stops."""
+        rows = (self._read_json(self.backup_dir / "cache" / STOP_FAILURE_FILE) or {}).get(
+            "marks"
+        )
+        marks: dict[tuple[str, str], float] = {}
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            email, at = row.get("email"), row.get("at")
+            if isinstance(email, str) and isinstance(at, (int, float)):
+                marks[(email, row.get("organizationUuid") or "")] = float(at)
+        return marks
+
 
     def _duplicate_account_warnings(
         self, accounts_info: list[AccountInfo]

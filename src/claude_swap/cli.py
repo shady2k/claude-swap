@@ -7,10 +7,12 @@ import contextlib
 import json
 import math
 import os
+import re
+import shlex
 import sys
 
-from claude_swap import __version__, account_proxy, paths, printer
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap import __version__, account_proxy, launch_agent, paths, printer
+from claude_swap.exceptions import ClaudeSwitchError, SessionError
 from claude_swap.json_output import error_envelope
 from claude_swap.models import (
     ACCOUNT_PRIORITY_MAX,
@@ -109,6 +111,13 @@ def _translate_subcommand(argv: list[str]) -> list[str]:
     return argv
 
 
+_SERVICE_COMMANDS = frozenset({
+    "mcp", "plugin", "plugins", "auth", "setup-token", "install", "update",
+    "upgrade", "doctor", "import", "purge",
+    "--version", "-v", "--help", "-h",
+})
+
+
 def _run_command(argv: list[str]) -> None:
     """Handle `cswap run NUM|EMAIL [--no-share] [-- <claude args>]`.
 
@@ -144,6 +153,7 @@ Examples:
   cswap run 2 --no-share
   cswap run 2 --no-share-history
   cswap run 2 --require-session
+  cswap run --auto -- --resume
   cswap run 2 -- --resume
         """,
     )
@@ -153,6 +163,18 @@ Examples:
         metavar="NUM|EMAIL",
         help="Account to run (number or email). Omit to use the current "
         "directory's mapping (see `cswap map`).",
+    )
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help=(
+            "Launch the managed account with the most remaining quota "
+            "instead of a named or mapped one, without switching the default "
+            "login. The account is chosen by the same comparison `cswap "
+            "switch --strategy best` makes; no account with quota left is a "
+            "refusal, not a fallback. This is what the thin `claude` wrapper "
+            "runs (see `cswap wrapper`)."
+        ),
     )
     parser.add_argument(
         "--no-share",
@@ -195,6 +217,8 @@ Examples:
         help="Enable debug logging",
     )
     args = parser.parse_args(head)
+    if args.auto and args.account is not None:
+        parser.error("--auto chooses the account itself: give no NUM|EMAIL with it")
 
     # The parser's --help belongs on stdout. Nothing printed after it does:
     # see _run_launch.
@@ -226,6 +250,40 @@ def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
 
         # share_history goes through as given: None (neither flag) leaves it
         # to run.shareHistory, which SessionManager.run resolves.
+        if args.auto:
+            # `claude`'s own housekeeping is not a session: `claude mcp add`
+            # must write the login the user manages their MCP servers on (a
+            # session profile's copy is deleted by the next _sync_mcp_servers),
+            # and `--version`/`update` must answer without a quota. The default
+            # login's own proxy is still checked, fail-closed.
+            if tail and tail[0] in _SERVICE_COMMANDS:
+                manager.exec_default(tail, primary_profile=True)
+                return  # only reachable in tests where exec/exit is mocked
+
+            row, why = switcher.auto_run_target()
+            if row is None:
+                raise SessionError(why)
+            # The choice is the (slot, email, organization) triple of ONE
+            # capture, not a number to resolve again: verify it just before the
+            # launch so a `swap`/`move` in between refuses instead of running
+            # the account that took the number.
+            account = (str(row[0]), row[1], row[3])
+            print(
+                dimmed(
+                    f"Account-{account[0]} has the most remaining quota — "
+                    "launching it."
+                )
+            )
+            manager.run(
+                account[0],
+                _rate_limit_hook(tail, account),
+                share=not args.no_share,
+                share_history=args.share_history,
+                require_session=args.require_session,
+                account=account,
+            )
+            return  # only reachable in tests where exec/exit is mocked
+
         if args.account is not None:
             manager.run(
                 args.account,
@@ -266,6 +324,99 @@ def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+def _wrapper_command(argv: list[str]) -> None:
+    """Handle `cswap wrapper`: print the thin `claude` wrapper's path.
+
+    The install itself is a symlink the user makes, because the wrapper has to
+    sit in a directory ahead of the real Claude Code in ``PATH`` and only they
+    know which one that is. Pre-dispatched before the main parser for the same
+    reason as `run`: the main parser's required mutually-exclusive group can't
+    hold a positional subcommand. Rules: ``docs/auto-launch.md``.
+    """
+    parser = argparse.ArgumentParser(
+        prog="cswap wrapper",
+        description=(
+            "Print the path of claude-swap's thin `claude` wrapper: a symlink "
+            "to it, ahead of the real Claude Code in PATH, makes every "
+            "`claude` launch the managed account with the most quota left "
+            "(`cswap run --auto`) without switching the default login."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Example:
+  mkdir -p ~/.local/claude-swap/bin
+  ln -s "$(cswap wrapper)" ~/.local/claude-swap/bin/claude
+  export PATH="$HOME/.local/claude-swap/bin:$PATH"
+        """,
+    )
+    parser.parse_args(argv)
+
+    from claude_swap import wrapper
+
+    print(wrapper.WRAPPER_PATH)
+
+
+def _rate_limit_hook(tail: list[str], account: tuple[str, str, str]) -> list[str]:
+    """``tail`` with the ``StopFailure`` hook that marks an exhausted account.
+
+    Claude Code reports a turn it gave up on to a ``StopFailure`` hook, with
+    ``error: rate_limit`` for a 429 (measured on 2.1.329, interactive and
+    ``-p``: see ``docs/auto-launch.md``). The hook runs ``cswap rate-limited
+    <email> <organization>``, so the next launch knows this account's usage
+    reading predates a real refusal (``record_stop_failure``).
+
+    It travels as ``--settings``, which ADDS a settings source: the hooks in
+    the user's own ``settings.json`` still run (measured on 2.1.329). A
+    command line that already carries the user's ``--settings`` gets none of
+    this — cswap will not compete for that switch.
+
+    Neither does Claude Code's own housekeeping: a first argument that reads as
+    one of its subcommands (``attach``, ``logs``, ``stop``, ``remote-control``)
+    gets no hook. In front of a subcommand ``--settings`` turns the whole line
+    into a prompt instead of running it (measured on 2.1.329), so the rule is
+    "looks like a subcommand" rather than a list that a later release would
+    outdate. The cost is a one-word prompt (``claude hello``), which goes
+    without a mark; a repeat of it inside the serve window is answered from the
+    cache and may choose the same slot (``docs/auto-launch.md``).
+    """
+    if "--settings" in tail:
+        return tail
+    if tail and re.fullmatch(r"[a-z][a-z-]*", tail[0]):
+        return tail
+    program = launch_agent.resolve_program()
+    command = " ".join(
+        shlex.quote(part)
+        for part in (*program, "rate-limited", account[1], account[2])
+    )
+    settings = {
+        "hooks": {
+            "StopFailure": [
+                {
+                    "matcher": "rate_limit",
+                    "hooks": [{"type": "command", "command": command}],
+                }
+            ]
+        }
+    }
+    return ["--settings", json.dumps(settings), *tail]
+
+
+def _rate_limited_command(argv: list[str]) -> None:
+    """Handle `cswap rate-limited EMAIL [ORG]`: the StopFailure hook's target.
+
+    Not a user command. `cswap run --auto` passes it in the hook settings it
+    hands Claude Code (``_rate_limit_hook``); it records that the server
+    refused this account on its rate limit, which is what makes the next
+    launch prefer another one (``ClaudeAccountSwitcher.record_stop_failure``).
+    Silent: a hook's output is not the user's.
+    """
+    parser = argparse.ArgumentParser(prog="cswap rate-limited", add_help=False)
+    parser.add_argument("email")
+    parser.add_argument("organization", nargs="?", default="")
+    args = parser.parse_args(argv)
+    ClaudeAccountSwitcher().record_stop_failure(args.email, args.organization)
 
 
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
@@ -1594,6 +1745,12 @@ def main() -> None:
     if argv and argv[0] == "run":
         _run_command(argv[1:])
         return  # only reachable in tests where exec/exit is mocked
+    if argv and argv[0] == "wrapper":
+        _wrapper_command(argv[1:])
+        return
+    if argv and argv[0] == "rate-limited":
+        _rate_limited_command(argv[1:])
+        return
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
@@ -1665,6 +1822,8 @@ Commands:
   %(prog)s priority                   list account priorities
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
+  %(prog)s run --auto [-- ...]        run the account with the most quota left
+  %(prog)s wrapper                    print the path of the thin `claude` wrapper
   %(prog)s map <num|email> [path]     map a directory to an account
   %(prog)s map                        list directory mappings
   %(prog)s unmap [path]               remove a directory mapping
@@ -1699,6 +1858,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s add --proxy http://127.0.0.1:3128  # add it with its own proxy
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
+  %(prog)s run --auto -- --resume            # best account, no switch
   %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
   %(prog)s config set autoswitch.threshold 80
 

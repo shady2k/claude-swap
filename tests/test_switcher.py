@@ -6924,6 +6924,1019 @@ class TestUsageAwareSwitch:
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
 
+class _FakeClock:
+    """The clock the usage store reads, so a test owns every timestamp."""
+
+    def __init__(self, now: float = 1_000_000.0):
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+_REFRESHED_CREDENTIAL = json.dumps({
+    "claudeAiOauth": {
+        "accessToken": "sk-refreshed",
+        "refreshToken": "rt-refreshed",
+        "expiresAt": 9999999999000,
+    },
+})
+
+class _UsageEndpoint:
+    """The usage API, answered per account, recording who was asked.
+
+    ``answers[email]`` is the usage dict a request for that account returns,
+    or ``None`` for a failed request. ``calls`` is the request order — how
+    many times, and for whom, a launch asked the server.
+    """
+
+    def __init__(self, answers: dict[str, dict | None]):
+        self.answers = dict(answers)
+        self.calls: list[str] = []
+
+    def __call__(self, account_num, email, credentials, **kwargs):
+        self.calls.append(email)
+        usage = self.answers.get(email)
+        if usage is None:
+            return oauth.UsageOutcome(None, error="network")
+        return oauth.UsageOutcome(usage)
+
+
+class TestAutoRunTarget:
+    """`cswap run --auto` picks a launchable account with quota left.
+
+    Every case runs against a REAL ``UsageStore`` on a controlled clock and a
+    substituted usage endpoint, so the readings, their ages, their poll plans
+    and the requests a launch makes are the ones the production path sees.
+    """
+
+    def _setup(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def _seed(self, s: ClaudeAccountSwitcher, num: int, email: str) -> None:
+        s._write_account_credentials(
+            str(num),
+            email,
+            json.dumps({
+                "claudeAiOauth": {
+                    "accessToken": f"sk-{num}",
+                    "refreshToken": f"rt-{num}",
+                },
+            }),
+        )
+        s._write_account_config(
+            str(num),
+            email,
+            json.dumps({
+                "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},
+            }),
+        )
+        data = s._get_sequence_data()
+        data["accounts"][str(num)] = {
+            "email": email,
+            "uuid": f"uuid-{num}",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        if num not in data["sequence"]:
+            data["sequence"].append(num)
+            data["sequence"].sort()
+        if data["activeAccountNumber"] is None:
+            data["activeAccountNumber"] = num
+        s._write_json(s.sequence_file, data)
+
+    def _make_live(self, temp_home: Path, email: str, num: int) -> None:
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
+        }))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},
+        }))
+
+    @staticmethod
+    def _usage(pct: float, resets_at: str | None = None) -> dict:
+        window: dict = {"pct": pct}
+        if resets_at is not None:
+            window["resets_at"] = resets_at
+        return {"five_hour": window, "seven_day": {"pct": 0.0}}
+
+    def _three(
+        self, temp_home: Path, monkeypatch, clock: _FakeClock, answers: dict
+    ) -> tuple[ClaudeAccountSwitcher, _UsageEndpoint]:
+        s = self._setup(temp_home)
+        for num, email in enumerate(
+            ("a@example.com", "b@example.com", "c@example.com"), start=1
+        ):
+            self._seed(s, num, email)
+        s._usage_store = UsageStore(s.backup_dir / "cache", clock=clock)
+        endpoint = _UsageEndpoint(answers)
+        monkeypatch.setattr(
+            "claude_swap.oauth.try_fetch_usage_for_account", endpoint
+        )
+        return s, endpoint
+
+    def _stored(
+        self,
+        s: ClaudeAccountSwitcher,
+        clock: _FakeClock,
+        num: int,
+        email: str,
+        usage: dict,
+        *,
+        age_s: float = 0.0,
+        next_poll_in: float | None = None,
+    ) -> None:
+        """Store one reading, as if the collector had taken it ``age_s`` ago."""
+        now = clock.now
+        clock.now = now - age_s
+        s._usage_store.record(
+            {str(num): FetchRecord(usage=usage)},
+            {str(num): (email, "")},
+            plans=(
+                {str(num): (clock.now + next_poll_in, 600.0)}
+                if next_poll_in is not None
+                else None
+            ),
+        )
+        clock.now = now
+
+    def _three_readings(
+        self,
+        temp_home: Path,
+        monkeypatch,
+        clock: _FakeClock,
+        readings: dict[str, dict],
+        answers: dict,
+        **stored_kwargs,
+    ) -> tuple[ClaudeAccountSwitcher, _UsageEndpoint]:
+        s, endpoint = self._three(
+            temp_home, monkeypatch, clock, answers or readings
+        )
+        for num, email in enumerate(
+            ("a@example.com", "b@example.com", "c@example.com"), start=1
+        ):
+            if email in readings:
+                self._stored(
+                    s, clock, num, email, readings[email], **stored_kwargs
+                )
+        return s, endpoint
+
+    def _pair(
+        self, temp_home: Path, monkeypatch, clock: _FakeClock, answers: dict
+    ) -> tuple[ClaudeAccountSwitcher, _UsageEndpoint]:
+        """The same harness with two managed accounts, for launch choices."""
+        s = self._setup(temp_home)
+        for num, email in enumerate(("a@example.com", "b@example.com"), start=1):
+            self._seed(s, num, email)
+        s._usage_store = UsageStore(s.backup_dir / "cache", clock=clock)
+        endpoint = _UsageEndpoint(answers)
+        monkeypatch.setattr(
+            "claude_swap.oauth.try_fetch_usage_for_account", endpoint
+        )
+        return s, endpoint
+
+    def _pair_readings(
+        self,
+        temp_home: Path,
+        monkeypatch,
+        clock: _FakeClock,
+        readings: dict[str, dict],
+        answers: dict,
+        **stored_kwargs,
+    ) -> tuple[ClaudeAccountSwitcher, _UsageEndpoint]:
+        s, endpoint = self._pair(temp_home, monkeypatch, clock, answers or readings)
+        for num, email in enumerate(("a@example.com", "b@example.com"), start=1):
+            if email in readings:
+                self._stored(
+                    s, clock, num, email, readings[email], **stored_kwargs
+                )
+        return s, endpoint
+
+    def test_the_account_with_the_most_headroom_is_launched(
+        self, temp_home: Path, monkeypatch
+    ):
+        clock = _FakeClock()
+        s, endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(50),
+                "b@example.com": self._usage(10),
+                "c@example.com": self._usage(20),
+            },
+            answers={},
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+
+        row, why = s.auto_run_target()
+
+        assert row is not None and row[0] == 2 and row[1] == "b@example.com"
+        assert why == ""
+        # A reading inside SERVE_TTL_S is current by design: no request.
+        assert endpoint.calls == []
+
+    def test_the_live_login_is_launched_when_it_has_the_most_room(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A "stay" verdict is not a dead end for a launch."""
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(10),
+                "b@example.com": self._usage(60),
+                "c@example.com": self._usage(99),
+            },
+            answers={},
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+
+        row, _why = s.auto_run_target()
+
+        assert row is not None and row[0] == 1
+        assert row[4] is True, "the launch can use the same-account fast path"
+
+    def test_a_launch_is_not_a_switch(self, temp_home: Path, monkeypatch):
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(50),
+                "b@example.com": self._usage(20),
+                "c@example.com": self._usage(10),
+            },
+            answers={},
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+
+        with patch.object(s, "_perform_switch") as perform:
+            s.auto_run_target()
+
+        perform.assert_not_called()
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_an_unreadable_live_login_yields_the_best_readable_account(
+        self, temp_home: Path, monkeypatch
+    ):
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "b@example.com": self._usage(30),
+                "c@example.com": self._usage(70),
+            },
+            answers={},
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+
+        row, _why = s.auto_run_target()
+
+        assert row is not None and row[0] == 2
+
+    def test_an_unmanaged_live_login_is_not_a_candidate(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A login with no slot has no usage to launch on, and is not added:
+        `cswap switch` would add it (`add_account`), a launch must not."""
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(80),
+                "b@example.com": self._usage(10),
+                "c@example.com": self._usage(10),
+            },
+            answers={},
+        )
+        self._make_live(temp_home, "stranger@example.com", 9)
+
+        row, _why = s.auto_run_target()
+
+        assert row is not None and row[0] == 2
+        assert "9" not in s._get_sequence_data()["accounts"]
+
+    def test_an_account_that_spent_its_quota_before_the_poll_is_passed_over(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The reading a launch ranks on may be up to SERVE_TTL_S old.
+
+        Here both readings are trusted but stale (200 s, inside the 300 s
+        decision window) and both poll plans say "not yet", so nothing is
+        refetched before the choice. The chosen account is then asked once
+        more — the account spent its quota inside that window — and the launch
+        moves on to the next candidate instead of running it.
+        """
+        clock = _FakeClock()
+        s, endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(30),
+                "b@example.com": self._usage(60),
+                "c@example.com": self._usage(90),
+            },
+            answers={
+                "a@example.com": self._usage(100),
+                "b@example.com": self._usage(60),
+            },
+            age_s=200,
+            next_poll_in=600,
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+
+        row, _why = s.auto_run_target()
+
+        assert row is not None and row[1] == "b@example.com"
+        # One confirmation per candidate, in ranking order, and no more.
+        assert endpoint.calls == ["a@example.com", "b@example.com"]
+
+    def test_a_fresh_reading_is_never_asked_again(
+        self, temp_home: Path, monkeypatch
+    ):
+        """SERVE_TTL_S is the budget: inside it the reading is current."""
+        clock = _FakeClock()
+        s, endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(30),
+                "b@example.com": self._usage(60),
+                "c@example.com": self._usage(90),
+            },
+            answers={"a@example.com": self._usage(100)},
+            age_s=100,
+            next_poll_in=600,
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+
+        row, _why = s.auto_run_target()
+
+        assert row is not None and row[1] == "a@example.com"
+        assert endpoint.calls == []
+
+    def test_a_confirmed_reading_reorders_the_remaining_candidates(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The launch goes to the account the CONFIRMED readings like best.
+
+        A ranks first on a stale 30%, confirms as 95% (5% left) while B's
+        reading still says 40%: launching A would run the account with the
+        smaller share, so B is taken. Ordered by the first capture, the old
+        code returned A.
+        """
+        clock = _FakeClock()
+        s, endpoint = self._pair_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(30),
+                "b@example.com": self._usage(60),
+            },
+            answers={
+                "a@example.com": self._usage(95),
+                "b@example.com": self._usage(60),
+            },
+            age_s=200,
+            next_poll_in=600,
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+
+        row, why = s.auto_run_target()
+
+        assert why == ""
+        assert row is not None and row[1] == "b@example.com"
+        # One confirmation each, in ranking order, and no third request.
+        assert endpoint.calls == ["a@example.com", "b@example.com"]
+
+    def test_a_confirmed_tie_goes_to_the_first_slot_in_the_rotation(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A tie is a tie, whoever the first capture led with.
+
+        B's stale 30% used outranks A's 40%, so B is confirmed first — and it
+        comes back at 60% used, the number A already has. With the readings
+        equal, the launch goes to the slot that comes first in the rotation.
+        """
+        clock = _FakeClock()
+        s, endpoint = self._pair_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(60),
+                "b@example.com": self._usage(30),
+            },
+            answers={
+                "a@example.com": self._usage(60),
+                "b@example.com": self._usage(60),
+            },
+            age_s=200,
+            next_poll_in=600,
+        )
+
+        row, why = s.auto_run_target()
+
+        assert why == ""
+        assert row is not None and row[1] == "a@example.com"
+        # Confirmed in ranking order, once each.
+        assert endpoint.calls == ["b@example.com", "a@example.com"]
+
+    def test_the_refusal_names_the_reset_the_confirmation_found(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The reset in the refusal comes from the confirmed reading.
+
+        A's stale 30% confirms as 100%, resetting in an hour; B was already
+        spent with a weekly reset. The refusal must promise the hour.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        hourly = (now + timedelta(hours=1)).isoformat()
+        weekly = (now + timedelta(days=7)).isoformat()
+        clock = _FakeClock()
+        s, endpoint = self._pair_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(30),
+                "b@example.com": {
+                    "five_hour": {"pct": 0.0},
+                    "seven_day": {"pct": 100.0, "resets_at": weekly},
+                },
+            },
+            answers={"a@example.com": self._usage(100, hourly)},
+            age_s=200,
+            next_poll_in=600,
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+
+        row, why = s.auto_run_target()
+
+        assert row is None
+        assert "Every managed account is at its limit" in why
+        expected = oauth.reset_clock_string(
+            datetime.fromisoformat(hourly), datetime.now(timezone.utc)
+        )
+        assert f"the nearest reset is at {expected}" in why
+        assert endpoint.calls == ["a@example.com"]
+
+    # -- an expired live token is not a missing reading -----------------
+
+    @staticmethod
+    def _expire_live_login(
+        temp_home: Path, s: ClaudeAccountSwitcher, num: int, email: str
+    ) -> None:
+        """Make the live login slot ``num``'s own credential with a dead token.
+
+        The same bytes go to the live store and the slot's backup, so the
+        refresh is attributable (``_fetch_active_usage``) — the shape a
+        morning launch meets. The stale ``infos`` snapshot a second collect
+        pass re-uses still says "expired".
+        """
+        creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": f"sk-{num}",
+                "refreshToken": f"rt-{num}",
+                "expiresAt": 1000,
+            },
+        })
+        s._write_account_credentials(str(num), email, creds)
+        (temp_home / ".claude" / ".credentials.json").write_text(creds)
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": email,
+                "accountUuid": f"uuid-{num}",
+            },
+        }))
+
+    @staticmethod
+    def _token_endpoint(
+        monkeypatch, credentials: str | None, error: str | None = None
+    ) -> None:
+        """The token endpoint: a successor credential, or a failure kind."""
+        monkeypatch.setattr(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            lambda *a, **kw: oauth.RefreshOutcome(credentials, error),
+        )
+        monkeypatch.setattr(
+            "claude_swap.oauth.fetch_oauth_profile", lambda *a, **k: None
+        )
+
+    def test_an_expired_live_token_launches_on_its_own_reading(
+        self, temp_home: Path, monkeypatch
+    ):
+        """First launch of the day: the live token expired overnight.
+
+        The confirmation pass sees the stale credential again and reports
+        ``token expired``, which is a statement about the token — not about
+        the quota — so A's 90% must still beat B's 20%.
+        """
+        clock = _FakeClock()
+        s, endpoint = self._pair_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {"b@example.com": self._usage(80)},
+            answers={"a@example.com": self._usage(10)},
+        )
+        self._expire_live_login(temp_home, s, 1, "a@example.com")
+        self._token_endpoint(monkeypatch, _REFRESHED_CREDENTIAL)
+
+        row, why = s.auto_run_target()
+
+        assert why == ""
+        assert row is not None and row[0] == 1
+        assert endpoint.calls == ["a@example.com"]
+
+    def test_an_only_account_with_an_expired_token_still_launches(
+        self, temp_home: Path, monkeypatch
+    ):
+        """One managed account whose live token expired is still a launch."""
+        clock = _FakeClock()
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        s._usage_store = UsageStore(s.backup_dir / "cache", clock=clock)
+        endpoint = _UsageEndpoint({"a@example.com": self._usage(10)})
+        monkeypatch.setattr(
+            "claude_swap.oauth.try_fetch_usage_for_account", endpoint
+        )
+        self._expire_live_login(temp_home, s, 1, "a@example.com")
+        self._token_endpoint(monkeypatch, _REFRESHED_CREDENTIAL)
+
+        row, why = s.auto_run_target()
+
+        assert why == ""
+        assert row is not None and row[0] == 1
+
+    def test_an_expired_token_keeps_a_reading_under_its_poll_plan(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A reading inside the plan window is still the account's answer.
+
+        The token is expired and the poll plan says the next request is not
+        due, so nothing is asked before the choice: the stored 10% used (90%
+        left) is what the ranking and the confirmation both run on.
+        """
+        clock = _FakeClock()
+        s, endpoint = self._pair_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(10),
+                "b@example.com": self._usage(80),
+            },
+            answers={
+                "a@example.com": self._usage(10),
+                "b@example.com": self._usage(80),
+            },
+            age_s=300,
+            next_poll_in=600,
+        )
+        self._expire_live_login(temp_home, s, 1, "a@example.com")
+        self._token_endpoint(monkeypatch, _REFRESHED_CREDENTIAL)
+
+        row, why = s.auto_run_target()
+
+        assert why == ""
+        assert row is not None and row[0] == 1
+
+    def test_a_two_hour_old_reading_is_refreshed_into_the_choice(
+        self, temp_home: Path, monkeypatch
+    ):
+        """An old reading is the starting point, not the answer.
+
+        The stored reading is two hours old, past ``STALE_OK_S``: the launch
+        asks the server, the expired token is refreshed, and the fresh 10%
+        used (90% left) beats B's 20%.
+        """
+        clock = _FakeClock()
+        s, endpoint = self._pair_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(50),
+                "b@example.com": self._usage(80),
+            },
+            answers={"a@example.com": self._usage(10)},
+            age_s=7200,
+        )
+        self._expire_live_login(temp_home, s, 1, "a@example.com")
+        self._token_endpoint(monkeypatch, _REFRESHED_CREDENTIAL)
+
+        row, why = s.auto_run_target()
+
+        assert why == ""
+        assert row is not None and row[0] == 1
+        assert endpoint.calls.count("a@example.com") == 1
+
+    def test_a_429_on_the_expired_token_does_not_hide_the_reading(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A server refusing fresher data is not a spent quota.
+
+        429 with ``Retry-After: 3000`` parks the slot in backoff, so the
+        confirmation cannot refresh the expired token — the reading that
+        refusal left behind is all there is, and it says A has 90% left
+        against B's 20%.
+        """
+        clock = _FakeClock()
+        s, endpoint = self._pair_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(10),
+                "b@example.com": self._usage(80),
+            },
+            answers={},
+            age_s=120,
+        )
+        s._usage_store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3000.0)},
+            {"1": ("a@example.com", "")},
+        )
+        self._expire_live_login(temp_home, s, 1, "a@example.com")
+        self._token_endpoint(monkeypatch, _REFRESHED_CREDENTIAL)
+
+        row, why = s.auto_run_target()
+
+        assert why == ""
+        assert row is not None and row[0] == 1
+        assert endpoint.calls == []
+
+    def test_a_dead_refresh_token_is_not_reported_as_a_limit(
+        self, temp_home: Path, monkeypatch
+    ):
+        """``invalid_grant`` while confirming says nothing about the quota.
+
+        A's confirmation cannot produce a reading, so the launch is refused —
+        but the refusal must not claim A is at its limit, which is a
+        measurement nobody made. The second launch meets the same account with
+        no reading at all (the store kept the failure, so A is not even a
+        confirmation candidate); that is still a re-login to make, not a
+        weekly wait.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        weekly = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+        clock = _FakeClock()
+        s, _endpoint = self._pair_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(10),
+                "b@example.com": {
+                    "five_hour": {"pct": 0.0},
+                    "seven_day": {"pct": 100.0, "resets_at": weekly},
+                },
+            },
+            answers={},
+            age_s=200,
+            next_poll_in=600,
+        )
+        self._expire_live_login(temp_home, s, 1, "a@example.com")
+        self._token_endpoint(monkeypatch, None, "invalid_grant")
+
+        def refused() -> str:
+            row, why = s.auto_run_target()
+            assert row is None
+            assert "at its limit" not in why
+            assert "could not be read" in why
+            assert "Account(s) 1" in why
+            return why
+
+        refused()
+        clock.now += 30
+        refused()
+
+    def test_a_candidate_with_no_reading_at_all_is_not_reported_as_a_limit(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A reading that never arrived is unknown, not zero.
+
+        A is launchable but was never read (no stored reading, and its first
+        request fails); B is measured at 100% with a weekly reset. The refusal
+        says A's quota could not be read and keeps B's reset as the nearest
+        one — it does not call A spent.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        weekly = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+        clock = _FakeClock()
+        s, _endpoint = self._pair_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "b@example.com": {
+                    "five_hour": {"pct": 0.0},
+                    "seven_day": {"pct": 100.0, "resets_at": weekly},
+                },
+            },
+            answers={},
+        )
+
+        row, why = s.auto_run_target()
+
+        assert row is None
+        assert "at its limit" not in why
+        assert "could not be read" in why
+        assert "Account(s) 1" in why
+        expected = oauth.reset_clock_string(
+            datetime.fromisoformat(weekly), datetime.now(timezone.utc)
+        )
+        assert f"the nearest reset is at {expected}" in why
+
+    def test_an_account_over_its_limit_is_not_launched_at_zero_headroom(
+        self, temp_home: Path, monkeypatch
+    ):
+        """105% and 100% are both spent: `best` prefers 0 over -5, a launch
+        must prefer neither."""
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(105),
+                "b@example.com": self._usage(100),
+                "c@example.com": self._usage(100),
+            },
+            answers={},
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+
+        row, why = s.auto_run_target()
+
+        assert row is None
+        assert "Every managed account is at its limit" in why
+        assert "Nothing was launched" in why
+
+    def test_the_promised_reset_is_the_last_spent_window(
+        self, temp_home: Path, monkeypatch
+    ):
+        """7d at 100% (reset in 72 h) binds, even though 5h at 5% resets in an
+        hour: the account is not usable again until the 7d window turns."""
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        weekly = (now + timedelta(hours=72)).isoformat()
+        hourly = (now + timedelta(hours=1)).isoformat()
+        usage = {
+            "five_hour": {"pct": 5.0, "resets_at": hourly},
+            "seven_day": {"pct": 100.0, "resets_at": weekly},
+        }
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {"a@example.com": usage},
+            answers={},
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+
+        row, why = s.auto_run_target()
+
+        assert row is None
+        expected = oauth.reset_clock_string(
+            datetime.fromisoformat(weekly), datetime.now(timezone.utc)
+        )
+        assert f"the nearest reset is at {expected}" in why
+
+    def test_no_readable_usage_at_all_is_a_refusal(
+        self, temp_home: Path, monkeypatch
+    ):
+        clock = _FakeClock()
+        s, _endpoint = self._three(temp_home, monkeypatch, clock, {})
+        self._make_live(temp_home, "a@example.com", 1)
+
+        row, why = s.auto_run_target()
+
+        assert row is None
+        assert "remaining quota could be read" in why
+
+    def test_disabled_and_api_key_slots_are_passed_over(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A disabled slot is out of rotation, and `cswap run` refuses an
+        API-key account, so neither may be nominated."""
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(95),
+                "b@example.com": self._usage(0),
+                "c@example.com": self._usage(0),
+            },
+            answers={},
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+        data = s._get_sequence_data()
+        data["accounts"]["2"]["disabled"] = True
+        data["accounts"]["3"]["kind"] = "api_key"
+        s._write_json(s.sequence_file, data)
+
+        row, _why = s.auto_run_target()
+
+        assert row is not None and row[0] == 1
+
+    def test_model_windows_are_folded_in(self, temp_home: Path, monkeypatch):
+        """`autoswitch.model` is the only model list a launch reads: an
+        account whose named model window is spent is not the best one."""
+        s0 = self._setup(temp_home)
+        set_setting(s0.backup_dir, "autoswitch.model", "Fable")
+
+        def scoped(fable_pct: float) -> dict:
+            return {
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": 0.0},
+                "scoped": [{"name": "Fable", "pct": fable_pct}],
+            }
+
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": scoped(95.0),
+                "b@example.com": self._usage(40),
+                "c@example.com": scoped(10.0),
+            },
+            answers={},
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+
+        row, _why = s.auto_run_target()
+
+        assert row is not None and row[0] == 3
+
+    def test_no_accounts_managed_is_a_refusal(self, temp_home: Path):
+        s = self._setup(temp_home)
+
+        row, why = s.auto_run_target()
+
+        assert row is None
+        assert "No accounts are managed yet" in why
+
+    def test_nothing_launchable_is_a_refusal(self, temp_home: Path):
+        s = self._setup(temp_home)
+        # A slot with a record but no stored credential/config: switchable=False.
+        data = s._get_sequence_data()
+        data["sequence"] = [1]
+        data["accounts"]["1"] = {
+            "email": "a@example.com",
+            "uuid": "uuid-1",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        s._write_json(s.sequence_file, data)
+
+        row, why = s.auto_run_target()
+
+        assert row is None
+        assert "No managed account can be launched" in why
+
+
+class TestAutoRunRateLimitMark:
+    """A ``StopFailure`` report outranks a reading older than it.
+
+    Claude Code tells cswap when the server refused it on the rate limit
+    (``cswap run --auto`` passes the hook). That is proof the account's stored
+    reading is obsolete — whatever headroom it shows — until a newer one is
+    fetched.
+    """
+
+    _setup = TestAutoRunTarget._setup
+    _seed = TestAutoRunTarget._seed
+    _make_live = TestAutoRunTarget._make_live
+    _usage = staticmethod(TestAutoRunTarget._usage)
+    _three = TestAutoRunTarget._three
+    _stored = TestAutoRunTarget._stored
+    _three_readings = TestAutoRunTarget._three_readings
+
+    def test_a_marked_account_yields_to_one_with_quota(
+        self, temp_home: Path, monkeypatch
+    ):
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(30),
+                "b@example.com": self._usage(60),
+            },
+            answers={},
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+        clock.now += 1  # the session that was refused ran after that reading
+        s.record_stop_failure("a@example.com", "")
+
+        row, _why = s.auto_run_target()
+
+        assert row is not None and row[1] == "b@example.com"
+
+    def test_a_newer_reading_clears_the_mark(self, temp_home: Path, monkeypatch):
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(30),
+                "b@example.com": self._usage(60),
+            },
+            answers={},
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+        clock.now += 1
+        s.record_stop_failure("a@example.com", "")
+        assert s._stop_failure_marks()
+        # The limit reset and a fresh reading arrived: newer evidence.
+        clock.now += 600
+        self._stored(
+            s, clock, 1, "a@example.com", self._usage(5), age_s=0
+        )
+        self._stored(
+            s, clock, 2, "b@example.com", self._usage(60), age_s=0
+        )
+
+        row, _why = s.auto_run_target()
+
+        assert row is not None and row[1] == "a@example.com"
+
+    def test_only_marked_accounts_launch_the_best_of_them(
+        self, temp_home: Path, monkeypatch
+    ):
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(30),
+                "b@example.com": self._usage(60),
+            },
+            answers={},
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+        clock.now += 1
+        for email in ("a@example.com", "b@example.com"):
+            s.record_stop_failure(email, "")
+
+        row, _why = s.auto_run_target()
+
+        assert row is not None and row[1] == "a@example.com"
+
+    def test_the_mark_is_stored_by_account_not_by_slot(
+        self, temp_home: Path, monkeypatch
+    ):
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(30),
+                "b@example.com": self._usage(60),
+            },
+            answers={},
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+        clock.now += 1
+        s.record_stop_failure("a@example.com", "org-1")
+
+        # The key is the account, so a `swap` that renumbers slots cannot move
+        # the mark onto the account that took the slot.
+        assert s._stop_failure_marks() == {("a@example.com", "org-1"): clock.now}
+
 class TestClaudeCodeLockCooperation:
     """_perform_switch must hold Claude Code's own advisory locks
     (~/.claude.lock and ~/.claude.json.lock) while mutating credentials/config,

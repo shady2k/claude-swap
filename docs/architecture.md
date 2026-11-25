@@ -26,6 +26,7 @@ It works on the same files and Keychain items Claude Code uses, and takes Claude
 - `usage_store.py`: `UsageStore`, the per-account usage table. `poll_policy.py` holds every polling number. `snapshot_source.py` is the read path for dashboards.
 - `oauth.py`: the token, usage and profile endpoints, the header probe, and the formatting of reset times. `subscription.py` reads the plan label; `pace.py` computes the weekly pace marker.
 - `account_proxy.py`: an account's proxy, and the pinned route its requests take. Every network call in `oauth.py` and `subscription.py` goes through it.
+- `wrapper.py`: the thin `claude` script (`scripts/claude`) and the rule that keeps cswap and the wrapper from launching each other.
 - `transfer.py`: export and import. `settings.py`: `settings.json`. `migrations.py`: one-time data migrations. `update_check.py`: the PyPI version check.
 
 **Storage and platform.** Leaf modules that the core calls.
@@ -109,6 +110,16 @@ A launch of an account with a proxy reads the route once, refuses before any Cla
 
 Read next: the module docstring of `session.py`, and [proxy.md](proxy.md#launching-claude-code).
 
+### A launch on the best account
+
+`cswap run --auto` picks the account with `ClaudeAccountSwitcher.auto_run_target` from one capture of the roster (`_build_accounts_info`): the launchable slots ranked by headroom above 0, then by "Claude Code has not reported a rate-limit stop on it", then by headroom, then the live login. The winner's reading is confirmed once (`_collect_usage_entries(fetch={winner})`) and the next candidate is taken when that confirmation has no room left — `SERVE_TTL_S` is the oldest a ranking reading may be. The launch is then the session-mode one above, without touching `sequence.json` or the default login; the slot travels into it as the (slot, email, organization) it was read with.
+
+`StopFailure` with matcher `rate_limit` is what Claude Code reports a refused turn with; `cswap run --auto` passes that hook through `--settings`, and it runs `cswap rate-limited <email> <organization>` (`record_stop_failure`), which stamps `cache/stop-failure.json`. Marked means "the reading predates the refusal" — a reading newer than the stamp clears it, so no deadline is stored.
+
+The thin `claude` wrapper calls `cswap run --auto` for every launch. `session.find_claude` is the one place that resolves the binary a launch hands the terminal to, and it never returns the wrapper: a `claude` that is the wrapper (recognised by a marker line in its first bytes) is walked past on `PATH`.
+
+Read next: `wrapper.py` and [auto-launch.md](auto-launch.md).
+
 ### Auto-switch
 
 `AutoSwitchEngine.tick` collects usage, ranks the candidates (`_rank_candidates`), freshens the chosen target's token (`_freshen_target`) and calls `switcher.switch_to`. `cswap auto`, the TUI's auto screen and the menu bar all run this same engine and render its events. Cooldown and quarantine are kept in `autoswitch_state.json` under their own lock, so a cron-driven `--once` and a long-running loop agree.
@@ -127,6 +138,7 @@ Read next: the module docstring of `autoswitch.py`. The rules as users see them 
 - **Surfaces hold no account logic.** Dashboards read through `SnapshotSource`; the engine does not print.
 - **Import direction.** `session.py` and `credentials.py` do not import `switcher.py`. `fsutil.py` imports nothing from the package. The TUI's heavy imports stay inside `tui.run`.
 - **Paths come from `paths.py`.** Do not hardcode `~/.claude`; Claude Code's own resolution has cases that differ.
+- **A launch hands the terminal to the real Claude Code, never to the wrapper.** `session.find_claude` is the only resolver; choosing an account happens once, in the wrapper's `cswap run --auto`.
 - **A request for an account travels that account's route.** Every network call in `oauth.py` and `subscription.py` takes an `account_proxy` route; a slot with no proxy goes direct, and one whose proxy is set never does. The route comes from the same read as the credential it is used for (`AccountInfo` in `switcher.py`), so a concurrent `swap`/`move` cannot pair one account's token with another slot's route. A launch of such an account takes the same route — checked before Claude Code starts and handed to it in the environment — and one whose route cannot be confirmed is refused rather than run direct.
 
 ## Tests

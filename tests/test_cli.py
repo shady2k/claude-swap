@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -1280,7 +1281,7 @@ class TestRunCommand:
         """An empty backup root: nothing here may depend on settings.json."""
         self.backup_dir = tmp_path
 
-    def _dispatch(self, argv: list[str], **switcher_attrs):
+    def _dispatch(self, argv: list[str], argv0: str = "claude-swap", **switcher_attrs):
         """Run cli.main() with a fake SessionManager; returns recorded calls."""
         calls = []
 
@@ -1295,18 +1296,24 @@ class TestRunCommand:
                 share=True,
                 share_history=None,
                 require_session=False,
+                account=None,
             ):
                 calls.append((
                     "run", identifier, claude_args, share, share_history,
                     require_session,
                 ))
+                if account is not None:
+                    calls.append(("run_account", account))
+
+            def exec_default(self, claude_args, *, primary_profile=False):
+                calls.append(("exec_default", claude_args, primary_profile))
 
         with patch("claude_swap.session.SessionManager", FakeSessionManager), \
              patch("claude_swap.cli.ClaudeAccountSwitcher",
                    return_value=MagicMock(backup_dir=self.backup_dir,
                                           **switcher_attrs)), \
              patch("os.geteuid", return_value=1000, create=True), \
-             patch.object(sys, "argv", ["claude-swap", *argv]):
+             patch.object(sys, "argv", [argv0, *argv]):
             cli.main()
         return calls
 
@@ -1417,6 +1424,256 @@ class TestRunCommand:
 
         assert excinfo.value.code == 1
         assert "boom" in capsys.readouterr().err
+
+    @staticmethod
+    def _row(num: int, email: str = "user@example.com", org: str = "") -> tuple:
+        """What ``auto_run_target`` answers: the account row it chose."""
+        return (num, email, "Org", org, False, "creds", "", None)
+
+    def _auto_dispatch(self, argv, auto_run_target):
+        """Dispatch `cswap run --auto` with a switcher that answers the choice."""
+        return self._dispatch(
+            argv,
+            auto_run_target=MagicMock(side_effect=auto_run_target),
+        )
+
+    def _launch(self, calls) -> tuple:
+        """The one `manager.run(...)` the dispatch made."""
+        runs = [call for call in calls if call[0] == "run"]
+        assert len(runs) == 1
+        return runs[0]
+
+    def test_auto_launches_the_account_it_chose(self):
+        calls = self._auto_dispatch(
+            ["run", "--auto", "--", "--resume", "-p", "a b"],
+            lambda **kwargs: (self._row(2), ""),
+        )
+        _kind, number, claude_args, share, share_history, require_session = (
+            self._launch(calls)
+        )
+        assert number == "2"
+        assert claude_args[-3:] == ["--resume", "-p", "a b"]
+        assert (share, share_history, require_session) == (True, None, False)
+        # The choice travels as the identity triple it was read with, so the
+        # launch can refuse a slot that moved instead of resolving the number.
+        assert ("run_account", ("2", "user@example.com", "")) in calls
+
+    def test_auto_passes_the_rate_limit_hook(self):
+        """The hook that marks an account Claude Code was refused on.
+
+        Measured on Claude Code 2.1.329: ``StopFailure`` with matcher
+        ``rate_limit`` runs the command, in interactive and ``-p`` sessions.
+        """
+        calls = self._auto_dispatch(
+            ["run", "--auto", "--", "-p", "hi"],
+            lambda **kwargs: (self._row(2, "b@example.com", "org-1"), ""),
+        )
+        claude_args = self._launch(calls)[2]
+        assert claude_args[0] == "--settings"
+        settings = json.loads(claude_args[1])
+        hook = settings["hooks"]["StopFailure"][0]
+        assert hook["matcher"] == "rate_limit"
+        command = hook["hooks"][0]["command"]
+        assert "rate-limited" in command
+        assert "b@example.com" in command and "org-1" in command
+        assert claude_args[2:] == ["-p", "hi"]
+
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            ["attach", "x"],
+            ["remote-control"],
+            ["stop", "x"],
+            ["logs", "x"],
+            ["respawn", "nosuch"],
+        ],
+    )
+    def test_a_subcommand_is_never_given_the_hook(self, tail):
+        """``--settings`` in front of a subcommand turns the line into a prompt.
+
+        Measured on Claude Code 2.1.329: ``claude --settings{} attach nosuch``
+        answers "Not logged in" and runs a session with the words as the
+        prompt, and ``remote-control --help`` refuses the ``--settings``.
+        """
+        calls = self._auto_dispatch(
+            ["run", "--auto", "--", *tail],
+            lambda **kwargs: (self._row(2), ""),
+        )
+
+        assert self._launch(calls)[2] == tail
+
+    @pytest.mark.parametrize(
+        "tail", [["-p", "hi"], ["--resume"], ["fix the bug"]]
+    )
+    def test_a_prompt_still_gets_the_hook(self, tail):
+        """A flag or prose is a session, not a subcommand: it gets the mark.
+
+        ``claude hello`` is the boundary: one lowercase word reads as a
+        subcommand, so it goes without a hook and relies on the launch's own
+        confirmation instead.
+        """
+        calls = self._auto_dispatch(
+            ["run", "--auto", "--", *tail],
+            lambda **kwargs: (self._row(2), ""),
+        )
+
+        claude_args = self._launch(calls)[2]
+        assert claude_args[0] == "--settings"
+        assert claude_args[2:] == tail
+
+    def test_the_hook_runs_the_installation_that_was_invoked(self, tmp_path):
+        """Two installations on one machine, and the hook picks the right one.
+
+        `claude-swap` is the other console script `pyproject.toml` declares.
+        Launched through a virtualenv's `claude-swap` with an older `cswap`
+        earlier in PATH, the hook must run the installation that is running:
+        the older one has no `rate-limited` handler, so the mark would never be
+        recorded and the next launch could take the same account.
+        """
+        from claude_swap import launch_agent
+
+        venv_bin = tmp_path / "venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        invoked = venv_bin / "claude-swap"
+        invoked.write_text("#!/bin/sh\n")
+        old_bin = tmp_path / "old" / "bin"
+        old_bin.mkdir(parents=True)
+        older = old_bin / "cswap"
+        older.write_text("#!/bin/sh\n")
+
+        with patch.object(launch_agent.shutil, "which", return_value=str(older)):
+            calls = self._dispatch(
+                ["run", "--auto", "--", "-p", "hello there"],
+                argv0=str(invoked),
+                auto_run_target=MagicMock(
+                    side_effect=lambda **kwargs: (self._row(2), "")
+                ),
+            )
+
+        claude_args = self._launch(calls)[2]
+        settings = json.loads(claude_args[1])
+        command = settings["hooks"]["StopFailure"][0]["hooks"][0]["command"]
+        assert shlex.split(command)[0] == str(invoked)
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="hook command uses POSIX shlex.quote"
+    )
+    def test_the_hook_command_ignores_the_current_directory(
+        self, temp_home: Path, tmp_path: Path
+    ):
+        """A ``json.py`` next to the session must not be imported by the hook.
+
+        ``python -m`` puts the current directory first on ``sys.path``, so the
+        hook would run the project's own module, exit non-zero and leave the
+        account unmarked — the next launch would take the exhausted account
+        again. Measured on 2.1.329 with a ``json.py`` that raises on import.
+        """
+        from claude_swap import launch_agent
+        from claude_swap.paths import get_backup_root
+
+        with patch.object(launch_agent.sys, "argv", ["/nonexistent/cswap"]), \
+             patch.object(launch_agent.shutil, "which", return_value=None):
+            command = cli._rate_limit_hook(
+                ["-p", "hi"], ("2", "b@example.com", "org-1")
+            )
+        settings = json.loads(command[1])
+        hook_command = settings["hooks"]["StopFailure"][0]["hooks"][0]["command"]
+
+        workdir = tmp_path / "checkout"
+        workdir.mkdir()
+        (workdir / "json.py").write_text("raise RuntimeError('not the stdlib')\n")
+        env = {
+            "HOME": str(temp_home),
+            "PATH": os.environ.get("PATH", ""),
+        }
+
+        result = subprocess.run(
+            hook_command, shell=True, cwd=workdir, env=env,
+            capture_output=True, text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+        marks = json.loads(
+            (get_backup_root() / "cache" / "stop-failure.json").read_text()
+        )["marks"]
+        assert [(m["email"], m["organizationUuid"]) for m in marks] == [
+            ("b@example.com", "org-1")
+        ]
+
+    def test_a_user_settings_switch_is_not_competed_with(self):
+        calls = self._auto_dispatch(
+            ["run", "--auto", "--", "--settings", "/tmp/mine.json"],
+            lambda **kwargs: (self._row(2), ""),
+        )
+        assert self._launch(calls)[2] == ["--settings", "/tmp/mine.json"]
+
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            ["mcp", "add", "-s", "user", "x", "cmd"],
+            ["mcp", "list"],
+            ["plugin", "install", "y"],
+            ["auth", "login"],
+            ["update"],
+            ["--version"],
+            ["-h"],
+        ],
+    )
+    def test_claude_housekeeping_goes_to_the_default_login(self, tail):
+        """`claude mcp add` must not write a session profile's copy (the next
+        _sync_mcp_servers deletes it), and `--version` must not need a quota."""
+        target = MagicMock(side_effect=AssertionError("no account should be chosen"))
+        calls = self._dispatch(
+            ["run", "--auto", "--", *tail], auto_run_target=target
+        )
+
+        assert ("exec_default", tail, True) in calls
+        assert not [call for call in calls if call[0] == "run"]
+        target.assert_not_called()
+
+    def test_auto_forwards_the_run_flags(self):
+        calls = self._auto_dispatch(
+            ["run", "--auto", "--no-share", "--no-share-history", "--require-session"],
+            lambda **kwargs: (self._row(3), ""),
+        )
+        _kind, number, _args, share, share_history, require_session = (
+            self._launch(calls)
+        )
+        assert number == "3"
+        assert (share, share_history, require_session) == (False, False, True)
+
+    def test_auto_refusal_exits_non_zero_and_launches_nothing(self, capsys):
+        with pytest.raises(SystemExit) as excinfo:
+            self._auto_dispatch(
+                ["run", "--auto"],
+                lambda **kwargs: (
+                    None,
+                    "Every managed account is at its limit. Nothing was launched.",
+                ),
+            )
+
+        assert excinfo.value.code == 1
+        assert "is at its limit" in capsys.readouterr().err
+
+    def test_auto_names_the_account_it_chose(self, capsys):
+        self._auto_dispatch(["run", "--auto"], lambda **kwargs: (self._row(2), ""))
+        assert "Account-2 has the most remaining quota" in capsys.readouterr().err
+
+    def test_auto_with_an_account_is_a_usage_error(self):
+        with patch.object(sys, "argv", ["claude-swap", "run", "--auto", "2"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+
+    def test_wrapper_prints_the_shipped_script(self, capsys):
+        from claude_swap import wrapper
+
+        with patch.object(sys, "argv", ["claude-swap", "wrapper"]):
+            cli.main()
+
+        printed = Path(capsys.readouterr().out.strip())
+        assert printed == wrapper.WRAPPER_PATH
+        assert printed.is_file()
 
     def test_whatever_the_launch_prints_goes_to_stderr(self, capsys):
         """Stdout is claude's. A notice from anywhere on the way to the
@@ -2559,8 +2816,8 @@ class TestRunAutoResolve:
             ):
                 calls.append(("run", identifier, claude_args, share, share_history))
 
-            def exec_default(self, claude_args):
-                calls.append(("exec_default", claude_args))
+            def exec_default(self, claude_args, *, primary_profile=False):
+                calls.append(("exec_default", claude_args, primary_profile))
 
         return FakeSessionManager
 
@@ -2640,7 +2897,7 @@ class TestRunAutoResolve:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run"]):
             cli.main()
-        assert ("exec_default", []) in calls
+        assert ("exec_default", [], False) in calls
         captured = capsys.readouterr()
         assert captured.out == ""
         assert "No account mapped" in captured.err
@@ -2661,7 +2918,7 @@ class TestRunAutoResolve:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run"]):
             cli.main()
-        assert ("exec_default", []) in calls
+        assert ("exec_default", [], False) in calls
         captured = capsys.readouterr()
         assert captured.out == ""
         assert "no longer exists" in captured.err

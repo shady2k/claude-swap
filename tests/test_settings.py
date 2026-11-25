@@ -237,6 +237,37 @@ class TestRunSettings:
         assert raw == {"schemaVersion": 1, "run": {"shareHistory": True}}
 
 
+class TestNonessentialTrafficSetting:
+    """``run.disableNonessentialTraffic``: on unless the user turns it off.
+
+    Off means cswap does not set the variable at all; Claude Code's own
+    documentation says ``0`` would not turn the traffic back on, so leaving it
+    unset is the only way to give auto-updates and Remote Control back.
+    """
+
+    def test_on_by_default(self, tmp_path: Path):
+        assert load_run_settings(tmp_path).disable_nonessential_traffic is True
+
+    def test_reads_the_setting(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"run": {"disableNonessentialTraffic": False}})
+        )
+        assert load_run_settings(tmp_path).disable_nonessential_traffic is False
+
+    def test_a_non_boolean_falls_back_to_the_default(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"run": {"disableNonessentialTraffic": "no"}})
+        )
+        assert load_run_settings(tmp_path).disable_nonessential_traffic is True
+
+    def test_the_key_is_one_cswap_reads(self, tmp_path: Path):
+        """A key nothing reads would be listed as unrecognized."""
+        settings_path(tmp_path).write_text(
+            json.dumps({"run": {"disableNonessentialTraffic": False}})
+        )
+        assert unrecognized_keys(tmp_path) == []
+
+
 class TestNoProxy:
     """``run.noProxy``: the bypass list a proxied launch hands Claude Code."""
 

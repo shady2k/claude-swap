@@ -24,6 +24,7 @@ from claude_swap import fsutil
 from claude_swap import macos_keychain
 from claude_swap import oauth
 from claude_swap import session as session_mod
+from claude_swap import wrapper
 from claude_swap.credentials import CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE
 from claude_swap.exceptions import (
     AccountNotFoundError,
@@ -118,6 +119,22 @@ def _windows_without_symlinks(monkeypatch):
     machine."""
     monkeypatch.setattr(session_mod, "can_symlink", lambda _dir: False)
     monkeypatch.setattr(fsutil, "_LINK_PROBES", {})
+
+
+@pytest.fixture(autouse=True)
+def _a_claude_on_path(monkeypatch):
+    """Resolve a ``claude``, as a machine with Claude Code installed does.
+
+    ``_session_validity`` does not spawn a name it could not resolve: with no
+    ``claude`` at all the verdict is "unreachable" — a statement about the
+    machine, not about the profile — so nothing is cleaned up. Tests that stub
+    the probe's spawn therefore also need the resolution; the ones that test
+    the resolution, or its absence, patch ``shutil.which`` or ``find_claude``
+    themselves and win over this.
+    """
+    monkeypatch.setattr(
+        session_mod.shutil, "which", lambda name: f"/fake/bin/{name}"
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -1844,6 +1861,43 @@ class TestRun:
 
         assert exc.value.env["ANTHROPIC_API_KEY"] == "sk-ant-key"
 
+    def test_an_automatic_fast_path_drops_the_shell_auth_overrides(
+        self, manager, capture_exec, monkeypatch, capsys
+    ):
+        """``--auto`` chose this account, so the shell's override goes.
+
+        The fast path runs plain claude on the default login, whose proxy is
+        the chosen account's. An ``ANTHROPIC_API_KEY`` from the terminal would
+        make Claude Code bill a different credential than the account the
+        proxy belongs to.
+        """
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-key")
+        monkeypatch.setenv("UNRELATED_VAR", "kept")
+        monkeypatch.setattr(
+            manager.switcher,
+            "_get_current_account",
+            lambda: (ACCOUNT_EMAIL, ORG_UUID),
+        )
+        choice = (ACCOUNT_NUM, ACCOUNT_EMAIL, ORG_UUID)
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run(choice[0], [], account=choice)
+
+        assert "ANTHROPIC_API_KEY" not in exc.value.env
+        assert exc.value.env["UNRELATED_VAR"] == "kept"
+        assert "Ignoring ANTHROPIC_API_KEY" in capsys.readouterr().out
+
+    def test_an_automatic_launch_refuses_a_slot_that_moved(
+        self, manager, capture_exec, monkeypatch
+    ):
+        """A swap between the choice and the launch must refuse, not run the
+        account that took the number."""
+        monkeypatch.setattr(
+            manager.switcher, "account_still_holds", lambda *identity: False
+        )
+
+        with pytest.raises(SessionError, match="holds another account"):
+            manager.run("2", [], account=("2", ACCOUNT_EMAIL, ORG_UUID))
+
     def test_exec_default_uses_plain_env(self, manager, capture_exec, monkeypatch):
         """exec_default launches plain claude with the unmodified environment."""
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-key")
@@ -1859,6 +1913,82 @@ class TestRun:
         monkeypatch.setattr(session_mod.shutil, "which", lambda name: None)
         with pytest.raises(SessionError, match="not found on PATH"):
             manager.exec_default([])
+
+    def test_a_service_command_publishes_the_main_profile(
+        self, manager, capture_exec, stream_proxy, dead_proxy_url, temp_home,
+        monkeypatch,
+    ):
+        """`claude mcp add` from inside a session writes the user's profile.
+
+        The session terminal exports its own profile in ``CLAUDE_CONFIG_DIR``
+        and ``CLAUDE_SECURESTORAGE_CONFIG_DIR``. Handing them on would record
+        the server in a copy the next launch overwrites (``_sync_sharing``),
+        and resolving the proxy from it would send the command through the
+        session account's route — while Claude Code 2.1.322 still looked up
+        its stored login (file and Keychain item) through the second one.
+        """
+        session_profile = temp_home / ".claude" / "sessions" / "1"
+        session_profile.mkdir(parents=True)
+        (session_profile / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "account1@example.com",
+                "organizationUuid": "org-uuid-1",
+            },
+        }))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": ACCOUNT_EMAIL,
+                "organizationUuid": ORG_UUID,
+            },
+        }))
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
+        manager.switcher.set_account_proxy("1", dead_proxy_url)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(session_profile))
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(session_profile))
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.exec_default(
+                ["mcp", "add", "-s", "user", "demo", "/bin/true"],
+                primary_profile=True,
+            )
+
+        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
+        assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in exc.value.env
+        assert exc.value.env["HTTPS_PROXY"] == stream_proxy.url
+        assert [path for path, _ in stream_proxy.requests] == [
+            "api.anthropic.com:443"
+        ]
+
+    def test_a_claude_that_cannot_be_spawned_keeps_the_profile(
+        self, manager, seeded_switcher, capture_exec, refresh_rotates, monkeypatch
+    ):
+        """`find_claude` answering nothing is not a verdict on the login.
+
+        The profile has just been seeded; if the probe cannot be spawned the
+        launch must report that, not treat the profile as invalid — the
+        "invalid" verdict deletes the directory and its Keychain entry.
+        """
+        answers = []
+
+        def gone_after_the_start():
+            answers.append(1)
+            return "/fake/bin/claude" if len(answers) == 1 else None
+
+        monkeypatch.setattr(session_mod, "find_claude", gone_after_the_start)
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        with pytest.raises(
+            SessionError, match=r"did not run or did\s+not answer"
+        ):
+            manager.run("2", [])
+
+        assert session_dir.is_dir()
+        assert (session_dir / ".credentials.json").exists()
+        # The slot's stored login is untouched as well.
+        assert json.loads(
+            seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+        )["claudeAiOauth"]["refreshToken"]
 
 
 # ---------------------------------------------------------------------------
@@ -1937,6 +2067,72 @@ def dead_proxy_url():
 
 def _no_proxy_from_settings(manager: SessionManager) -> str:
     return load_run_settings(manager.switcher.backup_dir).no_proxy
+
+
+class TestFindClaudeNeverHandsOverToTheWrapper:
+    """The wrapper launches cswap; cswap must not launch the wrapper back.
+
+    ``find_claude`` is the only resolver a launch uses, and a ``claude`` that
+    turns out to be claude-swap's own wrapper is walked past. What it must not
+    do is change what an ordinary setup resolves to.
+    """
+
+    @staticmethod
+    def _binary(directory: Path, body: str = "#!/bin/sh\nexit 0\n") -> Path:
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "claude"
+        path.write_text(body)
+        path.chmod(0o755)
+        return path
+
+    def _wrapper_link(self, directory: Path) -> Path:
+        directory.mkdir(parents=True, exist_ok=True)
+        link = directory / "claude"
+        link.symlink_to(wrapper.WRAPPER_PATH)
+        return link
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="the wrapper is a POSIX shell script"
+    )
+    def test_the_wrapper_on_path_is_passed_over(self, tmp_path, monkeypatch):
+        real = self._binary(tmp_path / "real")
+        link = self._wrapper_link(tmp_path / "bin")
+        monkeypatch.setenv("PATH", os.pathsep.join([str(link.parent), str(real.parent)]))
+        monkeypatch.setattr(session_mod.shutil, "which", lambda name: str(link))
+
+        assert session_mod.find_claude() == str(real)
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="the wrapper is a POSIX shell script"
+    )
+    def test_the_wrapper_alone_is_not_a_claude(self, tmp_path, monkeypatch):
+        link = self._wrapper_link(tmp_path / "bin")
+        monkeypatch.setenv("PATH", str(link.parent))
+        monkeypatch.setattr(session_mod.shutil, "which", lambda name: str(link))
+
+        assert session_mod.find_claude() is None
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="the wrapper is a POSIX shell script"
+    )
+    def test_a_copy_of_the_wrapper_is_recognised_too(self, tmp_path, monkeypatch):
+        real = self._binary(tmp_path / "real")
+        copied_dir = tmp_path / "copied"
+        copied_dir.mkdir()
+        copied = copied_dir / "claude"
+        copied.write_bytes(wrapper.WRAPPER_PATH.read_bytes())
+        copied.chmod(0o755)
+        monkeypatch.setenv("PATH", os.pathsep.join([str(copied_dir), str(real.parent)]))
+        monkeypatch.setattr(session_mod.shutil, "which", lambda name: str(copied))
+
+        assert session_mod.find_claude() == str(real)
+
+    def test_an_ordinary_claude_is_returned_unchanged(self, monkeypatch):
+        monkeypatch.setattr(
+            session_mod.shutil, "which", lambda name: "/fake/bin/claude"
+        )
+
+        assert session_mod.find_claude() == "/fake/bin/claude"
 
 
 class TestTheLaunchTakesTheAccountsProxy:
@@ -2261,6 +2457,79 @@ print(json.dumps({{
         assert child["config_dir"] == str(
             session_dir_for(manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
         )
+
+
+class TestNonessentialTrafficSetting:
+    """``run.disableNonessentialTraffic``: on by default, off means "do not set".
+
+    ``0`` does not re-enable Claude Code's traffic (its own documentation), so
+    turning the setting off has to leave the variable unset — and leave an
+    inherited value exactly as the shell had it.
+    """
+
+    def _off(self, manager):
+        set_setting(
+            manager.switcher.backup_dir, "run.disableNonessentialTraffic", "false"
+        )
+
+    def test_off_stops_cswap_from_setting_the_variable(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
+        monkeypatch,
+    ):
+        monkeypatch.delenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", raising=False)
+        self._off(manager)
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        assert "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" not in exc.value.env
+
+    def test_off_leaves_an_inherited_value_alone(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "0")
+        self._off(manager)
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        assert exc.value.env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "0"
+
+    def test_off_reaches_the_plain_launch_on_the_default_login(
+        self, manager, capture_exec, monkeypatch
+    ):
+        monkeypatch.delenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", raising=False)
+        self._off(manager)
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.exec_default([])
+
+        assert "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" not in exc.value.env
+
+    def test_the_probe_follows_the_setting(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
+        monkeypatch,
+    ):
+        monkeypatch.delenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", raising=False)
+        self._off(manager)
+
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [])
+
+        assert auth_status_tracks_seed  # the probe ran
+        assert "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" not in auth_status_tracks_seed[0]
+
+    def test_on_by_default(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
+        monkeypatch,
+    ):
+        monkeypatch.delenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", raising=False)
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        assert exc.value.env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
 
 
 class TestAnUnusableProxyStopsTheLaunch:
@@ -5884,6 +6153,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         with pytest.raises(SessionError, match="stashed — please retry"):
             manager.setup_session("2", share=False)
 
+        # The slot's stored login is untouched as well.
         assert seeded_switcher.read_account_credentials(
             ACCOUNT_NUM, ACCOUNT_EMAIL
         ) == CREDS, "test premise: the backup still holds the spent generation"

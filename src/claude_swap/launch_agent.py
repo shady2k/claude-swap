@@ -261,7 +261,16 @@ def resolve_program() -> list[str]:
 
     Prefers the installed console script (stable across upgrades, see the
     module docstring) and falls back to running the package through the
-    interpreter that is executing right now.
+    interpreter that is executing right now. That fallback carries ``-P``:
+    ``-m`` puts the current directory first on ``sys.path``, where a file of
+    the same name as a stdlib module (``json.py``) would be imported instead
+    of it.
+
+    Both console scripts ``pyproject.toml`` declares (``cswap`` and
+    ``claude-swap``) name this installation, so either one as ``argv[0]``
+    answers for it — otherwise a launch through ``claude-swap`` would embed
+    whichever ``cswap`` ``PATH`` finds, possibly an older release that cannot
+    record a rate-limit mark.
 
     The path is made absolute but deliberately NOT resolved: a `uv tool
     install` puts a symlink at ``~/.local/bin/cswap`` pointing into the tool's
@@ -272,14 +281,14 @@ def resolve_program() -> list[str]:
     candidate = sys.argv[0] if sys.argv and sys.argv[0] else None
     if candidate is not None:
         absolute = Path(os.path.abspath(candidate))
-        if absolute.name == "cswap" and absolute.is_file():
+        if absolute.name in ("cswap", "claude-swap") and absolute.is_file():
             return [str(absolute)]
 
     which = shutil.which("cswap")
     if which:
         return [str(Path(os.path.abspath(which)))]
 
-    return [sys.executable, "-m", "claude_swap"]
+    return [sys.executable, "-P", "-m", "claude_swap"]
 
 
 def program_arguments(program: list[str] | None = None) -> list[str]:

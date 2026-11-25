@@ -1,0 +1,27 @@
+#!/bin/sh
+# claude-swap thin wrapper
+#
+# Every `claude` runs
+#
+#     cswap run --auto -- "$@"
+#
+# so the account with the most quota left is chosen and started as its own
+# session profile, with its own proxy, and the default login is never
+# switched. Install it as a symlink in a directory of its own, ahead of the
+# real Claude Code in PATH — not in the directory Claude Code's own installer
+# keeps its launcher in:
+#
+#     mkdir -p ~/.local/claude-swap/bin
+#     ln -s "$(cswap wrapper)" ~/.local/claude-swap/bin/claude
+#     export PATH="$HOME/.local/claude-swap/bin:$PATH"
+#
+# Rules: docs/auto-launch.md. Mechanism: claude_swap/wrapper.py.
+set -u
+
+if ! command -v cswap >/dev/null 2>&1; then
+    echo "claude: cswap is not on PATH, so this wrapper cannot choose an account." >&2
+    echo "claude: install claude-swap (uv tool install claude-swap) and put it on PATH." >&2
+    exit 127
+fi
+
+exec cswap run --auto -- "$@"
