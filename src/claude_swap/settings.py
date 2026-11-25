@@ -21,6 +21,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -106,9 +107,9 @@ class RunSettings:
     history in ``~/.claude``, so the account only decides whose quota is
     used. Off gives each account a history of its own.
 
-    ``no_proxy``: the comma-separated ``NO_PROXY`` list a proxied account's
-    launch hands Claude Code. One list for every account, because what is
-    local is a property of the machine, not of the login.
+    ``no_proxy``: the ``NO_PROXY`` list a proxied account's launch hands
+    Claude Code, stored comma-separated. One list for every account, because
+    what is local is a property of the machine, not of the login.
     """
 
     share_history: bool = True
@@ -506,7 +507,13 @@ def load_run_settings(backup_root: Path) -> RunSettings:
 
 
 def normalize_no_proxy(value: str) -> str:
-    """Trim a comma-separated ``NO_PROXY`` list; refuse a ``*`` entry.
+    """Trim a ``NO_PROXY`` list; refuse a ``*`` entry.
+
+    Entries are separated by commas, whitespace, or both: Claude Code's own
+    documentation writes the list with spaces, and the clients built on
+    ``proxy-from-env`` accept either, so ``localhost *`` is the same list as
+    ``localhost,*`` and must be refused as such. The stored form joins with
+    commas.
 
     ``NO_PROXY=*`` means "bypass the proxy for every host", which is the
     direct connection the per-account setting exists to prevent, so one ``*``
@@ -514,8 +521,7 @@ def normalize_no_proxy(value: str) -> str:
     ``cswap config set``, so a value that would be refused at launch time
     cannot be written either.
     """
-    kept = [entry.strip() for entry in value.split(",")]
-    kept = [entry for entry in kept if entry]
+    kept = [entry for entry in re.split(r"[,\s]+", value) if entry]
     if "*" in kept:
         raise ConfigError(
             "run.noProxy cannot contain '*' — it would bypass the proxy for "

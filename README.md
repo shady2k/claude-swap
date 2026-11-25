@@ -316,6 +316,7 @@ cswap config set autoswitch.threshold 80  # validated: rejects out-of-range valu
 cswap config set autoswitch.weeklyThreshold 97  # own switch line for the 7-day/per-model windows
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
 cswap config set run.shareHistory false   # each account keeps its own chat history (see "run")
+cswap config set run.noProxy 'localhost,10.0.0.0/8'  # hosts a proxied launch reaches directly
 cswap config set updates.check false      # no daily PyPI lookup for the "newer version" hint
 cswap config set usage.headerProbe true   # opt in: setup-token usage via a 1-token request (see "add-token")
 cswap config set usage.fableProbe true    # opt in: also their Fable weekly limit, via a 1-token Fable request

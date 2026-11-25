@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from claude_swap import account_proxy
 from claude_swap import fsutil
 from claude_swap import macos_keychain
 from claude_swap import oauth
@@ -2029,14 +2030,18 @@ class TestTheLaunchTakesTheAccountsProxy:
         """``claude auth status`` is Claude Code too: it gets the proxy the
         launch will, or a probe on a proxied account could go direct."""
         manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
+        monkeypatch.setenv("https_proxy", "http://shell.invalid:1")
         monkeypatch.setenv("NO_PROXY", "*")
 
         with pytest.raises(_ExecCalled):
             manager.run("2", [])
 
+        # The probe really ran, and on the account's route.
+        assert auth_status_tracks_seed
         for probe_env in auth_status_tracks_seed:
             assert probe_env["HTTPS_PROXY"] == stream_proxy.url
             assert probe_env["https_proxy"] == stream_proxy.url
+            assert "shell.invalid" not in " ".join(probe_env.values())
             assert probe_env["NO_PROXY"] != "*"
             assert probe_env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
 
@@ -2046,12 +2051,17 @@ class TestTheLaunchTakesTheAccountsProxy:
         """Plain claude on the default login is the same account's traffic."""
         manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
         _active_default_login(monkeypatch, manager)
+        monkeypatch.setenv("https_proxy", "http://shell.invalid:1")
+        monkeypatch.setenv("NO_PROXY", "*")
 
         with pytest.raises(_ExecCalled) as exc:
             manager.run("2", [])
 
         assert "CLAUDE_CONFIG_DIR" not in exc.value.env
         assert exc.value.env["HTTPS_PROXY"] == stream_proxy.url
+        assert exc.value.env["https_proxy"] == stream_proxy.url
+        assert "shell.invalid" not in " ".join(exc.value.env.values())
+        assert exc.value.env["NO_PROXY"] != "*"
         assert [path for path, _ in stream_proxy.requests] == [
             "api.anthropic.com:443"
         ]
@@ -2061,14 +2071,86 @@ class TestTheLaunchTakesTheAccountsProxy:
     ):
         manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
         _active_default_login(monkeypatch, manager)
+        monkeypatch.setenv("https_proxy", "http://shell.invalid:1")
+        monkeypatch.setenv("NO_PROXY", "*")
 
         with pytest.raises(_ExecCalled) as exc:
             manager.exec_default(["--resume"])
 
         assert exc.value.env["HTTPS_PROXY"] == stream_proxy.url
+        assert exc.value.env["https_proxy"] == stream_proxy.url
+        assert "shell.invalid" not in " ".join(exc.value.env.values())
+        assert exc.value.env["NO_PROXY"] != "*"
         assert [path for path, _ in stream_proxy.requests] == [
             "api.anthropic.com:443"
         ]
+
+    def test_the_password_reaches_the_child_only_through_the_environment(
+        self,
+        manager,
+        capture_exec,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        stream_proxy,
+        monkeypatch,
+    ):
+        """An argv is visible to every process on the machine, so the URL's
+        password may reach the probe and claude through the environment only."""
+        url = stream_proxy.url.replace("http://", "http://user:secret@")
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, url)
+        probe_argv: list[list[str]] = []
+        spawn_run = session_mod.spawn.run
+
+        def record(argv, **kwargs):
+            probe_argv.append(list(argv))
+            return spawn_run(argv, **kwargs)
+
+        monkeypatch.setattr(session_mod.spawn, "run", record)
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", ["--resume"])
+
+        assert exc.value.argv == ["/fake/bin/claude", "--resume"]
+        assert probe_argv and probe_argv[0][1:3] == ["auth", "status"]
+        for argv in (exc.value.argv, *probe_argv):
+            assert [arg for arg in argv if "secret" in arg] == []
+        # The environment is where it does travel.
+        assert auth_status_tracks_seed
+        assert all(env["HTTPS_PROXY"] == url for env in auth_status_tracks_seed)
+
+    def test_a_slot_that_changes_owner_during_the_check_stops_the_launch(
+        self,
+        manager,
+        capture_exec,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        stream_proxy,
+        monkeypatch,
+    ):
+        """The CONNECT runs outside any lock, so the account list can change
+        under it. The profile prepared afterwards must still be the account
+        whose route this launch checked — here a `swap` gives the slot to the
+        neighbour while the check runs."""
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
+        real_probe = account_proxy.probe
+
+        def swap_then_probe(route, timeout=account_proxy.PROBE_TIMEOUT_S):
+            manager.switcher.swap_accounts("1", ACCOUNT_NUM)
+            real_probe(route, timeout=timeout)
+
+        monkeypatch.setattr(account_proxy, "probe", swap_then_probe)
+
+        with pytest.raises(SessionError, match="now holds another account"):
+            manager.run("2", [])
+
+        # No profile work and no probe of the neighbour: the launch stopped
+        # before anything could pair one account's profile with another's
+        # route.
+        assert auth_status_tracks_seed == []
+        neighbour_dir = session_dir_for(
+            manager.switcher.backup_dir, ACCOUNT_NUM, "account1@example.com"
+        )
+        assert not neighbour_dir.exists()
 
     def test_an_account_without_a_proxy_keeps_what_it_inherited(
         self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
@@ -2222,6 +2304,26 @@ class TestAnUnusableProxyStopsTheLaunch:
             manager.run("2", [])
 
         assert auth_status_tracks_seed == []
+
+    def test_the_fast_path_refuses_before_starting_claude(
+        self, manager, capture_exec, dead_proxy_url, monkeypatch
+    ):
+        """Plain claude on the default login is still this account's launch,
+        so it gets the same check and the same refusal."""
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, dead_proxy_url)
+        _active_default_login(monkeypatch, manager)
+
+        with pytest.raises(SessionError, match="cannot be used"):
+            manager.run("2", [])
+
+    def test_exec_default_refuses_before_starting_claude(
+        self, manager, capture_exec, dead_proxy_url, monkeypatch
+    ):
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, dead_proxy_url)
+        _active_default_login(monkeypatch, manager)
+
+        with pytest.raises(SessionError, match="cannot be used"):
+            manager.exec_default(["--resume"])
 
     def test_the_message_never_carries_a_credential(
         self, manager, capture_exec, capsys
@@ -4500,7 +4602,7 @@ class TestShareHistoryDecision:
         manager.switcher.platform = Platform.WINDOWS
         handed_over = []
 
-        def setup_session(identifier, share, share_history=None, route=None):
+        def setup_session(identifier, share, share_history=None, route=None, account=None):
             handed_over.append(share_history)
             raise SessionError("stop here")
 
