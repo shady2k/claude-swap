@@ -1555,6 +1555,9 @@ class TestRunCommand:
         command = settings["hooks"]["StopFailure"][0]["hooks"][0]["command"]
         assert shlex.split(command)[0] == str(invoked)
 
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="hook command uses POSIX shlex.quote"
+    )
     def test_the_hook_command_ignores_the_current_directory(
         self, temp_home: Path, tmp_path: Path
     ):
