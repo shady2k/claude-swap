@@ -177,6 +177,47 @@ def test_same_email_different_org_is_still_a_mismatch(
     )
 
 
+def test_a_switch_during_the_overwrite_question_sends_no_profile_request(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """``add`` asks before it overwrites a slot, and the auto engine can
+    switch the live account while it waits for the answer.
+
+    The token and the identity that labels it are read in one short account
+    lock, so the profile request — which asks "whose token is this" over the
+    SLOT's route — is never sent at all when the two disagree.
+    """
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    s._write_json(s.sequence_file, {
+        "activeAccountNumber": 1,
+        "lastUpdated": "2024-01-01T00:00:00Z",
+        "sequence": [1, 2],
+        "accounts": {
+            "1": {"email": "ax@example.com", "uuid": "u-ax",
+                  "added": "2024-01-01T00:00:00Z"},
+            "2": {"email": "neighbour@example.com", "uuid": "u-nb",
+                  "added": "2024-01-02T00:00:00Z"},
+        },
+    })
+    config_path = s._get_claude_config_path()
+
+    def answer(_prompt: str) -> str:
+        # The auto engine switches the live login while the question is up.
+        config_path.write_text(json.dumps({"oauthAccount": {
+            "emailAddress": "neighbour@example.com", "organizationUuid": "",
+        }}), encoding="utf-8")
+        return "y"
+
+    with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
+         patch("builtins.input", side_effect=answer), \
+         patch("claude_swap.oauth.fetch_oauth_profile") as mock_fetch:
+        with pytest.raises(ConfigError):
+            s.add_account(slot=2)
+
+    mock_fetch.assert_not_called()
+    assert s._get_sequence_data()["accounts"]["2"]["email"] == "neighbour@example.com"
+
+
 @pytest.mark.parametrize("foreign_org", ["", None], ids=["org-empty", "org-none"])
 def test_add_refuses_a_foreign_credential_on_refresh_in_place(
     temp_home: Path, mock_claude_config: Path, foreign_org,

@@ -547,9 +547,6 @@ class ClaudeAccountSwitcher:
             tuple[str, str, str, str, str, str], bool
         ] = {}
 
-        # Slots whose ownership moved while ``_build_accounts_info`` was
-        # reading them; the collect pass sends no request for them this pass.
-        self._owner_moved: set[str] = set()
         # Managed accounts in the last snapshot, for `status`'s tag suffix and
         # its account total — the same capture as the rows, no extra read.
         self._snapshot_records: dict[str, dict] = {}
@@ -2099,7 +2096,7 @@ class ClaudeAccountSwitcher:
             # slot mutation or another process held the lock) sends nothing.
             record = accounts.get(str(num)) or {}
             if verified and (
-                str(num) in self._owner_moved
+                self._route_unconfirmed(route)
                 or not self._record_is(record, email, org_uuid)
             ):
                 continue
@@ -2312,7 +2309,8 @@ class ClaudeAccountSwitcher:
         return {
             key: record[key]
             for key in cls.USER_ACCOUNT_SETTINGS
-            if record.get(key) is not None
+            if key in record
+            and (key == account_proxy.FIELD or record[key] is not None)
         }
 
     @staticmethod
@@ -3880,6 +3878,13 @@ class ClaudeAccountSwitcher:
         )
 
     @staticmethod
+    def _route_unconfirmed(route: "account_proxy.ProxyRoute | None") -> bool:
+        """Whether this row's route was withheld because its owner could not be
+        pinned: the prohibition travels in the row itself, so no consumer has
+        to keep a parallel set of slot numbers in step."""
+        return route is not None and route.invalid == _ROUTE_UNCONFIRMED
+
+    @staticmethod
     def _identity_is(
         identity: tuple[str, str, str] | None, email: str, org_uuid: str
     ) -> bool:
@@ -4497,7 +4502,12 @@ class ClaudeAccountSwitcher:
                         f"Alias '{alias}' is already used by account {conflict}"
                     )
 
-            current_creds = self._read_capture_credentials()
+            # The token and the identity that labels it are read under ONE
+            # short lock: the profile request below must never send another
+            # account's token after a switch landed while add waited for input.
+            with FileLock(self.lock_file):
+                current_creds = self._read_capture_credentials()
+                self._reject_identity_drift_since_verify(identity)
             if current_creds is None:
                 raise CredentialReadError("Failed to read credentials for current account")
             if not current_creds:
@@ -4643,8 +4653,13 @@ class ClaudeAccountSwitcher:
                     f"Alias '{alias}' is already used by account {conflict}"
                 )
 
-        # Read new account credentials BEFORE any destructive operations
-        current_creds = self._read_capture_credentials()
+        # Read new account credentials BEFORE any destructive operations. The
+        # token and the identity that labels it are read under ONE short lock:
+        # the profile request below must never send another account's token
+        # after a switch landed while add waited for the overwrite answer.
+        with FileLock(self.lock_file):
+            current_creds = self._read_capture_credentials()
+            self._reject_identity_drift_since_verify(identity)
         if current_creds is None:
             raise CredentialReadError("Failed to read credentials for current account")
         if not current_creds:
@@ -4714,23 +4729,34 @@ class ClaudeAccountSwitcher:
         # Update sequence.json — under the account lock every slot mutation
         # takes, from a fresh read. Two things are decided here and nowhere
         # earlier: that the slot still belongs to (or is free for) this
-        # account, and which proxy it keeps. A `swap`/`move` completing while
-        # this add read its inputs must not get this record written over
-        # another account's, and a `cswap proxy` landing after `carried` was
-        # captured has to win over that stale copy — losing it would send the
-        # account direct on its next request.
+        # account, and which proxy it keeps — the setting on the record the
+        # account holds now, losing only to an explicit --proxy.
         with FileLock(self.lock_file):
             data = self._get_sequence_data() or {}
-            previous = (data.get("accounts") or {}).get(str(account_num)) or {}
-            if previous and not self._record_is(
-                previous, current_email, organization_uuid
+            occupant = (data.get("accounts") or {}).get(str(account_num)) or {}
+            if occupant and not self._record_is(
+                occupant, current_email, organization_uuid
             ):
                 raise ConfigError(
                     f"Slot {account_num} was taken by another account while "
                     "this add was running; the registry was not changed. "
                     "Run the command again."
                 )
-            carried.pop(account_proxy.FIELD, None)
+            # The proxy belongs to the ACCOUNT, not to the number. An ordinary
+            # `add --slot` to a free slot finds the target record empty, and
+            # the cleanup above has already deleted the record the account is
+            # leaving — so the setting is taken from whichever of the two
+            # still has it, and only then loses to an explicit --proxy.
+            previous = occupant
+            if not self._record_is(previous, current_email, organization_uuid):
+                owner_slot = self._find_account_slot(
+                    data, current_email, organization_uuid
+                )
+                previous = (
+                    (data.get("accounts") or {}).get(owner_slot) or {}
+                    if owner_slot
+                    else {}
+                )
             if account_proxy.FIELD in previous:
                 carried[account_proxy.FIELD] = previous[account_proxy.FIELD]
             data["accounts"][account_num] = {
@@ -5104,11 +5130,9 @@ class ClaudeAccountSwitcher:
                 "Account lock held elsewhere; rendering stored usage without "
                 "confirming any account's route this pass.", exc_info=True,
             )
-            rows = self._build_accounts_info_locked(
+            return self._build_accounts_info_locked(
                 active_only=active_only, routes_confirmed=False
             )
-            self._owner_moved.update(str(row[0]) for row in rows)
-            return rows
 
     def _build_accounts_info_locked(
         self, *, active_only: bool, routes_confirmed: bool
@@ -5133,9 +5157,6 @@ class ClaudeAccountSwitcher:
         # read failed with no fallback. Read by _static_usage_sentinel (main
         # thread writes it here before the fetch pool starts → no data race).
         self._record_active_verdict(None)
-        # Slots whose ownership changed while this snapshot was being read; the
-        # collect pass sends no request for them (see ``_identity_is``).
-        self._owner_moved = set()
         for num in data.get("sequence", []):
             account = data.get("accounts", {}).get(str(num), {})
             email = account.get("email", "unknown")
@@ -5164,7 +5185,7 @@ class ClaudeAccountSwitcher:
                 if not self._identity_is(
                     self._get_current_identity_triple(), email, org_uuid
                 ):
-                    self._owner_moved.add(str(num))
+                    route = account_proxy.unusable(_ROUTE_UNCONFIRMED)
             else:
                 # Display read cache: this value feeds sentinels, token-status
                 # lines and the usage GET. Nothing writes or POSTs it — the
@@ -5184,12 +5205,13 @@ class ClaudeAccountSwitcher:
         # route is this slot's.
         if routes_confirmed:
             published = self._get_sequence_data() or {}
-            for num, email, _org_name, org_uuid, _active, _creds, _alias, _route in (
-                accounts_info
-            ):
+            for index, row in enumerate(accounts_info):
+                num, email, _org_name, org_uuid = row[0], row[1], row[2], row[3]
                 record = (published.get("accounts") or {}).get(str(num)) or {}
                 if not self._record_is(record, email, org_uuid):
-                    self._owner_moved.add(str(num))
+                    accounts_info[index] = row[:7] + (
+                        account_proxy.unusable(_ROUTE_UNCONFIRMED),
+                    )
         return accounts_info
 
     def _fetch_active_usage(
@@ -5962,8 +5984,8 @@ class ClaudeAccountSwitcher:
         Re-derived on every collect pass (never persisted), so it can't
         outlive the condition that produced it.
         """
-        num, email, _, _, is_active, creds, _alias, _route = account_info
-        if str(num) in self._owner_moved:
+        num, email, _, _, is_active, creds, _alias, route = account_info
+        if self._route_unconfirmed(route):
             # The snapshot could not pin this slot's owner (a slot mutation or
             # another process held the lock while it was read): send nothing
             # and show the stored reading. Re-derived next pass.
@@ -6928,19 +6950,15 @@ class ClaudeAccountSwitcher:
         """Build the ``--status --json`` payload (no active / unmanaged / managed).
 
         Everything comes from the same locked snapshot as ``--list``: the slot,
-        its proxy and the credential the request uses, so the reported `proxy`
-        and the route actually taken cannot disagree.
+        the credential the request uses and the record its route was taken
+        from. The reported `proxy` is that record's stored setting even when
+        the pass had to skip the request (a lock held elsewhere, an owner that
+        moved), which `usageStatus` reports instead.
         """
         identity = self._get_current_account()
         if identity is None:
             return {"schemaVersion": SCHEMA_VERSION, "active": None}
         current_email, _current_org_uuid = identity
-
-        if not self._get_sequence_data_migrated():
-            return {
-                "schemaVersion": SCHEMA_VERSION,
-                "active": {"email": current_email, "managed": False},
-            }
 
         row = self._active_snapshot_row()
         if row is None:
@@ -6949,7 +6967,7 @@ class ClaudeAccountSwitcher:
                 "active": {"email": current_email, "managed": False},
             }
 
-        account_num, email, org_name, org_uuid, _active, _creds, alias, route = row
+        account_num, email, org_name, org_uuid, _active, _creds, alias, _route = row
         entry, _login_expires_at = self._active_account_usage(row)
         # Decision-grade projection, same rule as the --list payload: stale
         # beyond STALE_OK_S reports unavailable, not "ok" with old numbers.
@@ -6966,7 +6984,13 @@ class ClaudeAccountSwitcher:
         }
         if alias:
             active["alias"] = alias
-        proxy = None if route is None else route.display()
+        # From the record, not from the route: a lock another process holds
+        # makes the route unusable for this pass, and that is a property of the
+        # REQUEST, reported through `usageStatus` — the stored setting is still
+        # what the account has, and must not read as a proxy error.
+        proxy = account_proxy.describe(
+            self._snapshot_records.get(str(account_num))
+        )
         if proxy:
             active["proxy"] = proxy
         if usage is not None:
@@ -6998,10 +7022,6 @@ class ClaudeAccountSwitcher:
             print(f"{bolded('Status:')} {dimmed('No active Claude account')}")
             return None
         current_email, current_org_uuid = identity
-
-        if not self._get_sequence_data_migrated():
-            print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
-            return None
 
         row = self._active_snapshot_row()
         if row is None:

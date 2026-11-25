@@ -47,6 +47,7 @@ wherever it leaves the process, and it never enters an export; see
 from __future__ import annotations
 
 import base64
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -330,6 +331,23 @@ def describe(record: Mapping | None) -> str | None:
     """The masked form of a record's proxy, or None when it has none."""
     route = route_for(record)
     return None if route is None else route.display()
+
+
+#: A URL, with a scheme or with credentials but no scheme: the two shapes a
+#: proxy value takes when someone mistypes it into a command line.
+_URL_SHAPED = re.compile(r"\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s'\"]+")
+_USERINFO_SHAPED = re.compile(r"\b[^\s:/@'\"]+:[^\s/@'\"]+@[^\s'\"]+")
+
+
+def redact_urls(text: str) -> str:
+    """``text`` with every URL-shaped run replaced by a static ``<URL>``.
+
+    For the diagnostics of the two commands that accept a proxy URL: argparse
+    formats the offending value into its own errors (an extra positional, a
+    value attached to a flag, a failed integer conversion), and the identifier
+    message does too — any of which may be ``http://user:password@host``.
+    """
+    return _USERINFO_SHAPED.sub("<URL>", _URL_SHAPED.sub("<URL>", text))
 
 
 def send(

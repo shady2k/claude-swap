@@ -9,7 +9,7 @@ import math
 import os
 import sys
 
-from claude_swap import __version__, paths, printer
+from claude_swap import __version__, account_proxy, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
 from claude_swap.models import (
@@ -629,26 +629,23 @@ Examples:
         sys.exit(130)
 
 
-def _reject_attached_values(parser: argparse.ArgumentParser, argv: list[str]) -> None:
-    """Refuse ``--flag=value`` on a flag that takes no value, without echoing it.
+class _DiagnosticsParser(argparse.ArgumentParser):
+    """A parser whose errors never echo a proxy URL.
 
-    argparse reports that shape as ``ignored explicit argument '<value>'`` —
-    measured on CPython 3.12–3.14 — and the value is the whole URL when someone
-    types ``--unset=http://user:pass@host:port``. The commands that take a proxy
-    URL must not reproduce it, so the flag's own name is all the message names.
+    The two commands that take a proxy URL are the only ones whose arguments
+    can carry a password, and argparse formats the offending value into every
+    shape it refuses: a value attached to a boolean flag
+    (``--unset=http://user:pass@host``), a second positional, a ``--slot`` that
+    failed its integer conversion, an abbreviated flag. Redacting at ``error``
+    covers all of them from one place instead of enumerating the shapes.
     """
-    flags = {
-        option
-        for action in parser._actions
-        for option in action.option_strings
-        if action.nargs == 0
-    }
-    for token in argv:
-        if "=" not in token:
-            continue
-        name = token.split("=", 1)[0]
-        if name in flags:
-            parser.error(f"{name} takes no value (the value is not echoed)")
+
+    redact_urls = False
+
+    def error(self, message: str) -> None:
+        if self.redact_urls:
+            message = account_proxy.redact_urls(message)
+        super().error(message)
 
 
 def _carries_proxy(argv: list[str]) -> bool:
@@ -670,7 +667,7 @@ def _proxy_command(argv: list[str]) -> None:
     the setting does, and the cases in which it refuses to send at all, is in
     `account_proxy`.
     """
-    parser = argparse.ArgumentParser(
+    parser = _DiagnosticsParser(
         prog="cswap proxy",
         description=(
             "Set, remove, or list the HTTP proxy of an account. Every request "
@@ -708,16 +705,13 @@ Only http:// proxies are supported; HTTPS tunnels through them (CONNECT).
         "--unset", action="store_true", help="Remove the account's proxy"
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    # ``parse_known_args``: argparse's own "unrecognized arguments: <values>"
-    # would echo a mistyped second URL — credentials included — into stderr,
-    # and this command is the one that takes an argument carrying a password.
-    _reject_attached_values(parser, argv)
-    args, extra = parser.parse_known_args(argv)
-    if extra:
-        parser.error(
-            "unexpected extra argument (a proxy URL is given once; values "
-            "are not echoed)"
-        )
+    # Every shape argparse refuses here — an extra positional, a value attached
+    # to a boolean flag, an abbreviated flag — echoes the offending value, and
+    # on this command that value may hold a password. One redaction at the
+    # parser's ``error`` covers them all; the identifier-resolution errors
+    # below go through the same helper.
+    parser.redact_urls = True
+    args = parser.parse_args(argv)
 
     if args.unset and args.url:
         parser.error("--unset does not take a URL argument")
@@ -749,7 +743,7 @@ Only http:// proxies are supported; HTTPS tunnels through them (CONNECT).
             )
             print(f"{accent('Set')} proxy {described} for Account-{account_num}")
     except ClaudeSwitchError as e:
-        error(f"Error: {e}")
+        error(f"Error: {account_proxy.redact_urls(str(e))}")
         sys.exit(1)
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
@@ -1626,7 +1620,7 @@ def main() -> None:
     # keeps working unchanged.
     argv = _translate_subcommand(argv)
 
-    parser = argparse.ArgumentParser(
+    parser = _DiagnosticsParser(
         prog=_prog_name(),
         usage="%(prog)s <command> [args] [options]",
         description="""Multi-Account Switcher for Claude Code
@@ -1944,22 +1938,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=argparse.SUPPRESS,
     )
 
-    if _carries_proxy(argv):
-        # ``add --proxy URL`` takes the only argument that can carry a
-        # password, and argparse's "unrecognized arguments: <values>" echoes a
-        # second URL verbatim. Same construction as `cswap proxy`: a static
-        # message, and a value attached to a boolean flag is refused before
-        # argparse formats it. Every other invocation keeps argparse's own
-        # diagnostics.
-        _reject_attached_values(parser, argv)
-        args, extra = parser.parse_known_args(argv)
-        if extra:
-            parser.error(
-                "unexpected extra argument (a proxy URL is given once; values "
-                "are not echoed)"
-            )
-    else:
-        args = parser.parse_args(argv)
+    # ``add --proxy URL`` takes the only argument of this parser that can
+    # carry a password. Every refusal argparse formats for it echoes the
+    # value — an extra positional, ``--slot=<URL>``, ``--alias=<URL>`` — so
+    # redaction is on for exactly those invocations and off otherwise.
+    parser.redact_urls = _carries_proxy(argv)
+    args = parser.parse_args(argv)
 
     # No action selected: emit a clean, subcommand-oriented message rather than
     # the raw argparse "one of the arguments ... is required" (which would list
@@ -2206,12 +2190,21 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 sys.exit(_menubar_foreground(switcher, service_pid, worker=worker))
             sys.exit(_menubar_start(args))
     except ClaudeSwitchError as e:
+        # `add --proxy` is the one path through this handler whose error may
+        # name a URL (an identifier that is one, a slot conflict): the same
+        # redaction the parser uses, so the value never reaches stderr or a
+        # log line.
+        message = (
+            account_proxy.redact_urls(str(e))
+            if _carries_proxy(argv)
+            else str(e)
+        )
         # In JSON mode keep stdout pure JSON: emit the structured error envelope
         # there (exit 1) instead of a red stderr line.
         if args.json:
             print(json.dumps(error_envelope(e), indent=2))
         else:
-            error(f"Error: {e}")
+            error(f"Error: {message}")
         sys.exit(1)
     except KeyboardInterrupt:
         # Route the cancellation note to stderr in JSON mode so stdout stays

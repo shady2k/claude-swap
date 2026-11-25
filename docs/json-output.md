@@ -10,7 +10,9 @@
 
 ## Usage windows
 
-Each account row has a `usage` object with `fiveHour` and `sevenDay` windows (`pct`, `resetsAt`).
+Each account row has a `usageStatus` and a `usage` object with `fiveHour` and `sevenDay` windows (`pct`, `resetsAt`).
+
+`usageStatus` reports the state of the reading, not the quota: `ok`, `unavailable` (nothing decision-grade is stored), `no_credentials`, `api_key` (no subscription quota), `keychain_unavailable`, `token_expired`, `relogin_required`, `foreign_credential` (the live login belongs to another account), and `owner_changed` — this pass could not confirm the account's owner and route (another cswap process held the account lock, or the account moved between the reads), so no request was sent and the last stored reading is shown. `owner_changed` is re-derived on every pass; it is not a stored state.
 
 - A window's `pct` is `null` when the usage API reported `utilization: null` for it.
 - A window the account does not have (an Ultra account's `fiveHour`) is omitted.
@@ -31,7 +33,7 @@ These apply to `list` rows and the managed active row from `status --json`. All 
 | `threshold` | a per-account threshold is set with `cswap threshold` | e.g. `85.0`; absent otherwise, so a fleet that never sets a policy emits rows identical to before. |
 | `alias` | an alias is set with `cswap alias` | e.g. `"dev"`; accounts without one omit the key. |
 | `loginExpiresAt` | the stored login records when its refresh token expires | ISO-8601 UTC: the moment the slot will need a fresh `/login` and `cswap add --slot N`, so a script can warn a few days ahead instead of discovering `relogin_required`. Absent when Claude Code recorded no such date for that login. |
-| `proxy` | the account has a proxy set with `cswap proxy` | The masked URL, e.g. `"http://user:***@127.0.0.1:3128"` — the password never leaves the store. A stored value that cannot be used reads `"invalid (…)"` and fails every request closed instead of going direct. Absent only for a direct account (no key at all). |
+| `proxy` | the account has a proxy set with `cswap proxy` | The stored setting, masked: e.g. `"http://user:***@127.0.0.1:3128"` — the password never leaves the store. A stored value that cannot be used reads `"invalid (…)"` and fails every request closed instead of going direct. Absent only for a direct account (no key at all). A request skipped this pass (see `owner_changed`) does not change this field. |
 | `plan` | the slot's subscription plan has been read from the profile endpoint at least once | `label` as the human views print it (`Ultra`, `Max 5x`, `Pro`, `Team`, `Free`), the raw `tier`, then `organizationType`, `billingType`, `subscriptionStatus` and `planDisplayName` when the profile carried them, `expired` (`true` once the subscription is `canceled` and the account is back on the free tier; the human views show that as a highlighted `Free`) and `fetchedAt`, the last successful profile read. Plans refresh on their own six-hour cadence, not with usage. |
 
 ## Pace fields on weekly windows

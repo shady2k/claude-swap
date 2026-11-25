@@ -602,6 +602,49 @@ class TestSettingLifecycle:
             "http://127.0.0.1:3128"
         )
 
+    def test_an_ordinary_add_to_a_free_slot_keeps_the_proxy(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """``add --slot N`` moves the account, not the setting: a free target
+        slot has no record of its own to read it from, and dropping it here
+        would send the account direct on its next request."""
+        s = _switcher(sample_sequence_data)
+        s.set_account_proxy("1", "http://user:pw@127.0.0.1:3128")
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live", "refreshToken": "rt-live",
+            "expiresAt": 9999999999000,
+        }})
+        with patch.object(s, "_read_capture_credentials", return_value=creds), \
+             patch("claude_swap.oauth.fetch_oauth_profile", return_value=None):
+            s.add_account(slot=4, assume_yes=True)
+        data = s._get_sequence_data()
+        assert "1" not in data["accounts"] and "1" not in data["sequence"]
+        assert data["accounts"]["4"]["email"] == "test@example.com"
+        assert data["accounts"]["4"]["proxy"] == "http://user:pw@127.0.0.1:3128"
+
+    def test_a_damaged_null_proxy_survives_a_move_and_still_fails_closed(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """``null`` is damage, not "no proxy": a move must carry the KEY, so
+        the destination keeps refusing instead of quietly going direct."""
+        s = _switcher(sample_sequence_data)
+        data = s._get_sequence_data()
+        data["accounts"]["1"][account_proxy.FIELD] = None
+        s._write_json(s.sequence_file, data)
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live", "refreshToken": "rt-live",
+            "expiresAt": 9999999999000,
+        }})
+        with patch.object(s, "_read_capture_credentials", return_value=creds), \
+             patch("claude_swap.oauth.fetch_oauth_profile", return_value=None):
+            s.add_account(slot=4, assume_yes=True)
+
+        record = s._get_sequence_data()["accounts"]["4"]
+        assert account_proxy.FIELD in record and record[account_proxy.FIELD] is None
+        assert account_proxy.describe(record) == (
+            "invalid (the stored value is not a URL)"
+        )
+
     def test_add_stores_an_explicit_proxy(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
@@ -1095,6 +1138,26 @@ class TestOwnershipUnderTheLock:
         by_num = {a["number"]: a for a in payload["accounts"]}
         assert by_num[1]["usageStatus"] == "owner_changed"
         assert USAGE_OWNER_CHANGED == "owner changed"  # the sentinel itself
+
+    def test_status_json_keeps_the_stored_proxy_when_the_lock_is_held(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+        direct_calls,
+    ):
+        """A skip must not be reported through `proxy`: the field is the
+        stored setting, so a lock nobody can see on screen must not make an
+        account with a healthy proxy read as broken."""
+        s = _switcher(sample_sequence_data)
+        s.set_account_proxy("1", "http://user:pw@127.0.0.1:3128")
+        handle = FileLock(s.lock_file, timeout=1.0)
+        assert handle.acquire()
+        try:
+            payload = s._build_status_payload()
+        finally:
+            handle.release()
+
+        assert payload["active"]["proxy"] == "http://user:***@127.0.0.1:3128"
+        assert payload["active"]["usageStatus"] == "owner_changed"
+        assert direct_calls == []
 
     def test_a_sibling_with_the_same_email_is_not_the_account(
         self, temp_home: Path, sample_sequence_data: dict, direct_calls,

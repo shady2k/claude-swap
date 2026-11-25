@@ -2341,7 +2341,7 @@ class TestProxyCommand:
         assert exc.value.code == 2
         err = capsys.readouterr().err
         assert "secret" not in err and "3129" not in err
-        assert "unexpected extra argument" in err
+        assert "unrecognized arguments: <URL>" in err
 
     @pytest.mark.parametrize("flag", ["--unset", "--debug"])
     def test_a_value_attached_to_a_boolean_flag_is_not_echoed(
@@ -2359,8 +2359,38 @@ class TestProxyCommand:
         assert exc.value.code == 2
         err = capsys.readouterr().err
         assert "secret" not in err
-        assert f"{flag} takes no value" in err
+        assert f"argument {flag}: ignored explicit argument '<URL>'" in err
         assert ClaudeAccountSwitcher().sequence_file.read_bytes() == before
+
+    def test_an_abbreviated_flag_does_not_echo_its_value(self, temp_home, capsys):
+        """argparse expands ``--uns`` to ``--unset`` before it refuses the
+        attached value, so matching the flag's exact spelling was not enough."""
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._proxy_command([
+                    "2", "--uns=http://user:secret@127.0.0.1:3128",
+                ])
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "secret" not in err and "3128" not in err
+        assert "ignored explicit argument '<URL>'" in err
+
+    def test_a_url_that_lands_on_the_identifier_is_not_echoed(
+        self, temp_home, capsys,
+    ):
+        """``proxy <URL> --unset`` resolves the URL as an account identifier;
+        the not-found message would repeat it, password included."""
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._proxy_command([
+                    "http://user:secret@127.0.0.1:3128", "--unset",
+                ])
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "secret" not in err and "3128" not in err
+        assert "No account found with identifier: <URL>" in err
 
     def test_add_with_a_second_url_is_not_echoed(self, temp_home, capsys):
         """The main parser is the other place a proxy URL arrives; its extra
@@ -2376,7 +2406,25 @@ class TestProxyCommand:
         assert exc.value.code == 2
         err = capsys.readouterr().err
         assert "secret" not in err and "3129" not in err
-        assert "unexpected extra argument" in err
+        assert "unrecognized arguments: <URL>" in err
+
+    def test_add_with_a_url_that_lands_on_another_argument_is_not_echoed(
+        self, temp_home, capsys,
+    ):
+        """``--slot`` converts to int, so a URL there fails argparse's own
+        ``invalid int value`` — which formats the value it could not convert."""
+        with patch("os.geteuid", return_value=1000, create=True) as _:
+            with pytest.raises(SystemExit) as exc:
+                with patch.object(sys, "argv", [
+                    "claude-swap", "add", "--proxy",
+                    "http://user:secret@127.0.0.1:3128",
+                    "--slot=http://user:other-secret@127.0.0.1:3129",
+                ]):
+                    cli.main()
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "secret" not in err and "3129" not in err
+        assert "invalid int value: '<URL>'" in err
 
     def test_an_unknown_flag_is_not_echoed_either(self, temp_home, capsys):
         self._seeded_switcher_env(temp_home)
