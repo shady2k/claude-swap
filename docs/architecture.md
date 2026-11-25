@@ -25,6 +25,7 @@ It works on the same files and Keychain items Claude Code uses, and takes Claude
 - `session.py`: `SessionManager`, behind `cswap run`. `mappings.py` maps a directory to an account.
 - `usage_store.py`: `UsageStore`, the per-account usage table. `poll_policy.py` holds every polling number. `snapshot_source.py` is the read path for dashboards.
 - `oauth.py`: the token, usage and profile endpoints, the header probe, and the formatting of reset times. `subscription.py` reads the plan label; `pace.py` computes the weekly pace marker.
+- `account_proxy.py`: an account's proxy, and the pinned route its requests take. Every network call in `oauth.py` and `subscription.py` goes through it.
 - `transfer.py`: export and import. `settings.py`: `settings.json`. `migrations.py`: one-time data migrations. `update_check.py`: the PyPI version check.
 
 **Storage and platform.** Leaf modules that the core calls.
@@ -104,7 +105,9 @@ Read next: the docstrings of `consume_backup_grant` and `_fetch_active_usage`.
 
 If the account is already the active default login, it starts plain `claude` instead, because two copies of one credential drift apart.
 
-Read next: the module docstring of `session.py`.
+A launch of an account with a proxy reads the route once, refuses before any Claude Code process (the `claude auth status` probe included) when one `CONNECT` through it fails, and hands Claude Code that proxy in its environment. The same applies to plain claude on a default login whose slot has one.
+
+Read next: the module docstring of `session.py`, and [proxy.md](proxy.md#launching-claude-code).
 
 ### Auto-switch
 
@@ -124,6 +127,7 @@ Read next: the module docstring of `autoswitch.py`. The rules as users see them 
 - **Surfaces hold no account logic.** Dashboards read through `SnapshotSource`; the engine does not print.
 - **Import direction.** `session.py` and `credentials.py` do not import `switcher.py`. `fsutil.py` imports nothing from the package. The TUI's heavy imports stay inside `tui.run`.
 - **Paths come from `paths.py`.** Do not hardcode `~/.claude`; Claude Code's own resolution has cases that differ.
+- **A request for an account travels that account's route.** Every network call in `oauth.py` and `subscription.py` takes an `account_proxy` route; a slot with no proxy goes direct, and one whose proxy is set never does. The route comes from the same read as the credential it is used for (`AccountInfo` in `switcher.py`), so a concurrent `swap`/`move` cannot pair one account's token with another slot's route. A launch of such an account takes the same route — checked before Claude Code starts and handed to it in the environment — and one whose route cannot be confirmed is refused rather than run direct.
 
 ## Tests
 

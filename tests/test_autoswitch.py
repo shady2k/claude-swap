@@ -2593,7 +2593,7 @@ class TestTokenIdentity:
             "expiresAt": 99_999_999_999_000,
         }})
 
-        def refresh(creds):
+        def refresh(creds, *args, **kwargs):
             data = json.loads(creds)["claudeAiOauth"]
             if data["refreshToken"] == "rt-2":
                 return oauth.RefreshOutcome(
@@ -2641,7 +2641,7 @@ class TestTokenIdentity:
             }}),
         )
 
-        def refresh(creds):
+        def refresh(creds, *args, **kwargs):
             data = json.loads(creds)["claudeAiOauth"]
             if data["refreshToken"] == "rt-2-dead":
                 return oauth.RefreshOutcome(None, "invalid_grant")

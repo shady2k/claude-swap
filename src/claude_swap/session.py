@@ -43,6 +43,15 @@ Junctions are not symlinks to the stdlib: ``is_symlink()`` is False for one,
 link cswap made" is therefore ``fsutil.is_link``, and the merge walks a
 profile's history with its own eyes (``_history_tree``).
 
+Every launch — a session profile, plain claude on the default login, and the
+``claude auth status`` probe — gets its environment from ``_claude_env``:
+non-essential traffic off, and, for an account that has a proxy, that account's
+``HTTPS_PROXY``/``HTTP_PROXY``/``ALL_PROXY``/``NO_PROXY`` in place of whatever
+the shell carried. The route is read once, before any profile work, and
+``account_proxy.probe`` refuses the launch when it cannot be used. Nothing here
+forbids a direct connection at the OS level: a program that ignores these
+variables still goes out directly (``docs/proxy.md``).
+
 This module must not import ``switcher`` (switcher imports us for the
 session-aware guards); it receives a ``ClaudeAccountSwitcher`` instance.
 """
@@ -61,7 +70,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from claude_swap import macos_keychain, spawn
+from claude_swap import account_proxy, macos_keychain, spawn
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
@@ -85,6 +94,7 @@ from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import ClaudeSession, scan_sessions
 from claude_swap.settings import (
+    DEFAULT_NO_PROXY,
     atomic_write_json,
     explicit_share_history,
     load_run_settings,
@@ -717,11 +727,49 @@ def _adds_nothing(target: Path, candidate: Path) -> bool:
         return False
 
 
-def _probe_env(session_dir: Path) -> dict[str, str]:
-    """Env for the auth-status probe: session config dir, auth overrides dropped."""
+def _claude_env(
+    base: dict[str, str],
+    route: account_proxy.ProxyRoute | None,
+    no_proxy: str,
+) -> dict[str, str]:
+    """The environment every Claude Code process cswap starts is given.
+
+    ``CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`` switches off the traffic
+    Claude Code sends for its own purposes (code.claude.com/docs/en/env-vars):
+    auto-updates, telemetry, error reporting, ``/feedback`` and Claude-drafted
+    feedback, release notes, the PR/MR status badges, availability checks such
+    as the fast mode check, and the feature flags it would otherwise fetch —
+    which is what makes Remote Control unavailable in these sessions. ``0``
+    does not turn that traffic back on; only unsetting the variable does.
+
+    For an account with a proxy the account's own variables go in over the
+    inherited ones (see ``account_proxy.launch_env``); an account without one
+    keeps the proxy variables it inherited, exactly as before the setting
+    existed. Nothing here forbids a direct connection at the OS level: a
+    program that ignores these variables still reaches the internet directly.
+    """
+    env = dict(base)
+    if route is not None:
+        env = account_proxy.launch_env(route, no_proxy, env)
+    env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+    return env
+
+
+def _probe_env(
+    session_dir: Path,
+    route: account_proxy.ProxyRoute | None = None,
+    no_proxy: str = DEFAULT_NO_PROXY,
+) -> dict[str, str]:
+    """Env for the auth-status probe: session config dir, auth overrides dropped.
+
+    ``claude auth status`` is documented as a local check, but it is still
+    Claude Code being spawned into the profile — a network client as ever — so
+    the probe gets the environment the launch will (:func:`_claude_env`). By
+    then the proxy has already answered the pre-start check.
+    """
     env = {k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS}
     env["CLAUDE_CONFIG_DIR"] = str(session_dir)
-    return env
+    return _claude_env(env, route, no_proxy)
 
 
 class SessionManager:
@@ -769,6 +817,13 @@ class SessionManager:
         and a session on the default login is the one thing an account
         switch can later pull out from under it.
 
+        The account's proxy, if it has one, is resolved here — once, with the
+        identity that names the slot — and checked with one ``CONNECT`` before
+        any profile is created, seeded or probed: an unusable proxy ends the
+        command here, with Claude Code never started. That identity goes on to
+        ``setup_session``, which refuses the launch when the slot no longer
+        holds it.
+
         Notices on the way are printed plainly. `cswap run` sends them to
         stderr, because stdout is claude's (``cli._run_launch``).
         """
@@ -789,6 +844,15 @@ class SessionManager:
         # Guard before the same-account direct-launch fast path below (which
         # _exec's claude and never returns) — and before setup_session.
         self._ensure_not_api_key(account_num, email)
+        # ONE route for this launch, read with the account it belongs to: the
+        # environment the launch hands Claude Code and the pre-start probe
+        # must both be this account's proxy, never whichever slot holds the
+        # number later (see ``account_route``). The identity is also handed to
+        # setup_session, which refuses the launch when a `swap`/`move` gave the
+        # slot to another account during the check — the accepted "one command
+        # at a time" boundary in docs/proxy.md.
+        route = self.switcher.account_route(account_num, email, org_uuid)
+        self._check_proxy(route, f"Account-{account_num} ({email})")
 
         config_dir_preset = os.environ.get("CLAUDE_CONFIG_DIR")
         # Same-account fast path: never create a second credential copy
@@ -838,7 +902,7 @@ class SessionManager:
                 session_dir_for(self.switcher.backup_dir, account_num, email),
                 share_history,
             )
-            env = dict(os.environ)
+            env = self._launch_env(route, dict(os.environ))
             # Run on the default login, not on the preset profile.
             env.pop("CLAUDE_CONFIG_DIR", None)
             self._exec(claude_bin, claude_args, env=env)
@@ -856,7 +920,11 @@ class SessionManager:
             )
 
         session_dir, account_num, email = self.setup_session(
-            identifier, share, requested_history
+            identifier,
+            share,
+            requested_history,
+            route=route,
+            account=(account_num, email, org_uuid),
         )
 
         print(
@@ -867,7 +935,7 @@ class SessionManager:
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
-        self._exec(claude_bin, claude_args, env=env)
+        self._exec(claude_bin, claude_args, env=self._launch_env(route, env))
 
     def _history_on_the_fast_path(
         self, session_dir: Path, share_history: bool
@@ -994,16 +1062,58 @@ class SessionManager:
 
         Used by `cswap run` (no account) when the cwd has no mapping, or its
         mapped account no longer exists. Equivalent to typing `claude`
-        directly: the unmodified environment is passed through (no session
-        profile, no auth-override scrubbing), so whatever the default login
-        resolves to is what runs.
+        directly: no session profile and no auth-override scrubbing, so
+        whatever the default login resolves to is what runs.
+
+        When that login belongs to a managed slot that has a proxy, the launch
+        takes that slot's proxy, and refuses before starting when it cannot be
+        used — the same environment and the same pre-start check a session
+        launch gets. A login that names no slot keeps the proxy variables it
+        inherited: there is no account whose route they could be replaced
+        with.
         """
         claude_bin = shutil.which("claude")
         if not claude_bin:
             raise SessionError(
                 "'claude' was not found on PATH. Install Claude Code first."
             )
-        self._exec(claude_bin, claude_args, env=dict(os.environ))
+        route = self.switcher.live_login_route()
+        self._check_proxy(route, "The default login's account")
+        self._exec(
+            claude_bin, claude_args, env=self._launch_env(route, dict(os.environ))
+        )
+
+    def _check_proxy(
+        self, route: account_proxy.ProxyRoute | None, who: str
+    ) -> None:
+        """Refuse the launch before Claude Code starts when its proxy is unusable.
+
+        One ``CONNECT api.anthropic.com:443`` (``account_proxy.probe``): no
+        connection, no 200, rejected credentials, a redirect or an unparsable
+        stored value all end the command here — before any profile work, any
+        ``claude`` spawn and any token. The message never repeats the proxy
+        URL or its user name: both may carry credentials.
+        """
+        if route is None:
+            return
+        try:
+            account_proxy.probe(route)
+        except account_proxy.ProxyRouteError as e:
+            raise SessionError(
+                f"{who} has a proxy that cannot be used: {e}. "
+                "Claude Code was not started."
+            ) from None
+
+    def _launch_env(
+        self, route: account_proxy.ProxyRoute | None, base: dict[str, str]
+    ) -> dict[str, str]:
+        """Environment for one launch (``_claude_env`` with ``run.noProxy``)."""
+        no_proxy = DEFAULT_NO_PROXY if route is None else self._no_proxy()
+        return _claude_env(base, route, no_proxy)
+
+    def _no_proxy(self) -> str:
+        """The ``NO_PROXY`` list a launch hands Claude Code (``run.noProxy``)."""
+        return load_run_settings(self.switcher.backup_dir).no_proxy
 
     def _exec(self, claude_bin: str, claude_args: list[str], env: dict[str, str]) -> NoReturn:
         """Hand the terminal over to claude. Never returns.
@@ -1040,15 +1150,36 @@ class SessionManager:
     # -- bootstrap -------------------------------------------------------
 
     def setup_session(
-        self, identifier: str, share: bool, share_history: bool | None = None
+        self,
+        identifier: str,
+        share: bool,
+        share_history: bool | None = None,
+        route: account_proxy.ProxyRoute | None = None,
+        account: tuple[str, str, str] | None = None,
     ) -> tuple[Path, str, str]:
         """Ensure a valid session profile exists; returns (dir, num, email).
 
         ``share_history`` is read like ``run``'s: ``None`` means
-        ``run.shareHistory`` decides.
+        ``run.shareHistory`` decides. ``route`` is the account's proxy, already
+        checked before this call: it goes to the ``auth status`` probe so the
+        probe reaches the profile through the same route the launch will.
+
+        ``account`` is the ``(slot, email, organization)`` a launch resolved
+        and checked its proxy for. The slot is read again here, and a record
+        that no longer holds that account ends the launch before any profile
+        work: preparing the neighbour's profile under this account's route
+        would be a session the launch never selected.
         """
         share_history = self._resolve_share_history(share_history)
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+        if account is not None and (account_num, email, org_uuid) != account:
+            selected_num, selected_email, _selected_org = account
+            raise SessionError(
+                f"Account-{selected_num} ({selected_email}) changed while its "
+                "proxy was being checked: the slot now holds another account. "
+                "Nothing was prepared and Claude Code was not started; run "
+                "the command again."
+            )
         # Defense-in-depth: also guard here (run() guards before its fast path).
         self._ensure_not_api_key(account_num, email)
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
@@ -1061,7 +1192,9 @@ class SessionManager:
         stale = is_session_stale(session_dir) and profile_is_quiescent(session_dir)
 
         # Cheap reuse check without the lock: most launches hit this.
-        if not stale and self._is_session_valid(session_dir, email, org_uuid):
+        if not stale and self._is_session_valid(
+            session_dir, email, org_uuid, route=route
+        ):
             self._sync_sharing(session_dir, share, share_history)
             return session_dir, account_num, email
 
@@ -1145,7 +1278,9 @@ class SessionManager:
             if is_session_stale(session_dir) and profile_is_quiescent(session_dir):
                 self.switcher._invalidate_session_credentials(account_num, email)
                 clear_session_stale(session_dir)
-            if self._is_session_valid(session_dir, email, org_uuid):
+            if self._is_session_valid(
+                session_dir, email, org_uuid, route=route
+            ):
                 # Valid, but possibly not on the generation WE just paid for.
                 # The consume above runs outside this lock (it POSTs), so a
                 # peer `cswap run` can bootstrap while we wait — and its
@@ -1176,7 +1311,9 @@ class SessionManager:
             self._bootstrap(session_dir, account_num, email, org_uuid)
             self._sync_sharing(session_dir, share, share_history)
 
-            verdict = self._session_validity(session_dir, email, org_uuid)
+            verdict = self._session_validity(
+                session_dir, email, org_uuid, route=route
+            )
             # NEITHER probe-failure verdict may reach `_cleanup_failed_session`
             # below: it deletes the Keychain entry and the whole directory, and
             # running it here would destroy a profile we never managed to look
@@ -1343,7 +1480,11 @@ class SessionManager:
     # -- validation ------------------------------------------------------
 
     def _session_validity(
-        self, session_dir: Path, email: str, org_uuid: str
+        self,
+        session_dir: Path,
+        email: str,
+        org_uuid: str,
+        route: account_proxy.ProxyRoute | None = None,
     ) -> str:
         """``"valid"`` / ``"invalid"`` / ``"unknown"`` / ``"unreachable"``.
 
@@ -1377,7 +1518,7 @@ class SessionManager:
         try:
             result = spawn.run(
                 [claude_bin, "auth", "status", "--json"],
-                env=_probe_env(session_dir),
+                env=_probe_env(session_dir, route, self._no_proxy()),
                 capture_output=True,
                 text=True,
                 timeout=_AUTH_STATUS_TIMEOUT,
@@ -1416,7 +1557,13 @@ class SessionManager:
             return "invalid"
         return "valid"
 
-    def _is_session_valid(self, session_dir: Path, email: str, org_uuid: str) -> bool:
+    def _is_session_valid(
+        self,
+        session_dir: Path,
+        email: str,
+        org_uuid: str,
+        route: account_proxy.ProxyRoute | None = None,
+    ) -> bool:
         """Whether the profile is usable as far as we can tell.
 
         Reuse-shaped view of :meth:`_session_validity`, and best-effort by
@@ -1438,7 +1585,7 @@ class SessionManager:
         difference between a correct cleanup and deleting a working profile,
         and this boolean cannot express it.
         """
-        verdict = self._session_validity(session_dir, email, org_uuid)
+        verdict = self._session_validity(session_dir, email, org_uuid, route=route)
         if verdict == "unknown":
             return _artifacts_say_usable(session_dir, email, org_uuid)
         return verdict == "valid"

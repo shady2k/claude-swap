@@ -279,7 +279,9 @@ class TestUsageDisplay:
     @pytest.mark.parametrize("key", [API_KEY, PERSONAL_KEY])
     def test_collect_usage_short_circuits(self, temp_home: Path, key):
         s = _linux_switcher()
-        info = [(2, "api-key-2@token.local", "", "", False, key, "")]
+        info = [(
+            2, "api-key-2@token.local", "", "", False, key, "", None,
+        )]
         entries = s._collect_usage_entries(info)
         assert entries["2"].sentinel == USAGE_API_KEY
         assert entries["2"].decision_value() == USAGE_API_KEY
@@ -290,7 +292,9 @@ class TestUsageDisplay:
         get_global_config_path().write_text(
             json.dumps({"primaryApiKey": key}), encoding="utf-8"
         )
-        entry, _login_expires_at = s._active_account_usage("2", "api-key-2@token.local", "")
+        entry, _login_expires_at = s._active_account_usage((
+            2, "api-key-2@token.local", "", "", True, key, "", None,
+        ))
         assert entry.sentinel == USAGE_API_KEY
         assert entry.decision_value() == USAGE_API_KEY
 

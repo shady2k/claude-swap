@@ -1457,7 +1457,8 @@ class TestRunCommand:
             'import json, sys\nprint(json.dumps({"args": sys.argv[1:]}))\n'
         )
         # An unmapped directory launches the default login, which reads no
-        # credential on the way, so the stub needs nothing account-shaped.
+        # credential on the way; its route is the one account-shaped answer
+        # this launch asks for (none: no slot, so nothing to apply).
         script = textwrap.dedent("""\
             import sys
             from pathlib import Path
@@ -1470,6 +1471,7 @@ class TestRunCommand:
                 backup_dir=Path.cwd(),
                 _logger=None,
                 slot_for_directory=lambda cwd: (None, None),
+                live_login_route=lambda: None,
                 _is_running_in_container=lambda: True,
             )
             argv = ["cswap", "run", "--", sys.argv[1], "--output-format", "stream-json"]
@@ -2228,6 +2230,307 @@ class TestAliasCommand:
 
         data = ClaudeAccountSwitcher()._get_sequence_data()
         assert data["accounts"]["1"]["alias"] == "dev"
+
+class TestProxyCommand:
+    """`cswap proxy` — set/unset/list an account's HTTP proxy."""
+
+    def _seeded_switcher_env(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["accounts"]["2"] = {
+            "email": "work@co.com",
+            "uuid": "u2",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [2]
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    def test_set_proxy_by_number_masks_the_password(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._proxy_command(["2", "http://user:secret@127.0.0.1:3128"])
+
+        out = capsys.readouterr().out
+        assert "secret" not in out
+        assert "127.0.0.1:3128" in out
+        data = ClaudeAccountSwitcher()._get_sequence_data()
+        assert data["accounts"]["2"]["proxy"] == (
+            "http://user:secret@127.0.0.1:3128"
+        )
+
+    def test_set_proxy_by_email(self, temp_home):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._proxy_command(["work@co.com", "http://127.0.0.1:3128"])
+        data = ClaudeAccountSwitcher()._get_sequence_data()
+        assert data["accounts"]["2"]["proxy"] == "http://127.0.0.1:3128"
+
+    def test_unset_proxy(self, temp_home, capsys):
+        switcher = self._seeded_switcher_env(temp_home)
+        switcher.set_account_proxy("2", "http://127.0.0.1:3128")
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._proxy_command(["2", "--unset"])
+        assert "Cleared" in capsys.readouterr().out
+        assert "proxy" not in ClaudeAccountSwitcher()._get_sequence_data()[
+            "accounts"
+        ]["2"]
+
+    def test_list_proxies(self, temp_home, capsys):
+        switcher = self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._proxy_command([])
+        assert "No account proxies set" in capsys.readouterr().out
+
+        switcher.set_account_proxy("2", "http://user:secret@127.0.0.1:3128")
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._proxy_command([])
+        out = capsys.readouterr().out
+        assert "127.0.0.1:3128" in out and "work@co.com" in out
+        assert "secret" not in out
+
+    def test_an_unusable_proxy_is_refused_and_changes_nothing(
+        self, temp_home, capsys,
+    ):
+        switcher = self._seeded_switcher_env(temp_home)
+        before = switcher.sequence_file.read_bytes()
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._proxy_command(["2", "https://user:secret@127.0.0.1:3128"])
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "only http://" in err
+        assert "secret" not in err
+        assert switcher.sequence_file.read_bytes() == before
+
+    def test_a_url_without_unset_and_unset_with_a_url_are_usage_errors(
+        self, temp_home, capsys,
+    ):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._proxy_command(["2"])
+        assert exc.value.code == 2
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._proxy_command(["2", "--unset", "http://127.0.0.1:3128"])
+        assert exc.value.code == 2
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="root guard is POSIX-only")
+    def test_proxy_refuses_root(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=0, create=True), \
+             patch.object(ClaudeAccountSwitcher, "_is_running_in_container",
+                          return_value=False):
+            with pytest.raises(SystemExit) as exc:
+                cli._proxy_command(["2", "http://127.0.0.1:3128"])
+        assert exc.value.code == 1
+        assert "root" in capsys.readouterr().err
+
+    def test_a_stray_second_argument_is_not_echoed(self, temp_home, capsys):
+        """A mistyped second URL can carry a password; argparse would print it."""
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._proxy_command([
+                    "2", "http://user:secret@127.0.0.1:3128",
+                    "http://user:other-secret@127.0.0.1:3129",
+                ])
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "secret" not in err and "3129" not in err
+        assert "unrecognized arguments: <URL>" in err
+
+    @pytest.mark.parametrize("flag", ["--unset", "--debug"])
+    def test_a_value_attached_to_a_boolean_flag_is_not_echoed(
+        self, temp_home, capsys, flag,
+    ):
+        """``--unset=http://user:secret@host`` is one token, and argparse's
+        "ignored explicit argument '<value>'" would print all of it."""
+        self._seeded_switcher_env(temp_home)
+        before = ClaudeAccountSwitcher().sequence_file.read_bytes()
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._proxy_command([
+                    "2", f"{flag}=http://user:secret@127.0.0.1:3128",
+                ])
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "secret" not in err
+        assert f"argument {flag}: ignored explicit argument '<URL>'" in err
+        assert ClaudeAccountSwitcher().sequence_file.read_bytes() == before
+
+    def test_an_abbreviated_flag_does_not_echo_its_value(self, temp_home, capsys):
+        """argparse expands ``--uns`` to ``--unset`` before it refuses the
+        attached value, so matching the flag's exact spelling was not enough."""
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._proxy_command([
+                    "2", "--uns=http://user:secret@127.0.0.1:3128",
+                ])
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "secret" not in err and "3128" not in err
+        assert "ignored explicit argument '<URL>'" in err
+
+    def test_a_url_that_lands_on_the_identifier_is_not_echoed(
+        self, temp_home, capsys,
+    ):
+        """``proxy <URL> --unset`` resolves the URL as an account identifier;
+        the not-found message would repeat it, password included."""
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._proxy_command([
+                    "http://user:secret@127.0.0.1:3128", "--unset",
+                ])
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "secret" not in err and "3128" not in err
+        assert "No account found with identifier: <URL>" in err
+
+    def test_add_with_a_second_url_is_not_echoed(self, temp_home, capsys):
+        """The main parser is the other place a proxy URL arrives; its extra
+        positional would be echoed verbatim by argparse."""
+        with patch("os.geteuid", return_value=1000, create=True) as _:
+            with pytest.raises(SystemExit) as exc:
+                with patch.object(sys, "argv", [
+                    "claude-swap", "add", "--proxy",
+                    "http://user:secret@127.0.0.1:3128",
+                    "http://user:other-secret@127.0.0.1:3129",
+                ]):
+                    cli.main()
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "secret" not in err and "3129" not in err
+        assert "unrecognized arguments: <URL>" in err
+
+    def test_add_with_a_url_that_lands_on_another_argument_is_not_echoed(
+        self, temp_home, capsys,
+    ):
+        """``--slot`` converts to int, so a URL there fails argparse's own
+        ``invalid int value`` — which formats the value it could not convert."""
+        with patch("os.geteuid", return_value=1000, create=True) as _:
+            with pytest.raises(SystemExit) as exc:
+                with patch.object(sys, "argv", [
+                    "claude-swap", "add", "--proxy",
+                    "http://user:secret@127.0.0.1:3128",
+                    "--slot=http://user:other-secret@127.0.0.1:3129",
+                ]):
+                    cli.main()
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "secret" not in err and "3129" not in err
+        assert "invalid int value: '<URL>'" in err
+
+    @pytest.mark.parametrize("flag", ["--pr", "--pro", "--prox"])
+    def test_add_with_an_abbreviated_proxy_flag_is_not_echoed(
+        self, temp_home, capsys, flag,
+    ):
+        """argparse expands any unambiguous prefix of ``--proxy`` before it
+        parses, so each of these takes a proxy value as well; the gate that
+        turns redaction on matched only the full spelling, and a stray URL was
+        echoed."""
+        with patch("os.geteuid", return_value=1000, create=True):
+            for given in (
+                [flag, "http://user:fictional-marker@127.0.0.1:3128"],
+                [f"{flag}=http://user:fictional-marker@127.0.0.1:3128"],
+            ):
+                with pytest.raises(SystemExit) as exc:
+                    with patch.object(sys, "argv", [
+                        "claude-swap", "add", *given,
+                        "http://user:other-fictional-marker@127.0.0.1:3129",
+                    ]):
+                        cli.main()
+                assert exc.value.code == 2
+                err = capsys.readouterr().err
+                assert "fictional-marker" not in err
+
+    @pytest.mark.parametrize("form", ["separate", "attached"])
+    def test_add_with_a_password_holding_a_space_is_not_echoed(
+        self, temp_home, capsys, form,
+    ):
+        """A password is arbitrary text: in a ``--slot`` value holding a URL
+        with a space in its password, the URL pattern stopped at the space and
+        printed the rest of the password."""
+        url = "http://user:first half-fictional-marker@127.0.0.1:3128"
+        slot = ["--slot", url] if form == "separate" else [f"--slot={url}"]
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                with patch.object(sys, "argv", [
+                    "claude-swap", "add", "--proxy",
+                    "http://user:proxy-password@127.0.0.1:3128", *slot,
+                ]):
+                    cli.main()
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "fictional-marker" not in err
+        assert "proxy-password" not in err
+
+    def test_a_stray_proxy_argument_holding_a_space_is_not_echoed(
+        self, temp_home, capsys,
+    ):
+        """The same value as a stray positional reaches ``unrecognized
+        arguments`` joined with spaces, with no quoting to bound it."""
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                with patch.object(sys, "argv", [
+                    "claude-swap", "add", "--proxy",
+                    "http://user:proxy-password@127.0.0.1:3128",
+                    "http://user:first half-fictional-marker@127.0.0.1:3129",
+                ]):
+                    cli.main()
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "fictional-marker" not in err
+        assert "proxy-password" not in err
+
+    def test_an_unknown_flag_is_not_echoed_either(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._proxy_command(["2", "--http://user:secret@host"])
+        assert exc.value.code == 2
+        assert "secret" not in capsys.readouterr().err
+
+    def test_proxy_dispatched_from_main(self, temp_home):
+        with patch("claude_swap.cli._proxy_command") as proxy_fn, \
+             patch.object(sys, "argv",
+                          ["claude-swap", "proxy", "2", "http://127.0.0.1:3128"]):
+            cli.main()
+        proxy_fn.assert_called_once_with(["2", "http://127.0.0.1:3128"])
+
+    def test_add_with_proxy_flag(self, temp_home, mock_claude_config, capsys):
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        with patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(ClaudeAccountSwitcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(fake_creds, False)), \
+             patch.object(ClaudeAccountSwitcher, "_write_account_credentials"), \
+             patch.object(sys, "argv",
+                          ["claude-swap", "add", "--proxy",
+                           "http://user:secret@127.0.0.1:3128"]):
+            cli.main()
+
+        data = ClaudeAccountSwitcher()._get_sequence_data()
+        assert data["accounts"]["1"]["proxy"] == (
+            "http://user:secret@127.0.0.1:3128"
+        )
+
+    def test_proxy_flag_without_add_errors(self, temp_home, capsys):
+        with patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv",
+                          ["claude-swap", "list", "--proxy",
+                           "http://127.0.0.1:3128"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 2
+        assert "--proxy can only be used with 'add'" in capsys.readouterr().err
+
 
     def test_alias_flag_without_add_errors(self, temp_home, capsys):
         with patch("os.geteuid", return_value=1000, create=True), \

@@ -7,15 +7,19 @@ import json
 import logging
 import os
 import shutil
+import socket
+import subprocess
 import sys
 import threading
 import unicodedata
 from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from claude_swap import account_proxy
 from claude_swap import fsutil
 from claude_swap import macos_keychain
 from claude_swap import oauth
@@ -54,7 +58,7 @@ from claude_swap.session import (
     slugify_email,
     stale_marker_for,
 )
-from claude_swap.settings import set_setting
+from claude_swap.settings import load_run_settings, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 ACCOUNT_EMAIL = "account2@example.com"
@@ -1855,6 +1859,485 @@ class TestRun:
         monkeypatch.setattr(session_mod.shutil, "which", lambda name: None)
         with pytest.raises(SessionError, match="not found on PATH"):
             manager.exec_default([])
+
+
+# ---------------------------------------------------------------------------
+# the launch's proxy
+# ---------------------------------------------------------------------------
+
+
+class _ConnectProxy:
+    """A loopback proxy that answers CONNECT with a status the test picks.
+
+    The pre-start check is exactly one ``CONNECT api.anthropic.com:443``, so
+    recording it proves the account's proxy (and its credentials) carried the
+    check, and answering 200 or a refusal proves the launch goes ahead or
+    does not. Nothing here reaches the network: the tunnel is answered, not
+    forwarded, so no origin is ever dialled.
+    """
+
+    def __init__(self, status: int = 200) -> None:
+        self.status = status
+        self.requests: list[tuple[str, dict]] = []
+        proxy = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def do_CONNECT(self):  # noqa: N802 - http.server's spelling
+                proxy.requests.append((self.path, dict(self.headers)))
+                self.send_response(proxy.status)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args) -> None:
+                pass
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.httpd.daemon_threads = True
+        self.thread = threading.Thread(
+            target=self.httpd.serve_forever, daemon=True
+        )
+
+    def __enter__(self) -> "_ConnectProxy":
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=5)
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+
+@pytest.fixture
+def stream_proxy():
+    """A proxy that accepts the pre-start check."""
+    with _ConnectProxy() as server:
+        yield server
+
+
+@pytest.fixture
+def dead_proxy_url():
+    """A proxy address that refuses the connection, without a fixed port.
+
+    A bound socket that never listens makes the OS refuse the connection, and
+    holding it for the test keeps anything else from taking the port.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    try:
+        yield f"http://127.0.0.1:{sock.getsockname()[1]}"
+    finally:
+        sock.close()
+
+
+def _no_proxy_from_settings(manager: SessionManager) -> str:
+    return load_run_settings(manager.switcher.backup_dir).no_proxy
+
+
+class TestTheLaunchTakesTheAccountsProxy:
+    """The environment Claude Code is started with, and the check before it."""
+
+    def test_a_session_launch_carries_the_accounts_proxy(
+        self,
+        manager,
+        capture_exec,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        stream_proxy,
+    ):
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        env = exc.value.env
+        for name in (
+            "HTTPS_PROXY", "https_proxy",
+            "HTTP_PROXY", "http_proxy",
+            "ALL_PROXY", "all_proxy",
+        ):
+            assert env[name] == stream_proxy.url
+        expected_no_proxy = _no_proxy_from_settings(manager)
+        assert env["NO_PROXY"] == expected_no_proxy
+        assert env["no_proxy"] == expected_no_proxy
+        assert env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+        # One CONNECT, to the endpoint every run needs, before the launch.
+        assert [path for path, _ in stream_proxy.requests] == [
+            "api.anthropic.com:443"
+        ]
+
+    def test_inherited_spellings_do_not_win_over_the_accounts(
+        self,
+        manager,
+        capture_exec,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        stream_proxy,
+        monkeypatch,
+    ):
+        """A shell's lower-case proxy and ``NO_PROXY=*`` must not undo the
+        account's route: Claude Code resolves ``https_proxy`` first."""
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
+        monkeypatch.setenv("https_proxy", "http://shell.invalid:1")
+        monkeypatch.setenv("HTTP_PROXY", "http://shell.invalid:1")
+        monkeypatch.setenv("all_proxy", "http://shell.invalid:1")
+        monkeypatch.setenv("NO_PROXY", "*")
+        monkeypatch.setenv("no_proxy", "*")
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        env = exc.value.env
+        inherited = [
+            value for value in env.values() if "shell.invalid" in value
+        ]
+        assert inherited == []
+        assert env["https_proxy"] == stream_proxy.url
+        assert env["NO_PROXY"] == _no_proxy_from_settings(manager)
+        assert "*" not in env["NO_PROXY"]
+
+    def test_the_run_no_proxy_setting_is_the_whole_list(
+        self,
+        manager,
+        capture_exec,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        stream_proxy,
+    ):
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
+        set_setting(manager.switcher.backup_dir, "run.noProxy", "localhost, 10.0.0.0/8")
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        assert exc.value.env["NO_PROXY"] == "localhost,10.0.0.0/8"
+        assert exc.value.env["no_proxy"] == "localhost,10.0.0.0/8"
+
+    def test_the_auth_status_probe_travels_the_same_route(
+        self,
+        manager,
+        capture_exec,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        stream_proxy,
+        monkeypatch,
+    ):
+        """``claude auth status`` is Claude Code too: it gets the proxy the
+        launch will, or a probe on a proxied account could go direct."""
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
+        monkeypatch.setenv("https_proxy", "http://shell.invalid:1")
+        monkeypatch.setenv("NO_PROXY", "*")
+
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [])
+
+        # The probe really ran, and on the account's route.
+        assert auth_status_tracks_seed
+        for probe_env in auth_status_tracks_seed:
+            assert probe_env["HTTPS_PROXY"] == stream_proxy.url
+            assert probe_env["https_proxy"] == stream_proxy.url
+            assert "shell.invalid" not in " ".join(probe_env.values())
+            assert probe_env["NO_PROXY"] != "*"
+            assert probe_env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+
+    def test_the_fast_path_carries_the_proxy_too(
+        self, manager, capture_exec, stream_proxy, monkeypatch
+    ):
+        """Plain claude on the default login is the same account's traffic."""
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
+        _active_default_login(monkeypatch, manager)
+        monkeypatch.setenv("https_proxy", "http://shell.invalid:1")
+        monkeypatch.setenv("NO_PROXY", "*")
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
+        assert exc.value.env["HTTPS_PROXY"] == stream_proxy.url
+        assert exc.value.env["https_proxy"] == stream_proxy.url
+        assert "shell.invalid" not in " ".join(exc.value.env.values())
+        assert exc.value.env["NO_PROXY"] != "*"
+        assert [path for path, _ in stream_proxy.requests] == [
+            "api.anthropic.com:443"
+        ]
+
+    def test_exec_default_carries_the_live_logins_proxy(
+        self, manager, capture_exec, stream_proxy, monkeypatch
+    ):
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
+        _active_default_login(monkeypatch, manager)
+        monkeypatch.setenv("https_proxy", "http://shell.invalid:1")
+        monkeypatch.setenv("NO_PROXY", "*")
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.exec_default(["--resume"])
+
+        assert exc.value.env["HTTPS_PROXY"] == stream_proxy.url
+        assert exc.value.env["https_proxy"] == stream_proxy.url
+        assert "shell.invalid" not in " ".join(exc.value.env.values())
+        assert exc.value.env["NO_PROXY"] != "*"
+        assert [path for path, _ in stream_proxy.requests] == [
+            "api.anthropic.com:443"
+        ]
+
+    def test_the_password_reaches_the_child_only_through_the_environment(
+        self,
+        manager,
+        capture_exec,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        stream_proxy,
+        monkeypatch,
+    ):
+        """An argv is visible to every process on the machine, so the URL's
+        password may reach the probe and claude through the environment only."""
+        url = stream_proxy.url.replace("http://", "http://user:secret@")
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, url)
+        probe_argv: list[list[str]] = []
+        spawn_run = session_mod.spawn.run
+
+        def record(argv, **kwargs):
+            probe_argv.append(list(argv))
+            return spawn_run(argv, **kwargs)
+
+        monkeypatch.setattr(session_mod.spawn, "run", record)
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", ["--resume"])
+
+        assert exc.value.argv == ["/fake/bin/claude", "--resume"]
+        assert probe_argv and probe_argv[0][1:3] == ["auth", "status"]
+        for argv in (exc.value.argv, *probe_argv):
+            assert [arg for arg in argv if "secret" in arg] == []
+        # The environment is where it does travel.
+        assert auth_status_tracks_seed
+        assert all(env["HTTPS_PROXY"] == url for env in auth_status_tracks_seed)
+
+    def test_a_slot_that_changes_owner_during_the_check_stops_the_launch(
+        self,
+        manager,
+        capture_exec,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        stream_proxy,
+        monkeypatch,
+    ):
+        """The CONNECT runs outside any lock, so the account list can change
+        under it. The profile prepared afterwards must still be the account
+        whose route this launch checked — here a `swap` gives the slot to the
+        neighbour while the check runs."""
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
+        real_probe = account_proxy.probe
+
+        def swap_then_probe(route, timeout=account_proxy.PROBE_TIMEOUT_S):
+            manager.switcher.swap_accounts("1", ACCOUNT_NUM)
+            real_probe(route, timeout=timeout)
+
+        monkeypatch.setattr(account_proxy, "probe", swap_then_probe)
+
+        with pytest.raises(SessionError, match="now holds another account"):
+            manager.run("2", [])
+
+        # No profile work and no probe of the neighbour: the launch stopped
+        # before anything could pair one account's profile with another's
+        # route.
+        assert auth_status_tracks_seed == []
+        neighbour_dir = session_dir_for(
+            manager.switcher.backup_dir, ACCOUNT_NUM, "account1@example.com"
+        )
+        assert not neighbour_dir.exists()
+
+    def test_an_account_without_a_proxy_keeps_what_it_inherited(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
+        stream_proxy, monkeypatch,
+    ):
+        """No proxy set: the launch behaves as it did before the setting, and
+        the check sends nothing."""
+        monkeypatch.setenv("HTTPS_PROXY", "http://shell.invalid:3128")
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        assert exc.value.env["HTTPS_PROXY"] == "http://shell.invalid:3128"
+        assert exc.value.env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+        assert stream_proxy.requests == []
+
+    def test_an_unknown_default_login_inherits_its_proxy_variables(
+        self, manager, capture_exec, monkeypatch
+    ):
+        """A live login cswap has no slot for is not an account whose route
+        could be imposed, so the inherited variables stay."""
+        monkeypatch.setenv("HTTPS_PROXY", "http://shell.invalid:3128")
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.exec_default([])
+
+        assert exc.value.env["HTTPS_PROXY"] == "http://shell.invalid:3128"
+        assert exc.value.env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+
+
+class TestTheChildProcessIsTheOneThatGetsIt:
+    """The env dict is a claim until a real child runs with it.
+
+    POSIX's handoff is ``os.execvpe``, which replaces this process with the
+    child and passes ``env`` as its whole environment. Here that call is
+    intercepted to run a fake ``claude`` instead, so what the child reads is
+    what the launch would have given it.
+    """
+
+    FAKE_CLAUDE = '''\
+#!/usr/bin/env python3
+import json, os, sys
+if sys.argv[1:3] == ["auth", "status"]:
+    print(json.dumps({{
+        "loggedIn": True,
+        "authMethod": "claude.ai",
+        "email": "{email}",
+        "orgId": "{org}",
+    }}))
+    sys.exit(0)
+print(json.dumps({{
+    "HTTPS_PROXY": os.environ.get("HTTPS_PROXY"),
+    "https_proxy": os.environ.get("https_proxy"),
+    "NO_PROXY": os.environ.get("NO_PROXY"),
+    "no_proxy": os.environ.get("no_proxy"),
+    "traffic": os.environ.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"),
+    "config_dir": os.environ.get("CLAUDE_CONFIG_DIR"),
+}}))
+'''
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="the POSIX exec handoff is what gives the child its environment",
+    )
+    def test_a_real_child_process_reads_the_accounts_proxy(
+        self,
+        manager,
+        refresh_rotates,
+        stream_proxy,
+        tmp_path,
+        monkeypatch,
+    ):
+        fake = tmp_path / "claude"
+        fake.write_text(
+            self.FAKE_CLAUDE.format(email=ACCOUNT_EMAIL, org=ORG_UUID)
+        )
+        fake.chmod(0o755)
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
+        monkeypatch.setenv("https_proxy", "http://shell.invalid:1")
+        monkeypatch.setenv("NO_PROXY", "*")
+
+        spawned = []
+
+        def fake_execvpe(binary, argv, env):
+            result = subprocess.run(
+                [*argv], env=env, capture_output=True, text=True
+            )
+            spawned.append((result.returncode, result.stdout, result.stderr))
+            raise SystemExit(result.returncode)
+
+        monkeypatch.setattr(session_mod.shutil, "which", lambda name: str(fake))
+        monkeypatch.setattr(session_mod.sys, "platform", "linux")
+        monkeypatch.setattr(session_mod.os, "execvpe", fake_execvpe)
+
+        with pytest.raises(SystemExit) as exit_info:
+            manager.run("2", [])
+
+        assert exit_info.value.code == 0
+        assert len(spawned) == 1
+        returncode, out, err = spawned[0]
+        assert returncode == 0, err
+        child = json.loads(out)
+        assert child["HTTPS_PROXY"] == stream_proxy.url
+        assert child["https_proxy"] == stream_proxy.url
+        assert child["NO_PROXY"] == _no_proxy_from_settings(manager)
+        assert child["no_proxy"] == _no_proxy_from_settings(manager)
+        assert child["traffic"] == "1"
+        assert child["config_dir"] == str(
+            session_dir_for(manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+        )
+
+
+class TestAnUnusableProxyStopsTheLaunch:
+    """Every refusal ends the command before Claude Code starts."""
+
+    @pytest.mark.parametrize("status", [407, 302, 502])
+    def test_a_proxy_that_does_not_open_the_tunnel(
+        self, manager, capture_exec, auth_status_tracks_seed, status
+    ):
+        with _ConnectProxy(status) as server:
+            manager.switcher.set_account_proxy(ACCOUNT_NUM, server.url)
+            with pytest.raises(SessionError, match="cannot be used"):
+                manager.run("2", [])
+
+        # Neither `claude auth status` nor the launch ran.
+        assert auth_status_tracks_seed == []
+        session_dir = session_dir_for(
+            manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        assert not session_dir.exists()
+
+    def test_an_unreachable_proxy(
+        self, manager, capture_exec, auth_status_tracks_seed, dead_proxy_url
+    ):
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, dead_proxy_url)
+
+        with pytest.raises(SessionError, match="cannot be used"):
+            manager.run("2", [])
+
+        assert auth_status_tracks_seed == []
+
+    def test_a_corrupt_setting(
+        self, manager, capture_exec, auth_status_tracks_seed
+    ):
+        """``"proxy": null`` is damage, not a cleared setting: fail closed."""
+        data = manager.switcher._get_sequence_data()
+        data["accounts"][ACCOUNT_NUM]["proxy"] = None
+        manager.switcher._write_json(manager.switcher.sequence_file, data)
+
+        with pytest.raises(SessionError, match="unusable"):
+            manager.run("2", [])
+
+        assert auth_status_tracks_seed == []
+
+    def test_the_fast_path_refuses_before_starting_claude(
+        self, manager, capture_exec, dead_proxy_url, monkeypatch
+    ):
+        """Plain claude on the default login is still this account's launch,
+        so it gets the same check and the same refusal."""
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, dead_proxy_url)
+        _active_default_login(monkeypatch, manager)
+
+        with pytest.raises(SessionError, match="cannot be used"):
+            manager.run("2", [])
+
+    def test_exec_default_refuses_before_starting_claude(
+        self, manager, capture_exec, dead_proxy_url, monkeypatch
+    ):
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, dead_proxy_url)
+        _active_default_login(monkeypatch, manager)
+
+        with pytest.raises(SessionError, match="cannot be used"):
+            manager.exec_default(["--resume"])
+
+    def test_the_message_never_carries_a_credential(
+        self, manager, capture_exec, capsys
+    ):
+        with _ConnectProxy(407) as server:
+            url = server.url.replace("http://", "http://user:secret@")
+            manager.switcher.set_account_proxy(ACCOUNT_NUM, url)
+            with pytest.raises(SessionError) as err:
+                manager.run("2", [])
+
+        text = str(err.value)
+        assert "secret" not in text and "user" not in text
+        captured = capsys.readouterr()
+        assert "secret" not in captured.out + captured.err
 
 
 class TestExec:
@@ -4119,7 +4602,7 @@ class TestShareHistoryDecision:
         manager.switcher.platform = Platform.WINDOWS
         handed_over = []
 
-        def setup_session(identifier, share, share_history=None):
+        def setup_session(identifier, share, share_history=None, route=None, account=None):
             handed_over.append(share_history)
             raise SessionError("stop here")
 
@@ -5230,7 +5713,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         # hits — on a profile seeded BEFORE our rotation.
         calls = {"n": 0}
 
-        def peer_bootstraps_while_we_wait(self, sdir, email, org_uuid):
+        def peer_bootstraps_while_we_wait(self, sdir, email, org_uuid, route=None):
             calls["n"] += 1
             if calls["n"] == 1:
                 return False  # pre-lock: nothing there yet
@@ -5279,7 +5762,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
 
         calls = {"n": 0}
 
-        def peer_bootstraps_while_we_wait(self, sdir, email, org_uuid):
+        def peer_bootstraps_while_we_wait(self, sdir, email, org_uuid, route=None):
             calls["n"] += 1
             if calls["n"] == 1:
                 return False
