@@ -498,6 +498,156 @@ def _launch_headroom(entry: UsageEntry, models: tuple[str, ...]) -> float | None
     return oauth.account_headroom(_launch_value(entry), models)
 
 
+class _AutoRunPlan:
+    """The launch candidates of ONE capture, best first, for ``cswap run --auto``.
+
+    Built by :meth:`ClaudeAccountSwitcher.auto_run_plan` from one
+    ``_build_accounts_info`` capture (the roster, credentials and routes read
+    under the accounts lock) and one pass over the store's readings. Walking it
+    after an exit-check rejection therefore pays neither again: no second
+    capture, no second config probe, no second quota pass — one rejected slot
+    costs one row of the order, not a fresh list.
+
+    ``next()`` answers the best candidate still available and removes it, so a
+    loop over ``next()`` walks the ranking exactly as repeated
+    ``auto_run_target(exclude=…)`` calls did: quota left before none, no
+    just-reported rate-limit stop before one, more headroom before less, the
+    live login before another slot at equal headroom, the earlier slot before a
+    later one. Each candidate's reading is confirmed at most once, ``ordered``
+    highest first, so a stale reading cannot win.
+
+    ``why()`` explains why nothing is left when a candidate never got a
+    usable reading or every one of them is at its limit. A plan whose
+    candidates were all handed out answers the empty string: there is nothing
+    left to say about quota, only about the refusals the caller collected.
+    """
+
+    def __init__(
+        self,
+        switcher: "ClaudeAccountSwitcher",
+        models: tuple[str, ...],
+        infos: list[AccountInfo],
+        candidates: list[AccountInfo],
+        entries: dict[str, UsageEntry],
+        marks,
+        live: AccountInfo | None,
+        empty_why: str | None,
+    ) -> None:
+        self._switcher = switcher
+        self._models = models
+        self._infos = infos
+        self._entries = entries
+        self._marks = marks
+        self._live = live
+        self._empty_why = empty_why
+        self._rotation = {str(row[0]): pos for pos, row in enumerate(candidates)}
+        self._rooms = {
+            str(row[0]): _launch_headroom(entries[str(row[0])], models)
+            for row in candidates
+        }
+        self._confirmed: set[str] = set()
+        self._ordered = sorted(candidates, key=self._rank, reverse=True)
+
+    def _rank(self, row: AccountInfo) -> tuple:
+        num = str(row[0])
+        room = self._rooms[num]
+        return (
+            room is not None and room > 0,
+            not self._switcher._rate_limit_marked(
+                self._marks, row, self._entries[num]
+            ),
+            -1.0 if room is None else room,
+            row is self._live,
+            -self._rotation[num],
+        )
+
+    def _confirm(self, num: str) -> None:
+        """Replace one reading with the store's confirmation, at most once."""
+        if num in self._confirmed:
+            return
+        confirmed = self._switcher._collect_usage_entries(
+            self._infos, fetch={num}
+        )[num]
+        self._entries[num] = confirmed
+        self._rooms[num] = _launch_headroom(confirmed, self._models)
+        self._confirmed.add(num)
+
+    def next(self) -> AccountInfo | None:
+        """The best candidate left, or ``None``. Spends the row it answers."""
+        ordered = self._ordered
+        while ordered:
+            best: AccountInfo | None = None
+            for index, row in enumerate(ordered):
+                num = str(row[0])
+                # No point confirming a reading that already promises nothing:
+                # the confirmation would only spend a request.
+                if self._rooms[num] is None or self._rooms[num] <= 0:
+                    continue
+                self._confirm(num)
+                if self._rooms[num] is None or self._rooms[num] <= 0:
+                    continue
+                if best is None or self._rank(row) > self._rank(best):
+                    best = row
+                # A candidate still unconfirmed may hold more than the reading
+                # it was ranked on says: confirm it instead of launching on a
+                # stale order. An unconfirmed row's rank cannot have moved
+                # since the sort, so the highest of them is the one next in
+                # ``ordered``.
+                if (
+                    index + 1 < len(ordered)
+                    and self._rank(ordered[index + 1]) > self._rank(best)
+                ):
+                    continue
+                break
+            if best is None:
+                return None
+            ordered.remove(best)
+            return best
+        return None
+
+    def why(self) -> str:
+        """Why no candidate is left, or the empty string after all were spent."""
+        if self._empty_why is not None:
+            return self._empty_why
+        if not self._ordered:
+            return ""
+        # A missing reading is a failure of the READING (a spent refresh
+        # token, a server that keeps refusing), not a measured limit: the
+        # refusal must not claim one. Every candidate still in the order
+        # counts, not only the ones this launch tried to confirm — an account
+        # left without a reading by an earlier launch is in the same position,
+        # and "wait for the reset" would send the user to a stale refresh
+        # token's repair instead of to `cswap list`.
+        unread = [
+            str(row[0]) for row in self._ordered
+            if self._rooms[str(row[0])] is None
+        ]
+        if not any(
+            self._rooms[str(row[0])] is not None for row in self._ordered
+        ):
+            return (
+                "No account's remaining quota could be read, so none could be "
+                "chosen. Run `cswap list` to see why, or name an account: "
+                "`cswap run NUM`."
+            )
+        nearest = self._switcher._nearest_usable_reset(
+            self._ordered, self._entries, self._models
+        )
+        if unread:
+            return (
+                "No account could be launched: the remaining quota could not "
+                f"be read for Account(s) {', '.join(unread)} (run `cswap list` "
+                "to see why)"
+                + (f", and {nearest}" if nearest else "")
+                + "."
+            )
+        return (
+            "Every managed account is at its limit"
+            + (f" ({nearest})" if nearest else "")
+            + ". Nothing was launched."
+        )
+
+
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
 
@@ -1190,6 +1340,28 @@ class ClaudeAccountSwitcher:
             (data.get("accounts") or {}).get(str(account_num)), email, org_uuid
         )
 
+    def account_route_and_expectation(
+        self, account_num: str, email: str, org_uuid: str
+    ) -> tuple["account_proxy.ProxyRoute | None", "egress.Expectation | None"]:
+        """One account's route and egress rule, read from the SAME record.
+
+        A launch pins both to the account it resolved, and the pair comes from
+        one read: two reads with a ``swap``/``move`` between them would give
+        the launch one account's route with another's rule, or a route while
+        the rule vanished. A record that no longer names this account yields an
+        unusable route and an expectation carrying that error, so both refuse
+        the launch (a ruled account is never read as "no rule").
+
+        ``None`` for both is the account-with-nothing case: no proxy, no rule,
+        so nothing to pin and nothing to check.
+        """
+        data = self._get_sequence_data_migrated() or {}
+        record = (data.get("accounts") or {}).get(account_num)
+        if not self._record_is(record, email, org_uuid):
+            reason = "the slot no longer names this account"
+            return account_proxy.unusable(reason), egress.Expectation(error=reason)
+        return account_proxy.route_for(record), egress.read(record)
+
     def account_route(
         self, account_num: str, email: str, org_uuid: str
     ) -> "account_proxy.ProxyRoute | None":
@@ -1207,13 +1379,7 @@ class ClaudeAccountSwitcher:
         a move between the resolution and this read an error rather than a
         neighbour's proxy.
         """
-        data = self._get_sequence_data_migrated() or {}
-        record = (data.get("accounts") or {}).get(account_num)
-        if not self._record_is(record, email, org_uuid):
-            return account_proxy.unusable(
-                "the slot no longer names this account"
-            )
-        return account_proxy.route_for(record)
+        return self.account_route_and_expectation(account_num, email, org_uuid)[0]
 
     def account_expectation(
         self, account_num: str, email: str, org_uuid: str
@@ -1221,54 +1387,50 @@ class ClaudeAccountSwitcher:
         """The egress rule pinned to one account, or ``None`` without one.
 
         Accepted only while the record still names this account, for the same
-        reason :meth:`account_route` is: a ``swap``/``move`` between the
-        resolution and this read yields no rule rather than a neighbour's, and
-        the launch is refused by its identity check before any profile work.
+        reason :meth:`account_route` is. A record that moved yields an
+        expectation carrying ``error`` instead of ``None``: ``None`` is "no
+        rule", and treating a swapped slot as unruled is how a launch would
+        skip the check it promised.
         """
-        data = self._get_sequence_data_migrated() or {}
-        record = (data.get("accounts") or {}).get(account_num)
-        if not self._record_is(record, email, org_uuid):
-            # The record moved, so neither this account's rule nor a
-            # neighbour's can be read from the slot. There is nothing to apply
-            # here; the launch is refused by its own identity check before any
-            # profile work, and a proxied account's unusable route refuses
-            # even earlier.
-            return None
-        return egress.read(record)
+        return self.account_route_and_expectation(account_num, email, org_uuid)[1]
 
-    def live_login_expectation(self) -> "egress.Expectation | None":
-        """The egress rule of the slot the live default login belongs to.
+    def live_login_route_and_expectation(
+        self,
+    ) -> tuple["account_proxy.ProxyRoute | None", "egress.Expectation | None"]:
+        """The route and rule of the slot the live default login belongs to.
 
-        ``None`` when the live login names no slot: it is not an account cswap
-        manages, so no rule of its own exists to check.
+        ``(None, None)`` when the live login names no slot: it is not an
+        account cswap manages, so it has neither a route to impose nor a rule
+        to check.
         """
-        return self._expectation_for_login(self._get_current_account())
+        return self._route_and_expectation_for_login(self._get_current_account())
 
-    def default_profile_login_expectation(self) -> "egress.Expectation | None":
-        """The DEFAULT profile's login egress rule, whatever the environment says.
+    def default_profile_login_route_and_expectation(
+        self,
+    ) -> tuple["account_proxy.ProxyRoute | None", "egress.Expectation | None"]:
+        """The DEFAULT profile's login route and rule, whatever the environment says.
 
-        The expectation counterpart of :meth:`default_profile_login_route`:
-        the housekeeping commands ``cswap run --auto`` starts on the primary
-        profile must be checked against that login's rule.
+        ``live_login_route_and_expectation`` follows ``CLAUDE_CONFIG_DIR``, so
+        run from inside a session profile it answers for that profile's login.
+        Claude Code's own housekeeping commands launched by ``cswap run --auto``
+        run on the default profile even then (``session.SessionManager.
+        exec_default`` with ``primary_profile``), so their fail-closed checks
+        must be the default login's.
         """
         identity = self._get_current_identity_triple(
             get_default_global_config_path()
         )
-        return self._expectation_for_login(
+        return self._route_and_expectation_for_login(
             None if identity is None else identity[:2]
         )
 
-    def _expectation_for_login(
-        self, identity: tuple[str, str] | None
-    ) -> "egress.Expectation | None":
-        """The egress rule of the slot ``identity`` names, or ``None``."""
-        if identity is None:
-            return None
-        data = self._get_sequence_data_migrated() or {}
-        account_num = self._find_account_slot(data, *identity)
-        if account_num is None:
-            return None
-        return self.account_expectation(account_num, *identity)
+    def live_login_expectation(self) -> "egress.Expectation | None":
+        """The egress rule of the slot the live default login belongs to."""
+        return self.live_login_route_and_expectation()[1]
+
+    def default_profile_login_expectation(self) -> "egress.Expectation | None":
+        """The DEFAULT profile's login egress rule, whatever the environment says."""
+        return self.default_profile_login_route_and_expectation()[1]
 
     def live_login_route(self) -> "account_proxy.ProxyRoute | None":
         """The route of the slot the live default login belongs to.
@@ -1278,34 +1440,23 @@ class ClaudeAccountSwitcher:
         variables it inherited. ``cswap run`` uses this for the launch that
         runs plain claude on the default login.
         """
-        return self._route_for_login(self._get_current_account())
+        return self.live_login_route_and_expectation()[0]
 
     def default_profile_login_route(self) -> "account_proxy.ProxyRoute | None":
-        """The route of the DEFAULT profile's login, whatever the environment says.
+        """The route of the DEFAULT profile's login, whatever the environment says."""
+        return self.default_profile_login_route_and_expectation()[0]
 
-        ``live_login_route`` follows ``CLAUDE_CONFIG_DIR``, so run from inside a
-        session profile it answers for that profile's login. Claude Code's own
-        housekeeping commands launched by ``cswap run --auto`` run on the
-        default profile even then (``session.SessionManager.exec_default``
-        with ``primary_profile``), so their fail-closed proxy check must be the
-        default login's.
-        """
-        identity = self._get_current_identity_triple(
-            get_default_global_config_path()
-        )
-        return self._route_for_login(None if identity is None else identity[:2])
-
-    def _route_for_login(
+    def _route_and_expectation_for_login(
         self, identity: tuple[str, str] | None
-    ) -> "account_proxy.ProxyRoute | None":
-        """The route of the slot ``identity`` names, or ``None``."""
+    ) -> tuple["account_proxy.ProxyRoute | None", "egress.Expectation | None"]:
+        """``identity``'s slot read once, as :meth:`account_route_and_expectation`."""
         if identity is None:
-            return None
+            return None, None
         data = self._get_sequence_data_migrated() or {}
         account_num = self._find_account_slot(data, *identity)
         if account_num is None:
-            return None
-        return self.account_route(account_num, *identity)
+            return None, None
+        return self.account_route_and_expectation(account_num, *identity)
 
     def set_alias(self, identifier: str, alias: str) -> tuple[str, str]:
         """Set (or rename) the alias for the account matching identifier.
@@ -6923,26 +7074,22 @@ class ClaudeAccountSwitcher:
             return None, "exhausted"
         return None, "stay"
 
-    def auto_run_target(
+    def auto_run_plan(
         self,
         models: tuple[str, ...] | None = None,
         *,
         exclude: frozenset[str] | set[str] = frozenset(),
-    ) -> tuple[AccountInfo | None, str]:
-        """The account ``cswap run --auto`` launches, or why there is none.
+    ) -> "_AutoRunPlan":
+        """The launch candidates of ONE capture, ordered, for `cswap run --auto`.
 
-        ``exclude`` holds slot numbers already rejected by the caller. One
-        call answers the best launchable account outside that set; calling it
-        again with each rejected slot added walks the ranked candidates in
-        order, which is how ``cswap run --auto`` moves past an account whose
-        exit check failed. Ranking and tie-break are the same on every call.
-
-        One ranked pass over the launchable slots (``_build_accounts_info``:
-        the roster, credentials and routes of ``cswap list``'s own capture)
-        rather than the switch strategies' compare-with-the-live-login. A
-        launch may land on the login the terminal already has — ``cswap run``
-        then satisfies that on the default login, the same-account fast path —
-        and it never writes ``sequence.json``.
+        ``exclude`` holds slot numbers the caller does not consider at all.
+        The plan captures the roster once (``_build_accounts_info``: the
+        credentials and routes of ``cswap list``'s own capture, under the
+        account lock), orders the launchable slots by their ranking, and makes
+        one pass over the store's readings (``_collect_usage_entries``). The
+        loop that walks it (``_AutoRunPlan.next``) pays neither a second
+        capture nor a second quota pass, and confirms each candidate's reading
+        at most once while it walks.
 
         A slot is launchable when it is in rotation, not disabled, is not an
         API-key account (``cswap run`` refuses those), and has stored
@@ -6957,27 +7104,18 @@ class ClaudeAccountSwitcher:
         expired ranks on its stored measurement like any other
         (``_launch_value``): the token says nothing about the quota.
 
-        The candidates' readings are then confirmed one at a time, highest
-        ranked first — ``_collect_usage_entries(infos, fetch={candidate})``,
-        which respects the store's serve TTL, poll plan and failure backoff —
-        because a reading up to ``poll_policy.SERVE_TTL_S`` old may be the one
-        the account spent its quota after. Each confirmation replaces that
-        candidate's reading and the ordering is compared again: the launch goes
-        to the account the CONFIRMED readings give the most room, which may be
-        one the stale ordering had behind (30% used that confirms as 95% loses
-        to a reading of 60%). Each candidate is confirmed at most once.
-
-        Returns ``(row, "")``, or ``(None, message)`` naming the reason and,
-        when every account is at its limit, when the nearest one is usable
-        again — both read from the updated readings, not from the first
-        capture.
+        A launch never writes ``sequence.json``, and may land on the login the
+        terminal already has (``cswap run`` then satisfies that on the default
+        login, the same-account fast path).
         """
         if models is None:
             models = parse_model_names(load_settings(self.backup_dir).model)
 
         infos = self._build_accounts_info()
         if not infos:
-            return None, "No accounts are managed yet. Add one with `cswap add`."
+            empty_why = "No accounts are managed yet. Add one with `cswap add`."
+            return _AutoRunPlan(self, models, [], [], {}, {}, None, empty_why)
+
         records = self._snapshot_records
         candidates = [
             row
@@ -6991,85 +7129,46 @@ class ClaudeAccountSwitcher:
         ]
         if not candidates:
             if exclude:
-                return None, "Every launchable account was rejected."
-            return None, (
-                "No managed account can be launched: every slot is disabled, "
-                "an API-key account, or has no stored credentials/config."
-            )
+                empty_why = "Every launchable account was rejected."
+            else:
+                empty_why = (
+                    "No managed account can be launched: every slot is "
+                    "disabled, an API-key account, or has no stored "
+                    "credentials/config."
+                )
+            return _AutoRunPlan(self, models, infos, [], {}, {}, None, empty_why)
 
         entries = self._collect_usage_entries(infos)
         marks = self._stop_failure_marks()
         # The row the live login is, marked by the same capture (``is_active``)
         # so the tie-break reads no second registry.
         live = next((row for row in infos if row[4]), None)
-        rooms = {
-            str(row[0]): _launch_headroom(entries[str(row[0])], models)
-            for row in candidates
-        }
-
-        rotation = {str(row[0]): pos for pos, row in enumerate(candidates)}
-
-        def rank(row: AccountInfo) -> tuple:
-            room = rooms[str(row[0])]
-            return (
-                room is not None and room > 0,
-                not self._rate_limit_marked(marks, row, entries[str(row[0])]),
-                -1.0 if room is None else room,
-                row is live,
-                -rotation[str(row[0])],
-            )
-
-        ordered = sorted(candidates, key=rank, reverse=True)
-        best: AccountInfo | None = None
-        for index, row in enumerate(ordered):
-            num = str(row[0])
-            if rooms[num] is None or rooms[num] <= 0:
-                continue
-            confirmed = self._collect_usage_entries(infos, fetch={num})[num]
-            entries[num] = confirmed
-            rooms[num] = _launch_headroom(confirmed, models)
-            if rooms[num] is None or rooms[num] <= 0:
-                continue
-            if best is None or rank(row) > rank(best):
-                best = row
-            # A candidate still unconfirmed may hold more than the reading it
-            # was ranked on says: confirm it instead of launching on a stale
-            # order. An unconfirmed row's rank cannot have moved since the
-            # sort, so the highest of them is the one next in ``ordered``.
-            if index + 1 < len(ordered) and rank(ordered[index + 1]) > rank(best):
-                continue
-            break
-        if best is not None:
-            return best, ""
-
-        # A missing reading is a failure of the READING (a spent refresh
-        # token, a server that keeps refusing), not a measured limit: the
-        # refusal must not claim one. Every launchable candidate counts, not
-        # only the ones this launch tried to confirm — an account left without
-        # a reading by an earlier launch is in the same position, and
-        # "wait for the reset" would send the user to a stale refresh token's
-        # repair instead of to `cswap list`.
-        unread = [num for num, room in rooms.items() if room is None]
-        if not any(room is not None for room in rooms.values()):
-            return None, (
-                "No account's remaining quota could be read, so none could be "
-                "chosen. Run `cswap list` to see why, or name an account: "
-                "`cswap run NUM`."
-            )
-        nearest = self._nearest_usable_reset(candidates, entries, models)
-        if unread:
-            return None, (
-                "No account could be launched: the remaining quota could not "
-                f"be read for Account(s) {', '.join(unread)} (run `cswap list` "
-                "to see why)"
-                + (f", and {nearest}" if nearest else "")
-                + "."
-            )
-        return None, (
-            "Every managed account is at its limit"
-            + (f" ({nearest})" if nearest else "")
-            + ". Nothing was launched."
+        return _AutoRunPlan(
+            self, models, infos, candidates, entries, marks, live, None
         )
+
+    def auto_run_target(
+        self,
+        models: tuple[str, ...] | None = None,
+        *,
+        exclude: frozenset[str] | set[str] = frozenset(),
+    ) -> tuple[AccountInfo | None, str]:
+        """The account ``cswap run --auto`` launches, or why there is none.
+
+        The head of :meth:`auto_run_plan`, which is what a launch walks:
+        callers that mean to move past a rejected account use the plan rather
+        than calling this again with that slot excluded.
+
+        Returns ``(row, "")``, or ``(None, message)`` naming the reason and,
+        when every account is at its limit, when the nearest one is usable
+        again — both read from the confirmed readings, not from the first
+        capture.
+        """
+        plan = self.auto_run_plan(models, exclude=exclude)
+        row = plan.next()
+        if row is None:
+            return None, plan.why()
+        return row, ""
 
     def _nearest_usable_reset(
         self,

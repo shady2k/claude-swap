@@ -167,6 +167,13 @@ class TestNormalisation:
         with pytest.raises(egress.ExpectationError):
             egress.normalize_country(value)
 
+    def test_only_codes_iso_assigns_to_a_country_are_accepted(self):
+        """``ZZ`` is user-assigned, so no service could ever confirm it."""
+        assert len(egress.ISO_COUNTRY_CODES) == 249
+        for code in ("ZZ", "XK", "AA", "EU", "UK", "QZ"):
+            with pytest.raises(egress.ExpectationError):
+                egress.normalize_country(code)
+
     @pytest.mark.parametrize(
         "value, canonical",
         [
@@ -182,6 +189,15 @@ class TestNormalisation:
         "value", ["", "1.2.3", "999.1.1.1", "host", None, 1.2]
     )
     def test_a_bad_ip_is_refused(self, value):
+        with pytest.raises(egress.ExpectationError):
+            egress.normalize_ip(value)
+
+    @pytest.mark.parametrize(
+        "value",
+        ["fe80::1%eth0", "fe80::1%", "::1%1", "fe80::1%\x1b[31mred"],
+    )
+    def test_an_ip_with_a_zone_is_refused(self, value):
+        """``ipaddress`` keeps a zone's text, and only the address is echoed."""
         with pytest.raises(egress.ExpectationError):
             egress.normalize_ip(value)
 
@@ -310,13 +326,14 @@ class TestCheck:
             )
         assert len(proxy.requests) == 3
 
-    def test_a_redirect_is_refused_not_followed(
+    def test_a_redirect_moves_on_to_the_next_service(
         self, proxy, direct_counter, monkeypatch
     ):
-        """A 3xx is a refusal (``account_proxy``'s rule), never a new request.
+        """A 3xx over an HTTPS tunnel is the SERVICE's answer, not the proxy's.
 
-        It also ends the chain: the proxy, not the service, answered, so the
-        other endpoints would meet the same redirect.
+        The service moved or is refusing automated clients; the next service
+        may still answer, so one changed public address does not block every
+        launch. The redirect itself is still never followed.
         """
         elsewhere = "http://127.0.0.1:9/redirected"
         proxy.answer(
@@ -325,14 +342,75 @@ class TestCheck:
         proxy.answer(_url(proxy, "two"), {"ip": "1.2.3.4", "country": "US"})
         _endpoints(proxy, monkeypatch)
 
-        with pytest.raises(EgressCheckError, match="302"):
+        egress.check(
+            account_proxy.parse(proxy.url),
+            egress.read({egress.COUNTRY_FIELD: "US"}),
+        )
+
+        assert proxy.requests == [_url(proxy, "one"), _url(proxy, "two")]
+        assert direct_counter.hits == []
+
+    def test_every_service_redirecting_is_a_refusal(
+        self, proxy, direct_counter, monkeypatch
+    ):
+        for name in ("one", "two", "three"):
+            proxy.answer(_url(proxy, name), status=302, headers={"Location": "/"})
+        _endpoints(proxy, monkeypatch)
+
+        with pytest.raises(EgressCheckError) as exc:
             egress.check(
                 account_proxy.parse(proxy.url),
                 egress.read({egress.COUNTRY_FIELD: "US"}),
             )
 
-        assert proxy.requests == [_url(proxy, "one")]
+        assert "redirect" in str(exc.value)
+        assert len(proxy.requests) == 3
         assert direct_counter.hits == []
+
+    def test_a_user_assigned_country_in_an_answer_counts_as_missing(
+        self, proxy, monkeypatch
+    ):
+        """``ZZ`` names no country, so this answer cannot confirm the rule."""
+        proxy.answer(_url(proxy, "one"), {"ip": "1.2.3.4", "country": "ZZ"})
+        proxy.answer(_url(proxy, "two"), {"ip": "1.2.3.4", "country": "US"})
+        _endpoints(proxy, monkeypatch)
+
+        egress.check(
+            account_proxy.parse(proxy.url),
+            egress.read({egress.COUNTRY_FIELD: "US"}),
+        )
+
+        assert proxy.requests == [_url(proxy, "one"), _url(proxy, "two")]
+
+    def test_an_address_with_a_zone_in_an_answer_counts_as_missing(
+        self, proxy, monkeypatch
+    ):
+        """A zone's text is never repeated, and this answer cannot confirm."""
+        proxy.answer(
+            _url(proxy, "one"), {"ip": "fe80::1%\x1b[31mred", "country": "US"}
+        )
+        proxy.answer(_url(proxy, "two"), {"ip": "1.2.3.4", "country": "US"})
+        _endpoints(proxy, monkeypatch)
+
+        egress.check(
+            account_proxy.parse(proxy.url),
+            egress.read({egress.IP_FIELD: "1.2.3.4"}),
+        )
+
+        assert proxy.requests == [_url(proxy, "one"), _url(proxy, "two")]
+
+    def test_a_deeply_nested_answer_moves_on(self, proxy, monkeypatch):
+        """A body no parser can walk is this service's answer, not the route's."""
+        proxy.answer(_url(proxy, "one"), b"[" * 5000 + b"]" * 5000)
+        proxy.answer(_url(proxy, "two"), {"ip": "1.2.3.4", "country": "US"})
+        _endpoints(proxy, monkeypatch)
+
+        egress.check(
+            account_proxy.parse(proxy.url),
+            egress.read({egress.COUNTRY_FIELD: "US"}),
+        )
+
+        assert proxy.requests == [_url(proxy, "one"), _url(proxy, "two")]
 
     def test_the_shells_proxy_variables_are_not_consulted(
         self, proxy, direct_counter, monkeypatch
@@ -514,7 +592,9 @@ class TestProxyCommandExpectations:
         "args",
         [
             ["1", "http://127.0.0.1:3128", "--expect-country", "USA"],
+            ["1", "http://127.0.0.1:3128", "--expect-country", "ZZ"],
             ["1", "http://127.0.0.1:3128", "--expect-ip", "999.1.1.1"],
+            ["1", "http://127.0.0.1:3128", "--expect-ip", "fe80::1%eth0"],
         ],
     )
     def test_a_bad_expectation_writes_nothing(self, temp_home, capsys, args):
@@ -701,6 +781,20 @@ class TestJsonFields:
         switcher = _switcher()
         data = switcher._get_sequence_data()
         data["accounts"]["1"][egress.IP_FIELD] = "nonsense"
+        switcher._write_json(switcher.sequence_file, data)
+        _offline_usage(switcher, monkeypatch)
+        payload = switcher.list_accounts(json_output=True)
+        row = next(a for a in payload["accounts"] if a["number"] == 1)
+        assert row["proxyExpected"].startswith("invalid (")
+
+    def test_a_user_assigned_country_in_a_stored_rule_is_visible_damage(
+        self, temp_home, monkeypatch
+    ):
+        """``ZZ`` names no country, so a rule for it is damage, never "no rule"."""
+        switcher = _switcher()
+        switcher.set_account_proxy("1", "http://127.0.0.1:3128")
+        data = switcher._get_sequence_data()
+        data["accounts"]["1"][egress.COUNTRY_FIELD] = "ZZ"
         switcher._write_json(switcher.sequence_file, data)
         _offline_usage(switcher, monkeypatch)
         payload = switcher.list_accounts(json_output=True)

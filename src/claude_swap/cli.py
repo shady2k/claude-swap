@@ -264,34 +264,35 @@ def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
                 manager.exec_default(tail, primary_profile=True)
                 return  # only reachable in tests where exec/exit is mocked
 
-            # Walk the ranked candidates, not just the head: an account
-            # whose exit does not match its expectation is reported and the
-            # next one is tried. ``auto_run_target`` keeps its ranking and
-            # tie-break; the already-rejected slots go in ``exclude``, so each
-            # call answers the next candidate in that order.
+            # Walk the ranked candidates of ONE capture (``auto_run_plan``):
+            # an account whose proxy or exit check refuses is reported and the
+            # next one in that order is tried. The plan holds the roster and
+            # the readings, so a rejected slot costs one row of the order, not
+            # a second list capture, config probe and quota pass.
+            plan = switcher.auto_run_plan()
             rejected: list[str] = []
-            excluded: set[str] = set()
-            while True:
-                row, why = switcher.auto_run_target(exclude=excluded)
-                if row is None:
-                    if rejected:
-                        raise SessionError(
-                            "No account passed its exit check: "
-                            + "; ".join(rejected)
-                            + ". Nothing was launched."
-                        )
-                    raise SessionError(why)
+            chosen = 0
+            while (row := plan.next()) is not None:
                 # The choice is the (slot, email, organization) triple of ONE
                 # capture, not a number to resolve again: verify it just before
                 # the launch so a `swap`/`move` in between refuses instead of
                 # running the account that took the number.
                 account = (str(row[0]), row[1], row[3])
-                print(
-                    dimmed(
-                        f"Account-{account[0]} has the most remaining quota — "
-                        "launching it."
+                chosen += 1
+                if chosen == 1:
+                    print(
+                        dimmed(
+                            f"Account-{account[0]} has the most remaining "
+                            "quota — launching it."
+                        )
                     )
-                )
+                else:
+                    print(
+                        dimmed(
+                            f"Account-{account[0]} is the next available "
+                            "account — launching it."
+                        )
+                    )
                 try:
                     manager.run(
                         account[0],
@@ -309,9 +310,19 @@ def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
                         f"Account-{account[0]} was rejected: {e} "
                         "Trying the next account."
                     )
-                    excluded.add(account[0])
                     continue
                 return  # only reachable in tests where exec/exit is mocked
+            why = plan.why()
+            if rejected:
+                # ``why`` keeps what the remaining candidates answered — the
+                # reset time of an exhausted account, or the unreadable
+                # reading — instead of claiming every slot failed the check.
+                raise SessionError(
+                    "No account passed its exit check: "
+                    + "; ".join(rejected)
+                    + (f". {why}" if why else ". Nothing was launched.")
+                )
+            raise SessionError(why or "Nothing was launched.")
 
         if args.account is not None:
             manager.run(

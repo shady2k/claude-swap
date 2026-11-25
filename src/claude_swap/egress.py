@@ -16,9 +16,13 @@ GeoIP services in turn and reads only two fields of each answer — the exit IP
 and the country. The first answer that carries a field the account expects
 decides it: a different value is a refusal there and then, so the remaining
 services are not asked. An answer that lacks a needed field, or a request that
-fails (network, timeout, HTTP 4xx/5xx, invalid JSON), moves on to the next
-service; when none answers, the launch is refused with the per-service
-reason.
+fails (network, timeout, HTTP 4xx/5xx, invalid JSON, a redirect), moves on to
+the next service; when none answers, the launch is refused with the
+per-service reason. A redirect is not the proxy's fault once the request
+travels an HTTPS tunnel: it is that service refusing to answer in place, so
+the chain continues instead of stopping on a route that may still be fine.
+Only a refused route (no connection, 407 on the ``CONNECT``, an unparsable
+stored value) stops the chain, because every service would meet it.
 
 No rule means no request and no delay: :func:`check` returns before it reads
 an endpoint when :func:`read` gives it nothing, and ``check`` is the only
@@ -41,14 +45,13 @@ from __future__ import annotations
 import http.client
 import ipaddress
 import json
-import re
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from claude_swap.account_proxy import ProxyRoute, ProxyRouteError
+from claude_swap.account_proxy import PROXY_REDIRECT, ProxyRoute, ProxyRouteError
 from claude_swap.exceptions import EgressCheckError
 
 #: The ``sequence.json`` account fields. Either one alone is a rule; both
@@ -65,7 +68,40 @@ TIMEOUT_S = 3.0
 #: bytes; the cap keeps an unexpected body from being held in memory.
 MAX_BODY_BYTES = 64 * 1024
 
-_COUNTRY_SHAPE = re.compile(r"[A-Za-z]{2}\Z")
+#: The codes ISO 3166-1 assigns to a country, territory or special area: what
+#: a rule and a service answer may name. User-assigned codes (``ZZ``, ``XK``),
+#: unassigned pairs and anything longer are not countries, so a value outside
+#: this set is never compared as one. Grouped for review against the
+#: maintenance agency's list; membership is all the code uses.
+ISO_COUNTRY_CODES = frozenset(
+    """
+    AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ
+    BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ
+    CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ
+    DE DJ DK DM DO DZ
+    EC EE EG EH ER ES ET
+    FI FJ FK FM FO FR
+    GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY
+    HK HM HN HR HT HU
+    ID IE IL IM IN IO IQ IR IS IT
+    JE JM JO JP
+    KE KG KH KI KM KN KP KR KW KY KZ
+    LA LB LC LI LK LR LS LT LU LV LY
+    MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ
+    NA NC NE NF NG NI NL NO NP NR NU NZ
+    OM
+    PA PE PF PG PH PK PL PM PN PR PS PT PW PY
+    QA
+    RE RO RS RU RW
+    SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ
+    TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ
+    UA UG UM US UY UZ
+    VA VC VE VG VI VN VU
+    WF WS
+    YE YT
+    ZA ZM ZW
+    """.split()
+)
 
 
 class ExpectationError(ValueError):
@@ -78,16 +114,20 @@ class ExpectationError(ValueError):
 
 
 def normalize_country(value: object) -> str:
-    """``US`` for ``us``/``Us``; anything but two ASCII letters is refused.
+    """``US`` for ``us``/``Us``; anything but an assigned code is refused.
 
     The stored form is upper case, so a comparison never depends on how the
-    user typed the code.
+    user typed the code. Two ASCII letters are not enough: ``ZZ`` is
+    user-assigned and names no country, so a rule for it could never be
+    confirmed by a service answer.
     """
-    if not isinstance(value, str) or not _COUNTRY_SHAPE.fullmatch(value.strip()):
+    code = value.strip().upper() if isinstance(value, str) else ""
+    if code not in ISO_COUNTRY_CODES:
         raise ExpectationError(
-            "the expected country must be a two-letter ISO 3166-1 alpha-2 code"
+            "the expected country must be a two-letter ISO 3166-1 alpha-2 "
+            "code assigned to a country"
         )
-    return value.strip().upper()
+    return code
 
 
 def normalize_ip(value: object) -> str:
@@ -96,8 +136,13 @@ def normalize_ip(value: object) -> str:
     ``str(ipaddress.ip_address(...))`` is the canonical form: an IPv6 address
     is compressed and lower-cased, and an IPv4 address keeps no leading
     zeros, so two spellings of one address compare equal.
+
+    An address carrying an IPv6 zone (``fe80::1%eth0``) is refused rather
+    than canonicalised: ``ipaddress`` keeps the zone's text, and that text
+    arrives from a stored record or a service's answer and would then be
+    repeated in a refusal. Only the address itself is ever echoed.
     """
-    if not isinstance(value, str) or not value.strip():
+    if not isinstance(value, str) or not value.strip() or "%" in value:
         raise ExpectationError(
             "the expected IP must be a valid IPv4 or IPv6 address"
         )
@@ -275,7 +320,12 @@ def _observe(endpoint: Endpoint, route: ProxyRoute, timeout: float) -> Observati
     try:
         with route.open(request, timeout=timeout) as response:
             raw = response.read(MAX_BODY_BYTES)
-    except ProxyRouteError:
+    except ProxyRouteError as e:
+        if e.kind == PROXY_REDIRECT:
+            # Over an HTTPS tunnel this is the service's own 3xx, not the
+            # proxy's: it refuses to answer in place, and the next service may
+            # still answer. The redirect is still not followed.
+            raise _EndpointFailed("redirect") from None
         raise
     except urllib.error.HTTPError as e:
         e.close()
@@ -294,7 +344,9 @@ def _observe(endpoint: Endpoint, route: ProxyRoute, timeout: float) -> Observati
         raise _EndpointFailed("invalid HTTP reply") from None
     try:
         data = json.loads(raw.decode("utf-8", "replace"))
-    except ValueError:
+    except (ValueError, RecursionError):
+        # A deeply nested body is not JSON this module can use, and it is this
+        # service's answer, not the route's.
         raise _EndpointFailed("invalid JSON") from None
     if not isinstance(data, dict) or data.get("success") is False:
         raise _EndpointFailed("no usable answer")

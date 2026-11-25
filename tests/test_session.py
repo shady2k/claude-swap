@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import logging
@@ -2729,6 +2730,163 @@ class TestTheLaunchChecksTheEgressExpectation:
 
         with pytest.raises(EgressCheckError, match="default login"):
             manager.exec_default(["--resume"])
+
+    def test_a_dead_proxy_with_a_rule_is_an_egress_refusal(
+        self, manager, capture_exec, auth_status_tracks_seed, dead_proxy_url
+    ):
+        """A rule makes an unusable proxy the exit check's own refusal.
+
+        The exit cannot be confirmed either way, so ``cswap run --auto`` may
+        try the next account. An account without a rule keeps the launch's
+        own refusal (``TestAnUnusableProxyStopsTheLaunch``).
+        """
+        manager.switcher.update_account_proxy(
+            ACCOUNT_NUM, dead_proxy_url, expect_country="US"
+        )
+
+        with pytest.raises(EgressCheckError, match="cannot be used"):
+            manager.run("2", [])
+
+        assert auth_status_tracks_seed == []
+
+    def test_a_407_with_a_rule_is_an_egress_refusal(
+        self, manager, capture_exec, auth_status_tracks_seed
+    ):
+        with _ConnectProxy(407) as server:
+            manager.switcher.update_account_proxy(
+                ACCOUNT_NUM, server.url, expect_country="US"
+            )
+
+            with pytest.raises(EgressCheckError, match="407"):
+                manager.run("2", [])
+
+        assert auth_status_tracks_seed == []
+
+    def test_a_swap_during_the_proxy_check_ends_the_fast_path(
+        self, manager, capture_exec, monkeypatch
+    ):
+        """The route is checked before the same-account fast path.
+
+        That path runs plain claude on the default login and never reaches
+        ``setup_session``, so its own owner check is what keeps a ``swap``
+        made while the ``CONNECT`` ran from launching the newcomer.
+        """
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, "http://127.0.0.1:1")
+        _active_default_login(monkeypatch, manager)
+
+        def swap_then_accept(route, timeout=account_proxy.PROBE_TIMEOUT_S):
+            manager.switcher.swap_accounts("1", ACCOUNT_NUM)
+
+        monkeypatch.setattr(account_proxy, "probe", swap_then_accept)
+
+        with pytest.raises(SessionError, match="no longer holds the slot"):
+            manager.run("2", [])
+
+
+class TestAutoWalksPastAProxyRefusal:
+    """`cswap run --auto` through the real manager and the real launch loop.
+
+    ``test_cli.py`` feeds the loop a ready-made ``EgressCheckError``; here the
+    refusal comes from a real launch whose proxy does not accept a connection,
+    so the seam between ``_check_proxy`` and the loop's catch is exercised as
+    the launch makes it.
+    """
+
+    @staticmethod
+    def _launchable(switcher, monkeypatch) -> None:
+        """Both slots hold credentials and config, and a readable quota."""
+        from claude_swap.usage_store import UsageEntry
+
+        switcher._write_account_credentials("1", "account1@example.com", CREDS)
+        switcher._write_account_config(
+            "1",
+            "account1@example.com",
+            json.dumps({
+                "oauthAccount": {
+                    "emailAddress": "account1@example.com",
+                    "accountUuid": "uuid-1",
+                    "organizationUuid": "org-uuid-1",
+                },
+            }),
+        )
+        reading = UsageEntry(
+            last_good={"five_hour": {"pct": 10.0}, "seven_day": {"pct": 0.0}},
+            fetched_at=1.0,
+            age_s=0.0,
+        )
+        monkeypatch.setattr(
+            switcher,
+            "_collect_usage_entries",
+            lambda infos, fetch=None, *, scheduled=False: {
+                str(row[0]): reading for row in infos
+            },
+        )
+
+    @staticmethod
+    def _launch(args, tail, switcher):
+        from unittest.mock import patch
+
+        from claude_swap import cli
+
+        namespace = argparse.Namespace(
+            account=args,
+            auto=args is None,
+            no_share=False,
+            share_history=None,
+            require_session=False,
+            debug=False,
+        )
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=switcher), \
+             patch("os.geteuid", return_value=1000, create=True):
+            cli._run_launch(namespace, tail)
+
+    def test_auto_reports_the_first_slot_and_starts_the_second(
+        self, seeded_switcher, capture_exec, auth_status_tracks_seed,
+        refresh_rotates, dead_proxy_url, monkeypatch, capsys,
+    ):
+        self._launchable(seeded_switcher, monkeypatch)
+        seeded_switcher.update_account_proxy(
+            "1", dead_proxy_url, expect_country="US"
+        )
+
+        with pytest.raises(_ExecCalled) as exc:
+            self._launch(None, ["--resume"], seeded_switcher)
+
+        logged = capsys.readouterr()
+        text = logged.out + logged.err
+        assert "Account-1 was rejected" in text
+        assert "cannot be used" in text and "Trying the next account" in text
+        # The second candidate is not "the most remaining quota"; it is the
+        # next one the walk reached.
+        assert "Account-1 has the most remaining quota" in text
+        assert "Account-2 is the next available account" in text
+        # The launch that started is account 2's session profile, not 1's.
+        expected = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(expected)
+
+    def test_an_explicit_run_of_the_rejected_slot_starts_nothing(
+        self, seeded_switcher, capture_exec, auth_status_tracks_seed,
+        dead_proxy_url, monkeypatch, capsys,
+    ):
+        self._launchable(seeded_switcher, monkeypatch)
+        seeded_switcher.update_account_proxy(
+            "1", dead_proxy_url, expect_country="US"
+        )
+
+        # `_run_launch` reports a session-shaped refusal itself and exits 1.
+        with pytest.raises(SystemExit) as exited:
+            self._launch("1", ["--resume"], seeded_switcher)
+
+        assert exited.value.code == 1
+        logged = capsys.readouterr()
+        assert "cannot be used" in logged.out + logged.err
+        assert auth_status_tracks_seed == []
+        assert not session_dir_for(
+            seeded_switcher.backup_dir, "1", "account1@example.com"
+        ).exists()
+
 
 
 class TestExec:

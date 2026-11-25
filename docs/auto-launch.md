@@ -53,10 +53,14 @@ reads:
   window at 5% resets in an hour.
 
 An account that carries an egress expectation ([proxy.md](proxy.md#egress-expectation))
-must also pass it: when the exit IP or country does not match, or no GeoIP
-service can be asked, the launch prints the slot and the reason and takes the
-next candidate in the same ranking. If every candidate is rejected that way,
-nothing is launched and the command exits non-zero.
+must also pass it: when the proxy cannot be used (no connection, 407), the exit
+IP or country does not match, or no GeoIP service can be asked, the launch
+prints the slot and the reason and takes the next candidate in the same
+ranking. If every candidate is rejected that way, nothing is launched and the
+command exits non-zero, naming each refusal and — when the accounts that were
+not rejected have spent their quota — when the nearest reset is. The whole walk
+comes from one capture of the account list and one pass over the readings, so a
+rejected candidate costs one row of the ranking, not a fresh list.
 
 The choice is not a switch: `sequence.json` and the default login keep the
 account they had, so `cswap status`, the menu bar and auto-switching see no

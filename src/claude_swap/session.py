@@ -48,12 +48,14 @@ Every launch — a session profile, plain claude on the default login, and the
 non-essential traffic off (``run.disableNonessentialTraffic`` stops cswap from
 setting that variable), and, for an account that has a proxy, that account's
 ``HTTPS_PROXY``/``HTTP_PROXY``/``ALL_PROXY``/``NO_PROXY`` in place of whatever
-the shell carried. The route is read once, before any profile work, and
-``account_proxy.probe`` refuses the launch when it cannot be used. An account
-with an egress expectation is then measured through that same route
-(``egress.check``), still before any profile work and outside every lock: a
-mismatch, a damaged rule or an unanswerable chain refuses the launch just as
-firmly. Nothing here forbids a direct connection at the OS level: a program
+the shell carried. The account's route and its egress rule are read together,
+from the same record, before any profile work, and ``account_proxy.probe``
+refuses the launch when the route cannot be used. An account with an egress
+expectation is then measured through that same route (``egress.check``),
+still before any profile work and outside every lock: a mismatch, a damaged
+rule or an unanswerable chain refuses the launch just as firmly, and so does a
+slot that was given to another account while the checks ran. Nothing here
+forbids a direct connection at the OS level: a program
 that ignores these variables still goes out directly (``docs/proxy.md``).
 
 The binary every launch hands the terminal to comes from ``find_claude``,
@@ -884,12 +886,15 @@ class SessionManager:
         and a session on the default login is the one thing an account
         switch can later pull out from under it.
 
-        The account's proxy, if it has one, is resolved here — once, with the
-        identity that names the slot — and checked with one ``CONNECT`` before
-        any profile is created, seeded or probed: an unusable proxy ends the
-        command here, with Claude Code never started. That identity goes on to
-        ``setup_session``, which refuses the launch when the slot no longer
-        holds it.
+        The account's proxy and its egress rule, if it has either, are resolved
+        here — in one read, with the identity that names the slot — and the
+        proxy is checked with one ``CONNECT`` before any profile is created,
+        seeded or probed: an unusable proxy or an exit the account did not
+        promise ends the command here, with Claude Code never started. That
+        identity is checked again just before the fast path hands the terminal
+        to claude, and goes on to ``setup_session``, which makes the same check
+        on the session branch: a slot a ``swap``/``move`` gave to another
+        account during the checks ends the launch instead of running it.
 
         Notices on the way are printed plainly. `cswap run` sends them to
         stderr, because stdout is claude's (``cli._run_launch``).
@@ -923,24 +928,27 @@ class SessionManager:
         # Guard before the same-account direct-launch fast path below (which
         # _exec's claude and never returns) — and before setup_session.
         self._ensure_not_api_key(account_num, email)
-        # ONE route for this launch, read with the account it belongs to: the
-        # environment the launch hands Claude Code and the pre-start probe
-        # must both be this account's proxy, never whichever slot holds the
-        # number later (see ``account_route``). The identity is also handed to
+        # ONE read for this launch's route and rule, pinned to the account it
+        # belongs to: the environment the launch hands Claude Code and the
+        # pre-start check must both be this account's proxy and this account's
+        # expectation, never whichever slot holds the number later (see
+        # ``account_route_and_expectation``). The identity is also handed to
         # setup_session, which refuses the launch when a `swap`/`move` gave the
         # slot to another account during the check — the accepted "one command
         # at a time" boundary in docs/proxy.md.
-        route = self.switcher.account_route(account_num, email, org_uuid)
-        who = f"Account-{account_num} ({email})"
-        self._check_proxy(route, who)
-        # The expectation is read with the same identity as the route, and
-        # checked before any profile work: a mismatch or an unanswerable
-        # GeoIP chain ends the command here, with Claude Code never started.
-        self._check_egress(
-            route,
-            self.switcher.account_expectation(account_num, email, org_uuid),
-            who,
+        route, expectation = self.switcher.account_route_and_expectation(
+            account_num, email, org_uuid
         )
+        who = f"Account-{account_num} ({email})"
+        # The rule is already in hand, so a proxy that cannot be used is the
+        # same "the exit cannot be confirmed" refusal in both readings: for an
+        # account with a rule it is an egress refusal (`--auto` tries the next
+        # candidate), and for an account without one it stays the launch's own
+        # proxy refusal.
+        self._check_proxy(route, who, expectation)
+        # Checked before any profile work: a mismatch or an unanswerable GeoIP
+        # chain ends the command here, with Claude Code never started.
+        self._check_egress(route, expectation, who)
 
         config_dir_preset = os.environ.get("CLAUDE_CONFIG_DIR")
         # Same-account fast path: never create a second credential copy
@@ -993,6 +1001,17 @@ class SessionManager:
             if account is not None:
                 # Chosen for the user, so the shell's auth overrides go.
                 _warn_auth_overrides()
+            # The check above may have taken seconds (a `CONNECT`, then the
+            # GeoIP chain): a `swap`/`move` since then must end the launch, not
+            # run the account that took the slot. ``setup_session`` makes the
+            # same check on the session branch.
+            if not self.switcher.account_still_holds(account_num, email, org_uuid):
+                raise SessionError(
+                    f"Account-{account_num} ({email}) no longer holds the slot: "
+                    "a swap or move gave it to another account while its "
+                    "exit was being checked. Nothing was launched; run the "
+                    "command again."
+                )
             env = self._launch_env(
                 route, self._launch_base_env(account is not None)
             )
@@ -1197,18 +1216,21 @@ class SessionManager:
             # so leaving it would give the command this profile's config and
             # proxy with the session's stored login.
             env.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
-            route = self.switcher.default_profile_login_route()
-            expectation = self.switcher.default_profile_login_expectation()
+            route, expectation = (
+                self.switcher.default_profile_login_route_and_expectation()
+            )
         else:
-            route = self.switcher.live_login_route()
-            expectation = self.switcher.live_login_expectation()
+            route, expectation = self.switcher.live_login_route_and_expectation()
         who = "The default login's account"
-        self._check_proxy(route, who)
+        self._check_proxy(route, who, expectation)
         self._check_egress(route, expectation, who)
         self._exec(claude_bin, claude_args, env=self._launch_env(route, env))
 
     def _check_proxy(
-        self, route: account_proxy.ProxyRoute | None, who: str
+        self,
+        route: account_proxy.ProxyRoute | None,
+        who: str,
+        expectation: "egress.Expectation | None" = None,
     ) -> None:
         """Refuse the launch before Claude Code starts when its proxy is unusable.
 
@@ -1217,16 +1239,26 @@ class SessionManager:
         stored value all end the command here — before any profile work, any
         ``claude`` spawn and any token. The message never repeats the proxy
         URL or its user name: both may carry credentials.
+
+        ``expectation`` is the account's egress rule, when the caller already
+        holds it. A rule makes this refusal the same "the exit cannot be
+        confirmed" one the GeoIP check gives, so ``cswap run --auto`` treats it
+        as a reason to try the next candidate (a dead proxy is the same answer
+        as a wrong exit for an account that promised one). Without a rule it
+        stays the launch's own refusal (``SessionError``).
         """
         if route is None:
             return
         try:
             account_proxy.probe(route)
         except account_proxy.ProxyRouteError as e:
-            raise SessionError(
+            message = (
                 f"{who} has a proxy that cannot be used: {e}. "
                 "Claude Code was not started."
-            ) from None
+            )
+            if expectation is not None and expectation.required:
+                raise EgressCheckError(message) from None
+            raise SessionError(message) from None
 
     def _check_egress(
         self,

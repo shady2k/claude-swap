@@ -7172,6 +7172,76 @@ class TestAutoRunTarget:
         # Every reading was current, so the walk asked the endpoint nothing.
         assert endpoint.calls == []
 
+    def test_the_plan_captures_the_roster_once_while_it_walks(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A rejected candidate costs a row of the order, not a new capture.
+
+        `cswap run --auto` walks ``auto_run_plan`` instead of asking
+        ``auto_run_target(exclude=…)`` again: with ten rejected accounts that
+        was eleven captures of the roster and eleven passes over the readings.
+        """
+        clock = _FakeClock()
+        s, endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(10),
+                "b@example.com": self._usage(20),
+                "c@example.com": self._usage(50),
+            },
+            answers={},
+        )
+        captures = []
+        original = s._build_accounts_info
+
+        def counted(*args, **kwargs):
+            captures.append(1)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(s, "_build_accounts_info", counted)
+        plan = s.auto_run_plan()
+
+        walked = [plan.next(), plan.next(), plan.next()]
+
+        assert [row[0] for row in walked] == [1, 2, 3]
+        assert plan.next() is None
+        assert len(captures) == 1
+        # Every reading was current, so no confirmation asked the endpoint.
+        assert endpoint.calls == []
+
+    def test_a_rejected_slot_leaves_the_reset_reason_for_the_rest(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The final message keeps `why`: the reset time is what the user acts on."""
+        from datetime import datetime, timedelta, timezone
+
+        weekly = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+        clock = _FakeClock()
+        s, _endpoint = self._pair_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(10),
+                "b@example.com": {
+                    "five_hour": {"pct": 0.0},
+                    "seven_day": {"pct": 100.0, "resets_at": weekly},
+                },
+            },
+            answers={},
+        )
+
+        plan = s.auto_run_plan()
+        rejected = plan.next()
+        assert rejected is not None and rejected[0] == 1
+        assert plan.next() is None
+
+        why = plan.why()
+        assert "Every managed account is at its limit" in why
+        assert "the nearest reset is at" in why
+
     def test_the_live_login_is_launched_when_it_has_the_most_room(
         self, temp_home: Path, monkeypatch
     ):
