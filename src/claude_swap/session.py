@@ -45,12 +45,17 @@ profile's history with its own eyes (``_history_tree``).
 
 Every launch — a session profile, plain claude on the default login, and the
 ``claude auth status`` probe — gets its environment from ``_claude_env``:
-non-essential traffic off, and, for an account that has a proxy, that account's
+non-essential traffic off (``run.disableNonessentialTraffic`` stops cswap from
+setting that variable), and, for an account that has a proxy, that account's
 ``HTTPS_PROXY``/``HTTP_PROXY``/``ALL_PROXY``/``NO_PROXY`` in place of whatever
 the shell carried. The route is read once, before any profile work, and
 ``account_proxy.probe`` refuses the launch when it cannot be used. Nothing here
 forbids a direct connection at the OS level: a program that ignores these
 variables still goes out directly (``docs/proxy.md``).
+
+The binary every launch hands the terminal to comes from ``find_claude``,
+which never returns claude-swap's own ``claude`` wrapper: choosing an account
+is the wrapper's job, not something a launch already given one may repeat.
 
 This module must not import ``switcher`` (switcher imports us for the
 session-aware guards); it receives a ``ClaudeAccountSwitcher`` instance.
@@ -70,7 +75,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from claude_swap import account_proxy, macos_keychain, spawn
+from claude_swap import account_proxy, macos_keychain, spawn, wrapper
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
@@ -95,6 +100,7 @@ from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import ClaudeSession, scan_sessions
 from claude_swap.settings import (
     DEFAULT_NO_PROXY,
+    RunSettings,
     atomic_write_json,
     explicit_share_history,
     load_run_settings,
@@ -727,10 +733,44 @@ def _adds_nothing(target: Path, candidate: Path) -> bool:
         return False
 
 
+def find_claude() -> str | None:
+    """The real Claude Code binary, never claude-swap's own wrapper.
+
+    ``CSWAP_REAL_CLAUDE`` is the binary the wrapper resolved before it ran
+    ``cswap run --auto``; it wins, because the wrapper has already walked
+    ``PATH`` and a second walk could disagree with it. Started directly with
+    the wrapper on ``PATH``, the first ``claude`` found is passed over and the
+    walk goes on: exec'ing the wrapper from here would replace an explicit
+    ``cswap run 3`` account with an automatic choice, and would turn the
+    ``claude auth status`` probe into a second cswap. See ``wrapper.py``.
+    """
+    handed_down = os.environ.get(wrapper.REAL_CLAUDE_ENV)
+    if (
+        handed_down
+        and os.path.isfile(handed_down)
+        and os.access(handed_down, os.X_OK)
+        and not wrapper.is_wrapper(handed_down)
+    ):
+        return handed_down
+    found = shutil.which("claude")
+    if found is None or not wrapper.is_wrapper(found):
+        return found
+    for directory in os.get_exec_path():
+        candidate = os.path.join(directory, "claude")
+        if (
+            os.path.isfile(candidate)
+            and os.access(candidate, os.X_OK)
+            and not wrapper.is_wrapper(candidate)
+        ):
+            return candidate
+    return None
+
+
 def _claude_env(
     base: dict[str, str],
     route: account_proxy.ProxyRoute | None,
     no_proxy: str,
+    disable_nonessential_traffic: bool = True,
 ) -> dict[str, str]:
     """The environment every Claude Code process cswap starts is given.
 
@@ -740,7 +780,10 @@ def _claude_env(
     feedback, release notes, the PR/MR status badges, availability checks such
     as the fast mode check, and the feature flags it would otherwise fetch —
     which is what makes Remote Control unavailable in these sessions. ``0``
-    does not turn that traffic back on; only unsetting the variable does.
+    does not turn that traffic back on; only unsetting the variable does,
+    which is what ``run.disableNonessentialTraffic false`` amounts to: the
+    variable is not set here at all, and an inherited value is left as the
+    shell has it.
 
     For an account with a proxy the account's own variables go in over the
     inherited ones (see ``account_proxy.launch_env``); an account without one
@@ -751,7 +794,8 @@ def _claude_env(
     env = dict(base)
     if route is not None:
         env = account_proxy.launch_env(route, no_proxy, env)
-    env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+    if disable_nonessential_traffic:
+        env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
     return env
 
 
@@ -759,6 +803,7 @@ def _probe_env(
     session_dir: Path,
     route: account_proxy.ProxyRoute | None = None,
     no_proxy: str = DEFAULT_NO_PROXY,
+    disable_nonessential_traffic: bool = True,
 ) -> dict[str, str]:
     """Env for the auth-status probe: session config dir, auth overrides dropped.
 
@@ -769,7 +814,7 @@ def _probe_env(
     """
     env = {k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS}
     env["CLAUDE_CONFIG_DIR"] = str(session_dir)
-    return _claude_env(env, route, no_proxy)
+    return _claude_env(env, route, no_proxy, disable_nonessential_traffic)
 
 
 class SessionManager:
@@ -827,7 +872,7 @@ class SessionManager:
         Notices on the way are printed plainly. `cswap run` sends them to
         stderr, because stdout is claude's (``cli._run_launch``).
         """
-        claude_bin = shutil.which("claude")
+        claude_bin = find_claude()
         if not claude_bin:
             raise SessionError(
                 "'claude' was not found on PATH. Install Claude Code first."
@@ -1072,7 +1117,7 @@ class SessionManager:
         inherited: there is no account whose route they could be replaced
         with.
         """
-        claude_bin = shutil.which("claude")
+        claude_bin = find_claude()
         if not claude_bin:
             raise SessionError(
                 "'claude' was not found on PATH. Install Claude Code first."
@@ -1107,13 +1152,16 @@ class SessionManager:
     def _launch_env(
         self, route: account_proxy.ProxyRoute | None, base: dict[str, str]
     ) -> dict[str, str]:
-        """Environment for one launch (``_claude_env`` with ``run.noProxy``)."""
-        no_proxy = DEFAULT_NO_PROXY if route is None else self._no_proxy()
-        return _claude_env(base, route, no_proxy)
+        """Environment for one launch (``_claude_env`` with the ``run`` settings)."""
+        run = self._run_settings()
+        no_proxy = DEFAULT_NO_PROXY if route is None else run.no_proxy
+        return _claude_env(
+            base, route, no_proxy, run.disable_nonessential_traffic
+        )
 
-    def _no_proxy(self) -> str:
-        """The ``NO_PROXY`` list a launch hands Claude Code (``run.noProxy``)."""
-        return load_run_settings(self.switcher.backup_dir).no_proxy
+    def _run_settings(self) -> RunSettings:
+        """The ``run`` settings one launch applies (``run`` section of settings.json)."""
+        return load_run_settings(self.switcher.backup_dir)
 
     def _exec(self, claude_bin: str, claude_args: list[str], env: dict[str, str]) -> NoReturn:
         """Hand the terminal over to claude. Never returns.
@@ -1122,7 +1170,13 @@ class SessionManager:
         already released — an exec'd claude must never inherit a held flock).
         Windows: ``os.exec*`` detaches from the console confusingly, so stay
         resident as a thin wrapper and mirror claude's exit code.
+
+        ``CSWAP_REAL_CLAUDE`` is dropped first: it is the wrapper's note to
+        cswap, not part of Claude Code's environment. A ``claude`` a session
+        starts later must go through the wrapper and choose an account again
+        (``wrapper.py``).
         """
+        env.pop(wrapper.REAL_CLAUDE_ENV, None)
         argv = [claude_bin, *claude_args]
         if sys.platform == "win32":
             try:
@@ -1512,13 +1566,17 @@ class SessionManager:
             return "invalid"
         # On Windows `claude` is a `.cmd` shim, and a bare "claude" passed to
         # subprocess won't resolve it (PATHEXT isn't applied) — it raises
-        # FileNotFoundError. `shutil.which` finds the shim; when it finds
-        # nothing at all the run below still raises, and that is "unknown".
-        claude_bin = shutil.which("claude") or "claude"
+        # FileNotFoundError. `find_claude` answers like `shutil.which`; when it
+        # finds nothing at all the run below still raises, and that is "unknown".
+        # It also skips claude-swap's own wrapper, so the probe stays one claude.
+        claude_bin = find_claude() or "claude"
+        run = self._run_settings()
         try:
             result = spawn.run(
                 [claude_bin, "auth", "status", "--json"],
-                env=_probe_env(session_dir, route, self._no_proxy()),
+                env=_probe_env(
+                    session_dir, route, run.no_proxy, run.disable_nonessential_traffic
+                ),
                 capture_output=True,
                 text=True,
                 timeout=_AUTH_STATUS_TIMEOUT,

@@ -26,6 +26,7 @@ It works on the same files and Keychain items Claude Code uses, and takes Claude
 - `usage_store.py`: `UsageStore`, the per-account usage table. `poll_policy.py` holds every polling number. `snapshot_source.py` is the read path for dashboards.
 - `oauth.py`: the token, usage and profile endpoints, the header probe, and the formatting of reset times. `subscription.py` reads the plan label; `pace.py` computes the weekly pace marker.
 - `account_proxy.py`: an account's proxy, and the pinned route its requests take. Every network call in `oauth.py` and `subscription.py` goes through it.
+- `wrapper.py`: the thin `claude` script (`scripts/claude`) and the rule that keeps cswap and the wrapper from launching each other.
 - `transfer.py`: export and import. `settings.py`: `settings.json`. `migrations.py`: one-time data migrations. `update_check.py`: the PyPI version check.
 
 **Storage and platform.** Leaf modules that the core calls.
@@ -109,6 +110,14 @@ A launch of an account with a proxy reads the route once, refuses before any Cla
 
 Read next: the module docstring of `session.py`, and [proxy.md](proxy.md#launching-claude-code).
 
+### A launch on the best account
+
+`cswap run --auto` picks the account with `ClaudeAccountSwitcher.auto_run_target`, which is `_select_best_switchable` read as a launch: a strictly better account, else the login the terminal already has. It then runs the session-mode launch above for that slot, without touching `sequence.json` or the default login.
+
+The thin `claude` wrapper calls it for every launch. `session.find_claude` is the one place that resolves the binary a launch hands the terminal to, and it never returns the wrapper: the wrapper's own export (`CSWAP_REAL_CLAUDE`) is preferred, and a `claude` that is the wrapper is walked past on `PATH`. `_exec` drops that export before Claude Code starts, so a nested `claude` chooses again.
+
+Read next: `wrapper.py` and [auto-launch.md](auto-launch.md).
+
 ### Auto-switch
 
 `AutoSwitchEngine.tick` collects usage, ranks the candidates (`_rank_candidates`), freshens the chosen target's token (`_freshen_target`) and calls `switcher.switch_to`. `cswap auto`, the TUI's auto screen and the menu bar all run this same engine and render its events. Cooldown and quarantine are kept in `autoswitch_state.json` under their own lock, so a cron-driven `--once` and a long-running loop agree.
@@ -127,6 +136,7 @@ Read next: the module docstring of `autoswitch.py`. The rules as users see them 
 - **Surfaces hold no account logic.** Dashboards read through `SnapshotSource`; the engine does not print.
 - **Import direction.** `session.py` and `credentials.py` do not import `switcher.py`. `fsutil.py` imports nothing from the package. The TUI's heavy imports stay inside `tui.run`.
 - **Paths come from `paths.py`.** Do not hardcode `~/.claude`; Claude Code's own resolution has cases that differ.
+- **A launch hands the terminal to the real Claude Code, never to the wrapper.** `session.find_claude` is the only resolver; choosing an account happens once, in the wrapper's `cswap run --auto`.
 - **A request for an account travels that account's route.** Every network call in `oauth.py` and `subscription.py` takes an `account_proxy` route; a slot with no proxy goes direct, and one whose proxy is set never does. The route comes from the same read as the credential it is used for (`AccountInfo` in `switcher.py`), so a concurrent `swap`/`move` cannot pair one account's token with another slot's route. A launch of such an account takes the same route — checked before Claude Code starts and handed to it in the environment — and one whose route cannot be confirmed is refused rather than run direct.
 
 ## Tests

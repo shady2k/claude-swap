@@ -147,11 +147,19 @@ Launch Claude Code as a specific account in the current terminal only — every 
 ```bash
 cswap run 2                     # launch Claude Code as account 2, here only
 cswap run user@example.com      # by email
+cswap run --auto                # the account with the most quota left, no switch
 cswap run 2 -- --resume         # everything after '--' is forwarded to claude
 cswap run 2 --no-share-history  # keep this account's chat history to itself
 ```
 
 Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP servers, etc.) and share its chat history, so a conversation started under one account shows up in `--resume` under the others.
+
+<details>
+<summary>Pick the account for you — the <code>claude</code> wrapper</summary>
+
+`ln -s "$(cswap wrapper)" ~/.local/bin/claude`, in a directory ahead of the real Claude Code in `PATH`, makes every `claude` (and `claude --resume`) run `cswap run --auto` — the managed account with the most quota left, in its own session profile with its own proxy, while the default login stays where it is. Nothing with quota left is a refusal naming the nearest reset, not a fallback. The rules are in [docs/auto-launch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-launch.md).
+
+</details>
 
 <details>
 <summary>How it behaves — chat history, MCP servers, tokens</summary>
@@ -317,6 +325,7 @@ cswap config set autoswitch.weeklyThreshold 97  # own switch line for the 7-day/
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
 cswap config set run.shareHistory false   # each account keeps its own chat history (see "run")
 cswap config set run.noProxy 'localhost,10.0.0.0/8'  # hosts a proxied launch reaches directly
+cswap config set run.disableNonessentialTraffic false  # let Claude Code auto-update, keep Remote Control
 cswap config set updates.check false      # no daily PyPI lookup for the "newer version" hint
 cswap config set usage.headerProbe true   # opt in: setup-token usage via a 1-token request (see "add-token")
 cswap config set usage.fableProbe true    # opt in: also their Fable weekly limit, via a 1-token Fable request
@@ -433,6 +442,7 @@ cswap add-token --email user@example.com     # optional label override
 - [docs/auto-switch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-switch.md) — the exact auto-switch rules: hysteresis margins, landing rules, per-account thresholds and tiers, polling cadence. Read it to find out why it did or didn't switch.
 - [docs/json-output.md](https://github.com/realiti4/claude-swap/blob/main/docs/json-output.md) — every field in `--json` output, including the optional ones. Read it before writing a script against `cswap list --json` or `cswap auto --json`.
 - [docs/menubar.md](https://github.com/realiti4/claude-swap/blob/main/docs/menubar.md) — how the macOS menu bar runs under launchd: start at login, the wrapper app in `/Applications`, file locations, upgrades, the Login Items switch. Read it when the icon is missing or the service misbehaves.
+- [docs/auto-launch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-launch.md) — launching on the account with the most quota: which account `cswap run --auto` picks and why, what the `claude` wrapper does, how the next launch follows an exhausted account, and the non-essential-traffic switch.
 - [docs/proxy.md](https://github.com/realiti4/claude-swap/blob/main/docs/proxy.md) — the per-account proxy: the URL forms, what it routes, the fail-closed cases and how they are reported, storage, export and rollback.
 
 `cswap --help` and `cswap <command> --help` document every flag.

@@ -110,10 +110,17 @@ class RunSettings:
     ``no_proxy``: the ``NO_PROXY`` list a proxied account's launch hands
     Claude Code, stored comma-separated. One list for every account, because
     what is local is a property of the machine, not of the login.
+
+    ``disable_nonessential_traffic``: every launch sets
+    ``CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1``, which is what costs Claude
+    Code its auto-updates and Remote Control (see ``docs/proxy.md``).
+    Off stops cswap from setting the variable; it never unsets one the shell
+    already carries.
     """
 
     share_history: bool = True
     no_proxy: str = DEFAULT_NO_PROXY
+    disable_nonessential_traffic: bool = True
 
 
 @dataclass(frozen=True)
@@ -239,6 +246,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "run", "noProxy", "no_proxy", "string",
             help="Hosts a proxied account's launch reaches directly (NO_PROXY)",
+        ),
+        SettingSpec(
+            "run", "disableNonessentialTraffic", "disable_nonessential_traffic",
+            "bool",
+            help=(
+                "Set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 on every launch "
+                "(off returns Claude Code's auto-updates and Remote Control)"
+            ),
         ),
         SettingSpec(
             "updates", "check", "check", "bool",
@@ -503,6 +518,9 @@ def load_run_settings(backup_root: Path) -> RunSettings:
     return RunSettings(
         share_history=True if chosen is None else chosen,
         no_proxy=_no_proxy_setting(backup_root),
+        disable_nonessential_traffic=_disable_nonessential_traffic_setting(
+            backup_root
+        ),
     )
 
 
@@ -551,6 +569,22 @@ def _no_proxy_setting(backup_root: Path) -> str:
     except ConfigError as e:
         _logger.warning("settings.json: %s; using %r", e, DEFAULT_NO_PROXY)
         return DEFAULT_NO_PROXY
+
+
+def _disable_nonessential_traffic_setting(backup_root: Path) -> bool:
+    """``run.disableNonessentialTraffic``; a non-boolean value → the default."""
+    section = _read_raw(settings_path(backup_root)).get("run")
+    raw = section.get("disableNonessentialTraffic") \
+        if isinstance(section, dict) else None
+    if raw is None:
+        return RunSettings().disable_nonessential_traffic
+    if not isinstance(raw, bool):
+        _logger.warning(
+            "settings.json: run.disableNonessentialTraffic %r is not true or "
+            "false; using %r", raw, RunSettings().disable_nonessential_traffic,
+        )
+        return RunSettings().disable_nonessential_traffic
+    return raw
 
 
 def explicit_share_history(backup_root: Path) -> bool | None:

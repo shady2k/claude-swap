@@ -6681,6 +6681,132 @@ class ClaudeAccountSwitcher:
             return None, "exhausted"
         return None, "stay"
 
+    def auto_run_target(
+        self, models: tuple[str, ...] | None = None
+    ) -> tuple[str | None, str]:
+        """The account ``cswap run --auto`` launches, without switching anything.
+
+        The same comparison ``cswap switch --strategy best`` makes
+        (``_select_best_switchable``), read as a launch: when it names a
+        strictly better account, that account is started; when it stays, the
+        login the terminal already has keeps the most headroom and is started
+        — which ``cswap run`` then satisfies on the default login itself, the
+        same-account fast path. Either way only that account's session profile
+        runs: ``sequence.json`` and the default login are read, never written,
+        so a launch is not a switch.
+
+        A slot is a candidate when it is in rotation, not disabled, has stored
+        credentials and config, and is not an API-key slot — ``cswap run``
+        refuses those (``session.SessionManager._ensure_not_api_key``), so
+        nominating one would refuse a launch the next account could serve.
+        ``models`` folds the per-model weekly windows into the comparison the
+        way the switch strategies do; ``None`` reads ``autoswitch.model``, the
+        configured list, there being no ``--model`` flag on ``run``.
+
+        Every usage value behind the choice is the bookkeeping ``cswap switch
+        --strategy best`` already does (``_usage_by_account``): the last good
+        reading, refetched on ``poll_policy``'s schedule, which parks an
+        exhausted account until its own ``resets_at``. That is why the next
+        launch after an account runs out lands on another one — no extra
+        signal from Claude Code is needed or read.
+
+        Returns ``(number, note)``, ``note`` being ``"better"`` (a switch
+        would have moved there), ``"best"`` (the live login is the best one)
+        or ``"only"`` (the live login's usage is unknown or at its limit, so
+        the launch takes the best account whose own reading still shows room),
+        or ``(None, message)`` when nothing can be launched, with the reason —
+        and, when every account is at its limit, the nearest reset time.
+        """
+        if models is None:
+            models = parse_model_names(load_settings(self.backup_dir).model)
+
+        data = self._get_sequence_data() or {}
+        sequence = [str(num) for num in data.get("sequence", [])]
+        if not sequence:
+            return None, "No accounts are managed yet. Add one with `cswap add`."
+        candidates = [
+            num
+            for num in sequence
+            if not self._disabled_from_data(data, num)
+            and self._account_is_switchable(num)
+            and self._account_kind(num) != "api_key"
+        ]
+        if not candidates:
+            return None, (
+                "No managed account can be launched: every slot is disabled, "
+                "an API-key account, or has no stored credentials/config."
+            )
+
+        usage = self._usage_by_account()
+        identity = self._get_current_account()
+        live_num = self._find_account_slot(data, *identity) if identity else None
+
+        target, _note = self._select_best_switchable(live_num, models, usage)
+        if target in candidates:
+            return target, "better"
+        if live_num in candidates:
+            room = oauth.account_headroom(usage.get(live_num), models)
+            if room is not None and room > 0:
+                return live_num, "best"
+
+        readable = [
+            (room, num)
+            for num in candidates
+            if (room := oauth.account_headroom(usage.get(num), models)) is not None
+        ]
+        if readable:
+            # max() keeps the first maximal element, and `candidates` is in
+            # rotation order, so a tie lands on the earliest slot.
+            room, num = max(readable, key=lambda pair: pair[0])
+            if room > 0:
+                return num, "only"
+            nearest = self._nearest_reset(usage, candidates, models)
+            return None, (
+                "Every managed account is at its limit"
+                + (f" ({nearest})" if nearest else "")
+                + ". Nothing was launched."
+            )
+        return None, (
+            "No account's remaining quota could be read, so none could be "
+            "chosen. Run `cswap list` to see why, or name an account: "
+            "`cswap run NUM`."
+        )
+
+    @staticmethod
+    def _nearest_reset(
+        usage: dict, numbers: list[str], models: tuple[str, ...]
+    ) -> str | None:
+        """``the nearest reset is at 14:20, in 41m`` across ``numbers``' windows.
+
+        Read from the same windows the headroom came from, so a refused launch
+        says when it can succeed instead of only that it cannot. A window
+        without ``resets_at``, or with one that will not parse, is skipped.
+        """
+        from datetime import datetime
+
+        stamps = [
+            resets_at
+            for num in numbers
+            for _label, _pct, resets_at in oauth.relevant_windows(
+                usage.get(num), models
+            )
+            if resets_at
+        ]
+        parsed = []
+        for value in stamps:
+            try:
+                parsed.append((datetime.fromisoformat(value), value))
+            except (TypeError, ValueError):
+                continue
+        if not parsed:
+            return None
+        earliest = min(parsed)[1]
+        try:
+            countdown, clock = oauth.format_reset(earliest)
+        except (TypeError, ValueError):
+            return None
+        return f"the nearest reset is at {clock}, in {countdown}"
+
     def _duplicate_account_warnings(
         self, accounts_info: list[AccountInfo]
     ) -> list[str]:

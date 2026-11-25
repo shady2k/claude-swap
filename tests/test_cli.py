@@ -1418,6 +1418,60 @@ class TestRunCommand:
         assert excinfo.value.code == 1
         assert "boom" in capsys.readouterr().err
 
+    def _auto_dispatch(self, argv, auto_run_target):
+        """Dispatch `cswap run --auto` with a switcher that answers the choice."""
+        return self._dispatch(
+            argv,
+            auto_run_target=MagicMock(side_effect=auto_run_target),
+        )
+
+    def test_auto_launches_the_account_it_chose(self):
+        calls = self._auto_dispatch(
+            ["run", "--auto", "--", "--resume", "-p", "a b"],
+            lambda **kwargs: ("2", "better"),
+        )
+        assert ("run", "2", ["--resume", "-p", "a b"], True, None, False) in calls
+
+    def test_auto_forwards_the_run_flags(self):
+        calls = self._auto_dispatch(
+            ["run", "--auto", "--no-share", "--no-share-history", "--require-session"],
+            lambda **kwargs: ("3", "best"),
+        )
+        assert ("run", "3", [], False, False, True) in calls
+
+    def test_auto_refusal_exits_non_zero_and_launches_nothing(self, capsys):
+        with pytest.raises(SystemExit) as excinfo:
+            self._auto_dispatch(
+                ["run", "--auto"],
+                lambda **kwargs: (
+                    None,
+                    "Every managed account is at its limit. Nothing was launched.",
+                ),
+            )
+
+        assert excinfo.value.code == 1
+        assert "is at its limit" in capsys.readouterr().err
+
+    def test_auto_names_the_account_it_chose(self, capsys):
+        self._auto_dispatch(["run", "--auto"], lambda **kwargs: ("2", "better"))
+        assert "Account-2 has the most remaining quota" in capsys.readouterr().err
+
+    def test_auto_with_an_account_is_a_usage_error(self):
+        with patch.object(sys, "argv", ["claude-swap", "run", "--auto", "2"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+
+    def test_wrapper_prints_the_shipped_script(self, capsys):
+        from claude_swap import wrapper
+
+        with patch.object(sys, "argv", ["claude-swap", "wrapper"]):
+            cli.main()
+
+        printed = Path(capsys.readouterr().out.strip())
+        assert printed == wrapper.WRAPPER_PATH
+        assert printed.is_file()
+
     def test_whatever_the_launch_prints_goes_to_stderr(self, capsys):
         """Stdout is claude's. A notice from anywhere on the way to the
         launch, however it is printed, must not land in it."""

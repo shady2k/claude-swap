@@ -10,7 +10,7 @@ import os
 import sys
 
 from claude_swap import __version__, account_proxy, paths, printer
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, SessionError
 from claude_swap.json_output import error_envelope
 from claude_swap.models import (
     ACCOUNT_PRIORITY_MAX,
@@ -144,6 +144,7 @@ Examples:
   cswap run 2 --no-share
   cswap run 2 --no-share-history
   cswap run 2 --require-session
+  cswap run --auto -- --resume
   cswap run 2 -- --resume
         """,
     )
@@ -153,6 +154,18 @@ Examples:
         metavar="NUM|EMAIL",
         help="Account to run (number or email). Omit to use the current "
         "directory's mapping (see `cswap map`).",
+    )
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help=(
+            "Launch the managed account with the most remaining quota "
+            "instead of a named or mapped one, without switching the default "
+            "login. The account is chosen by the same comparison `cswap "
+            "switch --strategy best` makes; no account with quota left is a "
+            "refusal, not a fallback. This is what the thin `claude` wrapper "
+            "runs (see `cswap wrapper`)."
+        ),
     )
     parser.add_argument(
         "--no-share",
@@ -195,6 +208,8 @@ Examples:
         help="Enable debug logging",
     )
     args = parser.parse_args(head)
+    if args.auto and args.account is not None:
+        parser.error("--auto chooses the account itself: give no NUM|EMAIL with it")
 
     # The parser's --help belongs on stdout. Nothing printed after it does:
     # see _run_launch.
@@ -226,6 +241,25 @@ def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
 
         # share_history goes through as given: None (neither flag) leaves it
         # to run.shareHistory, which SessionManager.run resolves.
+        if args.auto:
+            number, why = switcher.auto_run_target()
+            if number is None:
+                raise SessionError(why)
+            print(
+                dimmed(
+                    f"Account-{number} has the most remaining quota — "
+                    "launching it."
+                )
+            )
+            manager.run(
+                number,
+                tail,
+                share=not args.no_share,
+                share_history=args.share_history,
+                require_session=args.require_session,
+            )
+            return  # only reachable in tests where exec/exit is mocked
+
         if args.account is not None:
             manager.run(
                 args.account,
@@ -266,6 +300,36 @@ def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+def _wrapper_command(argv: list[str]) -> None:
+    """Handle `cswap wrapper`: print the thin `claude` wrapper's path.
+
+    The install itself is a symlink the user makes, because the wrapper has to
+    sit in a directory ahead of the real Claude Code in ``PATH`` and only they
+    know which one that is. Pre-dispatched before the main parser for the same
+    reason as `run`: the main parser's required mutually-exclusive group can't
+    hold a positional subcommand. Rules: ``docs/auto-launch.md``.
+    """
+    parser = argparse.ArgumentParser(
+        prog="cswap wrapper",
+        description=(
+            "Print the path of claude-swap's thin `claude` wrapper: a symlink "
+            "to it, ahead of the real Claude Code in PATH, makes every "
+            "`claude` launch the managed account with the most quota left "
+            "(`cswap run --auto`) without switching the default login."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Example:
+  ln -s "$(cswap wrapper)" ~/.local/bin/claude
+        """,
+    )
+    parser.parse_args(argv)
+
+    from claude_swap import wrapper
+
+    print(wrapper.WRAPPER_PATH)
 
 
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
@@ -1594,6 +1658,9 @@ def main() -> None:
     if argv and argv[0] == "run":
         _run_command(argv[1:])
         return  # only reachable in tests where exec/exit is mocked
+    if argv and argv[0] == "wrapper":
+        _wrapper_command(argv[1:])
+        return
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
@@ -1665,6 +1732,8 @@ Commands:
   %(prog)s priority                   list account priorities
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
+  %(prog)s run --auto [-- ...]        run the account with the most quota left
+  %(prog)s wrapper                    print the path of the thin `claude` wrapper
   %(prog)s map <num|email> [path]     map a directory to an account
   %(prog)s map                        list directory mappings
   %(prog)s unmap [path]               remove a directory mapping
@@ -1699,6 +1768,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s add --proxy http://127.0.0.1:3128  # add it with its own proxy
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
+  %(prog)s run --auto -- --resume            # best account, no switch
   %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
   %(prog)s config set autoswitch.threshold 80
 

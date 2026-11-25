@@ -24,6 +24,7 @@ from claude_swap import fsutil
 from claude_swap import macos_keychain
 from claude_swap import oauth
 from claude_swap import session as session_mod
+from claude_swap import wrapper
 from claude_swap.credentials import CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE
 from claude_swap.exceptions import (
     AccountNotFoundError,
@@ -1939,6 +1940,120 @@ def _no_proxy_from_settings(manager: SessionManager) -> str:
     return load_run_settings(manager.switcher.backup_dir).no_proxy
 
 
+class TestFindClaudeNeverHandsOverToTheWrapper:
+    """The wrapper launches cswap; cswap must not launch the wrapper back.
+
+    ``find_claude`` is the only resolver a launch uses, and a ``claude`` that
+    turns out to be claude-swap's own wrapper is walked past. What it must not
+    do is change what an ordinary setup resolves to.
+    """
+
+    @staticmethod
+    def _binary(directory: Path, body: str = "#!/bin/sh\nexit 0\n") -> Path:
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "claude"
+        path.write_text(body)
+        path.chmod(0o755)
+        return path
+
+    def _wrapper_link(self, directory: Path) -> Path:
+        directory.mkdir(parents=True, exist_ok=True)
+        link = directory / "claude"
+        link.symlink_to(wrapper.WRAPPER_PATH)
+        return link
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="the wrapper is a POSIX shell script"
+    )
+    def test_the_wrapper_on_path_is_passed_over(self, tmp_path, monkeypatch):
+        real = self._binary(tmp_path / "real")
+        link = self._wrapper_link(tmp_path / "bin")
+        monkeypatch.setenv("PATH", os.pathsep.join([str(link.parent), str(real.parent)]))
+        monkeypatch.delenv(wrapper.REAL_CLAUDE_ENV, raising=False)
+        monkeypatch.setattr(session_mod.shutil, "which", lambda name: str(link))
+
+        assert session_mod.find_claude() == str(real)
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="the wrapper is a POSIX shell script"
+    )
+    def test_the_wrapper_alone_is_not_a_claude(self, tmp_path, monkeypatch):
+        link = self._wrapper_link(tmp_path / "bin")
+        monkeypatch.setenv("PATH", str(link.parent))
+        monkeypatch.delenv(wrapper.REAL_CLAUDE_ENV, raising=False)
+        monkeypatch.setattr(session_mod.shutil, "which", lambda name: str(link))
+
+        assert session_mod.find_claude() is None
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="the wrapper is a POSIX shell script"
+    )
+    def test_a_copy_of_the_wrapper_is_recognised_too(self, tmp_path, monkeypatch):
+        real = self._binary(tmp_path / "real")
+        copied_dir = tmp_path / "copied"
+        copied_dir.mkdir()
+        copied = copied_dir / "claude"
+        copied.write_bytes(wrapper.WRAPPER_PATH.read_bytes())
+        copied.chmod(0o755)
+        monkeypatch.setenv("PATH", os.pathsep.join([str(copied_dir), str(real.parent)]))
+        monkeypatch.delenv(wrapper.REAL_CLAUDE_ENV, raising=False)
+        monkeypatch.setattr(session_mod.shutil, "which", lambda name: str(copied))
+
+        assert session_mod.find_claude() == str(real)
+
+    def test_the_handed_down_path_wins(self, tmp_path, monkeypatch):
+        real = self._binary(tmp_path / "real")
+        monkeypatch.setenv(wrapper.REAL_CLAUDE_ENV, str(real))
+        monkeypatch.setattr(
+            session_mod.shutil, "which", lambda name: "/nonexistent/claude"
+        )
+
+        assert session_mod.find_claude() == str(real)
+
+    def test_a_handed_down_path_that_is_not_runnable_is_ignored(
+        self, tmp_path, monkeypatch
+    ):
+        gone = tmp_path / "gone" / "claude"
+        monkeypatch.setenv(wrapper.REAL_CLAUDE_ENV, str(gone))
+        monkeypatch.setattr(
+            session_mod.shutil, "which", lambda name: "/fake/bin/claude"
+        )
+
+        assert session_mod.find_claude() == "/fake/bin/claude"
+
+    def test_an_ordinary_claude_is_returned_unchanged(self, monkeypatch):
+        monkeypatch.delenv(wrapper.REAL_CLAUDE_ENV, raising=False)
+        monkeypatch.setattr(
+            session_mod.shutil, "which", lambda name: "/fake/bin/claude"
+        )
+
+        assert session_mod.find_claude() == "/fake/bin/claude"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="the POSIX exec handoff is what is checked"
+    )
+    def test_the_handoff_drops_the_wrappers_note(
+        self, manager, auth_status_tracks_seed, refresh_rotates, monkeypatch
+    ):
+        """``CSWAP_REAL_CLAUDE`` is cswap's own note, not Claude Code's env: a
+        ``claude`` started inside a session must choose an account again."""
+        handed: dict = {}
+
+        def fake_execvpe(binary, argv, env):
+            handed["env"] = env
+            raise SystemExit(0)
+
+        monkeypatch.setattr(session_mod.os, "execvpe", fake_execvpe)
+        # A path that really is an executable, so the test needs no Claude
+        # Code on the host: the interpreter running this suite.
+        monkeypatch.setenv(wrapper.REAL_CLAUDE_ENV, sys.executable)
+
+        with pytest.raises(SystemExit):
+            manager.run("2", [])
+
+        assert wrapper.REAL_CLAUDE_ENV not in handed["env"]
+
+
 class TestTheLaunchTakesTheAccountsProxy:
     """The environment Claude Code is started with, and the check before it."""
 
@@ -2261,6 +2376,79 @@ print(json.dumps({{
         assert child["config_dir"] == str(
             session_dir_for(manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
         )
+
+
+class TestNonessentialTrafficSetting:
+    """``run.disableNonessentialTraffic``: on by default, off means "do not set".
+
+    ``0`` does not re-enable Claude Code's traffic (its own documentation), so
+    turning the setting off has to leave the variable unset — and leave an
+    inherited value exactly as the shell had it.
+    """
+
+    def _off(self, manager):
+        set_setting(
+            manager.switcher.backup_dir, "run.disableNonessentialTraffic", "false"
+        )
+
+    def test_off_stops_cswap_from_setting_the_variable(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
+        monkeypatch,
+    ):
+        monkeypatch.delenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", raising=False)
+        self._off(manager)
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        assert "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" not in exc.value.env
+
+    def test_off_leaves_an_inherited_value_alone(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "0")
+        self._off(manager)
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        assert exc.value.env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "0"
+
+    def test_off_reaches_the_plain_launch_on_the_default_login(
+        self, manager, capture_exec, monkeypatch
+    ):
+        monkeypatch.delenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", raising=False)
+        self._off(manager)
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.exec_default([])
+
+        assert "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" not in exc.value.env
+
+    def test_the_probe_follows_the_setting(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
+        monkeypatch,
+    ):
+        monkeypatch.delenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", raising=False)
+        self._off(manager)
+
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [])
+
+        assert auth_status_tracks_seed  # the probe ran
+        assert "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" not in auth_status_tracks_seed[0]
+
+    def test_on_by_default(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
+        monkeypatch,
+    ):
+        monkeypatch.delenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", raising=False)
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        assert exc.value.env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
 
 
 class TestAnUnusableProxyStopsTheLaunch:

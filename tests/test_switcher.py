@@ -6924,6 +6924,222 @@ class TestUsageAwareSwitch:
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
 
+class TestAutoRunTarget:
+    """`cswap run --auto` picks the account `best` would land on, as a launch.
+
+    The comparison is `_select_best_switchable`, so these cases mirror the
+    `best` cases above; what differs is what a "stay" means — the launch simply
+    runs the login it already has, and nothing is written to sequence.json.
+    """
+
+    def _setup(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def _seed(self, s: ClaudeAccountSwitcher, num: int, email: str) -> None:
+        s._write_account_credentials(
+            str(num),
+            email,
+            json.dumps({
+                "claudeAiOauth": {
+                    "accessToken": f"sk-{num}",
+                    "refreshToken": f"rt-{num}",
+                },
+            }),
+        )
+        s._write_account_config(
+            str(num),
+            email,
+            json.dumps({
+                "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},
+            }),
+        )
+        data = s._get_sequence_data()
+        data["accounts"][str(num)] = {
+            "email": email,
+            "uuid": f"uuid-{num}",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        if num not in data["sequence"]:
+            data["sequence"].append(num)
+            data["sequence"].sort()
+        if data["activeAccountNumber"] is None:
+            data["activeAccountNumber"] = num
+        s._write_json(s.sequence_file, data)
+
+    def _make_live(self, temp_home: Path, email: str, num: int) -> None:
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
+        }))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},
+        }))
+
+    @staticmethod
+    def _usage(pct: float, resets_at: str | None = None) -> dict:
+        window: dict = {"pct": pct}
+        if resets_at is not None:
+            window["resets_at"] = resets_at
+        return {"five_hour": window, "seven_day": {"pct": 0.0}}
+
+    def _three(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = self._setup(temp_home)
+        for num, email in enumerate(
+            ("a@example.com", "b@example.com", "c@example.com"), start=1
+        ):
+            self._seed(s, num, email)
+        return s
+
+    def test_a_better_account_is_the_one_launched(self, temp_home: Path):
+        s = self._three(temp_home)
+        self._make_live(temp_home, "a@example.com", 1)
+        usage = {"1": self._usage(50), "2": self._usage(90), "3": self._usage(20)}
+
+        with patch.object(s, "_usage_by_account", return_value=usage):
+            assert s.auto_run_target() == ("3", "better")
+
+    def test_staying_means_the_live_login_is_launched(self, temp_home: Path):
+        """`best` returning "stay" is not a dead end for a launch: the login
+        the terminal already has is the one with the most headroom."""
+        s = self._three(temp_home)
+        self._make_live(temp_home, "a@example.com", 1)
+        usage = {"1": self._usage(10), "2": self._usage(60), "3": self._usage(99)}
+
+        with patch.object(s, "_usage_by_account", return_value=usage):
+            assert s.auto_run_target() == ("1", "best")
+
+    def test_a_launch_is_not_a_switch(self, temp_home: Path):
+        s = self._three(temp_home)
+        self._make_live(temp_home, "a@example.com", 1)
+        usage = {"1": self._usage(50), "2": self._usage(20), "3": self._usage(10)}
+
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "_perform_switch") as perform:
+            s.auto_run_target()
+
+        perform.assert_not_called()
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_an_unreadable_live_login_yields_the_best_readable_account(
+        self, temp_home: Path
+    ):
+        """The live login's usage is unknown: `best` refuses to compare, but a
+        launch still prefers an account whose quota it can prove."""
+        s = self._three(temp_home)
+        self._make_live(temp_home, "a@example.com", 1)
+        usage = {"1": None, "2": self._usage(30), "3": self._usage(70)}
+
+        with patch.object(s, "_usage_by_account", return_value=usage):
+            assert s.auto_run_target() == ("2", "only")
+
+    def test_an_unmanaged_live_login_is_not_a_candidate(self, temp_home: Path):
+        """A login with no slot has no usage to launch on, and is not added:
+        `cswap switch` would add it (`add_account`), a launch must not."""
+        s = self._three(temp_home)
+        self._make_live(temp_home, "stranger@example.com", 9)
+        usage = {"1": self._usage(80), "2": self._usage(10), "3": self._usage(10)}
+
+        with patch.object(s, "_usage_by_account", return_value=usage):
+            assert s.auto_run_target() == ("2", "only")
+        assert "9" not in s._get_sequence_data()["accounts"]
+
+    def test_every_account_at_its_limit_names_the_nearest_reset(
+        self, temp_home: Path
+    ):
+        s = self._three(temp_home)
+        self._make_live(temp_home, "a@example.com", 1)
+        usage = {
+            "1": self._usage(100, "2026-11-25T12:00:00+00:00"),
+            "2": self._usage(100, "2026-11-25T10:30:00+00:00"),
+            "3": self._usage(100),
+        }
+
+        with patch.object(s, "_usage_by_account", return_value=usage):
+            number, why = s.auto_run_target()
+
+        assert number is None
+        assert "Every managed account is at its limit" in why
+        assert "the nearest reset is at" in why
+
+    def test_no_readable_usage_at_all_is_a_refusal(self, temp_home: Path):
+        s = self._three(temp_home)
+        self._make_live(temp_home, "a@example.com", 1)
+        usage = {"1": None, "2": None, "3": None}
+
+        with patch.object(s, "_usage_by_account", return_value=usage):
+            number, why = s.auto_run_target()
+
+        assert number is None
+        assert "remaining quota could be read" in why
+
+    def test_disabled_and_api_key_slots_are_passed_over(self, temp_home: Path):
+        """A disabled slot is out of rotation, and `cswap run` refuses an
+        API-key account, so neither may be nominated."""
+        s = self._three(temp_home)
+        self._make_live(temp_home, "a@example.com", 1)
+        data = s._get_sequence_data()
+        data["accounts"]["2"]["disabled"] = True
+        s._write_json(s.sequence_file, data)
+        self._seed(s, 3, "c@example.com")
+        data = s._get_sequence_data()
+        data["accounts"]["3"]["kind"] = "api_key"
+        s._write_json(s.sequence_file, data)
+        usage = {"1": self._usage(95), "2": self._usage(0), "3": self._usage(0)}
+
+        with patch.object(s, "_usage_by_account", return_value=usage):
+            assert s.auto_run_target() == ("1", "best")
+
+    def test_model_windows_are_folded_in(self, temp_home: Path):
+        """`autoswitch.model` is the only model list a launch reads: an
+        account whose named model window is spent is not the best one."""
+        s = self._three(temp_home)
+        self._make_live(temp_home, "a@example.com", 1)
+        set_setting(s.backup_dir, "autoswitch.model", "Fable")
+
+        def scoped(fable_pct: float) -> dict:
+            return {
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": 0.0},
+                "scoped": [{"name": "Fable", "pct": fable_pct}],
+            }
+
+        usage = {"1": scoped(95.0), "2": self._usage(40), "3": scoped(10.0)}
+        with patch.object(s, "_usage_by_account", return_value=usage):
+            assert s.auto_run_target() == ("3", "better")
+
+    def test_no_accounts_managed_is_a_refusal(self, temp_home: Path):
+        s = self._setup(temp_home)
+
+        number, why = s.auto_run_target()
+
+        assert number is None
+        assert "No accounts are managed yet" in why
+
+    def test_nothing_launchable_is_a_refusal(self, temp_home: Path):
+        s = self._setup(temp_home)
+        # A slot with a record but no stored credential/config: switchable=False.
+        data = s._get_sequence_data()
+        data["sequence"] = [1]
+        data["accounts"]["1"] = {
+            "email": "a@example.com",
+            "uuid": "uuid-1",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        s._write_json(s.sequence_file, data)
+
+        number, why = s.auto_run_target()
+
+        assert number is None
+        assert "No managed account can be launched" in why
+
+
 class TestClaudeCodeLockCooperation:
     """_perform_switch must hold Claude Code's own advisory locks
     (~/.claude.lock and ~/.claude.json.lock) while mutating credentials/config,
