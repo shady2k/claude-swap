@@ -117,11 +117,16 @@ def normalize_country(value: object) -> str:
     """``US`` for ``us``/``Us``; anything but an assigned code is refused.
 
     The stored form is upper case, so a comparison never depends on how the
-    user typed the code. Two ASCII letters are not enough: ``ZZ`` is
-    user-assigned and names no country, so a rule for it could never be
-    confirmed by a service answer.
+    user typed the code. The two letters are checked BEFORE the case fold: a
+    non-ASCII letter can upper-case into two ASCII ones (``"ß"`` is ``"SS"``,
+    the ``ﬁ`` ligature is ``"FI"``), and such a value is neither what the user
+    typed nor what a service answers. Two ASCII letters are not enough
+    either: ``ZZ`` is user-assigned and names no country, so a rule for it
+    could never be confirmed by a service answer.
     """
-    code = value.strip().upper() if isinstance(value, str) else ""
+    raw = value.strip() if isinstance(value, str) else ""
+    two_ascii_letters = len(raw) == 2 and raw.isascii() and raw.isalpha()
+    code = raw.upper() if two_ascii_letters else ""
     if code not in ISO_COUNTRY_CODES:
         raise ExpectationError(
             "the expected country must be a two-letter ISO 3166-1 alpha-2 "

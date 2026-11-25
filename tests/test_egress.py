@@ -167,6 +167,16 @@ class TestNormalisation:
         with pytest.raises(egress.ExpectationError):
             egress.normalize_country(value)
 
+    @pytest.mark.parametrize("value", ["ß", "ﬁ", "ſſ"])
+    def test_a_non_ascii_letter_is_refused_before_the_case_fold(self, value):
+        """``"ß".upper()`` is ``"SS"`` and ``"ﬁ".upper()`` is ``"FI"``.
+
+        The two letters are checked before folding, so a Unicode look-alike
+        cannot name a country it was never typed as.
+        """
+        with pytest.raises(egress.ExpectationError):
+            egress.normalize_country(value)
+
     def test_only_codes_iso_assigns_to_a_country_are_accepted(self):
         """``ZZ`` is user-assigned, so no service could ever confirm it."""
         assert len(egress.ISO_COUNTRY_CODES) == 249
@@ -227,6 +237,7 @@ class TestReadRecord:
             {egress.IP_FIELD: None},
             {egress.IP_FIELD: "not-an-ip"},
             {egress.COUNTRY_FIELD: "US", egress.IP_FIELD: []},
+            {egress.COUNTRY_FIELD: "ß"},
         ],
     )
     def test_damage_reads_as_an_error_not_as_no_rule(self, record):
@@ -310,6 +321,21 @@ class TestCheck:
             )
         assert "DE" in str(exc.value) and "US" in str(exc.value)
         assert proxy.requests == [_url(proxy, "one")]
+
+    def test_a_country_that_is_not_ascii_is_a_missing_field(
+        self, proxy, monkeypatch
+    ):
+        """``"ß"`` folds to ``"SS"``, which is not this service's country."""
+        proxy.answer(_url(proxy, "one"), {"country": "ß"})
+        proxy.answer(_url(proxy, "two"), {"country": "US"})
+        _endpoints(proxy, monkeypatch)
+
+        egress.check(
+            account_proxy.parse(proxy.url),
+            egress.read({egress.COUNTRY_FIELD: "US"}),
+        )
+
+        assert proxy.requests == [_url(proxy, "one"), _url(proxy, "two")]
 
     def test_every_service_failing_is_a_refusal_with_the_reasons(
         self, proxy, monkeypatch

@@ -24,7 +24,7 @@ its arguments passed through unchanged and its exit code kept.
 ## Which account
 
 One ranked pass over the launchable slots
-(`ClaudeAccountSwitcher.auto_run_target`), from the same capture `cswap list`
+(`ClaudeAccountSwitcher.auto_run_plan`), from the same capture `cswap list`
 reads:
 
 - **A slot is launchable** when it is in rotation, not disabled, holds stored

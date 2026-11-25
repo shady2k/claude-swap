@@ -498,6 +498,25 @@ def _launch_headroom(entry: UsageEntry, models: tuple[str, ...]) -> float | None
     return oauth.account_headroom(_launch_value(entry), models)
 
 
+@dataclasses.dataclass(frozen=True)
+class DefaultLogin:
+    """The default login a launch runs on, pinned by identity.
+
+    ``identity`` is the ``(email, organization)`` the profile's config names
+    and ``slot`` the managed slot holding it (``None`` for a login cswap does
+    not manage). ``route`` and ``expectation`` are that slot's proxy and
+    egress rule, read from one record while it still named this login. The
+    whole snapshot is what ``session.SessionManager.exec_default`` checks
+    after its network probes and before it starts claude
+    (``ClaudeAccountSwitcher.default_login_still_holds``).
+    """
+
+    identity: tuple[str, str]
+    slot: str | None
+    route: "account_proxy.ProxyRoute | None"
+    expectation: "egress.Expectation | None"
+
+
 class _AutoRunPlan:
     """The launch candidates of ONE capture, best first, for ``cswap run --auto``.
 
@@ -513,8 +532,10 @@ class _AutoRunPlan:
     ``auto_run_target(exclude=…)`` calls did: quota left before none, no
     just-reported rate-limit stop before one, more headroom before less, the
     live login before another slot at equal headroom, the earlier slot before a
-    later one. Each candidate's reading is confirmed at most once, ``ordered``
-    highest first, so a stale reading cannot win.
+    later one. Each candidate's reading is confirmed at most once, when it
+    reaches the head, and the rest are re-sorted by the confirmed readings
+    before the next pick: a stale reading that promised more than the account
+    has cannot stay ahead of one the order never got to.
 
     ``why()`` explains why nothing is left when a candidate never got a
     usable reading or every one of them is at its limit. A plan whose
@@ -535,7 +556,7 @@ class _AutoRunPlan:
     ) -> None:
         self._switcher = switcher
         self._models = models
-        self._infos = infos
+        self._infos_by_num = {str(info[0]): info for info in infos}
         self._entries = entries
         self._marks = marks
         self._live = live
@@ -546,6 +567,7 @@ class _AutoRunPlan:
             for row in candidates
         }
         self._confirmed: set[str] = set()
+        self._spent = 0
         self._ordered = sorted(candidates, key=self._rank, reverse=True)
 
     def _rank(self, row: AccountInfo) -> tuple:
@@ -562,48 +584,48 @@ class _AutoRunPlan:
         )
 
     def _confirm(self, num: str) -> None:
-        """Replace one reading with the store's confirmation, at most once."""
+        """Replace one reading with the store's confirmation, at most once.
+
+        One row goes to the collector, not the whole roster: a confirmation
+        asks about one account, and handing it every row made it rebuild N
+        identities and re-read the store for all of them on each candidate.
+        """
         if num in self._confirmed:
             return
         confirmed = self._switcher._collect_usage_entries(
-            self._infos, fetch={num}
+            [self._infos_by_num[num]], fetch={num}
         )[num]
         self._entries[num] = confirmed
         self._rooms[num] = _launch_headroom(confirmed, self._models)
         self._confirmed.add(num)
 
     def next(self) -> AccountInfo | None:
-        """The best candidate left, or ``None``. Spends the row it answers."""
-        ordered = self._ordered
-        while ordered:
+        """The best candidate left, or ``None``. Spends the row it answers.
+
+        The order is the CURRENT ranking, recomputed after a confirmation
+        replaces a reading, so a candidate whose stale reading promised more
+        than it has falls behind the ones it outranked. A row is confirmed
+        when it reaches the head, which is the one the launch would take: a
+        candidate below it can only win once the confirmed reading says so.
+        """
+        while True:
+            self._ordered.sort(key=self._rank, reverse=True)
             best: AccountInfo | None = None
-            for index, row in enumerate(ordered):
-                num = str(row[0])
-                # No point confirming a reading that already promises nothing:
-                # the confirmation would only spend a request.
-                if self._rooms[num] is None or self._rooms[num] <= 0:
-                    continue
-                self._confirm(num)
-                if self._rooms[num] is None or self._rooms[num] <= 0:
-                    continue
-                if best is None or self._rank(row) > self._rank(best):
+            for row in self._ordered:
+                room = self._rooms[str(row[0])]
+                # A reading that promises nothing is not confirmed: the
+                # confirmation would only spend a request.
+                if room is not None and room > 0:
                     best = row
-                # A candidate still unconfirmed may hold more than the reading
-                # it was ranked on says: confirm it instead of launching on a
-                # stale order. An unconfirmed row's rank cannot have moved
-                # since the sort, so the highest of them is the one next in
-                # ``ordered``.
-                if (
-                    index + 1 < len(ordered)
-                    and self._rank(ordered[index + 1]) > self._rank(best)
-                ):
-                    continue
-                break
+                    break
             if best is None:
                 return None
-            ordered.remove(best)
-            return best
-        return None
+            num = str(best[0])
+            if num in self._confirmed:
+                self._ordered.remove(best)
+                self._spent += 1
+                return best
+            self._confirm(num)
 
     def why(self) -> str:
         """Why no candidate is left, or the empty string after all were spent."""
@@ -642,7 +664,11 @@ class _AutoRunPlan:
                 + "."
             )
         return (
-            "Every managed account is at its limit"
+            (
+                "Every other account is at its limit"
+                if self._spent
+                else "Every managed account is at its limit"
+            )
             + (f" ({nearest})" if nearest else "")
             + ". Nothing was launched."
         )
@@ -1381,82 +1407,69 @@ class ClaudeAccountSwitcher:
         """
         return self.account_route_and_expectation(account_num, email, org_uuid)[0]
 
-    def account_expectation(
-        self, account_num: str, email: str, org_uuid: str
-    ) -> "egress.Expectation | None":
-        """The egress rule pinned to one account, or ``None`` without one.
+    def default_login(
+        self, *, primary_profile: bool = False
+    ) -> "DefaultLogin | None":
+        """The default login a launch runs on, pinned with the slot it belongs to.
 
-        Accepted only while the record still names this account, for the same
-        reason :meth:`account_route` is. A record that moved yields an
-        expectation carrying ``error`` instead of ``None``: ``None`` is "no
-        rule", and treating a swapped slot as unruled is how a launch would
-        skip the check it promised.
-        """
-        return self.account_route_and_expectation(account_num, email, org_uuid)[1]
+        Follows ``CLAUDE_CONFIG_DIR``, so run from inside a session profile it
+        answers for that profile's login. ``primary_profile`` reads the DEFAULT
+        profile's login instead: Claude Code's own housekeeping commands
+        launched by ``cswap run --auto`` run on that profile even then
+        (``session.SessionManager.exec_default``), so their fail-closed checks
+        must be its login's. The route and the rule come from the slot's record,
+        read once and accepted only while the record still names this login
+        (:meth:`account_route_and_expectation`), so a slot a ``swap``/``move``
+        gave away yields an unusable route and a rule carrying that error.
 
-    def live_login_route_and_expectation(
-        self,
-    ) -> tuple["account_proxy.ProxyRoute | None", "egress.Expectation | None"]:
-        """The route and rule of the slot the live default login belongs to.
-
-        ``(None, None)`` when the live login names no slot: it is not an
+        ``None`` means there is no login to pin (a signed-out or unreadable
+        ``.claude.json``). A login that names no slot is a :class:`DefaultLogin`
+        with ``slot``, ``route`` and ``expectation`` all ``None``: it is not an
         account cswap manages, so it has neither a route to impose nor a rule
         to check.
         """
-        return self._route_and_expectation_for_login(self._get_current_account())
+        identity = self._default_login_identity(primary_profile)
+        if identity is None:
+            return None
+        account_num = self._find_account_slot(
+            self._get_sequence_data_migrated() or {}, *identity
+        )
+        if account_num is None:
+            return DefaultLogin(identity, None, None, None)
+        route, expectation = self.account_route_and_expectation(
+            account_num, *identity
+        )
+        return DefaultLogin(identity, account_num, route, expectation)
 
-    def default_profile_login_route_and_expectation(
-        self,
-    ) -> tuple["account_proxy.ProxyRoute | None", "egress.Expectation | None"]:
-        """The DEFAULT profile's login route and rule, whatever the environment says.
+    def default_login_still_holds(
+        self, login: "DefaultLogin | None", *, primary_profile: bool = False
+    ) -> bool:
+        """Whether ``login`` is still the default login and still holds its slot.
 
-        ``live_login_route_and_expectation`` follows ``CLAUDE_CONFIG_DIR``, so
-        run from inside a session profile it answers for that profile's login.
-        Claude Code's own housekeeping commands launched by ``cswap run --auto``
-        run on the default profile even then (``session.SessionManager.
-        exec_default`` with ``primary_profile``), so their fail-closed checks
-        must be the default login's.
+        The check a launch makes after its network checks and before it starts
+        claude: those take seconds with no lock held, so a ``switch`` can
+        replace the login and a ``swap``/``move`` can give its slot to another
+        account. Either would run claude through a route and a rule that no
+        longer belong to what runs. ``None`` pins "no login", so a login that
+        appeared meanwhile is a change too.
         """
-        identity = self._get_current_identity_triple(
+        identity = self._default_login_identity(primary_profile)
+        if identity != (None if login is None else login.identity):
+            return False
+        if login is None or login.slot is None:
+            return True
+        return self._slot_holding(*login.identity) == login.slot
+
+    def _default_login_identity(
+        self, primary_profile: bool
+    ) -> tuple[str, str] | None:
+        """``(email, organization)`` of the login a launch runs on."""
+        if not primary_profile:
+            return self._get_current_account()
+        triple = self._get_current_identity_triple(
             get_default_global_config_path()
         )
-        return self._route_and_expectation_for_login(
-            None if identity is None else identity[:2]
-        )
-
-    def live_login_expectation(self) -> "egress.Expectation | None":
-        """The egress rule of the slot the live default login belongs to."""
-        return self.live_login_route_and_expectation()[1]
-
-    def default_profile_login_expectation(self) -> "egress.Expectation | None":
-        """The DEFAULT profile's login egress rule, whatever the environment says."""
-        return self.default_profile_login_route_and_expectation()[1]
-
-    def live_login_route(self) -> "account_proxy.ProxyRoute | None":
-        """The route of the slot the live default login belongs to.
-
-        ``None`` when the live login names no slot: it is not an account cswap
-        manages, so no route can be imposed on it and a launch keeps the proxy
-        variables it inherited. ``cswap run`` uses this for the launch that
-        runs plain claude on the default login.
-        """
-        return self.live_login_route_and_expectation()[0]
-
-    def default_profile_login_route(self) -> "account_proxy.ProxyRoute | None":
-        """The route of the DEFAULT profile's login, whatever the environment says."""
-        return self.default_profile_login_route_and_expectation()[0]
-
-    def _route_and_expectation_for_login(
-        self, identity: tuple[str, str] | None
-    ) -> tuple["account_proxy.ProxyRoute | None", "egress.Expectation | None"]:
-        """``identity``'s slot read once, as :meth:`account_route_and_expectation`."""
-        if identity is None:
-            return None, None
-        data = self._get_sequence_data_migrated() or {}
-        account_num = self._find_account_slot(data, *identity)
-        if account_num is None:
-            return None, None
-        return self.account_route_and_expectation(account_num, *identity)
+        return None if triple is None else triple[:2]
 
     def set_alias(self, identifier: str, alias: str) -> tuple[str, str]:
         """Set (or rename) the alias for the account matching identifier.
@@ -4258,7 +4271,7 @@ class ClaudeAccountSwitcher:
 
         ``config_path`` overrides which profile's config is read — the default
         one when ``CLAUDE_CONFIG_DIR`` must not decide, as in
-        :meth:`default_profile_login_route` — and defaults to the profile the
+        :meth:`default_login` — and defaults to the profile the
         environment names.
 
         ``add_account`` used to read the config for its identity and again

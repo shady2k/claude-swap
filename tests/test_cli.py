@@ -1806,7 +1806,8 @@ class TestRunCommand:
                 backup_dir=Path.cwd(),
                 _logger=None,
                 slot_for_directory=lambda cwd: (None, None),
-                live_login_route_and_expectation=lambda: (None, None),
+                default_login=lambda *, primary_profile=False: None,
+                default_login_still_holds=lambda login, *, primary_profile=False: True,
                 _is_running_in_container=lambda: True,
             )
             argv = ["cswap", "run", "--", sys.argv[1], "--output-format", "stream-json"]

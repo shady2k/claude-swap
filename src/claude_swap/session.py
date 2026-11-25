@@ -1202,6 +1202,13 @@ class SessionManager:
         profile the next session launch syncs FROM, not in a session copy that
         launch overwrites (``_sync_sharing``), and the proxy must be that
         profile's login's.
+
+        The login, its slot and its route are ONE snapshot
+        (``switcher.default_login``), and the snapshot is checked again after
+        the network probes and before ``_exec``: a ``switch`` or a
+        ``swap``/``move`` landing during them must end the launch instead of
+        running claude through a route and a rule that no longer belong to
+        what runs.
         """
         claude_bin = find_claude()
         if not claude_bin:
@@ -1216,14 +1223,23 @@ class SessionManager:
             # so leaving it would give the command this profile's config and
             # proxy with the session's stored login.
             env.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
-            route, expectation = (
-                self.switcher.default_profile_login_route_and_expectation()
-            )
-        else:
-            route, expectation = self.switcher.live_login_route_and_expectation()
+        login = self.switcher.default_login(primary_profile=primary_profile)
+        route = None if login is None else login.route
+        expectation = None if login is None else login.expectation
         who = "The default login's account"
         self._check_proxy(route, who, expectation)
         self._check_egress(route, expectation, who)
+        # The checks above may have taken seconds (a CONNECT, then the GeoIP
+        # chain) with no lock held: the login and the slot it belonged to
+        # must still be the ones the route and the rule came from.
+        if not self.switcher.default_login_still_holds(
+            login, primary_profile=primary_profile
+        ):
+            raise SessionError(
+                "The default login or the slot it belongs to changed while "
+                "its exit was being checked. Nothing was launched; run the "
+                "command again."
+            )
         self._exec(claude_bin, claude_args, env=self._launch_env(route, env))
 
     def _check_proxy(

@@ -96,6 +96,16 @@ CONFIG = json.dumps(
         "theme": "light",
     }
 )
+CONFIG_1 = json.dumps(
+    {
+        "oauthAccount": {
+            "emailAddress": "account1@example.com",
+            "accountUuid": "uuid-1",
+            "organizationUuid": "org-uuid-1",
+        },
+        "theme": "dark",
+    }
+)
 
 
 def _host_can_symlink(where: Path) -> bool:
@@ -2349,6 +2359,58 @@ class TestTheLaunchTakesTheAccountsProxy:
             manager.switcher.backup_dir, ACCOUNT_NUM, "account1@example.com"
         )
         assert not neighbour_dir.exists()
+
+    @pytest.mark.parametrize(
+        "primary_profile", [False, True], ids=["live_login", "default_profile"]
+    )
+    def test_exec_default_refuses_a_login_that_switched_during_the_check(
+        self, manager, capture_exec, stream_proxy, monkeypatch, primary_profile
+    ):
+        """A ``switch`` while the check runs replaces the login itself.
+
+        The launch pinned its route and rule to the login it read; the login
+        that would run is another account now, so it stops before ``_exec``.
+        """
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
+        manager.switcher._write_account_credentials(
+            "1", "account1@example.com", CREDS
+        )
+        manager.switcher._write_account_config(
+            "1", "account1@example.com", CONFIG_1
+        )
+        _default_login_is(ACCOUNT_EMAIL, ORG_UUID)
+        real_probe = account_proxy.probe
+
+        def switch_then_probe(route, timeout=account_proxy.PROBE_TIMEOUT_S):
+            # Activation only: the backup of the outgoing login is not what
+            # this test is about, and the live store here is a temp home's.
+            manager.switcher.switch_to("1", force=True)
+            real_probe(route, timeout=timeout)
+
+        monkeypatch.setattr(account_proxy, "probe", switch_then_probe)
+
+        with pytest.raises(SessionError, match="changed while its exit"):
+            manager.exec_default(["--resume"], primary_profile=primary_profile)
+
+    @pytest.mark.parametrize(
+        "primary_profile", [False, True], ids=["live_login", "default_profile"]
+    )
+    def test_exec_default_refuses_a_slot_that_moved_during_the_check(
+        self, manager, capture_exec, stream_proxy, monkeypatch, primary_profile
+    ):
+        """The slot the login belongs to can change under the check too."""
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
+        _default_login_is(ACCOUNT_EMAIL, ORG_UUID)
+        real_probe = account_proxy.probe
+
+        def swap_then_probe(route, timeout=account_proxy.PROBE_TIMEOUT_S):
+            manager.switcher.swap_accounts("1", ACCOUNT_NUM)
+            real_probe(route, timeout=timeout)
+
+        monkeypatch.setattr(account_proxy, "probe", swap_then_probe)
+
+        with pytest.raises(SessionError, match="changed while its exit"):
+            manager.exec_default(["--resume"], primary_profile=primary_profile)
 
     def test_an_account_without_a_proxy_keeps_what_it_inherited(
         self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
@@ -5101,6 +5163,17 @@ def _active_default_login(monkeypatch, mgr: SessionManager) -> None:
     monkeypatch.setattr(
         mgr.switcher, "_get_current_account", lambda: (ACCOUNT_EMAIL, ORG_UUID)
     )
+
+
+def _default_login_is(email: str, org_uuid: str) -> None:
+    """Write ``email`` as the default login, the way a ``/login``
+    or a ``switch`` leaves ``.claude.json``."""
+    get_global_config_path().write_text(json.dumps({
+        "oauthAccount": {
+            "emailAddress": email,
+            "organizationUuid": org_uuid,
+        },
+    }))
 
 
 OPT_OUT = "cswap config set run.shareHistory false"
