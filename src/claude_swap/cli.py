@@ -12,7 +12,11 @@ import shlex
 import sys
 
 from claude_swap import __version__, account_proxy, launch_agent, paths, printer
-from claude_swap.exceptions import ClaudeSwitchError, SessionError
+from claude_swap.exceptions import (
+    ClaudeSwitchError,
+    EgressCheckError,
+    SessionError,
+)
 from claude_swap.json_output import error_envelope
 from claude_swap.models import (
     ACCOUNT_PRIORITY_MAX,
@@ -260,29 +264,65 @@ def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
                 manager.exec_default(tail, primary_profile=True)
                 return  # only reachable in tests where exec/exit is mocked
 
-            row, why = switcher.auto_run_target()
-            if row is None:
-                raise SessionError(why)
-            # The choice is the (slot, email, organization) triple of ONE
-            # capture, not a number to resolve again: verify it just before the
-            # launch so a `swap`/`move` in between refuses instead of running
-            # the account that took the number.
-            account = (str(row[0]), row[1], row[3])
-            print(
-                dimmed(
-                    f"Account-{account[0]} has the most remaining quota — "
-                    "launching it."
+            # Walk the ranked candidates of ONE capture (``auto_run_plan``):
+            # an account whose proxy or exit check refuses is reported and the
+            # next one in that order is tried. The plan holds the roster and
+            # the readings, so a rejected slot costs one row of the order, not
+            # a second list capture, config probe and quota pass.
+            plan = switcher.auto_run_plan()
+            rejected: list[str] = []
+            chosen = 0
+            while (row := plan.next()) is not None:
+                # The choice is the (slot, email, organization) triple of ONE
+                # capture, not a number to resolve again: verify it just before
+                # the launch so a `swap`/`move` in between refuses instead of
+                # running the account that took the number.
+                account = (str(row[0]), row[1], row[3])
+                chosen += 1
+                if chosen == 1:
+                    print(
+                        dimmed(
+                            f"Account-{account[0]} has the most remaining "
+                            "quota — launching it."
+                        )
+                    )
+                else:
+                    print(
+                        dimmed(
+                            f"Account-{account[0]} is the next available "
+                            "account — launching it."
+                        )
+                    )
+                try:
+                    manager.run(
+                        account[0],
+                        _rate_limit_hook(tail, account),
+                        share=not args.no_share,
+                        share_history=args.share_history,
+                        require_session=args.require_session,
+                        account=account,
+                    )
+                except EgressCheckError as e:
+                    # Raised before any profile work or claude start, so
+                    # trying the next candidate changes nothing on disk.
+                    rejected.append(str(e))
+                    warning(
+                        f"Account-{account[0]} was rejected: {e} "
+                        "Trying the next account."
+                    )
+                    continue
+                return  # only reachable in tests where exec/exit is mocked
+            why = plan.why()
+            if rejected:
+                # ``why`` keeps what the remaining candidates answered — the
+                # reset time of an exhausted account, or the unreadable
+                # reading — instead of claiming every slot failed the check.
+                raise SessionError(
+                    "No account passed its exit check: "
+                    + "; ".join(rejected)
+                    + (f". {why}" if why else ". Nothing was launched.")
                 )
-            )
-            manager.run(
-                account[0],
-                _rate_limit_hook(tail, account),
-                share=not args.no_share,
-                share_history=args.share_history,
-                require_session=args.require_session,
-                account=account,
-            )
-            return  # only reachable in tests where exec/exit is mocked
+            raise SessionError(why or "Nothing was launched.")
 
         if args.account is not None:
             manager.run(
@@ -824,28 +864,33 @@ def _carries_proxy(argv: list[str]) -> bool:
 
 
 def _proxy_command(argv: list[str]) -> None:
-    """Handle `cswap proxy [NUM|EMAIL] [URL] [--unset]`.
+    """Handle `cswap proxy [NUM|EMAIL] [URL] [--expect-country CC]
+    [--expect-ip IP] [--unset-expect] [--unset]`.
 
-    With no arguments, lists every account that has a proxy, password masked.
-    Otherwise attaches (or, with --unset, removes) one account's HTTP proxy.
-    Pre-dispatched before the main parser for the same reason as `alias`: the
-    main parser's required mutually-exclusive group can't hold a positional
-    subcommand.
+    With no arguments, lists every account that has a proxy or an egress
+    expectation, password masked. Otherwise attaches (or, with --unset,
+    removes) one account's HTTP proxy and/or sets what its exit must look
+    like. Pre-dispatched before the main parser for the same reason as
+    `alias`: the main parser's required mutually-exclusive group can't hold a
+    positional subcommand.
 
-    The URL is validated inside `set_account_proxy`, before any file is
-    touched, so a rejected value leaves `sequence.json` byte-identical. What
-    the setting does, and the cases in which it refuses to send at all, is in
-    `account_proxy`.
+    The URL, country and IP are validated inside `update_account_proxy`,
+    before any file is touched, so a rejected value leaves `sequence.json`
+    byte-identical. What the settings do, and the cases in which a launch
+    refuses to send at all, are in `account_proxy` and `egress`.
     """
     parser = _DiagnosticsParser(
         prog="cswap proxy",
         description=(
-            "Set, remove, or list the HTTP proxy of an account. Every request "
-            "cswap makes for that account then goes through it, and never "
-            "directly: if the proxy is unreachable, asks for credentials it "
-            "rejects, or the stored value is unusable, the request fails "
-            "instead of falling back. The rules are in `docs/proxy.md` and "
-            "the module docstring of `account_proxy`."
+            "Set, remove, or list the HTTP proxy of an account, and what its "
+            "exit must be. Every request cswap makes for that account then "
+            "goes through it, and never directly: if the proxy is "
+            "unreachable, asks for credentials it rejects, or the stored "
+            "value is unusable, the request fails instead of falling back. "
+            "With --expect-country/--expect-ip a launch is refused before "
+            "Claude Code starts unless the exit matches. The rules are in "
+            "`docs/proxy.md` and the module docstrings of `account_proxy` and "
+            "`egress`."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -853,10 +898,14 @@ Examples:
   cswap proxy 2 http://127.0.0.1:3128
   cswap proxy 2 http://user:pass@proxy.example:3128
   cswap proxy user@example.com http://127.0.0.1:3128
+  cswap proxy 2 --expect-country DE --expect-ip 203.0.113.7
+  cswap proxy 2 --expect-country de
+  cswap proxy 2 --unset-expect        # keep the proxy, drop the expectations
   cswap proxy 2 --unset               # back to a direct connection
-  cswap proxy                         # list accounts that use a proxy
+  cswap proxy                         # list accounts with a proxy or a rule
 
 Only http:// proxies are supported; HTTPS tunnels through them (CONNECT).
+An expectation needs a proxy on the same account; set one first.
         """,
     )
     parser.add_argument(
@@ -872,7 +921,23 @@ Only http:// proxies are supported; HTTPS tunnels through them (CONNECT).
         help="Proxy URL: http://[user:pass@]host[:port]",
     )
     parser.add_argument(
-        "--unset", action="store_true", help="Remove the account's proxy"
+        "--unset", action="store_true",
+        help="Remove the account's proxy (and its egress expectation)",
+    )
+    parser.add_argument(
+        "--expect-country",
+        metavar="CC",
+        help="The ISO 3166-1 alpha-2 country the account's exit must be",
+    )
+    parser.add_argument(
+        "--expect-ip",
+        metavar="IP",
+        help="The IPv4/IPv6 address the account's exit must be",
+    )
+    parser.add_argument(
+        "--unset-expect",
+        action="store_true",
+        help="Remove the account's egress expectation, keeping the proxy",
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     # Every shape argparse refuses here — an extra positional, a value attached
@@ -883,12 +948,41 @@ Only http:// proxies are supported; HTTPS tunnels through them (CONNECT).
     parser.redact_urls = True
     args = parser.parse_args(argv)
 
+    wants_expect = (
+        args.expect_country is not None
+        or args.expect_ip is not None
+        or args.unset_expect
+    )
     if args.unset and args.url:
         parser.error("--unset does not take a URL argument")
+    if args.unset and wants_expect:
+        parser.error(
+            "--unset already removes the egress expectation; it cannot be "
+            "combined with --expect-country, --expect-ip or --unset-expect"
+        )
     if args.unset and args.account is None:
         parser.error("NUM|EMAIL is required with --unset")
-    if args.account is not None and not args.unset and args.url is None:
-        parser.error("URL is required (or pass --unset to remove the proxy)")
+    if args.unset_expect and args.url:
+        parser.error("--unset-expect does not take a URL argument")
+    if args.unset_expect and (
+        args.expect_country is not None or args.expect_ip is not None
+    ):
+        parser.error(
+            "--unset-expect cannot be combined with --expect-country or "
+            "--expect-ip"
+        )
+    if wants_expect and args.account is None:
+        parser.error("NUM|EMAIL is required with --expect-country/--expect-ip")
+    if (
+        args.account is not None
+        and not args.unset
+        and not wants_expect
+        and args.url is None
+    ):
+        parser.error(
+            "URL is required (or pass --unset to remove the proxy, or "
+            "--expect-country/--expect-ip to change the exit expectation)"
+        )
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
@@ -900,18 +994,37 @@ Only http:// proxies are supported; HTTPS tunnels through them (CONNECT).
                 print(dimmed("No account proxies set"))
                 return
             print(bolded("Account proxies:"))
-            for num, described, email in rows:
-                print(f"  {num}: {described} {muted(f'({email})')}")
+            for num, described, email, expectation in rows:
+                suffix = f"  {muted(expectation)}" if expectation else ""
+                print(f"  {num}: {described} {muted(f'({email})')}{suffix}")
             return
 
         if args.unset:
             account_num = switcher.clear_account_proxy(args.account)
             print(f"{accent('Cleared')} proxy for Account-{account_num}")
         else:
-            account_num, described = switcher.set_account_proxy(
-                args.account, args.url
+            update = switcher.update_account_proxy(
+                args.account,
+                args.url,
+                expect_country=args.expect_country,
+                expect_ip=args.expect_ip,
+                unset_expect=args.unset_expect,
             )
-            print(f"{accent('Set')} proxy {described} for Account-{account_num}")
+            if args.url is not None:
+                print(
+                    f"{accent('Set')} proxy {update.proxy} for "
+                    f"Account-{update.account_num}"
+                )
+            if args.unset_expect:
+                print(
+                    f"{accent('Cleared')} egress expectation for "
+                    f"Account-{update.account_num}"
+                )
+            elif args.expect_country is not None or args.expect_ip is not None:
+                print(
+                    f"{accent('Set')} egress {update.expectation} for "
+                    f"Account-{update.account_num}"
+                )
     except ClaudeSwitchError as e:
         error(f"Error: {account_proxy.redact_urls(str(e))}")
         sys.exit(1)

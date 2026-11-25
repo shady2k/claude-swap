@@ -1273,6 +1273,20 @@ class TestCLICommands:
         assert "--email" in result.stdout  # modifier flag stays visible
 
 
+class _StubPlan:
+    """What ``auto_run_plan`` answers: rows in order, then a reason."""
+
+    def __init__(self, rows=(), why="Nothing was launched."):
+        self._rows = list(rows)
+        self._why = why
+
+    def next(self):
+        return self._rows.pop(0) if self._rows else None
+
+    def why(self):
+        return self._why
+
+
 class TestRunCommand:
     """`cswap run` pre-dispatch: parsing, forwarding, and dispatch."""
 
@@ -1427,14 +1441,16 @@ class TestRunCommand:
 
     @staticmethod
     def _row(num: int, email: str = "user@example.com", org: str = "") -> tuple:
-        """What ``auto_run_target`` answers: the account row it chose."""
+        """What the plan answers: one account row."""
         return (num, email, "Org", org, False, "creds", "", None)
 
-    def _auto_dispatch(self, argv, auto_run_target):
-        """Dispatch `cswap run --auto` with a switcher that answers the choice."""
+    def _auto_dispatch(self, argv, plan):
+        """Dispatch `cswap run --auto` with a switcher whose plan answers."""
+        if not isinstance(plan, _StubPlan):
+            plan = _StubPlan(plan)
         return self._dispatch(
             argv,
-            auto_run_target=MagicMock(side_effect=auto_run_target),
+            auto_run_plan=MagicMock(return_value=plan),
         )
 
     def _launch(self, calls) -> tuple:
@@ -1443,10 +1459,72 @@ class TestRunCommand:
         assert len(runs) == 1
         return runs[0]
 
+    def _auto_with_rejections(self, rows, rejected_slots):
+        """Dispatch `cswap run --auto` where the exit check rejects some slots."""
+        launched: list[tuple] = []
+
+        class FakeSessionManager:
+            def __init__(self, switcher):
+                pass
+
+            def run(
+                self,
+                identifier,
+                claude_args,
+                share=True,
+                share_history=None,
+                require_session=False,
+                account=None,
+            ):
+                launched.append(account)
+                if str(account[0]) in rejected_slots:
+                    from claude_swap.exceptions import EgressCheckError
+
+                    raise EgressCheckError(
+                        f"Account-{account[0]}: the exit country is DE, but US "
+                        "was expected. Claude Code was not started."
+                    )
+
+        with patch("claude_swap.session.SessionManager", FakeSessionManager), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher",
+                   return_value=MagicMock(
+                       backup_dir=self.backup_dir,
+                       auto_run_plan=MagicMock(
+                           return_value=_StubPlan(rows, "Nothing was launched.")
+                       ),
+                   )), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "run", "--auto", "--", "-p", "hi"]):
+            try:
+                cli.main()
+            except SystemExit as exc:
+                return launched, exc.code
+        return launched, None
+
+    def test_auto_tries_the_next_candidate_after_an_egress_rejection(self, capsys):
+        rows = [self._row(1, "a@example.com"), self._row(2, "b@example.com")]
+        launched, code = self._auto_with_rejections(rows, {"1"})
+
+        assert code is None and [account[0] for account in launched] == ["1", "2"]
+        err = capsys.readouterr().err
+        assert "Account-1" in err and "DE" in err
+        assert "Trying the next account" in err
+
+    def test_auto_refuses_when_every_candidate_is_rejected(self, capsys):
+        rows = [self._row(1, "a@example.com"), self._row(2, "b@example.com")]
+        launched, code = self._auto_with_rejections(rows, {"1", "2"})
+
+        assert code == 1
+        assert [account[0] for account in launched] == ["1", "2"]
+        err = capsys.readouterr().err
+        assert "No account passed its exit check" in err
+        assert "Account-1" in err and "Account-2" in err
+        assert "Nothing was launched" in err
+
     def test_auto_launches_the_account_it_chose(self):
         calls = self._auto_dispatch(
             ["run", "--auto", "--", "--resume", "-p", "a b"],
-            lambda **kwargs: (self._row(2), ""),
+            [self._row(2)],
         )
         _kind, number, claude_args, share, share_history, require_session = (
             self._launch(calls)
@@ -1466,7 +1544,7 @@ class TestRunCommand:
         """
         calls = self._auto_dispatch(
             ["run", "--auto", "--", "-p", "hi"],
-            lambda **kwargs: (self._row(2, "b@example.com", "org-1"), ""),
+            [self._row(2, "b@example.com", "org-1")],
         )
         claude_args = self._launch(calls)[2]
         assert claude_args[0] == "--settings"
@@ -1497,7 +1575,7 @@ class TestRunCommand:
         """
         calls = self._auto_dispatch(
             ["run", "--auto", "--", *tail],
-            lambda **kwargs: (self._row(2), ""),
+            [self._row(2)],
         )
 
         assert self._launch(calls)[2] == tail
@@ -1514,7 +1592,7 @@ class TestRunCommand:
         """
         calls = self._auto_dispatch(
             ["run", "--auto", "--", *tail],
-            lambda **kwargs: (self._row(2), ""),
+            [self._row(2)],
         )
 
         claude_args = self._launch(calls)[2]
@@ -1545,8 +1623,8 @@ class TestRunCommand:
             calls = self._dispatch(
                 ["run", "--auto", "--", "-p", "hello there"],
                 argv0=str(invoked),
-                auto_run_target=MagicMock(
-                    side_effect=lambda **kwargs: (self._row(2), "")
+                auto_run_plan=MagicMock(
+                    return_value=_StubPlan([self._row(2)])
                 ),
             )
 
@@ -1603,7 +1681,7 @@ class TestRunCommand:
     def test_a_user_settings_switch_is_not_competed_with(self):
         calls = self._auto_dispatch(
             ["run", "--auto", "--", "--settings", "/tmp/mine.json"],
-            lambda **kwargs: (self._row(2), ""),
+            [self._row(2)],
         )
         assert self._launch(calls)[2] == ["--settings", "/tmp/mine.json"]
 
@@ -1624,7 +1702,7 @@ class TestRunCommand:
         _sync_mcp_servers deletes it), and `--version` must not need a quota."""
         target = MagicMock(side_effect=AssertionError("no account should be chosen"))
         calls = self._dispatch(
-            ["run", "--auto", "--", *tail], auto_run_target=target
+            ["run", "--auto", "--", *tail], auto_run_plan=target
         )
 
         assert ("exec_default", tail, True) in calls
@@ -1634,7 +1712,7 @@ class TestRunCommand:
     def test_auto_forwards_the_run_flags(self):
         calls = self._auto_dispatch(
             ["run", "--auto", "--no-share", "--no-share-history", "--require-session"],
-            lambda **kwargs: (self._row(3), ""),
+            [self._row(3)],
         )
         _kind, number, _args, share, share_history, require_session = (
             self._launch(calls)
@@ -1646,8 +1724,8 @@ class TestRunCommand:
         with pytest.raises(SystemExit) as excinfo:
             self._auto_dispatch(
                 ["run", "--auto"],
-                lambda **kwargs: (
-                    None,
+                _StubPlan(
+                    [],
                     "Every managed account is at its limit. Nothing was launched.",
                 ),
             )
@@ -1656,7 +1734,7 @@ class TestRunCommand:
         assert "is at its limit" in capsys.readouterr().err
 
     def test_auto_names_the_account_it_chose(self, capsys):
-        self._auto_dispatch(["run", "--auto"], lambda **kwargs: (self._row(2), ""))
+        self._auto_dispatch(["run", "--auto"], [self._row(2)])
         assert "Account-2 has the most remaining quota" in capsys.readouterr().err
 
     def test_auto_with_an_account_is_a_usage_error(self):
@@ -1728,7 +1806,8 @@ class TestRunCommand:
                 backup_dir=Path.cwd(),
                 _logger=None,
                 slot_for_directory=lambda cwd: (None, None),
-                live_login_route=lambda: None,
+                default_login=lambda *, primary_profile=False: None,
+                default_login_still_holds=lambda identity, slot, *, primary_profile=False: True,
                 _is_running_in_container=lambda: True,
             )
             argv = ["cswap", "run", "--", sys.argv[1], "--output-format", "stream-json"]
@@ -2633,7 +2712,9 @@ class TestProxyCommand:
         assert exc.value.code == 2
         err = capsys.readouterr().err
         assert "secret" not in err and "3128" not in err
-        assert "ignored explicit argument '<URL>'" in err
+        # ``--unse`` is ambiguous now that ``--unset-expect`` exists; either
+        # way argparse names only the redacted token.
+        assert "<URL>" in err
 
     def test_a_url_that_lands_on_the_identifier_is_not_echoed(
         self, temp_home, capsys,

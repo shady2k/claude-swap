@@ -26,6 +26,7 @@ It works on the same files and Keychain items Claude Code uses, and takes Claude
 - `usage_store.py`: `UsageStore`, the per-account usage table. `poll_policy.py` holds every polling number. `snapshot_source.py` is the read path for dashboards.
 - `oauth.py`: the token, usage and profile endpoints, the header probe, and the formatting of reset times. `subscription.py` reads the plan label; `pace.py` computes the weekly pace marker.
 - `account_proxy.py`: an account's proxy, and the pinned route its requests take. Every network call in `oauth.py` and `subscription.py` goes through it.
+- `egress.py`: an account's expected exit country/IP, its storage rules, and the pre-launch check of them through the account's own route.
 - `wrapper.py`: the thin `claude` script (`scripts/claude`) and the rule that keeps cswap and the wrapper from launching each other.
 - `transfer.py`: export and import. `settings.py`: `settings.json`. `migrations.py`: one-time data migrations. `update_check.py`: the PyPI version check.
 
@@ -106,13 +107,13 @@ Read next: the docstrings of `consume_backup_grant` and `_fetch_active_usage`.
 
 If the account is already the active default login, it starts plain `claude` instead, because two copies of one credential drift apart.
 
-A launch of an account with a proxy reads the route once, refuses before any Claude Code process (the `claude auth status` probe included) when one `CONNECT` through it fails, and hands Claude Code that proxy in its environment. The same applies to plain claude on a default login whose slot has one.
+A launch of an account with a proxy reads the route and the egress rule from ONE record, refuses before any Claude Code process (the `claude auth status` probe included) when one `CONNECT` through it fails, and hands Claude Code that proxy in its environment. The same applies to plain claude on a default login whose slot has one. An account with an egress expectation is refused the same way when the exit does not match it, measured through that route before Claude Code starts — and an unusable proxy for such an account is that same refusal, so `cswap run --auto` moves to the next ranked candidate either way. A `swap`/`move` that gives the slot to another account while the checks run ends the launch, on the fast path too.
 
 Read next: the module docstring of `session.py`, and [proxy.md](proxy.md#launching-claude-code).
 
 ### A launch on the best account
 
-`cswap run --auto` picks the account with `ClaudeAccountSwitcher.auto_run_target` from one capture of the roster (`_build_accounts_info`): the launchable slots ranked by headroom above 0, then by "Claude Code has not reported a rate-limit stop on it", then by headroom, then the live login. The winner's reading is confirmed once (`_collect_usage_entries(fetch={winner})`) and the next candidate is taken when that confirmation has no room left — `SERVE_TTL_S` is the oldest a ranking reading may be. The launch is then the session-mode one above, without touching `sequence.json` or the default login; the slot travels into it as the (slot, email, organization) it was read with.
+`cswap run --auto` picks the account with `ClaudeAccountSwitcher.auto_run_plan` from one capture of the roster (`_build_accounts_info`): the launchable slots ranked by headroom above 0, then by "Claude Code has not reported a rate-limit stop on it", then by headroom, then the live login. The plan confirms a candidate's reading once when the walk reaches it (`_collect_usage_entries(fetch={candidate})`) and moves to the next one when that confirmation has no room left — `SERVE_TTL_S` is the oldest a ranking reading may be. The same plan answers the next candidate after a refused exit check, so a rejection costs one row of the order rather than a second capture. The launch is then the session-mode one above, without touching `sequence.json` or the default login; the slot travels into it as the (slot, email, organization) it was read with.
 
 `StopFailure` with matcher `rate_limit` is what Claude Code reports a refused turn with; `cswap run --auto` passes that hook through `--settings`, and it runs `cswap rate-limited <email> <organization>` (`record_stop_failure`), which stamps `cache/stop-failure.json`. Marked means "the reading predates the refusal" — a reading newer than the stamp clears it, so no deadline is stored.
 
@@ -139,7 +140,7 @@ Read next: the module docstring of `autoswitch.py`. The rules as users see them 
 - **Import direction.** `session.py` and `credentials.py` do not import `switcher.py`. `fsutil.py` imports nothing from the package. The TUI's heavy imports stay inside `tui.run`.
 - **Paths come from `paths.py`.** Do not hardcode `~/.claude`; Claude Code's own resolution has cases that differ.
 - **A launch hands the terminal to the real Claude Code, never to the wrapper.** `session.find_claude` is the only resolver; choosing an account happens once, in the wrapper's `cswap run --auto`.
-- **A request for an account travels that account's route.** Every network call in `oauth.py` and `subscription.py` takes an `account_proxy` route; a slot with no proxy goes direct, and one whose proxy is set never does. The route comes from the same read as the credential it is used for (`AccountInfo` in `switcher.py`), so a concurrent `swap`/`move` cannot pair one account's token with another slot's route. A launch of such an account takes the same route — checked before Claude Code starts and handed to it in the environment — and one whose route cannot be confirmed is refused rather than run direct.
+- **A request for an account travels that account's route.** Every network call in `oauth.py` and `subscription.py` takes an `account_proxy` route; a slot with no proxy goes direct, and one whose proxy is set never does. The route comes from the same read as the credential it is used for (`AccountInfo` in `switcher.py`), so a concurrent `swap`/`move` cannot pair one account's token with another slot's route. A launch of such an account takes the same route — checked before Claude Code starts and handed to it in the environment — and one whose route cannot be confirmed is refused rather than run direct. An egress expectation is measured on that same route, before Claude Code starts, and never through a direct connection.
 
 ## Tests
 

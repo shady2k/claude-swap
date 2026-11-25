@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from claude_swap import __version__, account_proxy
+from claude_swap import __version__, account_proxy, egress
 from claude_swap.credentials import looks_like_api_key
 from claude_swap.exceptions import (
     ConfigError,
@@ -644,8 +644,14 @@ def import_accounts(
                 new_record["kind"] = "api_key"
             if entry.get("alias"):
                 new_record["alias"] = entry["alias"]
-            if account_proxy.FIELD in previous:
-                new_record[account_proxy.FIELD] = previous[account_proxy.FIELD]
+            # The export never carries the proxy or its egress expectation,
+            # so an import must not clear what this machine already holds for
+            # the same account: both describe THIS host's route. Copied by
+            # key presence, so a hand-edited ``null`` keeps failing closed
+            # instead of reading as "no rule".
+            for field in (account_proxy.FIELD, *egress.FIELDS):
+                if field in previous:
+                    new_record[field] = previous[field]
             data["accounts"][target_num] = new_record
             if int(target_num) not in data["sequence"]:
                 data["sequence"].append(int(target_num))

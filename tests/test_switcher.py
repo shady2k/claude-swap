@@ -7141,6 +7141,187 @@ class TestAutoRunTarget:
         # A reading inside SERVE_TTL_S is current by design: no request.
         assert endpoint.calls == []
 
+    def test_excluding_a_candidate_walks_the_ranked_order(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The order is the ranking's, one candidate per call.
+
+        `cswap run --auto` rejects an account whose exit check failed by
+        calling again with that slot excluded; the next call must answer the
+        next account the same ranking would have chosen.
+        """
+        clock = _FakeClock()
+        s, endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(10),
+                "b@example.com": self._usage(20),
+                "c@example.com": self._usage(50),
+            },
+            answers={},
+        )
+        self._make_live(temp_home, "c@example.com", 3)
+
+        assert s.auto_run_target()[0][0] == 1
+        assert s.auto_run_target(exclude={"1"})[0][0] == 2
+        assert s.auto_run_target(exclude={"1", "2"})[0][0] == 3
+        row, why = s.auto_run_target(exclude={"1", "2", "3"})
+        assert row is None and "rejected" in why
+        # Every reading was current, so the walk asked the endpoint nothing.
+        assert endpoint.calls == []
+
+    def test_the_plan_captures_the_roster_once_while_it_walks(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A rejected candidate costs a row of the order, not a new capture.
+
+        `cswap run --auto` walks ``auto_run_plan`` instead of asking
+        ``auto_run_target(exclude=…)`` again: with ten rejected accounts that
+        was eleven captures of the roster and eleven passes over the readings.
+        """
+        clock = _FakeClock()
+        s, endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(10),
+                "b@example.com": self._usage(20),
+                "c@example.com": self._usage(50),
+            },
+            answers={},
+        )
+        captures = []
+        original = s._build_accounts_info
+
+        def counted(*args, **kwargs):
+            captures.append(1)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(s, "_build_accounts_info", counted)
+        plan = s.auto_run_plan()
+
+        walked = [plan.next(), plan.next(), plan.next()]
+
+        assert [row[0] for row in walked] == [1, 2, 3]
+        assert plan.next() is None
+        assert len(captures) == 1
+        # Every reading was current, so no confirmation asked the endpoint.
+        assert endpoint.calls == []
+
+    def test_a_confirmed_reading_reorders_the_rows_behind_it(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A rejected candidate's stale promise must not keep the next slot.
+
+        B (95% left) and E (90% left) rank first on readings that confirming
+        drops to 20% and 15%; A leads once its own 85% is confirmed. After the
+        exit check rejects A, the next ``next()`` must take C (70% left) —
+        ordered by the first capture, it would have been B (20% left).
+        """
+        clock = _FakeClock()
+        s = self._setup(temp_home)
+        emails = ("b@example.com", "e@example.com", "a@example.com", "c@example.com")
+        for num, email in enumerate(emails, start=1):
+            self._seed(s, num, email)
+        s._usage_store = UsageStore(s.backup_dir / "cache", clock=clock)
+        # ``_usage`` takes the USED share, so these are 95/90/85/70% left.
+        for num, (email, pct) in enumerate(zip(emails, (5, 10, 15, 30)), start=1):
+            self._stored(
+                s, clock, num, email, self._usage(pct),
+                age_s=200, next_poll_in=600,
+            )
+        endpoint = _UsageEndpoint({
+            "b@example.com": self._usage(80),
+            "e@example.com": self._usage(85),
+            "a@example.com": self._usage(15),
+            "c@example.com": self._usage(30),
+        })
+        monkeypatch.setattr(
+            "claude_swap.oauth.try_fetch_usage_for_account", endpoint
+        )
+
+        plan = s.auto_run_plan()
+
+        first = plan.next()
+        assert first is not None and first[1] == "a@example.com"
+        second = plan.next()
+        assert second is not None and second[1] == "c@example.com"
+        # Confirmed in the order they reached the head, once each.
+        assert endpoint.calls == [
+            "b@example.com", "e@example.com", "a@example.com", "c@example.com"
+        ]
+
+    def test_a_confirmation_hands_the_collector_one_account(
+        self, temp_home: Path, monkeypatch
+    ):
+        """One candidate's confirmation must not rebuild the whole roster.
+
+        The plan's first capture covers every account; each confirmation asks
+        the collector about the one candidate it is confirming, so N rows are
+        not identified and re-read per candidate.
+        """
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(30),
+                "b@example.com": self._usage(60),
+                "c@example.com": self._usage(10),
+            },
+            answers={},
+        )
+        sizes: list[int] = []
+        original = s._collect_usage_entries
+
+        def counted(infos, fetch=None, **kwargs):
+            if fetch is not None:
+                sizes.append(len(infos))
+            return original(infos, fetch=fetch, **kwargs)
+
+        monkeypatch.setattr(s, "_collect_usage_entries", counted)
+
+        plan = s.auto_run_plan()
+        assert plan.next() is not None
+        assert plan.next() is not None
+
+        assert sizes == [1, 1]
+
+    def test_a_rejected_slot_leaves_the_reset_reason_for_the_rest(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The final message keeps `why`: the reset time is what the user acts on."""
+        from datetime import datetime, timedelta, timezone
+
+        weekly = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+        clock = _FakeClock()
+        s, _endpoint = self._pair_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(10),
+                "b@example.com": {
+                    "five_hour": {"pct": 0.0},
+                    "seven_day": {"pct": 100.0, "resets_at": weekly},
+                },
+            },
+            answers={},
+        )
+
+        plan = s.auto_run_plan()
+        rejected = plan.next()
+        assert rejected is not None and rejected[0] == 1
+        assert plan.next() is None
+
+        why = plan.why()
+        assert "Every other account is at its limit" in why
+        assert "the nearest reset is at" in why
+
     def test_the_live_login_is_launched_when_it_has_the_most_room(
         self, temp_home: Path, monkeypatch
     ):
@@ -15352,7 +15533,7 @@ class TestSalvageCopyMode:
 
 
 class TestTheLaunchRoute:
-    """The proxy a launch pins: ``account_route`` and ``live_login_route``.
+    """The proxy a launch pins: ``account_route`` and ``default_login``.
 
     Both read one record and accept it only while it still names the account
     the launch was resolved for, so a slot a concurrent ``swap``/``move``
@@ -15395,7 +15576,7 @@ class TestTheLaunchRoute:
         self, temp_home: Path, sample_sequence_data: dict
     ):
         switcher = self._switcher(sample_sequence_data)
-        assert switcher.live_login_route() is None
+        assert switcher.default_login() is None
 
     def test_a_live_login_cswap_does_not_manage_is_no_route(
         self, temp_home: Path, sample_sequence_data: dict
@@ -15404,7 +15585,12 @@ class TestTheLaunchRoute:
         get_global_config_path().write_text(
             json.dumps({"oauthAccount": {"emailAddress": "stranger@example.com"}})
         )
-        assert switcher.live_login_route() is None
+
+        login = switcher.default_login()
+
+        assert login is not None
+        assert login.slot is None and login.route is None
+        assert login.identity == ("stranger@example.com", "")
 
     def test_the_live_logins_slot_carries_its_route(
         self, temp_home: Path, sample_sequence_data: dict
@@ -15415,6 +15601,75 @@ class TestTheLaunchRoute:
             json.dumps({"oauthAccount": {"emailAddress": "account2@example.com"}})
         )
 
-        route = switcher.live_login_route()
-        assert route is not None
-        assert (route.host, route.port) == ("127.0.0.1", 3128)
+        login = switcher.default_login()
+
+        assert login is not None and login.slot == "2"
+        assert login.route is not None
+        assert (login.route.host, login.route.port) == ("127.0.0.1", 3128)
+
+    def test_the_default_profile_login_ignores_the_environment(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A service command launched from a session terminal is the user's."""
+        switcher = self._switcher(sample_sequence_data)
+        session_profile = temp_home / ".claude" / "sessions" / "1"
+        session_profile.mkdir(parents=True)
+        (session_profile / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "account1@example.com"},
+        }))
+        get_global_config_path().write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "account2@example.com"}})
+        )
+
+        def with_session_profile():
+            os.environ["CLAUDE_CONFIG_DIR"] = str(session_profile)
+            try:
+                assert switcher.default_login().slot == "1"
+                assert switcher.default_login(primary_profile=True).slot == "2"
+            finally:
+                os.environ.pop("CLAUDE_CONFIG_DIR", None)
+
+        with_session_profile()
+
+    def test_a_snapshot_stops_holding_when_the_login_switches(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        get_global_config_path().write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "account2@example.com"}})
+        )
+        login = switcher.default_login()
+
+        get_global_config_path().write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "account1@example.com"}})
+        )
+
+        assert login is not None
+        assert not switcher.default_login_still_holds(login.identity, login.slot)
+
+    def test_a_snapshot_stops_holding_when_the_slot_moves(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        get_global_config_path().write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "account2@example.com"}})
+        )
+        login = switcher.default_login()
+
+        switcher.swap_accounts("1", "2")
+
+        assert login is not None
+        assert not switcher.default_login_still_holds(login.identity, login.slot)
+
+    def test_no_login_stays_pinned_until_one_appears(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A login that appears during the probes is a change too."""
+        switcher = self._switcher(sample_sequence_data)
+        assert switcher.default_login_still_holds(None, None)
+
+        get_global_config_path().write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "account2@example.com"}})
+        )
+
+        assert not switcher.default_login_still_holds(None, None)

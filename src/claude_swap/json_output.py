@@ -411,6 +411,7 @@ def account_row(
     login_expires_at: str | None = None,
     subscription_plan: dict | None = None,
     proxy: str = "",
+    expected: dict | None = None,
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
     backoff only; a lapsed one is the caller's to withhold."""
@@ -450,6 +451,11 @@ def account_row(
     # fleet that never uses a proxy produces rows byte-identical to before.
     if proxy:
         row["proxy"] = proxy
+    # Additive fields: the account's egress expectation, if any (see
+    # ``egress.json_fields``). No rule emits no key at all, so a fleet that
+    # never sets one produces rows byte-identical to before.
+    if expected:
+        row.update(expected)
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:

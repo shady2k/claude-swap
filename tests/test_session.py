@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import logging
@@ -19,16 +20,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from claude_swap import account_proxy
+from claude_swap import account_proxy, egress
 from claude_swap import fsutil
 from claude_swap import macos_keychain
 from claude_swap import oauth
 from claude_swap import session as session_mod
+from claude_swap import switcher as switcher_mod
 from claude_swap import wrapper
 from claude_swap.credentials import CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE
 from claude_swap.exceptions import (
     AccountNotFoundError,
     CredentialReadError,
+    EgressCheckError,
     LockError,
     SessionError,
     SwitchError,
@@ -42,7 +45,11 @@ from claude_swap.fsutil import (
 )
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
-from claude_swap.paths import get_backup_root, get_global_config_path
+from claude_swap.paths import (
+    get_backup_root,
+    get_default_global_config_path,
+    get_global_config_path,
+)
 from claude_swap.process_detection import ClaudeSession
 from claude_swap.session import (
     MCP_DISPLACED_STASH,
@@ -92,6 +99,16 @@ CONFIG = json.dumps(
             "organizationUuid": ORG_UUID,
         },
         "theme": "light",
+    }
+)
+CONFIG_1 = json.dumps(
+    {
+        "oauthAccount": {
+            "emailAddress": "account1@example.com",
+            "accountUuid": "uuid-1",
+            "organizationUuid": "org-uuid-1",
+        },
+        "theme": "dark",
     }
 )
 
@@ -1725,6 +1742,14 @@ class TestRun:
             "_default_login_identity",
             staticmethod(lambda: (ACCOUNT_EMAIL, ORG_UUID)),
         )
+        # The re-check before the handoff reads the default profile itself,
+        # whatever CLAUDE_CONFIG_DIR says.
+        get_default_global_config_path().write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": ACCOUNT_EMAIL,
+                "organizationUuid": ORG_UUID,
+            },
+        }))
         with pytest.raises(_ExecCalled) as exc:
             manager.run("2", [])
 
@@ -2348,6 +2373,182 @@ class TestTheLaunchTakesTheAccountsProxy:
         )
         assert not neighbour_dir.exists()
 
+    @pytest.mark.parametrize(
+        "primary_profile", [False, True], ids=["live_login", "default_profile"]
+    )
+    def test_exec_default_refuses_a_login_that_switched_during_the_check(
+        self, manager, capture_exec, stream_proxy, monkeypatch, primary_profile
+    ):
+        """A ``switch`` while the check runs replaces the login itself.
+
+        The launch pinned its route and rule to the login it read; the login
+        that would run is another account now, so it stops before ``_exec``.
+        """
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
+        manager.switcher._write_account_credentials(
+            "1", "account1@example.com", CREDS
+        )
+        manager.switcher._write_account_config(
+            "1", "account1@example.com", CONFIG_1
+        )
+        _default_login_is(ACCOUNT_EMAIL, ORG_UUID)
+        real_probe = account_proxy.probe
+
+        def switch_then_probe(route, timeout=account_proxy.PROBE_TIMEOUT_S):
+            # Activation only: the backup of the outgoing login is not what
+            # this test is about, and the live store here is a temp home's.
+            manager.switcher.switch_to("1", force=True)
+            real_probe(route, timeout=timeout)
+
+        monkeypatch.setattr(account_proxy, "probe", switch_then_probe)
+
+        with pytest.raises(SessionError, match="changed or could not be confirmed"):
+            manager.exec_default(["--resume"], primary_profile=primary_profile)
+
+    @pytest.mark.parametrize(
+        "primary_profile", [False, True], ids=["live_login", "default_profile"]
+    )
+    def test_exec_default_refuses_a_slot_that_moved_during_the_check(
+        self, manager, capture_exec, stream_proxy, monkeypatch, primary_profile
+    ):
+        """The slot the login belongs to can change under the check too."""
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
+        _default_login_is(ACCOUNT_EMAIL, ORG_UUID)
+        real_probe = account_proxy.probe
+
+        def swap_then_probe(route, timeout=account_proxy.PROBE_TIMEOUT_S):
+            manager.switcher.swap_accounts("1", ACCOUNT_NUM)
+            real_probe(route, timeout=timeout)
+
+        monkeypatch.setattr(account_proxy, "probe", swap_then_probe)
+
+        with pytest.raises(SessionError, match="changed or could not be confirmed"):
+            manager.exec_default(["--resume"], primary_profile=primary_profile)
+
+    def test_the_final_check_waits_for_a_switch_that_holds_the_lock(
+        self, manager, capture_exec, monkeypatch
+    ):
+        """A ``switch`` is invisible halfway through, and the re-check waits.
+
+        A switch writes the live credentials first and the ``.claude.json``
+        naming them second, both under ``lock_file``. A re-check landing in
+        between sees the outgoing login in its old slot, so without the lock it
+        would confirm a launch that in fact runs the incoming account's
+        credentials through the outgoing login's route. Here account 1 is the
+        login and the launch's snapshot; the switch to account 2 is held after
+        its credential write until the launch has asked for the lock.
+        """
+        switcher = manager.switcher
+        switcher.set_account_proxy("1", "http://127.0.0.1:3128")
+        monkeypatch.setattr(
+            account_proxy,
+            "probe",
+            lambda route, timeout=account_proxy.PROBE_TIMEOUT_S: None,
+        )
+        _default_login_is("account1@example.com", "org-uuid-1")
+
+        executed: list[list[str]] = []
+        monkeypatch.setattr(
+            session_mod.SessionManager,
+            "_exec",
+            lambda self, binary, argv, env: executed.append(list(argv)),
+        )
+
+        # The switch pauses under its locks between the two writes.
+        credentials_written = threading.Event()
+        switch_may_finish = threading.Event()
+        real_write_credentials = ClaudeAccountSwitcher._write_credentials
+
+        def write_credentials_then_pause(self, creds):
+            real_write_credentials(self, creds)
+            credentials_written.set()
+            switch_may_finish.wait(10)
+
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "_write_credentials", write_credentials_then_pause
+        )
+
+        # A readiness signal for the re-check's own lock request. The switch's
+        # acquisition comes before the credential write, so only the re-check
+        # signals; while the switch holds the lock it cannot get in.
+        checking = threading.Event()
+        real_lock = switcher_mod.FileLock
+
+        class SignallingLock(real_lock):
+            def acquire(self, timeout=None):
+                if credentials_written.is_set():
+                    checking.set()
+                return super().acquire(timeout)
+
+        monkeypatch.setattr(switcher_mod, "FileLock", SignallingLock)
+
+        switch_errors: list[BaseException] = []
+        launch_errors: list[BaseException] = []
+
+        def run_switch():
+            try:
+                switcher.switch_to(ACCOUNT_NUM, force=True)
+            except BaseException as e:  # noqa: BLE001 - reported below
+                switch_errors.append(e)
+
+        def run_launch():
+            try:
+                manager.exec_default(["--resume"])
+            except BaseException as e:  # noqa: BLE001 - reported below
+                launch_errors.append(e)
+
+        switch_thread = threading.Thread(target=run_switch, daemon=True)
+        switch_thread.start()
+        assert credentials_written.wait(10), "the switch never wrote credentials"
+
+        launch_thread = threading.Thread(target=run_launch, daemon=True)
+        launch_thread.start()
+        assert checking.wait(10), "the re-check never asked for the lock"
+        # The switch still holds the lock: the launch waits, it did not run.
+        assert launch_thread.is_alive()
+        assert executed == []
+
+        switch_may_finish.set()
+        switch_thread.join(10)
+        assert not switch_thread.is_alive()
+        assert switch_errors == []
+
+        # Released: the re-check now reads the login the switch wrote and
+        # refuses before _exec, which never saw a launch either.
+        launch_thread.join(10)
+        assert not launch_thread.is_alive()
+        assert len(launch_errors) == 1
+        assert isinstance(launch_errors[0], SessionError)
+        assert "changed or could not be confirmed" in str(launch_errors[0])
+        assert executed == []
+
+    def test_a_lock_that_cannot_be_taken_refuses_the_launch(
+        self, manager, capture_exec, monkeypatch
+    ):
+        """Fail closed: no lock, no confirmation, no launch."""
+        switcher = manager.switcher
+        _default_login_is(ACCOUNT_EMAIL, ORG_UUID)
+        login = switcher.default_login()
+        assert login is not None
+
+        # flock is per open file description, so a second handle in this test
+        # conflicts with the one the re-check would take, as a switch in
+        # another process would. A short timeout keeps the wait to a moment.
+        held = FileLock(switcher.lock_file)
+        assert held.acquire()
+        real_lock = switcher_mod.FileLock
+        monkeypatch.setattr(
+            switcher_mod,
+            "FileLock",
+            lambda path: real_lock(path, timeout=0.05),
+        )
+        try:
+            assert not switcher.default_login_still_holds(login.identity, login.slot)
+            with pytest.raises(SessionError, match="changed or could not be confirmed"):
+                manager.exec_default(["--resume"])
+        finally:
+            held.release()
+
     def test_an_account_without_a_proxy_keeps_what_it_inherited(
         self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
         stream_proxy, monkeypatch,
@@ -2607,6 +2808,314 @@ class TestAnUnusableProxyStopsTheLaunch:
         assert "secret" not in text and "user" not in text
         captured = capsys.readouterr()
         assert "secret" not in captured.out + captured.err
+
+
+class TestTheLaunchChecksTheEgressExpectation:
+    """A rule on the account is checked before Claude Code, through its route.
+
+    The GeoIP chain itself is ``tests/test_egress.py``'s subject; here the
+    seam is observed: an account without a rule never reaches it, one with a
+    rule gets the account's own route, and a refusal ends the launch before
+    any profile work or ``claude auth status``.
+    """
+
+    def _rule(self, manager, proxy, **kwargs) -> None:
+        manager.switcher.update_account_proxy(
+            ACCOUNT_NUM,
+            proxy.url,
+            expect_country=kwargs.pop("country", "US"),
+            expect_ip=kwargs.pop("ip", "1.2.3.4"),
+            **kwargs,
+        )
+
+    def test_without_a_rule_nothing_is_checked(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
+        stream_proxy, monkeypatch,
+    ):
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("egress.check ran without a rule")
+
+        monkeypatch.setattr(egress, "check", forbidden)
+
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [])
+
+        # Only the pre-existing CONNECT probe reached the proxy.
+        assert [path for path, _ in stream_proxy.requests] == [
+            "api.anthropic.com:443"
+        ]
+
+    def test_the_check_gets_the_accounts_own_route(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
+        stream_proxy, monkeypatch,
+    ):
+        self._rule(manager, stream_proxy)
+        seen = []
+
+        def record(route, expectation, timeout=egress.TIMEOUT_S):
+            seen.append((route, expectation))
+            return None
+
+        monkeypatch.setattr(egress, "check", record)
+
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [])
+
+        assert len(seen) == 1
+        route, expectation = seen[0]
+        assert (route.host, route.port) == (
+            account_proxy.parse(stream_proxy.url).host,
+            account_proxy.parse(stream_proxy.url).port,
+        )
+        assert expectation.country == "US" and expectation.ip == "1.2.3.4"
+
+    def test_a_mismatch_stops_the_launch_before_the_auth_probe(
+        self, manager, capture_exec, auth_status_tracks_seed, stream_proxy,
+        monkeypatch,
+    ):
+        self._rule(manager, stream_proxy)
+
+        def refused(route, expectation, timeout=egress.TIMEOUT_S):
+            raise EgressCheckError(
+                "the exit country is DE, but US was expected. "
+                "Claude Code was not started."
+            )
+
+        monkeypatch.setattr(egress, "check", refused)
+
+        with pytest.raises(EgressCheckError) as exc:
+            manager.run("2", [])
+
+        text = str(exc.value)
+        assert "Account-2" in text and "DE" in text and "US" in text
+        assert auth_status_tracks_seed == []
+        session_dir = session_dir_for(
+            manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        assert not session_dir.exists()
+
+    def test_a_damaged_rule_refuses_without_the_chain(
+        self, manager, capture_exec, auth_status_tracks_seed, stream_proxy,
+        monkeypatch,
+    ):
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
+        data = manager.switcher._get_sequence_data()
+        data["accounts"][ACCOUNT_NUM][egress.COUNTRY_FIELD] = None
+        manager.switcher._write_json(manager.switcher.sequence_file, data)
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("the chain ran for a damaged rule")
+
+        # The real check refuses before it reads any endpoint; this proves
+        # the endpoint layer is not reached either.
+        monkeypatch.setattr(egress, "_observe", forbidden)
+
+        with pytest.raises(EgressCheckError, match="unusable"):
+            manager.run("2", [])
+        assert auth_status_tracks_seed == []
+
+    def test_the_default_login_launch_checks_its_slots_rule(
+        self, manager, capture_exec, stream_proxy, monkeypatch
+    ):
+        self._rule(manager, stream_proxy)
+        _active_default_login(monkeypatch, manager)
+
+        def refused(route, expectation, timeout=egress.TIMEOUT_S):
+            raise EgressCheckError("the exit IP is 5.6.7.8, but 1.2.3.4 was expected")
+
+        monkeypatch.setattr(egress, "check", refused)
+
+        with pytest.raises(EgressCheckError, match="default login"):
+            manager.exec_default(["--resume"])
+
+    def test_a_dead_proxy_with_a_rule_is_an_egress_refusal(
+        self, manager, capture_exec, auth_status_tracks_seed, dead_proxy_url
+    ):
+        """A rule makes an unusable proxy the exit check's own refusal.
+
+        The exit cannot be confirmed either way, so ``cswap run --auto`` may
+        try the next account. An account without a rule keeps the launch's
+        own refusal (``TestAnUnusableProxyStopsTheLaunch``).
+        """
+        manager.switcher.update_account_proxy(
+            ACCOUNT_NUM, dead_proxy_url, expect_country="US"
+        )
+
+        with pytest.raises(EgressCheckError, match="cannot be used"):
+            manager.run("2", [])
+
+        assert auth_status_tracks_seed == []
+
+    def test_a_407_with_a_rule_is_an_egress_refusal(
+        self, manager, capture_exec, auth_status_tracks_seed
+    ):
+        with _ConnectProxy(407) as server:
+            manager.switcher.update_account_proxy(
+                ACCOUNT_NUM, server.url, expect_country="US"
+            )
+
+            with pytest.raises(EgressCheckError, match="407"):
+                manager.run("2", [])
+
+        assert auth_status_tracks_seed == []
+
+    def test_a_swap_during_the_proxy_check_ends_the_fast_path(
+        self, manager, capture_exec, monkeypatch
+    ):
+        """The route is checked before the same-account fast path.
+
+        That path runs plain claude on the default login and never reaches
+        ``setup_session``, so its own owner check is what keeps a ``swap``
+        made while the ``CONNECT`` ran from launching the newcomer.
+        """
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, "http://127.0.0.1:1")
+        _active_default_login(monkeypatch, manager)
+
+        def swap_then_accept(route, timeout=account_proxy.PROBE_TIMEOUT_S):
+            manager.switcher.swap_accounts("1", ACCOUNT_NUM)
+
+        monkeypatch.setattr(account_proxy, "probe", swap_then_accept)
+
+        with pytest.raises(SessionError, match="no longer the login"):
+            manager.run("2", [])
+
+    def test_a_switch_while_the_fast_path_prepares_ends_the_launch(
+        self, manager, capture_exec, monkeypatch
+    ):
+        """A ``switch`` replaces the login itself, which the fast path runs.
+
+        The same-account fast path hands the terminal to plain claude on the
+        default login, after merging that account's history. A switch in that
+        step leaves the route and the rule with the outgoing login and the
+        incoming account's credentials live, so the re-check ends the launch
+        before ``_exec``.
+        """
+        switcher = manager.switcher
+        switcher._write_account_credentials("1", "account1@example.com", CREDS)
+        switcher._write_account_config("1", "account1@example.com", CONFIG_1)
+        _default_login_is(ACCOUNT_EMAIL, ORG_UUID)
+
+        def switch_then_share_history(self, session_dir, share_history):
+            # Activation only: the backup of the outgoing login is not what
+            # this test is about, and the live store here is a temp home's.
+            switcher.switch_to("1", force=True)
+
+        monkeypatch.setattr(
+            session_mod.SessionManager,
+            "_history_on_the_fast_path",
+            switch_then_share_history,
+        )
+
+        with pytest.raises(SessionError, match="no longer the login"):
+            manager.run("2", [])
+
+
+class TestAutoWalksPastAProxyRefusal:
+    """`cswap run --auto` through the real manager and the real launch loop.
+
+    ``test_cli.py`` feeds the loop a ready-made ``EgressCheckError``; here the
+    refusal comes from a real launch whose proxy does not accept a connection,
+    so the seam between ``_check_proxy`` and the loop's catch is exercised as
+    the launch makes it.
+    """
+
+    @staticmethod
+    def _launchable(switcher, monkeypatch) -> None:
+        """Both slots hold credentials and config, and a readable quota."""
+        from claude_swap.usage_store import UsageEntry
+
+        switcher._write_account_credentials("1", "account1@example.com", CREDS)
+        switcher._write_account_config(
+            "1",
+            "account1@example.com",
+            json.dumps({
+                "oauthAccount": {
+                    "emailAddress": "account1@example.com",
+                    "accountUuid": "uuid-1",
+                    "organizationUuid": "org-uuid-1",
+                },
+            }),
+        )
+        reading = UsageEntry(
+            last_good={"five_hour": {"pct": 10.0}, "seven_day": {"pct": 0.0}},
+            fetched_at=1.0,
+            age_s=0.0,
+        )
+        monkeypatch.setattr(
+            switcher,
+            "_collect_usage_entries",
+            lambda infos, fetch=None, *, scheduled=False: {
+                str(row[0]): reading for row in infos
+            },
+        )
+
+    @staticmethod
+    def _launch(args, tail, switcher):
+        from unittest.mock import patch
+
+        from claude_swap import cli
+
+        namespace = argparse.Namespace(
+            account=args,
+            auto=args is None,
+            no_share=False,
+            share_history=None,
+            require_session=False,
+            debug=False,
+        )
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=switcher), \
+             patch("os.geteuid", return_value=1000, create=True):
+            cli._run_launch(namespace, tail)
+
+    def test_auto_reports_the_first_slot_and_starts_the_second(
+        self, seeded_switcher, capture_exec, auth_status_tracks_seed,
+        refresh_rotates, dead_proxy_url, monkeypatch, capsys,
+    ):
+        self._launchable(seeded_switcher, monkeypatch)
+        seeded_switcher.update_account_proxy(
+            "1", dead_proxy_url, expect_country="US"
+        )
+
+        with pytest.raises(_ExecCalled) as exc:
+            self._launch(None, ["--resume"], seeded_switcher)
+
+        logged = capsys.readouterr()
+        text = logged.out + logged.err
+        assert "Account-1 was rejected" in text
+        assert "cannot be used" in text and "Trying the next account" in text
+        # The second candidate is not "the most remaining quota"; it is the
+        # next one the walk reached.
+        assert "Account-1 has the most remaining quota" in text
+        assert "Account-2 is the next available account" in text
+        # The launch that started is account 2's session profile, not 1's.
+        expected = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(expected)
+
+    def test_an_explicit_run_of_the_rejected_slot_starts_nothing(
+        self, seeded_switcher, capture_exec, auth_status_tracks_seed,
+        dead_proxy_url, monkeypatch, capsys,
+    ):
+        self._launchable(seeded_switcher, monkeypatch)
+        seeded_switcher.update_account_proxy(
+            "1", dead_proxy_url, expect_country="US"
+        )
+
+        # `_run_launch` reports a session-shaped refusal itself and exits 1.
+        with pytest.raises(SystemExit) as exited:
+            self._launch("1", ["--resume"], seeded_switcher)
+
+        assert exited.value.code == 1
+        logged = capsys.readouterr()
+        assert "cannot be used" in logged.out + logged.err
+        assert auth_status_tracks_seed == []
+        assert not session_dir_for(
+            seeded_switcher.backup_dir, "1", "account1@example.com"
+        ).exists()
+
 
 
 class TestExec:
@@ -4821,6 +5330,17 @@ def _active_default_login(monkeypatch, mgr: SessionManager) -> None:
     monkeypatch.setattr(
         mgr.switcher, "_get_current_account", lambda: (ACCOUNT_EMAIL, ORG_UUID)
     )
+
+
+def _default_login_is(email: str, org_uuid: str) -> None:
+    """Write ``email`` as the default login, the way a ``/login``
+    or a ``switch`` leaves ``.claude.json``."""
+    get_global_config_path().write_text(json.dumps({
+        "oauthAccount": {
+            "emailAddress": email,
+            "organizationUuid": org_uuid,
+        },
+    }))
 
 
 OPT_OUT = "cswap config set run.shareHistory false"
