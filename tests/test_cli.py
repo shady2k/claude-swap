@@ -1457,7 +1457,8 @@ class TestRunCommand:
             'import json, sys\nprint(json.dumps({"args": sys.argv[1:]}))\n'
         )
         # An unmapped directory launches the default login, which reads no
-        # credential on the way, so the stub needs nothing account-shaped.
+        # credential on the way; its route is the one account-shaped answer
+        # this launch asks for (none: no slot, so nothing to apply).
         script = textwrap.dedent("""\
             import sys
             from pathlib import Path
@@ -1470,6 +1471,7 @@ class TestRunCommand:
                 backup_dir=Path.cwd(),
                 _logger=None,
                 slot_for_directory=lambda cwd: (None, None),
+                live_login_route=lambda: None,
                 _is_running_in_container=lambda: True,
             )
             argv = ["cswap", "run", "--", sys.argv[1], "--output-format", "stream-json"]

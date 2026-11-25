@@ -90,6 +90,14 @@ class UiSettings:
     org_tag: str = "auto"
 
 
+#: ``NO_PROXY`` list every launch starts with: loopback and the private
+#: networks, so a local service or a LAN host stays reachable without a detour
+#: through the account's proxy. ``run.noProxy`` replaces the whole list.
+DEFAULT_NO_PROXY = (
+    "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+)
+
+
 @dataclass(frozen=True)
 class RunSettings:
     """Defaults for ``cswap run`` (``run`` section); its flags override them.
@@ -97,9 +105,14 @@ class RunSettings:
     ``share_history``: sessions of every account read and write the one chat
     history in ``~/.claude``, so the account only decides whose quota is
     used. Off gives each account a history of its own.
+
+    ``no_proxy``: the comma-separated ``NO_PROXY`` list a proxied account's
+    launch hands Claude Code. One list for every account, because what is
+    local is a property of the machine, not of the login.
     """
 
     share_history: bool = True
+    no_proxy: str = DEFAULT_NO_PROXY
 
 
 @dataclass(frozen=True)
@@ -221,6 +234,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "run", "shareHistory", "share_history", "bool",
             help="cswap run shares one chat history across accounts",
+        ),
+        SettingSpec(
+            "run", "noProxy", "no_proxy", "string",
+            help="Hosts a proxied account's launch reaches directly (NO_PROXY)",
         ),
         SettingSpec(
             "updates", "check", "check", "bool",
@@ -480,9 +497,54 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
 
 
 def load_run_settings(backup_root: Path) -> RunSettings:
-    """Load the run section; missing/corrupt file or non-bool value → default."""
+    """Load the run section; a missing or corrupt value → that key's default."""
     chosen = explicit_share_history(backup_root)
-    return RunSettings() if chosen is None else RunSettings(share_history=chosen)
+    return RunSettings(
+        share_history=True if chosen is None else chosen,
+        no_proxy=_no_proxy_setting(backup_root),
+    )
+
+
+def normalize_no_proxy(value: str) -> str:
+    """Trim a comma-separated ``NO_PROXY`` list; refuse a ``*`` entry.
+
+    ``NO_PROXY=*`` means "bypass the proxy for every host", which is the
+    direct connection the per-account setting exists to prevent, so one ``*``
+    entry makes the whole list unusable. Shared with the strict parse of
+    ``cswap config set``, so a value that would be refused at launch time
+    cannot be written either.
+    """
+    kept = [entry.strip() for entry in value.split(",")]
+    kept = [entry for entry in kept if entry]
+    if "*" in kept:
+        raise ConfigError(
+            "run.noProxy cannot contain '*' — it would bypass the proxy for "
+            "every host; list the hosts and networks instead"
+        )
+    if not kept:
+        raise ConfigError(
+            "run.noProxy expects a comma-separated host or network list"
+        )
+    return ",".join(kept)
+
+
+def _no_proxy_setting(backup_root: Path) -> str:
+    """``run.noProxy`` as the file sets it, normalized; the default if unusable."""
+    section = _read_raw(settings_path(backup_root)).get("run")
+    raw = section.get("noProxy") if isinstance(section, dict) else None
+    if raw is None:
+        return DEFAULT_NO_PROXY
+    if not isinstance(raw, str):
+        _logger.warning(
+            "settings.json: run.noProxy %r is not a string; using %r",
+            raw, DEFAULT_NO_PROXY,
+        )
+        return DEFAULT_NO_PROXY
+    try:
+        return normalize_no_proxy(raw)
+    except ConfigError as e:
+        _logger.warning("settings.json: %s; using %r", e, DEFAULT_NO_PROXY)
+        return DEFAULT_NO_PROXY
 
 
 def explicit_share_history(backup_root: Path) -> bool | None:
@@ -601,6 +663,10 @@ def parse_setting_value(spec: SettingSpec, raw_value: str):
                 f"{spec.dotted} expects a non-empty value; use "
                 f"'cswap config unset {spec.dotted}' to clear it"
             )
+        if spec.dotted == "run.noProxy":
+            # The one string setting with a shape to enforce: a list, and
+            # never the `*` that would switch the proxy off.
+            return normalize_no_proxy(value)
         return value
     try:
         value = int(raw_value) if spec.kind == "int" else float(raw_value)

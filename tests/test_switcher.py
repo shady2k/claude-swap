@@ -28,7 +28,11 @@ from claude_swap.exceptions import (
 from claude_swap.usage_store import FetchRecord, UsageEntry, UsageStore
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform, normalize_alias
-from claude_swap.paths import get_backup_root, get_credentials_path
+from claude_swap.paths import (
+    get_backup_root,
+    get_credentials_path,
+    get_global_config_path,
+)
 from claude_swap.session import mark_session_stale
 from claude_swap.settings import set_setting, settings_path
 from claude_swap.credentials import ActiveCredentials
@@ -14332,3 +14336,72 @@ class TestSalvageCopyMode:
         assert salvage.read_bytes() == config_path.read_bytes()
         assert salvage.stat().st_mode & 0o777 == 0o600
         assert not list(temp_home.glob("*.tmp"))
+
+
+class TestTheLaunchRoute:
+    """The proxy a launch pins: ``account_route`` and ``live_login_route``.
+
+    Both read one record and accept it only while it still names the account
+    the launch was resolved for, so a slot a concurrent ``swap``/``move``
+    already gave away cannot lend its proxy.
+    """
+
+    @staticmethod
+    def _switcher(data: dict) -> ClaudeAccountSwitcher:
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    def test_an_account_without_a_proxy_has_no_route(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        assert switcher.account_route("2", "account2@example.com", "") is None
+
+    def test_the_route_of_the_named_record(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        switcher.set_account_proxy("2", "http://127.0.0.1:3128")
+
+        route = switcher.account_route("2", "account2@example.com", "")
+        assert route is not None
+        assert (route.host, route.port) == ("127.0.0.1", 3128)
+
+    def test_a_record_that_names_another_account_yields_an_unusable_route(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        switcher.set_account_proxy("2", "http://127.0.0.1:3128")
+
+        route = switcher.account_route("2", "account1@example.com", "")
+        assert route is not None and route.invalid
+
+    def test_no_live_login_is_no_route(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        assert switcher.live_login_route() is None
+
+    def test_a_live_login_cswap_does_not_manage_is_no_route(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        get_global_config_path().write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "stranger@example.com"}})
+        )
+        assert switcher.live_login_route() is None
+
+    def test_the_live_logins_slot_carries_its_route(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        switcher.set_account_proxy("2", "http://user:pw@127.0.0.1:3128")
+        get_global_config_path().write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "account2@example.com"}})
+        )
+
+        route = switcher.live_login_route()
+        assert route is not None
+        assert (route.host, route.port) == ("127.0.0.1", 3128)

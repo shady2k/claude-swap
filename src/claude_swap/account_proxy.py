@@ -42,11 +42,20 @@ The stored value keeps the password in ``sequence.json`` (mode 0600, written
 atomically by the switcher), because cswap has to present it. It is masked
 wherever it leaves the process, and it never enters an export; see
 :func:`describe` and ``docs/json-output.md``.
+
+The same route serves a launch, in two more shapes. :func:`probe` is the
+pre-start check: one ``CONNECT`` to :data:`PROBE_TARGET`, so an unreachable or
+misconfigured proxy refuses the launch before Claude Code starts.
+:func:`launch_env` is the other half — the variables Claude Code reads a proxy
+from, written in both spellings over whatever the shell carried. Nothing here
+forbids a direct connection at the OS level, so a program that ignores these
+variables still goes out directly (``docs/proxy.md``).
 """
 
 from __future__ import annotations
 
 import base64
+import http.client
 import re
 import urllib.error
 import urllib.parse
@@ -67,6 +76,24 @@ DEFAULT_PORT = 80
 PROXY_INVALID = "proxy-invalid"
 PROXY_AUTH = "proxy-auth"
 PROXY_REDIRECT = "proxy-redirect"
+#: The launch's pre-start probe got no usable answer: nothing listening, no
+#: name resolution, a timeout, or a CONNECT status of the proxy's own. It
+#: never reaches a usage row — the probe runs before a launch and its message
+#: is that launch's error.
+PROXY_UNREACHABLE = "proxy-unreachable"
+
+#: Seconds the launch's one ``CONNECT`` may take; the same budget
+#: :meth:`ProxyRoute.open` gives each request.
+PROBE_TIMEOUT_S = 5.0
+
+#: What the probe asks the proxy to open a tunnel to: the endpoint every
+#: Claude Code run needs.
+PROBE_TARGET = ("api.anthropic.com", 443)
+
+#: The variables a launch sets for a proxied account, and drops from what the
+#: shell carried. ``NO_PROXY`` included: an inherited ``NO_PROXY=*`` would
+#: switch the account's proxy off.
+LAUNCH_ENV_NAMES = ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY")
 
 
 class ProxyUrlError(ValueError):
@@ -360,6 +387,102 @@ def redact_urls(text: str, values: Iterable[str] = ()) -> str:
     return _USERINFO_SHAPED.sub("<URL>", _URL_SHAPED.sub("<URL>", text))
 
 
+def probe(route: ProxyRoute, timeout: float = PROBE_TIMEOUT_S) -> None:
+    """Ask ``route``'s proxy to open one tunnel to :data:`PROBE_TARGET`.
+
+    The launch's pre-start check, and the only request here that sends nothing
+    to an origin: one ``CONNECT api.anthropic.com:443`` carrying the URL's
+    credentials, no TLS handshake and no token. A 200 proves the proxy is
+    listening, speaks the proxy protocol, accepted those credentials, and
+    could reach that target itself. It does not prove TLS survives the proxy,
+    that the proxy allows the other hosts Claude Code may use, or that it stays
+    up for the session; those fail during the session instead.
+
+    ``http.client`` reports a refused tunnel as an ``OSError`` whose message is
+    "Tunnel connection failed: <code> <phrase>" — the shape
+    :meth:`ProxyRoute.open` already classifies through urllib — so
+    :func:`_tunnel_status` reads both and the proxy's own phrase never travels
+    on: it may name a credential.
+
+    Raises:
+        ProxyRouteError: the stored value is unusable, the proxy rejected the
+            credentials (407), redirected, answered with another status, or
+            could not be reached at all.
+    """
+    if route.invalid is not None:
+        raise ProxyRouteError(
+            PROXY_INVALID,
+            f"the account's proxy setting is unusable: {route.invalid}",
+        )
+    headers = (
+        {"Proxy-Authorization": route.authorization}
+        if route.authorization is not None
+        else {}
+    )
+    connection = http.client.HTTPConnection(
+        route.host, route.port, timeout=timeout
+    )
+    try:
+        connection.set_tunnel(*PROBE_TARGET, headers=headers)
+        connection.connect()
+    except OSError as e:
+        status = _tunnel_status(e)
+        if status == "407":
+            raise ProxyRouteError(
+                PROXY_AUTH,
+                "the proxy rejected the credentials in its URL (HTTP 407)",
+            ) from None
+        if status is not None and status.isdigit():
+            if 300 <= int(status) < 400:
+                raise ProxyRouteError(
+                    PROXY_REDIRECT,
+                    f"the proxy answered HTTP {status} to CONNECT instead of "
+                    "opening the tunnel",
+                ) from None
+            raise ProxyRouteError(
+                PROXY_UNREACHABLE,
+                f"the proxy answered HTTP {status} to CONNECT instead of "
+                "opening the tunnel",
+            ) from None
+        # Not a tunnel reply: refused, unresolvable, timed out. The socket's
+        # own text names the address at most, never the URL's credentials.
+        raise ProxyRouteError(
+            PROXY_UNREACHABLE, f"the proxy did not accept a connection ({e})"
+        ) from None
+    finally:
+        connection.close()
+
+
+def launch_env(
+    route: ProxyRoute, no_proxy: str, env: Mapping[str, str]
+) -> dict[str, str]:
+    """``env`` with the account's proxy in place of whatever it inherited.
+
+    Every spelling of every variable is dropped before the account's own are
+    written in both cases. Claude Code resolves ``https_proxy`` before
+    ``HTTPS_PROXY`` (code.claude.com/docs/en/network-config), so an inherited
+    lower-case value would otherwise win over the account's, and an inherited
+    ``NO_PROXY`` would add bypasses the account was never given: ``no_proxy``
+    (``run.noProxy``) is the whole list.
+
+    The URL is :meth:`ProxyRoute.text` — credentials included, because that is
+    how a client presents them to a proxy. It is as secret as the stored
+    value and must not be printed or logged.
+    """
+    written = {
+        name: value
+        for name, value in env.items()
+        if name.upper() not in LAUNCH_ENV_NAMES
+    }
+    url = route.text()
+    for name in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"):
+        written[name] = url
+        written[name.lower()] = url
+    written["NO_PROXY"] = no_proxy
+    written["no_proxy"] = no_proxy
+    return written
+
+
 def send(
     request: urllib.request.Request,
     timeout: float,
@@ -370,6 +493,9 @@ def send(
     The single entry point of every network call in ``oauth.py`` and
     ``subscription.py``: the direct branch is the ``route is None`` case only,
     so a proxied account cannot reach the network any other way.
+
+    A launch's environment is :func:`launch_env`; this function is only about
+    cswap's own requests.
     """
     if route is None:
         return urllib.request.urlopen(request, timeout=timeout)

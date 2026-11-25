@@ -1141,6 +1141,48 @@ class ClaudeAccountSwitcher:
             record.get("organizationUuid", "") or "",
         )
 
+    def account_route(
+        self, account_num: str, email: str, org_uuid: str
+    ) -> "account_proxy.ProxyRoute | None":
+        """The proxy route pinned to one account, or ``None`` without a proxy.
+
+        Read from ``sequence.json`` and accepted only while the record still
+        names this account, so a slot a concurrent ``swap``/``move`` has
+        already given to another account yields an unusable route rather than
+        a neighbour's proxy. ``None`` means the account has no proxy — the
+        absent field ``account_proxy.route_for`` reads as a direct connection.
+
+        For a launch, which must decide its route once (``session.py``): a
+        proxied account whose record moved is refused, never launched direct.
+        No lock is held across the launch, so the identity check is what makes
+        a move between the resolution and this read an error rather than a
+        neighbour's proxy.
+        """
+        data = self._get_sequence_data_migrated() or {}
+        record = (data.get("accounts") or {}).get(account_num)
+        if not self._record_is(record, email, org_uuid):
+            return account_proxy.unusable(
+                "the slot no longer names this account"
+            )
+        return account_proxy.route_for(record)
+
+    def live_login_route(self) -> "account_proxy.ProxyRoute | None":
+        """The route of the slot the live default login belongs to.
+
+        ``None`` when the live login names no slot: it is not an account cswap
+        manages, so no route can be imposed on it and a launch keeps the proxy
+        variables it inherited. ``cswap run`` uses this for the launch that
+        runs plain claude on the default login.
+        """
+        identity = self._get_current_account()
+        if identity is None:
+            return None
+        data = self._get_sequence_data_migrated() or {}
+        account_num = self._find_account_slot(data, *identity)
+        if account_num is None:
+            return None
+        return self.account_route(account_num, *identity)
+
     def set_alias(self, identifier: str, alias: str) -> tuple[str, str]:
         """Set (or rename) the alias for the account matching identifier.
 

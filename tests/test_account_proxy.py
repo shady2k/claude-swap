@@ -1237,3 +1237,111 @@ class TestOwnershipUnderTheLock:
         # is byte-identical to what it was.
         assert s._read_account_credentials("1", "test@example.com") == ""
         assert s._read_account_credentials("2", "account2@example.com") == sibling_before
+
+
+class TestProbe:
+    """The launch's pre-start check: one CONNECT, nothing else."""
+
+    def test_a_working_proxy_opens_the_tunnel(self, proxy):
+        account_proxy.probe(account_proxy.parse(proxy.url))
+        row = proxy.only("CONNECT")
+        assert row["path"] == "api.anthropic.com:443"
+        # One request and no other: the check sends nothing to an origin.
+        assert proxy.paths() == ["api.anthropic.com:443"]
+
+    def test_the_credentials_of_the_url_travel_on_the_tunnel(self, proxy):
+        account_proxy.probe(
+            account_proxy.parse(f"http://user:pw@{proxy.url.split('//')[1]}")
+        )
+        header = proxy.only("CONNECT")["headers"]["Proxy-Authorization"]
+        assert header == "Basic " + base64.b64encode(b"user:pw").decode()
+
+    def test_a_url_without_credentials_sends_no_proxy_authorization(self, proxy):
+        account_proxy.probe(account_proxy.parse(proxy.url))
+        assert "Proxy-Authorization" not in proxy.only("CONNECT")["headers"]
+
+    @pytest.mark.parametrize(
+        "status,phrase,kind",
+        [
+            (407, "Proxy Authentication Required", account_proxy.PROXY_AUTH),
+            (302, "Found", account_proxy.PROXY_REDIRECT),
+            (502, "Bad Gateway", account_proxy.PROXY_UNREACHABLE),
+        ],
+        ids=["407", "redirect", "other-status"],
+    )
+    def test_a_refusal_is_classified_without_the_proxys_own_phrase(
+        self, status, phrase, kind
+    ):
+        """The phrase is the proxy's text and may name a credential."""
+        with LocalServer(connect=(status, phrase)) as server:
+            with pytest.raises(account_proxy.ProxyRouteError) as err:
+                account_proxy.probe(account_proxy.parse(server.url))
+        assert err.value.kind == kind
+        assert phrase not in str(err.value)
+
+    def test_an_unreachable_proxy(self, dead_proxy):
+        route = account_proxy.parse(f"http://127.0.0.1:{dead_proxy.port}")
+        with pytest.raises(account_proxy.ProxyRouteError) as err:
+            account_proxy.probe(route)
+        assert err.value.kind == account_proxy.PROXY_UNREACHABLE
+
+    def test_a_proxy_that_never_answers_the_tunnel(self):
+        """A listening backlog with no accept: the connection opens and the
+        reply never comes, which is a timeout, not a refusal."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        try:
+            route = account_proxy.parse(
+                f"http://127.0.0.1:{sock.getsockname()[1]}"
+            )
+            with pytest.raises(account_proxy.ProxyRouteError) as err:
+                account_proxy.probe(route, timeout=0.2)
+        finally:
+            sock.close()
+        assert err.value.kind == account_proxy.PROXY_UNREACHABLE
+
+    def test_a_stored_value_that_does_not_parse_stops_the_probe(self):
+        route = account_proxy.unusable("the stored value is not a URL")
+        with pytest.raises(account_proxy.ProxyRouteError) as err:
+            account_proxy.probe(route)
+        assert err.value.kind == account_proxy.PROXY_INVALID
+
+
+class TestLaunchEnv:
+    """The variables a launch hands Claude Code for a proxied account."""
+
+    def test_both_spellings_and_the_whole_no_proxy_list(self):
+        route = account_proxy.parse("http://user:p%40ss@127.0.0.1:3128")
+        env = account_proxy.launch_env(route, "localhost,10.0.0.0/8", {"PATH": "/bin"})
+        assert env["PATH"] == "/bin"
+        for name in (
+            "HTTPS_PROXY", "https_proxy",
+            "HTTP_PROXY", "http_proxy",
+            "ALL_PROXY", "all_proxy",
+        ):
+            # The stored form, credentials included: that is how a client
+            # presents them to a proxy.
+            assert env[name] == "http://user:p%40ss@127.0.0.1:3128"
+        assert env["NO_PROXY"] == "localhost,10.0.0.0/8"
+        assert env["no_proxy"] == "localhost,10.0.0.0/8"
+
+    def test_every_inherited_spelling_is_dropped_first(self):
+        """A shell's ``https_proxy`` wins over ``HTTPS_PROXY`` in Claude Code,
+        and ``NO_PROXY=*`` would switch the account's proxy off."""
+        route = account_proxy.parse("http://127.0.0.1:3128")
+        inherited = {
+            "HTTPS_PROXY": "http://old.invalid:1",
+            "https_proxy": "http://old.invalid:1",
+            "HTTP_PROXY": "http://old.invalid:1",
+            "http_proxy": "http://old.invalid:1",
+            "ALL_PROXY": "http://old.invalid:1",
+            "all_proxy": "http://old.invalid:1",
+            "NO_PROXY": "*",
+            "no_proxy": "*",
+            "PATH": "/bin",
+        }
+        env = account_proxy.launch_env(route, "localhost", inherited)
+        assert "old.invalid" not in " ".join(env.values())
+        assert env["NO_PROXY"] == "localhost"
+        assert env["PATH"] == "/bin"

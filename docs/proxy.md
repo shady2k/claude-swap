@@ -17,6 +17,24 @@ The route is pinned to the account, not to the slot number: it is read in the sa
 
 Known risk, accepted: the ownership lookup for the live login takes the route of the slot `~/.claude.json` names, so a live token that actually belongs to another proxied account is checked over the named slot's route (direct when it has none). A token the lookup proves to be another account's is never written into a slot; when ownership cannot be determined at all (offline, a malformed reply), the switch keeps its pre-proxy behavior and reserves the slot for the credential it already stores.
 
+## Launching Claude Code
+
+A launch of a proxied account — `cswap run`, its plain-claude fast path on the default login, and `cswap run` with no account at all — is checked and dressed before Claude Code starts.
+
+**The check.** One `CONNECT api.anthropic.com:443` with the URL's credentials, 5 s, no TLS handshake and no token. A 200 proves the proxy is listening, speaks the proxy protocol, accepted the credentials, and could reach that one target. It does not prove TLS survives the proxy, that the proxy allows every other host Claude Code may use, or that it stays up for the session. Everything it does not like ends the command before any Claude Code process — including the `claude auth status` probe — with a message that repeats neither the URL nor its user name: no connection, no 200, 407, a redirect, an unreachable address, or a stored value that does not parse.
+
+**The environment.** That account's route goes into `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY`, in both cases, over whatever the shell carried: Claude Code resolves `https_proxy` before `HTTPS_PROXY`, so an inherited lower-case value would otherwise win, and an inherited `NO_PROXY=*` would switch the proxy off. `NO_PROXY` comes from `run.noProxy` alone — `cswap config set run.noProxy 'localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'` is the default, and an entry of `*` is refused because it bypasses the proxy for every host (how a `10.0.0.0/8` entry is read is up to the client that reads it; Claude Code does not document subnet support). An account without a proxy keeps the proxy variables it inherited. Every `cswap run` also gets `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` ([env-vars](https://code.claude.com/docs/en/env-vars)); the switch that turns that off belongs to the `cswap run --auto` stage and will *unset* the variable, since `0` disables the traffic too.
+
+**No account selected.** With no account named and no directory mapping (or a mapping whose account is gone), `cswap run` still launches plain claude on the default login. When that login belongs to a managed slot that has a proxy, the launch takes it and passes the check above; when the login is not a managed account, there is no route to apply and the inherited variables stay as they were.
+
+**What this is not.** Nothing forbids a direct connection at the OS level. A launch can still reach the internet directly through a program that ignores these variables (`psql`, `ssh`, `curl --noproxy '*'`), and cswap's own requests remain strictly on the account's route.
+
+Known limits of the environment, all Claude Code's own behaviour:
+
+- An `env` block in Claude Code's `settings.json` [replaces](https://code.claude.com/docs/en/settings-reference#how-env-values-interact-with-your-shell) the shell environment, so a proxy or `NO_PROXY` put there overrides the account's. Keep them out of `settings.json`.
+- Background sessions (`claude --bg`, `claude agents`) are served by one process per user with the environment of the terminal that started it first ([network-config](https://code.claude.com/docs/en/network-config#apply-network-settings-to-background-agents)); a session started later can therefore carry another account's proxy.
+- `cswap switch` and auto-switching change the account, not the proxy of a `claude` already running. The new proxy applies to the next launch.
+
 ## Boundaries
 
 The guarantee above is for ONE cswap command at a time, which is upstream's contract: two commands that change the account list at the same moment are not supported.
@@ -52,4 +70,4 @@ Only an absent key means "direct" — it is what `--unset` leaves and what every
 
 ## Rolling back
 
-A build without proxy support ignores the field and its requests for those accounts go direct. Before switching back, save the URLs and stop running such accounts through that version.
+A build without proxy support ignores the field, and its requests for those accounts go direct. It also starts Claude Code with whatever proxy variables the shell carries — no pre-start check, no account route. Before switching back, save the URLs and stop running such accounts through that version.
