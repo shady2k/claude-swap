@@ -91,6 +91,18 @@ an interactive session on a pseudo-terminal, and a hook of the user's own in
 `settings.json` ran alongside cswap's `--settings` one. A command line that
 already carries the user's `--settings` gets no hook from cswap.
 
+Neither does a command line whose first argument reads as one of Claude Code's
+subcommands — `attach`, `logs`, `stop`, `remote-control`, `respawn`, and the
+ones a later release adds. In front of a subcommand `--settings` turns the whole
+line into a prompt instead of running it (measured on 2.1.329: `claude
+--settings {} attach nosuch` answers "Not logged in", and `remote-control
+--help` refuses the flag), so `cswap` reads the first argument rather than
+holding a list of command names, which would go stale. The rule is "one lowercase
+word" (`re.fullmatch(r"[a-z][a-z-]*")`), and its cost is a prompt that is
+exactly one such word: `claude hello` runs without a mark, and the confirmation
+before the launch — one extra reading, within the 180 s serve window — is what
+keeps that account from being chosen again.
+
 ## What `--auto` does not do
 
 - **It ignores `cswap map`.** A directory mapping is a choice of account; it
@@ -118,7 +130,11 @@ are not sessions, so `--auto` hands them to the default login
   quota left.
 
 The default login's own proxy is still checked and handed over, fail-closed, the
-same as any launch of that login.
+same as any launch of that login. These commands run on the user's own profile
+even from inside a session, whose terminal exports its profile in
+`CLAUDE_CONFIG_DIR`: that variable is dropped for the child, so `claude mcp add`
+writes the profile the next session launch syncs FROM rather than a copy it
+overwrites.
 
 ## The wrapper
 

@@ -1304,8 +1304,8 @@ class TestRunCommand:
                 if account is not None:
                     calls.append(("run_account", account))
 
-            def exec_default(self, claude_args):
-                calls.append(("exec_default", claude_args))
+            def exec_default(self, claude_args, *, primary_profile=False):
+                calls.append(("exec_default", claude_args, primary_profile))
 
         with patch("claude_swap.session.SessionManager", FakeSessionManager), \
              patch("claude_swap.cli.ClaudeAccountSwitcher",
@@ -1477,6 +1477,91 @@ class TestRunCommand:
         assert "b@example.com" in command and "org-1" in command
         assert claude_args[2:] == ["-p", "hi"]
 
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            ["attach", "x"],
+            ["remote-control"],
+            ["stop", "x"],
+            ["logs", "x"],
+            ["respawn", "nosuch"],
+        ],
+    )
+    def test_a_subcommand_is_never_given_the_hook(self, tail):
+        """``--settings`` in front of a subcommand turns the line into a prompt.
+
+        Measured on Claude Code 2.1.329: ``claude --settings{} attach nosuch``
+        answers "Not logged in" and runs a session with the words as the
+        prompt, and ``remote-control --help`` refuses the ``--settings``.
+        """
+        calls = self._auto_dispatch(
+            ["run", "--auto", "--", *tail],
+            lambda **kwargs: (self._row(2), ""),
+        )
+
+        assert self._launch(calls)[2] == tail
+
+    @pytest.mark.parametrize(
+        "tail", [["-p", "hi"], ["--resume"], ["fix the bug"]]
+    )
+    def test_a_prompt_still_gets_the_hook(self, tail):
+        """A flag or prose is a session, not a subcommand: it gets the mark.
+
+        ``claude hello`` is the boundary: one lowercase word reads as a
+        subcommand, so it goes without a hook and relies on the launch's own
+        confirmation instead.
+        """
+        calls = self._auto_dispatch(
+            ["run", "--auto", "--", *tail],
+            lambda **kwargs: (self._row(2), ""),
+        )
+
+        claude_args = self._launch(calls)[2]
+        assert claude_args[0] == "--settings"
+        assert claude_args[2:] == tail
+
+    def test_the_hook_command_ignores_the_current_directory(
+        self, temp_home: Path, tmp_path: Path
+    ):
+        """A ``json.py`` next to the session must not be imported by the hook.
+
+        ``python -m`` puts the current directory first on ``sys.path``, so the
+        hook would run the project's own module, exit non-zero and leave the
+        account unmarked — the next launch would take the exhausted account
+        again. Measured on 2.1.329 with a ``json.py`` that raises on import.
+        """
+        from claude_swap import launch_agent
+        from claude_swap.paths import get_backup_root
+
+        with patch.object(launch_agent.sys, "argv", ["/nonexistent/cswap"]), \
+             patch.object(launch_agent.shutil, "which", return_value=None):
+            command = cli._rate_limit_hook(
+                ["-p", "hi"], ("2", "b@example.com", "org-1")
+            )
+        settings = json.loads(command[1])
+        hook_command = settings["hooks"]["StopFailure"][0]["hooks"][0]["command"]
+
+        workdir = tmp_path / "checkout"
+        workdir.mkdir()
+        (workdir / "json.py").write_text("raise RuntimeError('not the stdlib')\n")
+        env = {
+            "HOME": str(temp_home),
+            "PATH": os.environ.get("PATH", ""),
+        }
+
+        result = subprocess.run(
+            hook_command, shell=True, cwd=workdir, env=env,
+            capture_output=True, text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+        marks = json.loads(
+            (get_backup_root() / "cache" / "stop-failure.json").read_text()
+        )["marks"]
+        assert [(m["email"], m["organizationUuid"]) for m in marks] == [
+            ("b@example.com", "org-1")
+        ]
+
     def test_a_user_settings_switch_is_not_competed_with(self):
         calls = self._auto_dispatch(
             ["run", "--auto", "--", "--settings", "/tmp/mine.json"],
@@ -1504,7 +1589,7 @@ class TestRunCommand:
             ["run", "--auto", "--", *tail], auto_run_target=target
         )
 
-        assert ("exec_default", tail) in calls
+        assert ("exec_default", tail, True) in calls
         assert not [call for call in calls if call[0] == "run"]
         target.assert_not_called()
 
@@ -2693,8 +2778,8 @@ class TestRunAutoResolve:
             ):
                 calls.append(("run", identifier, claude_args, share, share_history))
 
-            def exec_default(self, claude_args):
-                calls.append(("exec_default", claude_args))
+            def exec_default(self, claude_args, *, primary_profile=False):
+                calls.append(("exec_default", claude_args, primary_profile))
 
         return FakeSessionManager
 
@@ -2774,7 +2859,7 @@ class TestRunAutoResolve:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run"]):
             cli.main()
-        assert ("exec_default", []) in calls
+        assert ("exec_default", [], False) in calls
         captured = capsys.readouterr()
         assert captured.out == ""
         assert "No account mapped" in captured.err
@@ -2795,7 +2880,7 @@ class TestRunAutoResolve:
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run"]):
             cli.main()
-        assert ("exec_default", []) in calls
+        assert ("exec_default", [], False) in calls
         captured = capsys.readouterr()
         assert captured.out == ""
         assert "no longer exists" in captured.err

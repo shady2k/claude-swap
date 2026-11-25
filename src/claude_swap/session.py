@@ -1146,7 +1146,9 @@ class SessionManager:
             and expires_at <= time.time() * 1000
         )
 
-    def exec_default(self, claude_args: list[str]) -> NoReturn:
+    def exec_default(
+        self, claude_args: list[str], *, primary_profile: bool = False
+    ) -> NoReturn:
         """Launch plain Claude Code with the current default login.
 
         Used by `cswap run` (no account) when the cwd has no mapping, or its
@@ -1160,17 +1162,27 @@ class SessionManager:
         launch gets. A login that names no slot keeps the proxy variables it
         inherited: there is no account whose route they could be replaced
         with.
+
+        ``primary_profile`` launches on the profile the user manages, even
+        when ``CLAUDE_CONFIG_DIR`` names another one — a session's terminal.
+        `cswap run --auto` passes it for Claude Code's own housekeeping
+        commands: their writes belong in the profile the next session launch
+        syncs FROM, not in a session copy that launch overwrites
+        (``_sync_sharing``), and the proxy must be that profile's login's.
         """
         claude_bin = find_claude()
         if not claude_bin:
             raise SessionError(
                 "'claude' was not found on PATH. Install Claude Code first."
             )
-        route = self.switcher.live_login_route()
+        env = dict(os.environ)
+        if primary_profile:
+            env.pop("CLAUDE_CONFIG_DIR", None)
+            route = self.switcher.default_profile_login_route()
+        else:
+            route = self.switcher.live_login_route()
         self._check_proxy(route, "The default login's account")
-        self._exec(
-            claude_bin, claude_args, env=self._launch_env(route, dict(os.environ))
-        )
+        self._exec(claude_bin, claude_args, env=self._launch_env(route, env))
 
     def _check_proxy(
         self, route: account_proxy.ProxyRoute | None, who: str
@@ -1604,10 +1616,15 @@ class SessionManager:
             return "invalid"
         # On Windows `claude` is a `.cmd` shim, and a bare "claude" passed to
         # subprocess won't resolve it (PATHEXT isn't applied) — it raises
-        # FileNotFoundError. `find_claude` answers like `shutil.which`; when it
-        # finds nothing at all the run below still raises, and that is "unknown".
-        # It also skips claude-swap's own wrapper, so the probe stays one claude.
-        claude_bin = find_claude() or "claude"
+        # FileNotFoundError. `find_claude` answers like `shutil.which`, and it
+        # also skips claude-swap's own wrapper, so the probe stays one claude.
+        # No claude at all is "unreachable" and never a fallback by name: that
+        # name runs whatever is left on PATH (cswap's wrapper, typically),
+        # whose nonzero exit reads as a BAD profile — and the caller deletes
+        # that profile and its Keychain entry on that verdict.
+        claude_bin = find_claude()
+        if claude_bin is None:
+            return "unreachable"
         run = self._run_settings()
         try:
             result = spawn.run(

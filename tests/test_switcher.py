@@ -6934,6 +6934,14 @@ class _FakeClock:
         return self.now
 
 
+_REFRESHED_CREDENTIAL = json.dumps({
+    "claudeAiOauth": {
+        "accessToken": "sk-refreshed",
+        "refreshToken": "rt-refreshed",
+        "expiresAt": 9999999999000,
+    },
+})
+
 class _UsageEndpoint:
     """The usage API, answered per account, recording who was asked.
 
@@ -7072,6 +7080,37 @@ class TestAutoRunTarget:
         for num, email in enumerate(
             ("a@example.com", "b@example.com", "c@example.com"), start=1
         ):
+            if email in readings:
+                self._stored(
+                    s, clock, num, email, readings[email], **stored_kwargs
+                )
+        return s, endpoint
+
+    def _pair(
+        self, temp_home: Path, monkeypatch, clock: _FakeClock, answers: dict
+    ) -> tuple[ClaudeAccountSwitcher, _UsageEndpoint]:
+        """The same harness with two managed accounts, for launch choices."""
+        s = self._setup(temp_home)
+        for num, email in enumerate(("a@example.com", "b@example.com"), start=1):
+            self._seed(s, num, email)
+        s._usage_store = UsageStore(s.backup_dir / "cache", clock=clock)
+        endpoint = _UsageEndpoint(answers)
+        monkeypatch.setattr(
+            "claude_swap.oauth.try_fetch_usage_for_account", endpoint
+        )
+        return s, endpoint
+
+    def _pair_readings(
+        self,
+        temp_home: Path,
+        monkeypatch,
+        clock: _FakeClock,
+        readings: dict[str, dict],
+        answers: dict,
+        **stored_kwargs,
+    ) -> tuple[ClaudeAccountSwitcher, _UsageEndpoint]:
+        s, endpoint = self._pair(temp_home, monkeypatch, clock, answers or readings)
+        for num, email in enumerate(("a@example.com", "b@example.com"), start=1):
             if email in readings:
                 self._stored(
                     s, clock, num, email, readings[email], **stored_kwargs
@@ -7250,6 +7289,306 @@ class TestAutoRunTarget:
 
         assert row is not None and row[1] == "a@example.com"
         assert endpoint.calls == []
+
+    def test_a_confirmed_reading_reorders_the_remaining_candidates(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The launch goes to the account the CONFIRMED readings like best.
+
+        A ranks first on a stale 30%, confirms as 95% (5% left) while B's
+        reading still says 40%: launching A would run the account with the
+        smaller share, so B is taken. Ordered by the first capture, the old
+        code returned A.
+        """
+        clock = _FakeClock()
+        s, endpoint = self._pair_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(30),
+                "b@example.com": self._usage(60),
+            },
+            answers={
+                "a@example.com": self._usage(95),
+                "b@example.com": self._usage(60),
+            },
+            age_s=200,
+            next_poll_in=600,
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+
+        row, why = s.auto_run_target()
+
+        assert why == ""
+        assert row is not None and row[1] == "b@example.com"
+        # One confirmation each, in ranking order, and no third request.
+        assert endpoint.calls == ["a@example.com", "b@example.com"]
+
+    def test_the_refusal_names_the_reset_the_confirmation_found(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The reset in the refusal comes from the confirmed reading.
+
+        A's stale 30% confirms as 100%, resetting in an hour; B was already
+        spent with a weekly reset. The refusal must promise the hour.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        hourly = (now + timedelta(hours=1)).isoformat()
+        weekly = (now + timedelta(days=7)).isoformat()
+        clock = _FakeClock()
+        s, endpoint = self._pair_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(30),
+                "b@example.com": {
+                    "five_hour": {"pct": 0.0},
+                    "seven_day": {"pct": 100.0, "resets_at": weekly},
+                },
+            },
+            answers={"a@example.com": self._usage(100, hourly)},
+            age_s=200,
+            next_poll_in=600,
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+
+        row, why = s.auto_run_target()
+
+        assert row is None
+        assert "Every managed account is at its limit" in why
+        expected = oauth.reset_clock_string(
+            datetime.fromisoformat(hourly), datetime.now(timezone.utc)
+        )
+        assert f"the nearest reset is at {expected}" in why
+        assert endpoint.calls == ["a@example.com"]
+
+    # -- an expired live token is not a missing reading -----------------
+
+    @staticmethod
+    def _expire_live_login(
+        temp_home: Path, s: ClaudeAccountSwitcher, num: int, email: str
+    ) -> None:
+        """Make the live login slot ``num``'s own credential with a dead token.
+
+        The same bytes go to the live store and the slot's backup, so the
+        refresh is attributable (``_fetch_active_usage``) — the shape a
+        morning launch meets. The stale ``infos`` snapshot a second collect
+        pass re-uses still says "expired".
+        """
+        creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": f"sk-{num}",
+                "refreshToken": f"rt-{num}",
+                "expiresAt": 1000,
+            },
+        })
+        s._write_account_credentials(str(num), email, creds)
+        (temp_home / ".claude" / ".credentials.json").write_text(creds)
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": email,
+                "accountUuid": f"uuid-{num}",
+            },
+        }))
+
+    @staticmethod
+    def _token_endpoint(
+        monkeypatch, credentials: str | None, error: str | None = None
+    ) -> None:
+        """The token endpoint: a successor credential, or a failure kind."""
+        monkeypatch.setattr(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            lambda *a, **kw: oauth.RefreshOutcome(credentials, error),
+        )
+        monkeypatch.setattr(
+            "claude_swap.oauth.fetch_oauth_profile", lambda *a, **k: None
+        )
+
+    def test_an_expired_live_token_launches_on_its_own_reading(
+        self, temp_home: Path, monkeypatch
+    ):
+        """First launch of the day: the live token expired overnight.
+
+        The confirmation pass sees the stale credential again and reports
+        ``token expired``, which is a statement about the token — not about
+        the quota — so A's 90% must still beat B's 20%.
+        """
+        clock = _FakeClock()
+        s, endpoint = self._pair_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {"b@example.com": self._usage(80)},
+            answers={"a@example.com": self._usage(10)},
+        )
+        self._expire_live_login(temp_home, s, 1, "a@example.com")
+        self._token_endpoint(monkeypatch, _REFRESHED_CREDENTIAL)
+
+        row, why = s.auto_run_target()
+
+        assert why == ""
+        assert row is not None and row[0] == 1
+        assert endpoint.calls == ["a@example.com"]
+
+    def test_an_only_account_with_an_expired_token_still_launches(
+        self, temp_home: Path, monkeypatch
+    ):
+        """One managed account whose live token expired is still a launch."""
+        clock = _FakeClock()
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        s._usage_store = UsageStore(s.backup_dir / "cache", clock=clock)
+        endpoint = _UsageEndpoint({"a@example.com": self._usage(10)})
+        monkeypatch.setattr(
+            "claude_swap.oauth.try_fetch_usage_for_account", endpoint
+        )
+        self._expire_live_login(temp_home, s, 1, "a@example.com")
+        self._token_endpoint(monkeypatch, _REFRESHED_CREDENTIAL)
+
+        row, why = s.auto_run_target()
+
+        assert why == ""
+        assert row is not None and row[0] == 1
+
+    def test_an_expired_token_keeps_a_reading_under_its_poll_plan(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A reading inside the plan window is still the account's answer.
+
+        The token is expired and the poll plan says the next request is not
+        due, so nothing is asked before the choice: the stored 10% used (90%
+        left) is what the ranking and the confirmation both run on.
+        """
+        clock = _FakeClock()
+        s, endpoint = self._pair_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(10),
+                "b@example.com": self._usage(80),
+            },
+            answers={
+                "a@example.com": self._usage(10),
+                "b@example.com": self._usage(80),
+            },
+            age_s=300,
+            next_poll_in=600,
+        )
+        self._expire_live_login(temp_home, s, 1, "a@example.com")
+        self._token_endpoint(monkeypatch, _REFRESHED_CREDENTIAL)
+
+        row, why = s.auto_run_target()
+
+        assert why == ""
+        assert row is not None and row[0] == 1
+
+    def test_a_two_hour_old_reading_is_refreshed_into_the_choice(
+        self, temp_home: Path, monkeypatch
+    ):
+        """An old reading is the starting point, not the answer.
+
+        The stored reading is two hours old, past ``STALE_OK_S``: the launch
+        asks the server, the expired token is refreshed, and the fresh 10%
+        used (90% left) beats B's 20%.
+        """
+        clock = _FakeClock()
+        s, endpoint = self._pair_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(50),
+                "b@example.com": self._usage(80),
+            },
+            answers={"a@example.com": self._usage(10)},
+            age_s=7200,
+        )
+        self._expire_live_login(temp_home, s, 1, "a@example.com")
+        self._token_endpoint(monkeypatch, _REFRESHED_CREDENTIAL)
+
+        row, why = s.auto_run_target()
+
+        assert why == ""
+        assert row is not None and row[0] == 1
+        assert endpoint.calls.count("a@example.com") == 1
+
+    def test_a_429_on_the_expired_token_does_not_hide_the_reading(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A server refusing fresher data is not a spent quota.
+
+        429 with ``Retry-After: 3000`` parks the slot in backoff, so the
+        confirmation cannot refresh the expired token — the reading that
+        refusal left behind is all there is, and it says A has 90% left
+        against B's 20%.
+        """
+        clock = _FakeClock()
+        s, endpoint = self._pair_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(10),
+                "b@example.com": self._usage(80),
+            },
+            answers={},
+            age_s=120,
+        )
+        s._usage_store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3000.0)},
+            {"1": ("a@example.com", "")},
+        )
+        self._expire_live_login(temp_home, s, 1, "a@example.com")
+        self._token_endpoint(monkeypatch, _REFRESHED_CREDENTIAL)
+
+        row, why = s.auto_run_target()
+
+        assert why == ""
+        assert row is not None and row[0] == 1
+        assert endpoint.calls == []
+
+    def test_a_dead_refresh_token_is_not_reported_as_a_limit(
+        self, temp_home: Path, monkeypatch
+    ):
+        """``invalid_grant`` while confirming says nothing about the quota.
+
+        A's confirmation cannot produce a reading, so the launch is refused —
+        but the refusal must not claim A is at its limit, which is a
+        measurement nobody made.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        weekly = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+        clock = _FakeClock()
+        s, _endpoint = self._pair_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(10),
+                "b@example.com": {
+                    "five_hour": {"pct": 0.0},
+                    "seven_day": {"pct": 100.0, "resets_at": weekly},
+                },
+            },
+            answers={},
+            age_s=200,
+            next_poll_in=600,
+        )
+        self._expire_live_login(temp_home, s, 1, "a@example.com")
+        self._token_endpoint(monkeypatch, None, "invalid_grant")
+
+        row, why = s.auto_run_target()
+
+        assert row is None
+        assert "at its limit" not in why
+        assert "could not be read" in why
+        assert "Account(s) 1" in why
 
     def test_an_account_over_its_limit_is_not_launched_at_zero_headroom(
         self, temp_home: Path, monkeypatch

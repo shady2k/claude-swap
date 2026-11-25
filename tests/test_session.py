@@ -122,6 +122,22 @@ def _windows_without_symlinks(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _a_claude_on_path(monkeypatch):
+    """Resolve a ``claude``, as a machine with Claude Code installed does.
+
+    ``_session_validity`` does not spawn a name it could not resolve: with no
+    ``claude`` at all the verdict is "unreachable" — a statement about the
+    machine, not about the profile — so nothing is cleaned up. Tests that stub
+    the probe's spawn therefore also need the resolution; the ones that test
+    the resolution, or its absence, patch ``shutil.which`` or ``find_claude``
+    themselves and win over this.
+    """
+    monkeypatch.setattr(
+        session_mod.shutil, "which", lambda name: f"/fake/bin/{name}"
+    )
+
+
+@pytest.fixture(autouse=True)
 def _default_login_signed_in(request, monkeypatch):
     """The default login holds a working token unless a test says otherwise.
 
@@ -1897,6 +1913,78 @@ class TestRun:
         monkeypatch.setattr(session_mod.shutil, "which", lambda name: None)
         with pytest.raises(SessionError, match="not found on PATH"):
             manager.exec_default([])
+
+    def test_a_service_command_publishes_the_main_profile(
+        self, manager, capture_exec, stream_proxy, dead_proxy_url, temp_home,
+        monkeypatch,
+    ):
+        """`claude mcp add` from inside a session writes the user's profile.
+
+        The session terminal exports its own profile in ``CLAUDE_CONFIG_DIR``.
+        Handing it on would record the server in a copy the next launch
+        overwrites (``_sync_sharing``), and resolving the proxy from it would
+        send the command through the session account's route.
+        """
+        session_profile = temp_home / ".claude" / "sessions" / "1"
+        session_profile.mkdir(parents=True)
+        (session_profile / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "account1@example.com",
+                "organizationUuid": "org-uuid-1",
+            },
+        }))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": ACCOUNT_EMAIL,
+                "organizationUuid": ORG_UUID,
+            },
+        }))
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
+        manager.switcher.set_account_proxy("1", dead_proxy_url)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(session_profile))
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.exec_default(
+                ["mcp", "add", "-s", "user", "demo", "/bin/true"],
+                primary_profile=True,
+            )
+
+        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
+        assert exc.value.env["HTTPS_PROXY"] == stream_proxy.url
+        assert [path for path, _ in stream_proxy.requests] == [
+            "api.anthropic.com:443"
+        ]
+
+    def test_a_claude_that_cannot_be_spawned_keeps_the_profile(
+        self, manager, seeded_switcher, capture_exec, refresh_rotates, monkeypatch
+    ):
+        """`find_claude` answering nothing is not a verdict on the login.
+
+        The profile has just been seeded; if the probe cannot be spawned the
+        launch must report that, not treat the profile as invalid — the
+        "invalid" verdict deletes the directory and its Keychain entry.
+        """
+        answers = []
+
+        def gone_after_the_start():
+            answers.append(1)
+            return "/fake/bin/claude" if len(answers) == 1 else None
+
+        monkeypatch.setattr(session_mod, "find_claude", gone_after_the_start)
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        with pytest.raises(
+            SessionError, match=r"did not run or did\s+not answer"
+        ):
+            manager.run("2", [])
+
+        assert session_dir.is_dir()
+        assert (session_dir / ".credentials.json").exists()
+        # The slot's stored login is untouched as well.
+        assert json.loads(
+            seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+        )["claudeAiOauth"]["refreshToken"]
 
 
 # ---------------------------------------------------------------------------
@@ -6061,9 +6149,10 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         with pytest.raises(SessionError, match="stashed — please retry"):
             manager.setup_session("2", share=False)
 
-        assert seeded_switcher.read_account_credentials(
-            ACCOUNT_NUM, ACCOUNT_EMAIL
-        ) == CREDS, "test premise: the backup still holds the spent generation"
+        # The slot's stored login is untouched as well.
+        assert json.loads(
+            seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+        )["claudeAiOauth"]["refreshToken"], "test premise: the backup still holds the spent generation"
         # The half the old assertions never covered: what landed in the
         # PROFILE. A warning that fires while the spent generation is seeded
         # anyway pins the symptom and misses the defect.

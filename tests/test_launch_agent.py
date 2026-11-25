@@ -206,7 +206,11 @@ def test_resolve_program_makes_a_relative_argv0_absolute(tmp_path, monkeypatch):
 def test_resolve_program_falls_back_to_the_interpreter_without_a_script(tmp_path):
     with patch.object(launch_agent.sys, "argv", [str(tmp_path / "gone")]):
         with patch.object(launch_agent.shutil, "which", return_value=None):
-            assert launch_agent.resolve_program() == [sys.executable, "-m", "claude_swap"]
+            # ``-P`` keeps the current directory off ``sys.path``: a
+            # ``json.py`` next to it must not shadow the stdlib one.
+            assert launch_agent.resolve_program() == [
+                sys.executable, "-P", "-m", "claude_swap"
+            ]
 
 
 def test_resolve_program_ignores_an_argv0_that_is_not_cswap(tmp_path):

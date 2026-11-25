@@ -7,10 +7,11 @@ import contextlib
 import json
 import math
 import os
+import re
 import shlex
 import sys
 
-from claude_swap import __version__, account_proxy, paths, printer
+from claude_swap import __version__, account_proxy, launch_agent, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError, SessionError
 from claude_swap.json_output import error_envelope
 from claude_swap.models import (
@@ -256,7 +257,7 @@ def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
             # and `--version`/`update` must answer without a quota. The default
             # login's own proxy is still checked, fail-closed.
             if tail and tail[0] in _SERVICE_COMMANDS:
-                manager.exec_default(tail)
+                manager.exec_default(tail, primary_profile=True)
                 return  # only reachable in tests where exec/exit is mocked
 
             row, why = switcher.auto_run_target()
@@ -370,19 +371,23 @@ def _rate_limit_hook(tail: list[str], account: tuple[str, str, str]) -> list[str
     the user's own ``settings.json`` still run (measured on 2.1.329). A
     command line that already carries the user's ``--settings`` gets none of
     this — cswap will not compete for that switch.
+
+    Neither does Claude Code's own housekeeping: a first argument that reads as
+    one of its subcommands (``attach``, ``logs``, ``stop``, ``remote-control``)
+    gets no hook. In front of a subcommand ``--settings`` turns the whole line
+    into a prompt instead of running it (measured on 2.1.329), so the rule is
+    "looks like a subcommand" rather than a list that a later release would
+    outdate. The cost is a one-word prompt (``claude hello``), which goes
+    without a mark and falls back to the launch's own confirmation.
     """
     if "--settings" in tail:
         return tail
+    if tail and re.fullmatch(r"[a-z][a-z-]*", tail[0]):
+        return tail
+    program = launch_agent.resolve_program()
     command = " ".join(
         shlex.quote(part)
-        for part in (
-            sys.executable,
-            "-m",
-            "claude_swap",
-            "rate-limited",
-            account[1],
-            account[2],
-        )
+        for part in (*program, "rate-limited", account[1], account[2])
     )
     settings = {
         "hooks": {

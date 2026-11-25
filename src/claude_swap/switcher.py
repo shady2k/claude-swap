@@ -465,7 +465,23 @@ def _same_directory(left: Path, right: Path) -> bool:
         return left == right
 
 
+def _launch_value(entry: UsageEntry) -> dict | str | None:
+    """The reading a launch decides on, with an expired token read as evidence.
 
+    ``USAGE_TOKEN_EXPIRED`` is a statement about the stored access token, not
+    about the quota: the launch's own fetch path refreshes it. So the
+    measurement under it still answers "how much is left", which is what the
+    ranking and the confirmation both need. The other sentinels are verdicts
+    ON the reading (re-login needed, a fetch that failed) and stay as they are.
+    """
+    if entry.sentinel == USAGE_TOKEN_EXPIRED:
+        return dataclasses.replace(entry, sentinel=None).decision_value()
+    return entry.decision_value()
+
+
+def _launch_headroom(entry: UsageEntry, models: tuple[str, ...]) -> float | None:
+    """Remaining quota a launch ranks on, expired token or not."""
+    return oauth.account_headroom(_launch_value(entry), models)
 
 
 class ClaudeAccountSwitcher:
@@ -1193,7 +1209,27 @@ class ClaudeAccountSwitcher:
         variables it inherited. ``cswap run`` uses this for the launch that
         runs plain claude on the default login.
         """
-        identity = self._get_current_account()
+        return self._route_for_login(self._get_current_account())
+
+    def default_profile_login_route(self) -> "account_proxy.ProxyRoute | None":
+        """The route of the DEFAULT profile's login, whatever the environment says.
+
+        ``live_login_route`` follows ``CLAUDE_CONFIG_DIR``, so run from inside a
+        session profile it answers for that profile's login. Claude Code's own
+        housekeeping commands launched by ``cswap run --auto`` run on the
+        default profile even then (``session.SessionManager.exec_default``
+        with ``primary_profile``), so their fail-closed proxy check must be the
+        default login's.
+        """
+        identity = self._get_current_identity_triple(
+            get_default_global_config_path()
+        )
+        return self._route_for_login(None if identity is None else identity[:2])
+
+    def _route_for_login(
+        self, identity: tuple[str, str] | None
+    ) -> "account_proxy.ProxyRoute | None":
+        """The route of the slot ``identity`` names, or ``None``."""
         if identity is None:
             return None
         data = self._get_sequence_data_migrated() or {}
@@ -3884,8 +3920,15 @@ class ClaudeAccountSwitcher:
         triple = self._get_current_identity_triple()
         return None if triple is None else triple[:2]
 
-    def _get_current_identity_triple(self) -> tuple[str, str, str] | None:
+    def _get_current_identity_triple(
+        self, config_path: Path | None = None
+    ) -> tuple[str, str, str] | None:
         """``(email, org_uuid, account_uuid)`` from ONE read of ``.claude.json``.
+
+        ``config_path`` overrides which profile's config is read — the default
+        one when ``CLAUDE_CONFIG_DIR`` must not decide, as in
+        :meth:`default_profile_login_route` — and defaults to the profile the
+        environment names.
 
         ``add_account`` used to read the config for its identity and again
         near the write. A ``/login`` landing in between pairs one account's
@@ -3893,7 +3936,7 @@ class ClaudeAccountSwitcher:
         ``_reject_foreign_credential_capture`` exists to close, so the guard
         must not widen it.
         """
-        config_path = self._get_claude_config_path()
+        config_path = config_path or self._get_claude_config_path()
         if not config_path.exists():
             return None
         data = self._read_json(config_path)
@@ -6720,18 +6763,24 @@ class ClaudeAccountSwitcher:
         ``autoswitch.model`` ones) before none, an account Claude Code has not
         just reported a rate-limit stop on before one it has
         (:meth:`record_stop_failure`), more headroom before less, and the live
-        login before another slot at equal headroom.
+        login before another slot at equal headroom. A reading whose access
+        token has expired ranks on its stored measurement like any other
+        (``_launch_value``): the token says nothing about the quota.
 
-        The winner's reading is then confirmed once — ``_collect_usage_entries
-        (infos, fetch={winner})``, which respects the store's serve TTL, poll
-        plan and failure backoff — because a reading up to
-        ``poll_policy.SERVE_TTL_S`` old may be the one the account spent its
-        quota after. A candidate whose confirmed reading has no room is passed
-        over for the next; each is confirmed at most once per launch.
+        The candidates' readings are then confirmed one at a time, highest
+        ranked first — ``_collect_usage_entries(infos, fetch={candidate})``,
+        which respects the store's serve TTL, poll plan and failure backoff —
+        because a reading up to ``poll_policy.SERVE_TTL_S`` old may be the one
+        the account spent its quota after. Each confirmation replaces that
+        candidate's reading and the ordering is compared again: the launch goes
+        to the account the CONFIRMED readings give the most room, which may be
+        one the stale ordering had behind (30% used that confirms as 95% loses
+        to a reading of 60%). Each candidate is confirmed at most once.
 
         Returns ``(row, "")``, or ``(None, message)`` naming the reason and,
         when every account is at its limit, when the nearest one is usable
-        again.
+        again — both read from the updated readings, not from the first
+        capture.
         """
         if models is None:
             models = parse_model_names(load_settings(self.backup_dir).model)
@@ -6761,9 +6810,7 @@ class ClaudeAccountSwitcher:
         # so the tie-break reads no second registry.
         live = next((row for row in infos if row[4]), None)
         rooms = {
-            str(row[0]): oauth.account_headroom(
-                entries[str(row[0])].decision_value(), models
-            )
+            str(row[0]): _launch_headroom(entries[str(row[0])], models)
             for row in candidates
         }
 
@@ -6776,20 +6823,34 @@ class ClaudeAccountSwitcher:
                 row is live,
             )
 
-        for row in sorted(candidates, key=rank, reverse=True):
-            room = rooms[str(row[0])]
-            if room is None or room <= 0:
+        ordered = sorted(candidates, key=rank, reverse=True)
+        best: AccountInfo | None = None
+        confirmed_nums: list[str] = []
+        for index, row in enumerate(ordered):
+            num = str(row[0])
+            if rooms[num] is None or rooms[num] <= 0:
                 continue
-            confirmed = self._collect_usage_entries(infos, fetch={str(row[0])})[
-                str(row[0])
-            ]
-            confirmed_room = oauth.account_headroom(
-                confirmed.decision_value(), models
-            )
-            if confirmed_room is None or confirmed_room <= 0:
+            confirmed = self._collect_usage_entries(infos, fetch={num})[num]
+            confirmed_nums.append(num)
+            entries[num] = confirmed
+            rooms[num] = _launch_headroom(confirmed, models)
+            if rooms[num] is None or rooms[num] <= 0:
                 continue
-            return row, ""
+            if best is None or rank(row) > rank(best):
+                best = row
+            # A candidate still unconfirmed may hold more than the reading it
+            # was ranked on says: confirm it instead of launching on a stale
+            # order.
+            if any(rank(other) > rank(best) for other in ordered[index + 1:]):
+                continue
+            break
+        if best is not None:
+            return best, ""
 
+        # A confirmation that came back without a reading is a failure of
+        # the READING (a spent refresh token, a server that keeps refusing),
+        # not a measured limit: the refusal must not claim one.
+        unread = [num for num in confirmed_nums if rooms[num] is None]
         if not any(room is not None for room in rooms.values()):
             return None, (
                 "No account's remaining quota could be read, so none could be "
@@ -6797,6 +6858,14 @@ class ClaudeAccountSwitcher:
                 "`cswap run NUM`."
             )
         nearest = self._nearest_usable_reset(candidates, entries, models)
+        if unread:
+            return None, (
+                "No account could be launched: the remaining quota could not "
+                f"be read for Account(s) {', '.join(unread)} (run `cswap list` "
+                "to see why)"
+                + (f", and {nearest}" if nearest else "")
+                + "."
+            )
         return None, (
             "Every managed account is at its limit"
             + (f" ({nearest})" if nearest else "")
@@ -6815,14 +6884,16 @@ class ClaudeAccountSwitcher:
         window resets — when the account is usable again — so a 7d window at
         100% resetting in 72h is not reported as the hour its 5h window at 5%
         has left. The earliest of those across the accounts is this launch's
-        next chance.
+        next chance. A reading whose access token expired counts with its
+        stored measurement (``_launch_value``) — the same evidence the
+        ranking used.
         """
         from datetime import datetime, timezone
 
         stamps = []
         for row in rows:
             ts = poll_policy.limiting_reset_ts(
-                entries[str(row[0])].decision_value(), models
+                _launch_value(entries[str(row[0])]), models
             )
             if ts is not None:
                 stamps.append(ts)
