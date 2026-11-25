@@ -145,6 +145,10 @@ _LOCKSTEP_RESET_TOLERANCE_S = 5.0
 # an age note there would be permanent noise.
 _USAGE_AGE_NOTE_S = poll_policy.SERVE_TTL_S
 
+#: Cache file of the launch's own evidence: one stamp per account for the last
+#: ``StopFailure`` rate-limit report Claude Code made (``record_stop_failure``).
+STOP_FAILURE_FILE = "stop-failure.json"
+
 #: One account's read snapshot: ``(num, email, org_name, org_uuid, is_active,
 #: creds, alias, route)``. The route is the proxy read by the same pass as the
 #: credential and the identity, so a request made for that credential cannot
@@ -1139,6 +1143,21 @@ class ClaudeAccountSwitcher:
             account_num,
             record.get("email", ""),
             record.get("organizationUuid", "") or "",
+        )
+
+    def account_still_holds(
+        self, account_num: str, email: str, org_uuid: str
+    ) -> bool:
+        """Whether slot ``account_num`` still holds ``(email, organization)``.
+
+        The check a launch given a choice makes before it starts: a
+        ``swap``/``move`` republishes slots, and the launch must refuse rather
+        than run the account that took the number (``session.SessionManager.
+        run(account=…)``).
+        """
+        data = self._get_sequence_data() or {}
+        return self._record_is(
+            (data.get("accounts") or {}).get(str(account_num)), email, org_uuid
         )
 
     def account_route(
@@ -6683,53 +6702,52 @@ class ClaudeAccountSwitcher:
 
     def auto_run_target(
         self, models: tuple[str, ...] | None = None
-    ) -> tuple[str | None, str]:
-        """The account ``cswap run --auto`` launches, without switching anything.
+    ) -> tuple[AccountInfo | None, str]:
+        """The account ``cswap run --auto`` launches, or why there is none.
 
-        The same comparison ``cswap switch --strategy best`` makes
-        (``_select_best_switchable``), read as a launch: when it names a
-        strictly better account, that account is started; when it stays, the
-        login the terminal already has keeps the most headroom and is started
-        — which ``cswap run`` then satisfies on the default login itself, the
-        same-account fast path. Either way only that account's session profile
-        runs: ``sequence.json`` and the default login are read, never written,
-        so a launch is not a switch.
+        One ranked pass over the launchable slots (``_build_accounts_info``:
+        the roster, credentials and routes of ``cswap list``'s own capture)
+        rather than the switch strategies' compare-with-the-live-login. A
+        launch may land on the login the terminal already has — ``cswap run``
+        then satisfies that on the default login, the same-account fast path —
+        and it never writes ``sequence.json``.
 
-        A slot is a candidate when it is in rotation, not disabled, has stored
-        credentials and config, and is not an API-key slot — ``cswap run``
-        refuses those (``session.SessionManager._ensure_not_api_key``), so
-        nominating one would refuse a launch the next account could serve.
-        ``models`` folds the per-model weekly windows into the comparison the
-        way the switch strategies do; ``None`` reads ``autoswitch.model``, the
-        configured list, there being no ``--model`` flag on ``run``.
+        A slot is launchable when it is in rotation, not disabled, is not an
+        API-key account (``cswap run`` refuses those), and has stored
+        credentials and config — except the live login itself, whose launch is
+        plain claude on its own credential. Ranking, highest first: quota left
+        (``oauth.account_headroom`` > 0 over the 5h and 7d windows, plus the
+        ``autoswitch.model`` ones) before none, an account Claude Code has not
+        just reported a rate-limit stop on before one it has
+        (:meth:`record_stop_failure`), more headroom before less, and the live
+        login before another slot at equal headroom.
 
-        Every usage value behind the choice is the bookkeeping ``cswap switch
-        --strategy best`` already does (``_usage_by_account``): the last good
-        reading, refetched on ``poll_policy``'s schedule, which parks an
-        exhausted account until its own ``resets_at``. That is why the next
-        launch after an account runs out lands on another one — no extra
-        signal from Claude Code is needed or read.
+        The winner's reading is then confirmed once — ``_collect_usage_entries
+        (infos, fetch={winner})``, which respects the store's serve TTL, poll
+        plan and failure backoff — because a reading up to
+        ``poll_policy.SERVE_TTL_S`` old may be the one the account spent its
+        quota after. A candidate whose confirmed reading has no room is passed
+        over for the next; each is confirmed at most once per launch.
 
-        Returns ``(number, note)``, ``note`` being ``"better"`` (a switch
-        would have moved there), ``"best"`` (the live login is the best one)
-        or ``"only"`` (the live login's usage is unknown or at its limit, so
-        the launch takes the best account whose own reading still shows room),
-        or ``(None, message)`` when nothing can be launched, with the reason —
-        and, when every account is at its limit, the nearest reset time.
+        Returns ``(row, "")``, or ``(None, message)`` naming the reason and,
+        when every account is at its limit, when the nearest one is usable
+        again.
         """
         if models is None:
             models = parse_model_names(load_settings(self.backup_dir).model)
 
-        data = self._get_sequence_data() or {}
-        sequence = [str(num) for num in data.get("sequence", [])]
-        if not sequence:
+        infos = self._build_accounts_info()
+        if not infos:
             return None, "No accounts are managed yet. Add one with `cswap add`."
+        records = self._snapshot_records
         candidates = [
-            num
-            for num in sequence
-            if not self._disabled_from_data(data, num)
-            and self._account_is_switchable(num)
-            and self._account_kind(num) != "api_key"
+            row
+            for row in infos
+            if (record := records.get(str(row[0])))
+            and not record.get("disabled")
+            and record.get("kind") != "api_key"
+            and (row[4] or row[5])
+            and self._read_account_config(str(row[0]), row[1])
         ]
         if not candidates:
             return None, (
@@ -6737,75 +6755,145 @@ class ClaudeAccountSwitcher:
                 "an API-key account, or has no stored credentials/config."
             )
 
-        usage = self._usage_by_account()
-        identity = self._get_current_account()
-        live_num = self._find_account_slot(data, *identity) if identity else None
-
-        target, _note = self._select_best_switchable(live_num, models, usage)
-        if target in candidates:
-            return target, "better"
-        if live_num in candidates:
-            room = oauth.account_headroom(usage.get(live_num), models)
-            if room is not None and room > 0:
-                return live_num, "best"
-
-        readable = [
-            (room, num)
-            for num in candidates
-            if (room := oauth.account_headroom(usage.get(num), models)) is not None
-        ]
-        if readable:
-            # max() keeps the first maximal element, and `candidates` is in
-            # rotation order, so a tie lands on the earliest slot.
-            room, num = max(readable, key=lambda pair: pair[0])
-            if room > 0:
-                return num, "only"
-            nearest = self._nearest_reset(usage, candidates, models)
-            return None, (
-                "Every managed account is at its limit"
-                + (f" ({nearest})" if nearest else "")
-                + ". Nothing was launched."
+        entries = self._collect_usage_entries(infos)
+        marks = self._stop_failure_marks()
+        # The row the live login is, marked by the same capture (``is_active``)
+        # so the tie-break reads no second registry.
+        live = next((row for row in infos if row[4]), None)
+        rooms = {
+            str(row[0]): oauth.account_headroom(
+                entries[str(row[0])].decision_value(), models
             )
+            for row in candidates
+        }
+
+        def rank(row: AccountInfo) -> tuple:
+            room = rooms[str(row[0])]
+            return (
+                room is not None and room > 0,
+                not self._rate_limit_marked(marks, row, entries[str(row[0])]),
+                -1.0 if room is None else room,
+                row is live,
+            )
+
+        for row in sorted(candidates, key=rank, reverse=True):
+            room = rooms[str(row[0])]
+            if room is None or room <= 0:
+                continue
+            confirmed = self._collect_usage_entries(infos, fetch={str(row[0])})[
+                str(row[0])
+            ]
+            confirmed_room = oauth.account_headroom(
+                confirmed.decision_value(), models
+            )
+            if confirmed_room is None or confirmed_room <= 0:
+                continue
+            return row, ""
+
+        if not any(room is not None for room in rooms.values()):
+            return None, (
+                "No account's remaining quota could be read, so none could be "
+                "chosen. Run `cswap list` to see why, or name an account: "
+                "`cswap run NUM`."
+            )
+        nearest = self._nearest_usable_reset(candidates, entries, models)
         return None, (
-            "No account's remaining quota could be read, so none could be "
-            "chosen. Run `cswap list` to see why, or name an account: "
-            "`cswap run NUM`."
+            "Every managed account is at its limit"
+            + (f" ({nearest})" if nearest else "")
+            + ". Nothing was launched."
         )
 
-    @staticmethod
-    def _nearest_reset(
-        usage: dict, numbers: list[str], models: tuple[str, ...]
+    def _nearest_usable_reset(
+        self,
+        rows: list[AccountInfo],
+        entries: dict[str, UsageEntry],
+        models: tuple[str, ...],
     ) -> str | None:
-        """``the nearest reset is at 14:20, in 41m`` across ``numbers``' windows.
+        """``the nearest reset is at 14:20, in 41m`` for a refused launch.
 
-        Read from the same windows the headroom came from, so a refused launch
-        says when it can succeed instead of only that it cannot. A window
-        without ``resets_at``, or with one that will not parse, is skipped.
+        ``poll_policy.limiting_reset_ts`` is when an account's *last* ≥100%
+        window resets — when the account is usable again — so a 7d window at
+        100% resetting in 72h is not reported as the hour its 5h window at 5%
+        has left. The earliest of those across the accounts is this launch's
+        next chance.
         """
-        from datetime import datetime
+        from datetime import datetime, timezone
 
-        stamps = [
-            resets_at
-            for num in numbers
-            for _label, _pct, resets_at in oauth.relevant_windows(
-                usage.get(num), models
+        stamps = []
+        for row in rows:
+            ts = poll_policy.limiting_reset_ts(
+                entries[str(row[0])].decision_value(), models
             )
-            if resets_at
-        ]
-        parsed = []
-        for value in stamps:
-            try:
-                parsed.append((datetime.fromisoformat(value), value))
-            except (TypeError, ValueError):
+            if ts is not None:
+                stamps.append(ts)
+        if not stamps:
+            return None
+        soonest = min(stamps)
+        now_utc = datetime.now(timezone.utc)
+        clock = oauth.reset_clock_string(
+            datetime.fromtimestamp(soonest, tz=timezone.utc), now_utc
+        )
+        return (
+            f"the nearest reset is at {clock}, "
+            f"in {oauth.format_countdown(soonest - now_utc.timestamp())}"
+        )
+
+    def _rate_limit_marked(
+        self,
+        marks: dict[tuple[str, str], float],
+        row: AccountInfo,
+        entry: UsageEntry,
+    ) -> bool:
+        """Whether Claude Code's last word on this account is a rate-limit stop.
+
+        True while the usage reading predates the stop (or there is none): the
+        server refused a request this reading says should have been served, so
+        the reading is provably obsolete for the choice. A reading taken at or
+        after the stamp is newer evidence and clears the mark — there is no
+        deadline to keep, which is why the mark needs no expiry.
+        """
+        at = marks.get((row[1], row[3]))
+        return at is not None and (
+            entry.fetched_at is None or entry.fetched_at < at
+        )
+
+    def record_stop_failure(self, email: str, org_uuid: str) -> None:
+        """Note that Claude Code reported a rate-limit stop on this account.
+
+        Called by the ``StopFailure`` hook ``cswap run --auto`` passes
+        (``cli._rate_limit_hook``); see ``docs/auto-launch.md``. Stored by
+        ``(email, organization)`` rather than slot, because a ``swap`` moves
+        slots and the mark belongs to the account.
+        """
+        path = self.backup_dir / "cache" / STOP_FAILURE_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with FileLock(path.with_name(f".{path.name}.lock")):
+            marks = self._stop_failure_marks()
+            # The store's clock, not ``time.time()``: the stamp is compared
+            # with the reading's ``fetchedAt``, which that clock wrote.
+            marks[(email, org_uuid or "")] = self._usage_store.clock()
+            self._write_json(path, {
+                "schemaVersion": 1,
+                "marks": [
+                    {"email": account, "organizationUuid": org, "at": at}
+                    for (account, org), at in marks.items()
+                ],
+            })
+
+    def _stop_failure_marks(self) -> dict[tuple[str, str], float]:
+        """``(email, organization) → epoch`` of the recorded rate-limit stops."""
+        rows = (self._read_json(self.backup_dir / "cache" / STOP_FAILURE_FILE) or {}).get(
+            "marks"
+        )
+        marks: dict[tuple[str, str], float] = {}
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
                 continue
-        if not parsed:
-            return None
-        earliest = min(parsed)[1]
-        try:
-            countdown, clock = oauth.format_reset(earliest)
-        except (TypeError, ValueError):
-            return None
-        return f"the nearest reset is at {clock}, in {countdown}"
+            email, at = row.get("email"), row.get("at")
+            if isinstance(email, str) and isinstance(at, (int, float)):
+                marks[(email, row.get("organizationUuid") or "")] = float(at)
+        return marks
+
 
     def _duplicate_account_warnings(
         self, accounts_info: list[AccountInfo]

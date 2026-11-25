@@ -157,7 +157,7 @@ Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP ser
 <details>
 <summary>Pick the account for you — the <code>claude</code> wrapper</summary>
 
-`ln -s "$(cswap wrapper)" ~/.local/bin/claude`, in a directory ahead of the real Claude Code in `PATH`, makes every `claude` (and `claude --resume`) run `cswap run --auto` — the managed account with the most quota left, in its own session profile with its own proxy, while the default login stays where it is. Nothing with quota left is a refusal naming the nearest reset, not a fallback. The rules are in [docs/auto-launch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-launch.md).
+`mkdir -p ~/.local/claude-swap/bin && ln -s "$(cswap wrapper)" ~/.local/claude-swap/bin/claude`, with that directory ahead of the real Claude Code in `PATH`, makes every `claude` (and `claude --resume`) run `cswap run --auto` — the managed account with the most quota left, in its own session profile with its own proxy, while the default login stays where it is. Nothing with quota left is a refusal naming when the nearest one is usable again, not a fallback; once Claude Code reports a rate-limit stop, the next launch prefers another account. The rules are in [docs/auto-launch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-launch.md).
 
 </details>
 

@@ -6,32 +6,23 @@ every ``claude``, ``claude --resume`` included, run
 
     cswap run --auto -- "$@"
 
-so one account is chosen by the ``best`` headroom comparison
+so one account is chosen by the headroom ranking
 (``ClaudeAccountSwitcher.auto_run_target``) and started as its own session
 profile with its own proxy — the default login is read, never switched. What
 a user sees is in ``docs/auto-launch.md``.
 
-Three rules keep the wrapper and cswap from handing the terminal to each
-other in a loop, and keep the account cswap chose:
+The script resolves nothing and searches nothing: it checks that ``cswap`` is
+on ``PATH`` and replaces itself with ``cswap run --auto -- "$@"``. Finding the
+real Claude Code is ``session.find_claude``'s single job, so there is one
+answer to "which binary is Claude Code" and it cannot disagree with itself.
 
-- The wrapper resolves the real Claude Code itself — the first ``claude`` on
-  ``PATH`` that is not this file, symlinks resolved, macOS's ``readlink``
-  without ``-f`` — and exports its path as ``CSWAP_REAL_CLAUDE``.
-  ``session.find_claude`` prefers that over ``shutil.which``.
-- ``session.find_claude`` never returns this file. Started as ``cswap run 3``
-  with the wrapper on ``PATH``, it walks ``PATH`` past the wrapper to the real
-  binary, so an explicit account is not replaced by an automatic choice, and
-  the ``claude auth status`` probe does not become a second cswap.
-  :func:`is_wrapper` recognises the shipped file whether it is symlinked or
-  copied.
-- ``CSWAP_REAL_CLAUDE`` is cswap's own plumbing: ``session._exec`` drops it
-  before Claude Code starts, so a ``claude`` a session starts later goes
-  through the wrapper and its account choice again.
-
-A copy of the script that is edited (or from another version) is not
-recognised as the wrapper: it still reaches the real binary through the
-export, but as an ordinary ``claude`` on ``PATH`` whose launch would choose
-again. Install it as a symlink.
+One rule keeps the two from handing the terminal to each other in a loop:
+``find_claude`` never returns this file. Started as ``cswap run 3`` with the
+wrapper on ``PATH``, it walks ``PATH`` past the wrapper to the real binary, so
+an explicit account is not replaced by an automatic choice, and the ``claude
+auth status`` probe does not become a second cswap. :func:`is_wrapper`
+recognises the script by a marker line in its first kilobytes — cheap on a
+377 MB binary, and still true of an edited copy or another version.
 """
 
 from __future__ import annotations
@@ -39,24 +30,31 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-#: The variable the wrapper uses to hand the real binary's path down to cswap.
-REAL_CLAUDE_ENV = "CSWAP_REAL_CLAUDE"
-
 #: The shipped script. ``cswap wrapper`` prints this; the wheel carries it.
 WRAPPER_PATH = Path(__file__).with_name("scripts") / "claude"
 
+#: The line that makes a file this wrapper, scanned for in its head only.
+MARKER = b"# claude-swap thin wrapper"
+
+#: How much of a candidate is read: the marker is in the first line, and a
+#: binary the size of Claude Code must never be read whole (measured: 0.21 s
+#: and 391 MiB for 377 MB, per check).
+HEAD_BYTES = 4096
+
 
 def is_wrapper(path: str | os.PathLike[str]) -> bool:
-    """Whether ``path`` is this shipped wrapper, symlinked or copied.
+    """Whether ``path`` is this shipped wrapper, symlinked, copied or edited.
 
-    The symlink is the documented install, so its resolved path is compared
-    first; a copy has other bytes or the same ones, which the second test
-    catches. Anything unreadable is not the wrapper: a broken path must not
-    be skipped as if it were cswap's own script.
+    The marker line is what it is recognised by, not the bytes of the shipped
+    file, so a copy someone adjusted (a different install directory in its
+    comment, a newer version of the script) is still known to be a wrapper and
+    is still never launched as Claude Code. Anything unreadable is not the
+    wrapper: a broken path must not be walked past as if it were our own
+    script.
     """
     try:
-        if os.path.realpath(path) == os.path.realpath(WRAPPER_PATH):
-            return True
-        return Path(path).read_bytes() == WRAPPER_PATH.read_bytes()
+        with open(path, "rb") as fh:
+            head = fh.read(HEAD_BYTES)
     except OSError:
         return False
+    return MARKER in head

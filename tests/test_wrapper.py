@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sys
 from pathlib import Path
 
@@ -55,10 +54,10 @@ FAKE_CSWAP = '''\
 import json, os, sys
 argv = sys.argv[1:]
 with open(os.environ["WRAPPER_TEST_CSWAP_RECORD"], "w", encoding="utf-8") as f:
-    json.dump({{"argv": argv, "real": os.environ.get("CSWAP_REAL_CLAUDE")}}, f)
+    json.dump({{"argv": argv}}, f)
 if os.environ.get("WRAPPER_TEST_HANDOVER"):
     # What the real `cswap run` does on POSIX: replace itself with claude.
-    real = os.environ["CSWAP_REAL_CLAUDE"]
+    real = os.environ["WRAPPER_TEST_REAL"]
     os.execv(real, [real, *argv[argv.index("--") + 1:]])
 sys.exit(int(os.environ.get("WRAPPER_TEST_CSWAP_EXIT", "0")))
 '''
@@ -85,14 +84,6 @@ class TestTheWrapper:
         bin_dir.mkdir()
         link = bin_dir / "claude"
         link.symlink_to(wrapper.WRAPPER_PATH)
-        # The wrapper's PATH is the case under test, so the few POSIX tools it
-        # calls are linked in by name instead of borrowing the host's PATH.
-        tools = tmp_path / "tools"
-        tools.mkdir()
-        for name in ("readlink", "dirname", "basename"):
-            found = shutil.which(name)
-            assert found, f"{name} is needed to run the wrapper"
-            (tools / name).symlink_to(found)
         return {
             "tmp": tmp_path,
             "real": real,
@@ -101,18 +92,18 @@ class TestTheWrapper:
             "wrapper_dir": link.parent,
             "real_dir": real.parent,
             "cswap_dir": cswap.parent,
-            "tools_dir": tools,
         }
 
     def _env(self, layout: dict[str, Path], **extra: str) -> dict[str, str]:
         env = {
             "PATH": os.pathsep.join(
                 str(layout[name])
-                for name in ("wrapper_dir", "real_dir", "cswap_dir", "tools_dir")
+                for name in ("wrapper_dir", "real_dir", "cswap_dir")
             ),
             "HOME": str(layout["tmp"] / "home"),
             "WRAPPER_TEST_CSWAP_RECORD": str(layout["tmp"] / "cswap.json"),
             "WRAPPER_TEST_REAL_RECORD": str(layout["tmp"] / "real.json"),
+            "WRAPPER_TEST_REAL": str(layout["real"]),
         }
         env.update(extra)
         return env
@@ -131,7 +122,6 @@ class TestTheWrapper:
         assert result.returncode == 0, result.stderr
         recorded = json.loads((layout["tmp"] / "cswap.json").read_text())
         assert recorded["argv"] == ["run", "--auto", "--", *TRICKY_ARGS]
-        assert recorded["real"] == str(layout["real"])
 
     def test_a_plain_claude_forwards_no_arguments(self, layout):
         result = self._run([str(layout["link"])], self._env(layout))
@@ -175,46 +165,45 @@ class TestTheWrapper:
         assert result.returncode == 0, result.stderr
         recorded = json.loads((layout["tmp"] / "cswap.json").read_text())
         assert recorded["argv"] == ["run", "--auto", "--", "--continue"]
-        assert recorded["real"] == str(layout["real"])
 
-    def test_no_real_claude_is_a_clear_refusal(self, layout):
-        """Only the wrapper on PATH: it must not hand itself to cswap."""
+    def test_the_wrapper_looks_for_no_binary_of_its_own(self, layout):
+        """Finding Claude Code is cswap's single job: with no real binary on
+        PATH the wrapper still hands over, and `cswap run` is what reports it."""
         env = self._env(layout)
         env["PATH"] = os.pathsep.join(
-            str(layout[name]) for name in ("wrapper_dir", "cswap_dir", "tools_dir")
+            str(layout[name]) for name in ("wrapper_dir", "cswap_dir")
         )
 
         result = self._run([str(layout["link"]), "--resume"], env)
 
-        assert result.returncode == 127
-        assert "no Claude Code binary is on PATH" in result.stderr
-        assert not (layout["tmp"] / "cswap.json").exists()
+        assert result.returncode == 0, result.stderr
+        recorded = json.loads((layout["tmp"] / "cswap.json").read_text())
+        assert recorded["argv"] == ["run", "--auto", "--", "--resume"]
 
     def test_no_cswap_is_a_clear_refusal(self, layout):
         env = self._env(layout)
         env["PATH"] = os.pathsep.join(
-            str(layout[name]) for name in ("wrapper_dir", "real_dir", "tools_dir")
+            str(layout[name]) for name in ("wrapper_dir", "real_dir")
         )
 
         result = self._run([str(layout["link"])], env)
 
         assert result.returncode == 127
         assert "cswap is not on PATH" in result.stderr
-        assert str(layout["real"]) in result.stderr
 
-    def test_a_handed_down_path_skips_the_search(self, layout):
-        """Started by cswap with the real binary already resolved: the wrapper
-        uses that path instead of walking PATH again."""
-        env = self._env(layout, CSWAP_REAL_CLAUDE=str(layout["real"]))
-        env["PATH"] = os.pathsep.join(
-            str(layout[name]) for name in ("wrapper_dir", "cswap_dir", "tools_dir")
-        )
+    def test_a_quoted_install_path_still_hands_over(self, layout):
+        """A directory with a space in it (a common macOS home) stays one PATH
+        entry and one argument, not two."""
+        spaced = layout["tmp"] / "with space"
+        spaced.mkdir()
+        link = spaced / "claude"
+        link.symlink_to(wrapper.WRAPPER_PATH)
 
-        result = self._run([str(layout["link"]), "-p", "hi"], env)
+        result = self._run([str(link), "-p", "hi"], self._env(layout))
 
         assert result.returncode == 0, result.stderr
         recorded = json.loads((layout["tmp"] / "cswap.json").read_text())
-        assert recorded["real"] == str(layout["real"])
+        assert recorded["argv"] == ["run", "--auto", "--", "-p", "hi"]
 
 
 class TestIsWrapper:
@@ -233,10 +222,58 @@ class TestIsWrapper:
         copied.write_bytes(wrapper.WRAPPER_PATH.read_bytes())
         assert wrapper.is_wrapper(copied)
 
+    def test_an_edited_copy_is_still_the_wrapper(self, tmp_path: Path):
+        """The marker, not the shipped bytes: a copy whose comments or
+        install directory were changed is still a wrapper, and still must
+        never be launched as Claude Code."""
+        edited = tmp_path / "claude"
+        edited.write_text(
+            wrapper.WRAPPER_PATH.read_text().replace(
+                "~/.local/claude-swap/bin", "~/.local/bin"
+            ) + "\n# local tweak\n"
+        )
+        assert wrapper.is_wrapper(edited)
+
     def test_another_binary_is_not(self, tmp_path: Path):
         other = tmp_path / "claude"
         other.write_text("#!/bin/sh\nexit 0\n")
         assert not wrapper.is_wrapper(other)
+
+    def test_a_large_binary_is_not_read_whole(self, tmp_path: Path, monkeypatch):
+        """A `claude` can be 377 MB (measured: 0.21 s and 391 MiB to compare
+        whole); a check on every launch reads only the head."""
+        big = tmp_path / "claude"
+        with open(big, "wb") as fh:
+            fh.write(b"\x7fELF" + b"\0" * (8 * 1024 * 1024))
+        read_bytes = 0
+        real_open = open
+
+        class Counting:
+            def __init__(self, fh):
+                self._fh = fh
+
+            def read(self, size=-1):
+                nonlocal read_bytes
+                read_bytes += size if size and size > 0 else 0
+                return self._fh.read(size)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self._fh.close()
+
+        monkeypatch.setattr(
+            "builtins.open",
+            lambda path, *a, **k: (
+                Counting(real_open(path, *a, **k))
+                if str(path) == str(big)
+                else real_open(path, *a, **k)
+            ),
+        )
+
+        assert not wrapper.is_wrapper(big)
+        assert read_bytes <= wrapper.HEAD_BYTES
 
     def test_a_missing_path_is_not(self, tmp_path: Path):
         assert not wrapper.is_wrapper(tmp_path / "nope")

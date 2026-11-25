@@ -7,6 +7,7 @@ import contextlib
 import json
 import math
 import os
+import shlex
 import sys
 
 from claude_swap import __version__, account_proxy, paths, printer
@@ -107,6 +108,13 @@ def _translate_subcommand(argv: list[str]) -> list[str]:
         return [flag, *rest]
 
     return argv
+
+
+_SERVICE_COMMANDS = frozenset({
+    "mcp", "plugin", "plugins", "auth", "setup-token", "install", "update",
+    "upgrade", "doctor", "import", "purge",
+    "--version", "-v", "--help", "-h",
+})
 
 
 def _run_command(argv: list[str]) -> None:
@@ -242,21 +250,36 @@ def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
         # share_history goes through as given: None (neither flag) leaves it
         # to run.shareHistory, which SessionManager.run resolves.
         if args.auto:
-            number, why = switcher.auto_run_target()
-            if number is None:
+            # `claude`'s own housekeeping is not a session: `claude mcp add`
+            # must write the login the user manages their MCP servers on (a
+            # session profile's copy is deleted by the next _sync_mcp_servers),
+            # and `--version`/`update` must answer without a quota. The default
+            # login's own proxy is still checked, fail-closed.
+            if tail and tail[0] in _SERVICE_COMMANDS:
+                manager.exec_default(tail)
+                return  # only reachable in tests where exec/exit is mocked
+
+            row, why = switcher.auto_run_target()
+            if row is None:
                 raise SessionError(why)
+            # The choice is the (slot, email, organization) triple of ONE
+            # capture, not a number to resolve again: verify it just before the
+            # launch so a `swap`/`move` in between refuses instead of running
+            # the account that took the number.
+            account = (str(row[0]), row[1], row[3])
             print(
                 dimmed(
-                    f"Account-{number} has the most remaining quota — "
+                    f"Account-{account[0]} has the most remaining quota — "
                     "launching it."
                 )
             )
             manager.run(
-                number,
-                tail,
+                account[0],
+                _rate_limit_hook(tail, account),
                 share=not args.no_share,
                 share_history=args.share_history,
                 require_session=args.require_session,
+                account=account,
             )
             return  # only reachable in tests where exec/exit is mocked
 
@@ -322,7 +345,9 @@ def _wrapper_command(argv: list[str]) -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Example:
-  ln -s "$(cswap wrapper)" ~/.local/bin/claude
+  mkdir -p ~/.local/claude-swap/bin
+  ln -s "$(cswap wrapper)" ~/.local/claude-swap/bin/claude
+  export PATH="$HOME/.local/claude-swap/bin:$PATH"
         """,
     )
     parser.parse_args(argv)
@@ -330,6 +355,62 @@ Example:
     from claude_swap import wrapper
 
     print(wrapper.WRAPPER_PATH)
+
+
+def _rate_limit_hook(tail: list[str], account: tuple[str, str, str]) -> list[str]:
+    """``tail`` with the ``StopFailure`` hook that marks an exhausted account.
+
+    Claude Code reports a turn it gave up on to a ``StopFailure`` hook, with
+    ``error: rate_limit`` for a 429 (measured on 2.1.329, interactive and
+    ``-p``: see ``docs/auto-launch.md``). The hook runs ``cswap rate-limited
+    <email> <organization>``, so the next launch knows this account's usage
+    reading predates a real refusal (``record_stop_failure``).
+
+    It travels as ``--settings``, which ADDS a settings source: the hooks in
+    the user's own ``settings.json`` still run (measured on 2.1.329). A
+    command line that already carries the user's ``--settings`` gets none of
+    this — cswap will not compete for that switch.
+    """
+    if "--settings" in tail:
+        return tail
+    command = " ".join(
+        shlex.quote(part)
+        for part in (
+            sys.executable,
+            "-m",
+            "claude_swap",
+            "rate-limited",
+            account[1],
+            account[2],
+        )
+    )
+    settings = {
+        "hooks": {
+            "StopFailure": [
+                {
+                    "matcher": "rate_limit",
+                    "hooks": [{"type": "command", "command": command}],
+                }
+            ]
+        }
+    }
+    return ["--settings", json.dumps(settings), *tail]
+
+
+def _rate_limited_command(argv: list[str]) -> None:
+    """Handle `cswap rate-limited EMAIL [ORG]`: the StopFailure hook's target.
+
+    Not a user command. `cswap run --auto` passes it in the hook settings it
+    hands Claude Code (``_rate_limit_hook``); it records that the server
+    refused this account on its rate limit, which is what makes the next
+    launch prefer another one (``ClaudeAccountSwitcher.record_stop_failure``).
+    Silent: a hook's output is not the user's.
+    """
+    parser = argparse.ArgumentParser(prog="cswap rate-limited", add_help=False)
+    parser.add_argument("email")
+    parser.add_argument("organization", nargs="?", default="")
+    args = parser.parse_args(argv)
+    ClaudeAccountSwitcher().record_stop_failure(args.email, args.organization)
 
 
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
@@ -1660,6 +1741,9 @@ def main() -> None:
         return  # only reachable in tests where exec/exit is mocked
     if argv and argv[0] == "wrapper":
         _wrapper_command(argv[1:])
+        return
+    if argv and argv[0] == "rate-limited":
+        _rate_limited_command(argv[1:])
         return
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])

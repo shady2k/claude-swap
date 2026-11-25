@@ -1295,11 +1295,17 @@ class TestRunCommand:
                 share=True,
                 share_history=None,
                 require_session=False,
+                account=None,
             ):
                 calls.append((
                     "run", identifier, claude_args, share, share_history,
                     require_session,
                 ))
+                if account is not None:
+                    calls.append(("run_account", account))
+
+            def exec_default(self, claude_args):
+                calls.append(("exec_default", claude_args))
 
         with patch("claude_swap.session.SessionManager", FakeSessionManager), \
              patch("claude_swap.cli.ClaudeAccountSwitcher",
@@ -1418,6 +1424,11 @@ class TestRunCommand:
         assert excinfo.value.code == 1
         assert "boom" in capsys.readouterr().err
 
+    @staticmethod
+    def _row(num: int, email: str = "user@example.com", org: str = "") -> tuple:
+        """What ``auto_run_target`` answers: the account row it chose."""
+        return (num, email, "Org", org, False, "creds", "", None)
+
     def _auto_dispatch(self, argv, auto_run_target):
         """Dispatch `cswap run --auto` with a switcher that answers the choice."""
         return self._dispatch(
@@ -1425,19 +1436,88 @@ class TestRunCommand:
             auto_run_target=MagicMock(side_effect=auto_run_target),
         )
 
+    def _launch(self, calls) -> tuple:
+        """The one `manager.run(...)` the dispatch made."""
+        runs = [call for call in calls if call[0] == "run"]
+        assert len(runs) == 1
+        return runs[0]
+
     def test_auto_launches_the_account_it_chose(self):
         calls = self._auto_dispatch(
             ["run", "--auto", "--", "--resume", "-p", "a b"],
-            lambda **kwargs: ("2", "better"),
+            lambda **kwargs: (self._row(2), ""),
         )
-        assert ("run", "2", ["--resume", "-p", "a b"], True, None, False) in calls
+        _kind, number, claude_args, share, share_history, require_session = (
+            self._launch(calls)
+        )
+        assert number == "2"
+        assert claude_args[-3:] == ["--resume", "-p", "a b"]
+        assert (share, share_history, require_session) == (True, None, False)
+        # The choice travels as the identity triple it was read with, so the
+        # launch can refuse a slot that moved instead of resolving the number.
+        assert ("run_account", ("2", "user@example.com", "")) in calls
+
+    def test_auto_passes_the_rate_limit_hook(self):
+        """The hook that marks an account Claude Code was refused on.
+
+        Measured on Claude Code 2.1.329: ``StopFailure`` with matcher
+        ``rate_limit`` runs the command, in interactive and ``-p`` sessions.
+        """
+        calls = self._auto_dispatch(
+            ["run", "--auto", "--", "-p", "hi"],
+            lambda **kwargs: (self._row(2, "b@example.com", "org-1"), ""),
+        )
+        claude_args = self._launch(calls)[2]
+        assert claude_args[0] == "--settings"
+        settings = json.loads(claude_args[1])
+        hook = settings["hooks"]["StopFailure"][0]
+        assert hook["matcher"] == "rate_limit"
+        command = hook["hooks"][0]["command"]
+        assert "rate-limited" in command
+        assert "b@example.com" in command and "org-1" in command
+        assert claude_args[2:] == ["-p", "hi"]
+
+    def test_a_user_settings_switch_is_not_competed_with(self):
+        calls = self._auto_dispatch(
+            ["run", "--auto", "--", "--settings", "/tmp/mine.json"],
+            lambda **kwargs: (self._row(2), ""),
+        )
+        assert self._launch(calls)[2] == ["--settings", "/tmp/mine.json"]
+
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            ["mcp", "add", "-s", "user", "x", "cmd"],
+            ["mcp", "list"],
+            ["plugin", "install", "y"],
+            ["auth", "login"],
+            ["update"],
+            ["--version"],
+            ["-h"],
+        ],
+    )
+    def test_claude_housekeeping_goes_to_the_default_login(self, tail):
+        """`claude mcp add` must not write a session profile's copy (the next
+        _sync_mcp_servers deletes it), and `--version` must not need a quota."""
+        target = MagicMock(side_effect=AssertionError("no account should be chosen"))
+        calls = self._dispatch(
+            ["run", "--auto", "--", *tail], auto_run_target=target
+        )
+
+        assert ("exec_default", tail) in calls
+        assert not [call for call in calls if call[0] == "run"]
+        target.assert_not_called()
 
     def test_auto_forwards_the_run_flags(self):
         calls = self._auto_dispatch(
             ["run", "--auto", "--no-share", "--no-share-history", "--require-session"],
-            lambda **kwargs: ("3", "best"),
+            lambda **kwargs: (self._row(3), ""),
         )
-        assert ("run", "3", [], False, False, True) in calls
+        _kind, number, _args, share, share_history, require_session = (
+            self._launch(calls)
+        )
+        assert number == "3"
+        assert (share, share_history, require_session) == (False, False, True)
 
     def test_auto_refusal_exits_non_zero_and_launches_nothing(self, capsys):
         with pytest.raises(SystemExit) as excinfo:
@@ -1453,7 +1533,7 @@ class TestRunCommand:
         assert "is at its limit" in capsys.readouterr().err
 
     def test_auto_names_the_account_it_chose(self, capsys):
-        self._auto_dispatch(["run", "--auto"], lambda **kwargs: ("2", "better"))
+        self._auto_dispatch(["run", "--auto"], lambda **kwargs: (self._row(2), ""))
         assert "Account-2 has the most remaining quota" in capsys.readouterr().err
 
     def test_auto_with_an_account_is_a_usage_error(self):

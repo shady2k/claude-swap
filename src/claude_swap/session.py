@@ -736,22 +736,13 @@ def _adds_nothing(target: Path, candidate: Path) -> bool:
 def find_claude() -> str | None:
     """The real Claude Code binary, never claude-swap's own wrapper.
 
-    ``CSWAP_REAL_CLAUDE`` is the binary the wrapper resolved before it ran
-    ``cswap run --auto``; it wins, because the wrapper has already walked
-    ``PATH`` and a second walk could disagree with it. Started directly with
-    the wrapper on ``PATH``, the first ``claude`` found is passed over and the
-    walk goes on: exec'ing the wrapper from here would replace an explicit
-    ``cswap run 3`` account with an automatic choice, and would turn the
-    ``claude auth status`` probe into a second cswap. See ``wrapper.py``.
+    A launch hands the terminal to Claude Code, and this is the only place
+    that says which file that is. The first ``claude`` on ``PATH`` is passed
+    over when it is the wrapper (:func:`wrapper.is_wrapper`) and the walk goes
+    on: exec'ing the wrapper from here would replace the account cswap already
+    chose with a second automatic choice (``cswap run 3`` included), and would
+    turn the ``claude auth status`` probe into another cswap.
     """
-    handed_down = os.environ.get(wrapper.REAL_CLAUDE_ENV)
-    if (
-        handed_down
-        and os.path.isfile(handed_down)
-        and os.access(handed_down, os.X_OK)
-        and not wrapper.is_wrapper(handed_down)
-    ):
-        return handed_down
     found = shutil.which("claude")
     if found is None or not wrapper.is_wrapper(found):
         return found
@@ -797,6 +788,22 @@ def _claude_env(
     if disable_nonessential_traffic:
         env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
     return env
+
+
+def _warn_auth_overrides() -> None:
+    """Say which shell auth variables this launch will not pass on.
+
+    ``AUTH_OVERRIDE_ENV_VARS`` replace the credential Claude Code would use
+    for the account this launch chose (Claude Code 2.1.175 reads them ahead of
+    the OAuth login), so a launch drops them — and says so, because the shell
+    that exported one expected it to be used.
+    """
+    scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
+    if scrubbed:
+        warning(
+            f"Ignoring {', '.join(scrubbed)} for this session — it would "
+            f"override the selected account inside Claude Code."
+        )
 
 
 def _probe_env(
@@ -849,12 +856,23 @@ class SessionManager:
         share: bool = True,
         share_history: bool | None = None,
         require_session: bool = False,
+        account: tuple[str, str, str] | None = None,
     ) -> NoReturn:
         """Launch Claude Code as the given account in the current terminal.
 
         ``share_history`` is the launch's own choice (``--share-history`` /
         ``--no-share-history``); ``None`` leaves it to ``run.shareHistory``
         (see ``_resolve_share_history``).
+
+        ``account`` is the ``(slot, email, organization)`` an automatic choice
+        made (``ClaudeAccountSwitcher.auto_run_target``). Such a launch is that
+        snapshot, not a number resolved again: the slot is read here, and a
+        record that no longer holds the account ends the launch with a reason
+        instead of running the account that took the number (a `swap`/`move`
+        landing between the choice and this launch). Its presence also means
+        the account was chosen for the user, so the shell's own auth overrides
+        are dropped — the filter the session branch applies — because this
+        account's credential is what was asked for.
 
         ``require_session`` turns the same-account fast path (a plain claude
         launch on the default login) into a refusal: a wrapper that hands a
@@ -885,7 +903,19 @@ class SessionManager:
         requested_history = share_history
         share_history = self._resolve_share_history(requested_history)
 
-        account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+        if account is not None:
+            account_num, email, org_uuid = account
+            if not self.switcher.account_still_holds(*account):
+                raise SessionError(
+                    f"Account-{account_num} ({email}) was chosen for this "
+                    "launch, but the slot holds another account now. Nothing "
+                    "was launched; run the command again."
+                )
+        else:
+            account_num, email, org_uuid = self.switcher.resolve_account(
+                identifier
+            )
+
         # Guard before the same-account direct-launch fast path below (which
         # _exec's claude and never returns) — and before setup_session.
         self._ensure_not_api_key(account_num, email)
@@ -947,7 +977,12 @@ class SessionManager:
                 session_dir_for(self.switcher.backup_dir, account_num, email),
                 share_history,
             )
-            env = self._launch_env(route, dict(os.environ))
+            if account is not None:
+                # Chosen for the user, so the shell's auth overrides go.
+                _warn_auth_overrides()
+            env = self._launch_env(
+                route, self._launch_base_env(account is not None)
+            )
             # Run on the default login, not on the preset profile.
             env.pop("CLAUDE_CONFIG_DIR", None)
             self._exec(claude_bin, claude_args, env=env)
@@ -957,12 +992,7 @@ class SessionManager:
                 "overriding it for this launch."
             )
 
-        scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
-        if scrubbed:
-            warning(
-                f"Ignoring {', '.join(scrubbed)} for this session — it would "
-                f"override the selected account inside Claude Code."
-            )
+        _warn_auth_overrides()
 
         session_dir, account_num, email = self.setup_session(
             identifier,
@@ -976,11 +1006,25 @@ class SessionManager:
             f"{accent('Launching')} Account-{account_num} ({email}) "
             f"{muted('[session mode]')}"
         )
-        env = {
-            k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
-        }
+        env = self._launch_base_env(True)
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
         self._exec(claude_bin, claude_args, env=self._launch_env(route, env))
+
+    def _launch_base_env(self, scrub_auth_overrides: bool) -> dict[str, str]:
+        """This process's environment, less the auth overrides a chosen
+        account must not be given.
+
+        The session branch always scrubs; the same-account fast path only does
+        so for an automatic choice (``run(account=…)``), where the account was
+        picked for the user and a stray ``ANTHROPIC_API_KEY`` would make the
+        process bill with a credential other than the account whose proxy it
+        was launched with. An explicit ``cswap run 3`` keeps its environment.
+        """
+        if not scrub_auth_overrides:
+            return dict(os.environ)
+        return {
+            k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
+        }
 
     def _history_on_the_fast_path(
         self, session_dir: Path, share_history: bool
@@ -1170,13 +1214,7 @@ class SessionManager:
         already released — an exec'd claude must never inherit a held flock).
         Windows: ``os.exec*`` detaches from the console confusingly, so stay
         resident as a thin wrapper and mirror claude's exit code.
-
-        ``CSWAP_REAL_CLAUDE`` is dropped first: it is the wrapper's note to
-        cswap, not part of Claude Code's environment. A ``claude`` a session
-        starts later must go through the wrapper and choose an account again
-        (``wrapper.py``).
         """
-        env.pop(wrapper.REAL_CLAUDE_ENV, None)
         argv = [claude_bin, *claude_args]
         if sys.platform == "win32":
             try:

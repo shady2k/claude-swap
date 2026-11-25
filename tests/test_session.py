@@ -1845,6 +1845,43 @@ class TestRun:
 
         assert exc.value.env["ANTHROPIC_API_KEY"] == "sk-ant-key"
 
+    def test_an_automatic_fast_path_drops_the_shell_auth_overrides(
+        self, manager, capture_exec, monkeypatch, capsys
+    ):
+        """``--auto`` chose this account, so the shell's override goes.
+
+        The fast path runs plain claude on the default login, whose proxy is
+        the chosen account's. An ``ANTHROPIC_API_KEY`` from the terminal would
+        make Claude Code bill a different credential than the account the
+        proxy belongs to.
+        """
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-key")
+        monkeypatch.setenv("UNRELATED_VAR", "kept")
+        monkeypatch.setattr(
+            manager.switcher,
+            "_get_current_account",
+            lambda: (ACCOUNT_EMAIL, ORG_UUID),
+        )
+        choice = (ACCOUNT_NUM, ACCOUNT_EMAIL, ORG_UUID)
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run(choice[0], [], account=choice)
+
+        assert "ANTHROPIC_API_KEY" not in exc.value.env
+        assert exc.value.env["UNRELATED_VAR"] == "kept"
+        assert "Ignoring ANTHROPIC_API_KEY" in capsys.readouterr().out
+
+    def test_an_automatic_launch_refuses_a_slot_that_moved(
+        self, manager, capture_exec, monkeypatch
+    ):
+        """A swap between the choice and the launch must refuse, not run the
+        account that took the number."""
+        monkeypatch.setattr(
+            manager.switcher, "account_still_holds", lambda *identity: False
+        )
+
+        with pytest.raises(SessionError, match="holds another account"):
+            manager.run("2", [], account=("2", ACCOUNT_EMAIL, ORG_UUID))
+
     def test_exec_default_uses_plain_env(self, manager, capture_exec, monkeypatch):
         """exec_default launches plain claude with the unmodified environment."""
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-key")
@@ -1969,7 +2006,6 @@ class TestFindClaudeNeverHandsOverToTheWrapper:
         real = self._binary(tmp_path / "real")
         link = self._wrapper_link(tmp_path / "bin")
         monkeypatch.setenv("PATH", os.pathsep.join([str(link.parent), str(real.parent)]))
-        monkeypatch.delenv(wrapper.REAL_CLAUDE_ENV, raising=False)
         monkeypatch.setattr(session_mod.shutil, "which", lambda name: str(link))
 
         assert session_mod.find_claude() == str(real)
@@ -1980,7 +2016,6 @@ class TestFindClaudeNeverHandsOverToTheWrapper:
     def test_the_wrapper_alone_is_not_a_claude(self, tmp_path, monkeypatch):
         link = self._wrapper_link(tmp_path / "bin")
         monkeypatch.setenv("PATH", str(link.parent))
-        monkeypatch.delenv(wrapper.REAL_CLAUDE_ENV, raising=False)
         monkeypatch.setattr(session_mod.shutil, "which", lambda name: str(link))
 
         assert session_mod.find_claude() is None
@@ -1996,62 +2031,16 @@ class TestFindClaudeNeverHandsOverToTheWrapper:
         copied.write_bytes(wrapper.WRAPPER_PATH.read_bytes())
         copied.chmod(0o755)
         monkeypatch.setenv("PATH", os.pathsep.join([str(copied_dir), str(real.parent)]))
-        monkeypatch.delenv(wrapper.REAL_CLAUDE_ENV, raising=False)
         monkeypatch.setattr(session_mod.shutil, "which", lambda name: str(copied))
 
         assert session_mod.find_claude() == str(real)
 
-    def test_the_handed_down_path_wins(self, tmp_path, monkeypatch):
-        real = self._binary(tmp_path / "real")
-        monkeypatch.setenv(wrapper.REAL_CLAUDE_ENV, str(real))
-        monkeypatch.setattr(
-            session_mod.shutil, "which", lambda name: "/nonexistent/claude"
-        )
-
-        assert session_mod.find_claude() == str(real)
-
-    def test_a_handed_down_path_that_is_not_runnable_is_ignored(
-        self, tmp_path, monkeypatch
-    ):
-        gone = tmp_path / "gone" / "claude"
-        monkeypatch.setenv(wrapper.REAL_CLAUDE_ENV, str(gone))
-        monkeypatch.setattr(
-            session_mod.shutil, "which", lambda name: "/fake/bin/claude"
-        )
-
-        assert session_mod.find_claude() == "/fake/bin/claude"
-
     def test_an_ordinary_claude_is_returned_unchanged(self, monkeypatch):
-        monkeypatch.delenv(wrapper.REAL_CLAUDE_ENV, raising=False)
         monkeypatch.setattr(
             session_mod.shutil, "which", lambda name: "/fake/bin/claude"
         )
 
         assert session_mod.find_claude() == "/fake/bin/claude"
-
-    @pytest.mark.skipif(
-        sys.platform == "win32", reason="the POSIX exec handoff is what is checked"
-    )
-    def test_the_handoff_drops_the_wrappers_note(
-        self, manager, auth_status_tracks_seed, refresh_rotates, monkeypatch
-    ):
-        """``CSWAP_REAL_CLAUDE`` is cswap's own note, not Claude Code's env: a
-        ``claude`` started inside a session must choose an account again."""
-        handed: dict = {}
-
-        def fake_execvpe(binary, argv, env):
-            handed["env"] = env
-            raise SystemExit(0)
-
-        monkeypatch.setattr(session_mod.os, "execvpe", fake_execvpe)
-        # A path that really is an executable, so the test needs no Claude
-        # Code on the host: the interpreter running this suite.
-        monkeypatch.setenv(wrapper.REAL_CLAUDE_ENV, sys.executable)
-
-        with pytest.raises(SystemExit):
-            manager.run("2", [])
-
-        assert wrapper.REAL_CLAUDE_ENV not in handed["env"]
 
 
 class TestTheLaunchTakesTheAccountsProxy:

@@ -112,9 +112,11 @@ Read next: the module docstring of `session.py`, and [proxy.md](proxy.md#launchi
 
 ### A launch on the best account
 
-`cswap run --auto` picks the account with `ClaudeAccountSwitcher.auto_run_target`, which is `_select_best_switchable` read as a launch: a strictly better account, else the login the terminal already has. It then runs the session-mode launch above for that slot, without touching `sequence.json` or the default login.
+`cswap run --auto` picks the account with `ClaudeAccountSwitcher.auto_run_target` from one capture of the roster (`_build_accounts_info`): the launchable slots ranked by headroom above 0, then by "Claude Code has not reported a rate-limit stop on it", then by headroom, then the live login. The winner's reading is confirmed once (`_collect_usage_entries(fetch={winner})`) and the next candidate is taken when that confirmation has no room left — `SERVE_TTL_S` is the oldest a ranking reading may be. The launch is then the session-mode one above, without touching `sequence.json` or the default login; the slot travels into it as the (slot, email, organization) it was read with.
 
-The thin `claude` wrapper calls it for every launch. `session.find_claude` is the one place that resolves the binary a launch hands the terminal to, and it never returns the wrapper: the wrapper's own export (`CSWAP_REAL_CLAUDE`) is preferred, and a `claude` that is the wrapper is walked past on `PATH`. `_exec` drops that export before Claude Code starts, so a nested `claude` chooses again.
+`StopFailure` with matcher `rate_limit` is what Claude Code reports a refused turn with; `cswap run --auto` passes that hook through `--settings`, and it runs `cswap rate-limited <email> <organization>` (`record_stop_failure`), which stamps `cache/stop-failure.json`. Marked means "the reading predates the refusal" — a reading newer than the stamp clears it, so no deadline is stored.
+
+The thin `claude` wrapper calls `cswap run --auto` for every launch. `session.find_claude` is the one place that resolves the binary a launch hands the terminal to, and it never returns the wrapper: a `claude` that is the wrapper (recognised by a marker line in its first bytes) is walked past on `PATH`.
 
 Read next: `wrapper.py` and [auto-launch.md](auto-launch.md).
 

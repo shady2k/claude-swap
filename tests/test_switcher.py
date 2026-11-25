@@ -6924,12 +6924,42 @@ class TestUsageAwareSwitch:
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
 
-class TestAutoRunTarget:
-    """`cswap run --auto` picks the account `best` would land on, as a launch.
+class _FakeClock:
+    """The clock the usage store reads, so a test owns every timestamp."""
 
-    The comparison is `_select_best_switchable`, so these cases mirror the
-    `best` cases above; what differs is what a "stay" means — the launch simply
-    runs the login it already has, and nothing is written to sequence.json.
+    def __init__(self, now: float = 1_000_000.0):
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class _UsageEndpoint:
+    """The usage API, answered per account, recording who was asked.
+
+    ``answers[email]`` is the usage dict a request for that account returns,
+    or ``None`` for a failed request. ``calls`` is the request order — how
+    many times, and for whom, a launch asked the server.
+    """
+
+    def __init__(self, answers: dict[str, dict | None]):
+        self.answers = dict(answers)
+        self.calls: list[str] = []
+
+    def __call__(self, account_num, email, credentials, **kwargs):
+        self.calls.append(email)
+        usage = self.answers.get(email)
+        if usage is None:
+            return oauth.UsageOutcome(None, error="network")
+        return oauth.UsageOutcome(usage)
+
+
+class TestAutoRunTarget:
+    """`cswap run --auto` picks a launchable account with quota left.
+
+    Every case runs against a REAL ``UsageStore`` on a controlled clock and a
+    substituted usage endpoint, so the readings, their ages, their poll plans
+    and the requests a launch makes are the ones the production path sees.
     """
 
     def _setup(self, temp_home: Path) -> ClaudeAccountSwitcher:
@@ -6987,119 +7017,340 @@ class TestAutoRunTarget:
             window["resets_at"] = resets_at
         return {"five_hour": window, "seven_day": {"pct": 0.0}}
 
-    def _three(self, temp_home: Path) -> ClaudeAccountSwitcher:
+    def _three(
+        self, temp_home: Path, monkeypatch, clock: _FakeClock, answers: dict
+    ) -> tuple[ClaudeAccountSwitcher, _UsageEndpoint]:
         s = self._setup(temp_home)
         for num, email in enumerate(
             ("a@example.com", "b@example.com", "c@example.com"), start=1
         ):
             self._seed(s, num, email)
-        return s
+        s._usage_store = UsageStore(s.backup_dir / "cache", clock=clock)
+        endpoint = _UsageEndpoint(answers)
+        monkeypatch.setattr(
+            "claude_swap.oauth.try_fetch_usage_for_account", endpoint
+        )
+        return s, endpoint
 
-    def test_a_better_account_is_the_one_launched(self, temp_home: Path):
-        s = self._three(temp_home)
+    def _stored(
+        self,
+        s: ClaudeAccountSwitcher,
+        clock: _FakeClock,
+        num: int,
+        email: str,
+        usage: dict,
+        *,
+        age_s: float = 0.0,
+        next_poll_in: float | None = None,
+    ) -> None:
+        """Store one reading, as if the collector had taken it ``age_s`` ago."""
+        now = clock.now
+        clock.now = now - age_s
+        s._usage_store.record(
+            {str(num): FetchRecord(usage=usage)},
+            {str(num): (email, "")},
+            plans=(
+                {str(num): (clock.now + next_poll_in, 600.0)}
+                if next_poll_in is not None
+                else None
+            ),
+        )
+        clock.now = now
+
+    def _three_readings(
+        self,
+        temp_home: Path,
+        monkeypatch,
+        clock: _FakeClock,
+        readings: dict[str, dict],
+        answers: dict,
+        **stored_kwargs,
+    ) -> tuple[ClaudeAccountSwitcher, _UsageEndpoint]:
+        s, endpoint = self._three(
+            temp_home, monkeypatch, clock, answers or readings
+        )
+        for num, email in enumerate(
+            ("a@example.com", "b@example.com", "c@example.com"), start=1
+        ):
+            if email in readings:
+                self._stored(
+                    s, clock, num, email, readings[email], **stored_kwargs
+                )
+        return s, endpoint
+
+    def test_the_account_with_the_most_headroom_is_launched(
+        self, temp_home: Path, monkeypatch
+    ):
+        clock = _FakeClock()
+        s, endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(50),
+                "b@example.com": self._usage(10),
+                "c@example.com": self._usage(20),
+            },
+            answers={},
+        )
         self._make_live(temp_home, "a@example.com", 1)
-        usage = {"1": self._usage(50), "2": self._usage(90), "3": self._usage(20)}
 
-        with patch.object(s, "_usage_by_account", return_value=usage):
-            assert s.auto_run_target() == ("3", "better")
+        row, why = s.auto_run_target()
 
-    def test_staying_means_the_live_login_is_launched(self, temp_home: Path):
-        """`best` returning "stay" is not a dead end for a launch: the login
-        the terminal already has is the one with the most headroom."""
-        s = self._three(temp_home)
+        assert row is not None and row[0] == 2 and row[1] == "b@example.com"
+        assert why == ""
+        # A reading inside SERVE_TTL_S is current by design: no request.
+        assert endpoint.calls == []
+
+    def test_the_live_login_is_launched_when_it_has_the_most_room(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A "stay" verdict is not a dead end for a launch."""
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(10),
+                "b@example.com": self._usage(60),
+                "c@example.com": self._usage(99),
+            },
+            answers={},
+        )
         self._make_live(temp_home, "a@example.com", 1)
-        usage = {"1": self._usage(10), "2": self._usage(60), "3": self._usage(99)}
 
-        with patch.object(s, "_usage_by_account", return_value=usage):
-            assert s.auto_run_target() == ("1", "best")
+        row, _why = s.auto_run_target()
 
-    def test_a_launch_is_not_a_switch(self, temp_home: Path):
-        s = self._three(temp_home)
+        assert row is not None and row[0] == 1
+        assert row[4] is True, "the launch can use the same-account fast path"
+
+    def test_a_launch_is_not_a_switch(self, temp_home: Path, monkeypatch):
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(50),
+                "b@example.com": self._usage(20),
+                "c@example.com": self._usage(10),
+            },
+            answers={},
+        )
         self._make_live(temp_home, "a@example.com", 1)
-        usage = {"1": self._usage(50), "2": self._usage(20), "3": self._usage(10)}
 
-        with patch.object(s, "_usage_by_account", return_value=usage), \
-             patch.object(s, "_perform_switch") as perform:
+        with patch.object(s, "_perform_switch") as perform:
             s.auto_run_target()
 
         perform.assert_not_called()
         assert s._get_sequence_data()["activeAccountNumber"] == 1
 
     def test_an_unreadable_live_login_yields_the_best_readable_account(
-        self, temp_home: Path
+        self, temp_home: Path, monkeypatch
     ):
-        """The live login's usage is unknown: `best` refuses to compare, but a
-        launch still prefers an account whose quota it can prove."""
-        s = self._three(temp_home)
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "b@example.com": self._usage(30),
+                "c@example.com": self._usage(70),
+            },
+            answers={},
+        )
         self._make_live(temp_home, "a@example.com", 1)
-        usage = {"1": None, "2": self._usage(30), "3": self._usage(70)}
 
-        with patch.object(s, "_usage_by_account", return_value=usage):
-            assert s.auto_run_target() == ("2", "only")
+        row, _why = s.auto_run_target()
 
-    def test_an_unmanaged_live_login_is_not_a_candidate(self, temp_home: Path):
+        assert row is not None and row[0] == 2
+
+    def test_an_unmanaged_live_login_is_not_a_candidate(
+        self, temp_home: Path, monkeypatch
+    ):
         """A login with no slot has no usage to launch on, and is not added:
         `cswap switch` would add it (`add_account`), a launch must not."""
-        s = self._three(temp_home)
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(80),
+                "b@example.com": self._usage(10),
+                "c@example.com": self._usage(10),
+            },
+            answers={},
+        )
         self._make_live(temp_home, "stranger@example.com", 9)
-        usage = {"1": self._usage(80), "2": self._usage(10), "3": self._usage(10)}
 
-        with patch.object(s, "_usage_by_account", return_value=usage):
-            assert s.auto_run_target() == ("2", "only")
+        row, _why = s.auto_run_target()
+
+        assert row is not None and row[0] == 2
         assert "9" not in s._get_sequence_data()["accounts"]
 
-    def test_every_account_at_its_limit_names_the_nearest_reset(
-        self, temp_home: Path
+    def test_an_account_that_spent_its_quota_before_the_poll_is_passed_over(
+        self, temp_home: Path, monkeypatch
     ):
-        s = self._three(temp_home)
+        """The reading a launch ranks on may be up to SERVE_TTL_S old.
+
+        Here both readings are trusted but stale (200 s, inside the 300 s
+        decision window) and both poll plans say "not yet", so nothing is
+        refetched before the choice. The chosen account is then asked once
+        more — the account spent its quota inside that window — and the launch
+        moves on to the next candidate instead of running it.
+        """
+        clock = _FakeClock()
+        s, endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(30),
+                "b@example.com": self._usage(60),
+                "c@example.com": self._usage(90),
+            },
+            answers={
+                "a@example.com": self._usage(100),
+                "b@example.com": self._usage(60),
+            },
+            age_s=200,
+            next_poll_in=600,
+        )
         self._make_live(temp_home, "a@example.com", 1)
-        usage = {
-            "1": self._usage(100, "2026-11-25T12:00:00+00:00"),
-            "2": self._usage(100, "2026-11-25T10:30:00+00:00"),
-            "3": self._usage(100),
-        }
 
-        with patch.object(s, "_usage_by_account", return_value=usage):
-            number, why = s.auto_run_target()
+        row, _why = s.auto_run_target()
 
-        assert number is None
+        assert row is not None and row[1] == "b@example.com"
+        # One confirmation per candidate, in ranking order, and no more.
+        assert endpoint.calls == ["a@example.com", "b@example.com"]
+
+    def test_a_fresh_reading_is_never_asked_again(
+        self, temp_home: Path, monkeypatch
+    ):
+        """SERVE_TTL_S is the budget: inside it the reading is current."""
+        clock = _FakeClock()
+        s, endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(30),
+                "b@example.com": self._usage(60),
+                "c@example.com": self._usage(90),
+            },
+            answers={"a@example.com": self._usage(100)},
+            age_s=100,
+            next_poll_in=600,
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+
+        row, _why = s.auto_run_target()
+
+        assert row is not None and row[1] == "a@example.com"
+        assert endpoint.calls == []
+
+    def test_an_account_over_its_limit_is_not_launched_at_zero_headroom(
+        self, temp_home: Path, monkeypatch
+    ):
+        """105% and 100% are both spent: `best` prefers 0 over -5, a launch
+        must prefer neither."""
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(105),
+                "b@example.com": self._usage(100),
+            },
+            answers={},
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+
+        row, why = s.auto_run_target()
+
+        assert row is None
         assert "Every managed account is at its limit" in why
-        assert "the nearest reset is at" in why
+        assert "Nothing was launched" in why
 
-    def test_no_readable_usage_at_all_is_a_refusal(self, temp_home: Path):
-        s = self._three(temp_home)
+    def test_the_promised_reset_is_the_last_spent_window(
+        self, temp_home: Path, monkeypatch
+    ):
+        """7d at 100% (reset in 72 h) binds, even though 5h at 5% resets in an
+        hour: the account is not usable again until the 7d window turns."""
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        weekly = (now + timedelta(hours=72)).isoformat()
+        hourly = (now + timedelta(hours=1)).isoformat()
+        usage = {
+            "five_hour": {"pct": 5.0, "resets_at": hourly},
+            "seven_day": {"pct": 100.0, "resets_at": weekly},
+        }
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {"a@example.com": usage},
+            answers={},
+        )
         self._make_live(temp_home, "a@example.com", 1)
-        usage = {"1": None, "2": None, "3": None}
 
-        with patch.object(s, "_usage_by_account", return_value=usage):
-            number, why = s.auto_run_target()
+        row, why = s.auto_run_target()
 
-        assert number is None
+        assert row is None
+        expected = oauth.reset_clock_string(
+            datetime.fromisoformat(weekly), datetime.now(timezone.utc)
+        )
+        assert f"the nearest reset is at {expected}" in why
+
+    def test_no_readable_usage_at_all_is_a_refusal(
+        self, temp_home: Path, monkeypatch
+    ):
+        clock = _FakeClock()
+        s, _endpoint = self._three(temp_home, monkeypatch, clock, {})
+        self._make_live(temp_home, "a@example.com", 1)
+
+        row, why = s.auto_run_target()
+
+        assert row is None
         assert "remaining quota could be read" in why
 
-    def test_disabled_and_api_key_slots_are_passed_over(self, temp_home: Path):
+    def test_disabled_and_api_key_slots_are_passed_over(
+        self, temp_home: Path, monkeypatch
+    ):
         """A disabled slot is out of rotation, and `cswap run` refuses an
         API-key account, so neither may be nominated."""
-        s = self._three(temp_home)
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(95),
+                "b@example.com": self._usage(0),
+                "c@example.com": self._usage(0),
+            },
+            answers={},
+        )
         self._make_live(temp_home, "a@example.com", 1)
         data = s._get_sequence_data()
         data["accounts"]["2"]["disabled"] = True
-        s._write_json(s.sequence_file, data)
-        self._seed(s, 3, "c@example.com")
-        data = s._get_sequence_data()
         data["accounts"]["3"]["kind"] = "api_key"
         s._write_json(s.sequence_file, data)
-        usage = {"1": self._usage(95), "2": self._usage(0), "3": self._usage(0)}
 
-        with patch.object(s, "_usage_by_account", return_value=usage):
-            assert s.auto_run_target() == ("1", "best")
+        row, _why = s.auto_run_target()
 
-    def test_model_windows_are_folded_in(self, temp_home: Path):
+        assert row is not None and row[0] == 1
+
+    def test_model_windows_are_folded_in(self, temp_home: Path, monkeypatch):
         """`autoswitch.model` is the only model list a launch reads: an
         account whose named model window is spent is not the best one."""
-        s = self._three(temp_home)
-        self._make_live(temp_home, "a@example.com", 1)
-        set_setting(s.backup_dir, "autoswitch.model", "Fable")
+        s0 = self._setup(temp_home)
+        set_setting(s0.backup_dir, "autoswitch.model", "Fable")
 
         def scoped(fable_pct: float) -> dict:
             return {
@@ -7108,16 +7359,30 @@ class TestAutoRunTarget:
                 "scoped": [{"name": "Fable", "pct": fable_pct}],
             }
 
-        usage = {"1": scoped(95.0), "2": self._usage(40), "3": scoped(10.0)}
-        with patch.object(s, "_usage_by_account", return_value=usage):
-            assert s.auto_run_target() == ("3", "better")
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": scoped(95.0),
+                "b@example.com": self._usage(40),
+                "c@example.com": scoped(10.0),
+            },
+            answers={},
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+
+        row, _why = s.auto_run_target()
+
+        assert row is not None and row[0] == 3
 
     def test_no_accounts_managed_is_a_refusal(self, temp_home: Path):
         s = self._setup(temp_home)
 
-        number, why = s.auto_run_target()
+        row, why = s.auto_run_target()
 
-        assert number is None
+        assert row is None
         assert "No accounts are managed yet" in why
 
     def test_nothing_launchable_is_a_refusal(self, temp_home: Path):
@@ -7134,11 +7399,124 @@ class TestAutoRunTarget:
         }
         s._write_json(s.sequence_file, data)
 
-        number, why = s.auto_run_target()
+        row, why = s.auto_run_target()
 
-        assert number is None
+        assert row is None
         assert "No managed account can be launched" in why
 
+
+class TestAutoRunRateLimitMark:
+    """A ``StopFailure`` report outranks a reading older than it.
+
+    Claude Code tells cswap when the server refused it on the rate limit
+    (``cswap run --auto`` passes the hook). That is proof the account's stored
+    reading is obsolete — whatever headroom it shows — until a newer one is
+    fetched.
+    """
+
+    _setup = TestAutoRunTarget._setup
+    _seed = TestAutoRunTarget._seed
+    _make_live = TestAutoRunTarget._make_live
+    _usage = staticmethod(TestAutoRunTarget._usage)
+    _three = TestAutoRunTarget._three
+    _stored = TestAutoRunTarget._stored
+    _three_readings = TestAutoRunTarget._three_readings
+
+    def test_a_marked_account_yields_to_one_with_quota(
+        self, temp_home: Path, monkeypatch
+    ):
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(30),
+                "b@example.com": self._usage(60),
+            },
+            answers={},
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+        clock.now += 1  # the session that was refused ran after that reading
+        s.record_stop_failure("a@example.com", "")
+
+        row, _why = s.auto_run_target()
+
+        assert row is not None and row[1] == "b@example.com"
+
+    def test_a_newer_reading_clears_the_mark(self, temp_home: Path, monkeypatch):
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(30),
+                "b@example.com": self._usage(60),
+            },
+            answers={},
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+        clock.now += 1
+        s.record_stop_failure("a@example.com", "")
+        assert s._stop_failure_marks()
+        # The limit reset and a fresh reading arrived: newer evidence.
+        clock.now += 600
+        self._stored(
+            s, clock, 1, "a@example.com", self._usage(5), age_s=0
+        )
+        self._stored(
+            s, clock, 2, "b@example.com", self._usage(60), age_s=0
+        )
+
+        row, _why = s.auto_run_target()
+
+        assert row is not None and row[1] == "a@example.com"
+
+    def test_only_marked_accounts_launch_the_best_of_them(
+        self, temp_home: Path, monkeypatch
+    ):
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(30),
+                "b@example.com": self._usage(60),
+            },
+            answers={},
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+        clock.now += 1
+        for email in ("a@example.com", "b@example.com"):
+            s.record_stop_failure(email, "")
+
+        row, _why = s.auto_run_target()
+
+        assert row is not None and row[1] == "a@example.com"
+
+    def test_the_mark_is_stored_by_account_not_by_slot(
+        self, temp_home: Path, monkeypatch
+    ):
+        clock = _FakeClock()
+        s, _endpoint = self._three_readings(
+            temp_home,
+            monkeypatch,
+            clock,
+            {
+                "a@example.com": self._usage(30),
+                "b@example.com": self._usage(60),
+            },
+            answers={},
+        )
+        self._make_live(temp_home, "a@example.com", 1)
+        clock.now += 1
+        s.record_stop_failure("a@example.com", "org-1")
+
+        # The key is the account, so a `swap` that renumbers slots cannot move
+        # the mark onto the account that took the slot.
+        assert s._stop_failure_marks() == {("a@example.com", "org-1"): clock.now}
 
 class TestClaudeCodeLockCooperation:
     """_perform_switch must hold Claude Code's own advisory locks
