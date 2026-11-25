@@ -25,6 +25,7 @@ from claude_swap import fsutil
 from claude_swap import macos_keychain
 from claude_swap import oauth
 from claude_swap import session as session_mod
+from claude_swap import switcher as switcher_mod
 from claude_swap import wrapper
 from claude_swap.credentials import CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE
 from claude_swap.exceptions import (
@@ -2411,6 +2412,129 @@ class TestTheLaunchTakesTheAccountsProxy:
 
         with pytest.raises(SessionError, match="changed while its exit"):
             manager.exec_default(["--resume"], primary_profile=primary_profile)
+
+    def test_the_final_check_waits_for_a_switch_that_holds_the_lock(
+        self, manager, capture_exec, monkeypatch
+    ):
+        """A ``switch`` is invisible halfway through, and the re-check waits.
+
+        A switch writes the live credentials first and the ``.claude.json``
+        naming them second, both under ``lock_file``. A re-check landing in
+        between sees the outgoing login in its old slot, so without the lock it
+        would confirm a launch that in fact runs the incoming account's
+        credentials through the outgoing login's route. Here account 1 is the
+        login and the launch's snapshot; the switch to account 2 is held after
+        its credential write until the launch has asked for the lock.
+        """
+        switcher = manager.switcher
+        switcher.set_account_proxy("1", "http://127.0.0.1:3128")
+        monkeypatch.setattr(
+            account_proxy,
+            "probe",
+            lambda route, timeout=account_proxy.PROBE_TIMEOUT_S: None,
+        )
+        _default_login_is("account1@example.com", "org-uuid-1")
+
+        executed: list[list[str]] = []
+        monkeypatch.setattr(
+            session_mod.SessionManager,
+            "_exec",
+            lambda self, binary, argv, env: executed.append(list(argv)),
+        )
+
+        # The switch pauses under its locks between the two writes.
+        credentials_written = threading.Event()
+        switch_may_finish = threading.Event()
+        real_write_credentials = ClaudeAccountSwitcher._write_credentials
+
+        def write_credentials_then_pause(self, creds):
+            real_write_credentials(self, creds)
+            credentials_written.set()
+            switch_may_finish.wait(10)
+
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "_write_credentials", write_credentials_then_pause
+        )
+
+        # A readiness signal for the re-check's own lock request. The switch's
+        # acquisition comes before the credential write, so only the re-check
+        # signals; while the switch holds the lock it cannot get in.
+        checking = threading.Event()
+        real_lock = switcher_mod.FileLock
+
+        class SignallingLock(real_lock):
+            def acquire(self, timeout=None):
+                if credentials_written.is_set():
+                    checking.set()
+                return super().acquire(timeout)
+
+        monkeypatch.setattr(switcher_mod, "FileLock", SignallingLock)
+
+        switch_errors: list[BaseException] = []
+
+        def run_switch():
+            try:
+                switcher.switch_to(ACCOUNT_NUM, force=True)
+            except BaseException as e:  # noqa: BLE001 - reported below
+                switch_errors.append(e)
+
+        def run_launch():
+            try:
+                manager.exec_default(["--resume"])
+            except BaseException as e:  # noqa: BLE001 - reported below
+                switch_errors.append(e)
+
+        switch_thread = threading.Thread(target=run_switch, daemon=True)
+        switch_thread.start()
+        assert credentials_written.wait(10), "the switch never wrote credentials"
+
+        launch_thread = threading.Thread(target=run_launch, daemon=True)
+        launch_thread.start()
+        assert checking.wait(10), "the re-check never asked for the lock"
+        # The switch still holds the lock: the launch waits, it did not run.
+        assert launch_thread.is_alive()
+        assert executed == []
+
+        switch_may_finish.set()
+        switch_thread.join(10)
+        assert not switch_thread.is_alive()
+        assert switch_errors == []
+
+        # Released: the re-check now reads the login the switch wrote and
+        # refuses before _exec, which never saw a launch either.
+        launch_thread.join(10)
+        assert not launch_thread.is_alive()
+        assert len(switch_errors) == 1
+        assert isinstance(switch_errors[0], SessionError)
+        assert "changed while its exit" in str(switch_errors[0])
+        assert executed == []
+
+    def test_a_lock_that_cannot_be_taken_refuses_the_launch(
+        self, manager, capture_exec, monkeypatch
+    ):
+        """Fail closed: no lock, no confirmation, no launch."""
+        switcher = manager.switcher
+        _default_login_is(ACCOUNT_EMAIL, ORG_UUID)
+        login = switcher.default_login()
+        assert login is not None
+
+        # flock is per open file description, so a second handle in this test
+        # conflicts with the one the re-check would take, as a switch in
+        # another process would. A short timeout keeps the wait to a moment.
+        held = FileLock(switcher.lock_file)
+        assert held.acquire()
+        real_lock = switcher_mod.FileLock
+        monkeypatch.setattr(
+            switcher_mod,
+            "FileLock",
+            lambda path: real_lock(path, timeout=0.05),
+        )
+        try:
+            assert not switcher.default_login_still_holds(login)
+            with pytest.raises(SessionError, match="changed while its exit"):
+                manager.exec_default(["--resume"])
+        finally:
+            held.release()
 
     def test_an_account_without_a_proxy_keeps_what_it_inherited(
         self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,

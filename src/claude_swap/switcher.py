@@ -1452,13 +1452,29 @@ class ClaudeAccountSwitcher:
         account. Either would run claude through a route and a rule that no
         longer belong to what runs. ``None`` pins "no login", so a login that
         appeared meanwhile is a change too.
+
+        The read runs under ``self.lock_file``, the lock a ``switch`` holds for
+        its whole mutation. A switch writes the live credentials first and the
+        ``.claude.json`` naming them second, so an unlocked read landing between
+        the two still sees the outgoing login in its old slot while the incoming
+        account's credentials are already live -- and would let the launch run
+        them through the outgoing login's route and rule. Under the lock the
+        read sees one side of the switch or the other, never its middle. Only
+        local reads happen here (no network under a lock), and the lock is
+        released before ``_exec`` hands the terminal over. A lock that cannot be
+        taken in time is a refusal (``False``), the same answer as a login that
+        changed: fail closed, launch nothing.
         """
-        identity = self._default_login_identity(primary_profile)
-        if identity != (None if login is None else login.identity):
+        try:
+            with FileLock(self.lock_file):
+                identity = self._default_login_identity(primary_profile)
+                if identity != (None if login is None else login.identity):
+                    return False
+                if login is None or login.slot is None:
+                    return True
+                return self._slot_holding(*login.identity) == login.slot
+        except LockError:
             return False
-        if login is None or login.slot is None:
-            return True
-        return self._slot_holding(*login.identity) == login.slot
 
     def _default_login_identity(
         self, primary_profile: bool
