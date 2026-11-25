@@ -2426,6 +2426,68 @@ class TestProxyCommand:
         assert "secret" not in err and "3129" not in err
         assert "invalid int value: '<URL>'" in err
 
+    @pytest.mark.parametrize("flag", ["--pr", "--pro", "--prox"])
+    def test_add_with_an_abbreviated_proxy_flag_is_not_echoed(
+        self, temp_home, capsys, flag,
+    ):
+        """argparse expands any unambiguous prefix of ``--proxy`` before it
+        parses, so each of these takes a proxy value as well; the gate that
+        turns redaction on matched only the full spelling, and a stray URL was
+        echoed."""
+        with patch("os.geteuid", return_value=1000, create=True):
+            for given in (
+                [flag, "http://user:fictional-marker@127.0.0.1:3128"],
+                [f"{flag}=http://user:fictional-marker@127.0.0.1:3128"],
+            ):
+                with pytest.raises(SystemExit) as exc:
+                    with patch.object(sys, "argv", [
+                        "claude-swap", "add", *given,
+                        "http://user:other-fictional-marker@127.0.0.1:3129",
+                    ]):
+                        cli.main()
+                assert exc.value.code == 2
+                err = capsys.readouterr().err
+                assert "fictional-marker" not in err
+
+    @pytest.mark.parametrize("form", ["separate", "attached"])
+    def test_add_with_a_password_holding_a_space_is_not_echoed(
+        self, temp_home, capsys, form,
+    ):
+        """A password is arbitrary text: in a ``--slot`` value holding a URL
+        with a space in its password, the URL pattern stopped at the space and
+        printed the rest of the password."""
+        url = "http://user:first half-fictional-marker@127.0.0.1:3128"
+        slot = ["--slot", url] if form == "separate" else [f"--slot={url}"]
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                with patch.object(sys, "argv", [
+                    "claude-swap", "add", "--proxy",
+                    "http://user:proxy-password@127.0.0.1:3128", *slot,
+                ]):
+                    cli.main()
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "fictional-marker" not in err
+        assert "proxy-password" not in err
+
+    def test_a_stray_proxy_argument_holding_a_space_is_not_echoed(
+        self, temp_home, capsys,
+    ):
+        """The same value as a stray positional reaches ``unrecognized
+        arguments`` joined with spaces, with no quoting to bound it."""
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                with patch.object(sys, "argv", [
+                    "claude-swap", "add", "--proxy",
+                    "http://user:proxy-password@127.0.0.1:3128",
+                    "http://user:first half-fictional-marker@127.0.0.1:3129",
+                ]):
+                    cli.main()
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "fictional-marker" not in err
+        assert "proxy-password" not in err
+
     def test_an_unknown_flag_is_not_echoed_either(self, temp_home, capsys):
         self._seeded_switcher_env(temp_home)
         with patch("os.geteuid", return_value=1000, create=True):

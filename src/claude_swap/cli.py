@@ -637,20 +637,39 @@ class _DiagnosticsParser(argparse.ArgumentParser):
     shape it refuses: a value attached to a boolean flag
     (``--unset=http://user:pass@host``), a second positional, a ``--slot`` that
     failed its integer conversion, an abbreviated flag. Redacting at ``error``
-    covers all of them from one place instead of enumerating the shapes.
+    covers all of them from one place instead of enumerating the shapes; the
+    whole tokens of the command line are dropped too, because a password may
+    hold a space and the URL pattern ends at one.
     """
 
     redact_urls = False
+    #: The tokens of this command line, captured by :meth:`parse_args`.
+    argv: tuple[str, ...] = ()
+
+    def parse_args(self, args=None, namespace=None):
+        self.argv = tuple(sys.argv[1:] if args is None else args)
+        return super().parse_args(args, namespace)
 
     def error(self, message: str) -> None:
         if self.redact_urls:
-            message = account_proxy.redact_urls(message)
+            message = account_proxy.redact_urls(message, self.argv)
         super().error(message)
+
+
+#: Every spelling argparse accepts for the main parser's ``--proxy``: it
+#: expands any unambiguous prefix of a long option. ``--purge`` is the only
+#: other option starting with ``--p``, so ``--p`` alone is refused as
+#: ambiguous, while ``--pr``, ``--pro`` and ``--prox`` reach ``--proxy``.
+_PROXY_FLAGS = ("--proxy", "--prox", "--pro", "--pr")
 
 
 def _carries_proxy(argv: list[str]) -> bool:
     """Whether this invocation gives a proxy URL, by flag or ``--proxy=URL``."""
-    return any(a == "--proxy" or a.startswith("--proxy=") for a in argv)
+    return any(
+        a == flag or a.startswith(flag + "=")
+        for a in argv
+        for flag in _PROXY_FLAGS
+    )
 
 
 def _proxy_command(argv: list[str]) -> None:

@@ -51,7 +51,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 #: The ``sequence.json`` account field. Absent means "direct", which is how
@@ -339,14 +339,24 @@ _URL_SHAPED = re.compile(r"\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s'\"]+")
 _USERINFO_SHAPED = re.compile(r"\b[^\s:/@'\"]+:[^\s/@'\"]+@[^\s'\"]+")
 
 
-def redact_urls(text: str) -> str:
+def redact_urls(text: str, values: Iterable[str] = ()) -> str:
     """``text`` with every URL-shaped run replaced by a static ``<URL>``.
 
     For the diagnostics of the two commands that accept a proxy URL: argparse
     formats the offending value into its own errors (an extra positional, a
     value attached to a flag, a failed integer conversion), and the identifier
     message does too — any of which may be ``http://user:password@host``.
+
+    ``values`` are the command line's own tokens. A password is arbitrary
+    text, spaces included, and the patterns below end at the first space, so a
+    token that is itself URL-shaped is removed whole first — including the
+    part after ``=``, which is the shape argparse echoes for a value attached
+    to a flag. Tokens that are not URL-shaped are left alone.
     """
+    for value in values:
+        for token in (value, value.partition("=")[2]):
+            if _URL_SHAPED.match(token) or _USERINFO_SHAPED.search(token):
+                text = text.replace(token, "<URL>")
     return _USERINFO_SHAPED.sub("<URL>", _URL_SHAPED.sub("<URL>", text))
 
 
