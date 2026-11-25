@@ -50,7 +50,7 @@ jobs:
   # the name branch protection matches on, and renaming it silently drops the
   # required check.
   macos-keychain:
-    runs-on: macos-latest
+    runs-on: macos-15
 
     steps:
       - uses: actions/checkout@v4
