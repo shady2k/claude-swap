@@ -15,6 +15,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from claude_swap import account_proxy
 from claude_swap.printer import warning as print_warning
 
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
@@ -32,6 +33,8 @@ SETUP_TOKEN_SCOPES = ("user:inference",)
 # sooner; once a model is gone the probe fails with http-404 and the account
 # shows its usage as unavailable until the id is updated.
 USAGE_PROBE_URL = "https://api.anthropic.com/v1/messages"
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 USAGE_PROBE_MODEL = "claude-haiku-5-5"
 USAGE_PROBE_API_VERSION = "2023-06-01"
 # OAuth inference requests are only accepted with Claude Code's system prompt.
@@ -263,13 +266,18 @@ class RefreshOutcome:
 
 
 def try_refresh_oauth_credentials(
-    credentials: str, timeout_s: float = 10.0
+    credentials: str, timeout_s: float = 10.0,
+    route: account_proxy.ProxyRoute | None = None,
 ) -> RefreshOutcome:
     """Refresh an OAuth access token via direct token endpoint POST.
 
     ``timeout_s`` bounds the network exchange. Callers that hold locks other
     processes contend for should pass a budget comfortably inside the
     contenders' acquire timeout (see ``_fetch_active_usage``).
+
+    ``route`` is the account's pinned proxy (see ``account_proxy``), or None
+    for an account without one. A route failure is ``transient``: nothing was
+    necessarily spent, and the next pass retries — through the same proxy.
     """
     # ``no_refresh_token`` is a PERMANENT verdict (it strikes at
     # AUTH_DEAD_STRIKES=1), so it demands a structurally complete OAuth dict
@@ -302,7 +310,7 @@ def try_refresh_oauth_credentials(
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        with account_proxy.send(req, timeout_s, route) as resp:
             resp_data = json.loads(resp.read().decode())
 
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -449,7 +457,9 @@ def refresh_oauth_credentials(credentials: str) -> str | None:
     return try_refresh_oauth_credentials(credentials).credentials
 
 
-def fetch_oauth_profile(access_token: str) -> dict | None:
+def fetch_oauth_profile(
+    access_token: str, route: account_proxy.ProxyRoute | None = None
+) -> dict | None:
     """Resolve an OAuth access token to its account identity, or None.
 
     ``GET /api/oauth/profile`` answers the one question the credential bytes
@@ -465,16 +475,20 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
     response *does* resolve, and classification decides whether such partial
     evidence is sufficient for each decision. Must not be called while any
     credential/config lock is held (network under locks is forbidden).
+
+    ``route`` is the proxy of the slot the token is *believed* to belong to
+    (see ``account_proxy``); the caller decides that, and the answer is
+    advisory either way — a proxied route that fails leaves the ownership
+    question unresolved, exactly like being offline.
     """
-    url = "https://api.anthropic.com/api/oauth/profile"
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
         "User-Agent": "claude-swap/1.0",
     }
-    req = urllib.request.Request(url, headers=headers)
+    req = urllib.request.Request(PROFILE_URL, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with account_proxy.send(req, 5, route) as resp:
             data = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         if e.code == 401:
@@ -581,16 +595,17 @@ def fresh_reset_strings(window: dict) -> tuple[str, str] | None:
     return None
 
 
-def request_usage_data(access_token: str) -> dict:
+def request_usage_data(
+    access_token: str, route: account_proxy.ProxyRoute | None = None
+) -> dict:
     """Request raw utilization data from the Anthropic usage API."""
-    url = "https://api.anthropic.com/api/oauth/usage"
     headers = {
         "Authorization": f"Bearer {access_token}",
         "anthropic-beta": OAUTH_BETA_HEADER,
         "User-Agent": "claude-swap/1.0",
     }
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=5) as resp:
+    req = urllib.request.Request(USAGE_URL, headers=headers)
+    with account_proxy.send(req, 5, route) as resp:
         return json.loads(resp.read().decode())
 
 
@@ -720,7 +735,9 @@ def _scoped_limit(
     return limit
 
 
-def request_usage_via_probe(access_token: str) -> dict:
+def request_usage_via_probe(
+    access_token: str, route: account_proxy.ProxyRoute | None = None
+) -> dict:
     """Read utilization from the rate-limit headers of a minimal model request.
 
     Every ``/v1/messages`` response carries the account's unified 5h/7d
@@ -741,8 +758,8 @@ def request_usage_via_probe(access_token: str) -> dict:
     with its Retry-After.
     """
     try:
-        with urllib.request.urlopen(
-            _probe_request(access_token, USAGE_PROBE_MODEL), timeout=10
+        with account_proxy.send(
+            _probe_request(access_token, USAGE_PROBE_MODEL), 10, route
         ) as resp:
             return parse_unified_ratelimit_headers(resp.headers)
     except urllib.error.HTTPError as e:
@@ -781,7 +798,8 @@ def _probe_request(access_token: str, model: str) -> urllib.request.Request:
 
 
 def _add_scoped_limits(
-    data: dict, access_token: str, last_usage: dict | None
+    data: dict, access_token: str, last_usage: dict | None,
+    route: account_proxy.ProxyRoute | None = None,
 ) -> None:
     """Add to ``data`` each per-model weekly bucket the main probe lacks.
 
@@ -819,7 +837,7 @@ def _add_scoped_limits(
                 model, limit["probe_after"],
             )
         elif "rejected" not in data:
-            limit = _probe_scoped_limit(access_token, model, prefix, now)
+            limit = _probe_scoped_limit(access_token, model, prefix, now, route)
         if limit is not None:
             have.add(name)
             limits.append(limit)
@@ -854,7 +872,8 @@ def _paused_scoped_limit(
 
 
 def _probe_scoped_limit(
-    access_token: str, model: str, prefix: str, now: datetime
+    access_token: str, model: str, prefix: str, now: datetime,
+    route: account_proxy.ProxyRoute | None = None,
 ) -> dict | None:
     """One 1-token request to ``model``, read as its weekly bucket.
 
@@ -864,8 +883,8 @@ def _probe_scoped_limit(
     access to the model, a network error) says nothing about it: None.
     """
     try:
-        with urllib.request.urlopen(
-            _probe_request(access_token, model), timeout=10
+        with account_proxy.send(
+            _probe_request(access_token, model), 10, route
         ) as resp:
             return _scoped_limit_from_headers(resp.headers, prefix, None, now)
     except urllib.error.HTTPError as e:
@@ -955,6 +974,7 @@ def _usage_from_probe(
     context: str,
     scoped_probe: bool = False,
     last_usage: dict | None = None,
+    route: account_proxy.ProxyRoute | None = None,
 ) -> "UsageOutcome":
     """Usage from the header probe, classified like an endpoint fetch.
 
@@ -972,9 +992,9 @@ def _usage_from_probe(
     not among those and stay.
     """
     try:
-        data = request_usage_via_probe(access_token)
+        data = request_usage_via_probe(access_token, route)
         if scoped_probe:
-            _add_scoped_limits(data, access_token, last_usage)
+            _add_scoped_limits(data, access_token, last_usage, route)
     except Exception as e:
         kind, retry_after = _classify_usage_error(e)
         cause = kind if retry_after is None else f"{kind}, retry-after {retry_after:.0f}s"
@@ -1077,6 +1097,10 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     ``retry_after_s`` is the parsed ``Retry-After`` header when the server sent
     one (seconds form only — the HTTP-date form is rare enough to ignore).
     """
+    if isinstance(e, account_proxy.ProxyRouteError):
+        # A request that never left on its route (unusable setting, refused
+        # credentials, a redirect). No retry may fall back to a direct one.
+        return e.kind, None
     if isinstance(e, urllib.error.HTTPError):
         retry_after = None
         raw = e.headers.get("Retry-After") if e.headers else None
@@ -1366,7 +1390,7 @@ def fetch_usage(access_token: str) -> dict | None:
 # a grant the live login also holds; the retry would be declined the same way.
 _DETERMINISTIC_REFRESH_ERRORS = (
     "store-unmirrored", "invalid_client", "consume-busy", "stash-unreadable",
-    "live-login",
+    "live-login", "slot-moved",
 )
 
 
@@ -1380,6 +1404,7 @@ def try_fetch_usage_for_account(
     header_probe: bool = False,
     scoped_probe: bool = False,
     last_usage: dict | None = None,
+    route: account_proxy.ProxyRoute | None = None,
 ) -> UsageOutcome:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
@@ -1398,6 +1423,10 @@ def try_fetch_usage_for_account(
     the ``"setup-token"`` error and no request is sent. ``scoped_probe`` and
     ``last_usage`` (the account's stored reading) only shape that probe, see
     :func:`_usage_from_probe`.
+
+    ``route`` is the account's pinned proxy (``account_proxy``). It follows the
+    account through the refresh, the retry after a 401 and the header probe,
+    so no branch of this function can reach the network directly.
     """
     context = f"for account {account_num}"  # no email: paste-safe for public issues
     oauth = extract_oauth_data(credentials)
@@ -1408,7 +1437,7 @@ def try_fetch_usage_for_account(
     if is_setup_token(oauth):
         if header_probe:
             return _usage_from_probe(
-                access_token, context, scoped_probe, last_usage
+                access_token, context, scoped_probe, last_usage, route
             )
         return UsageOutcome(None, error="setup-token")
 
@@ -1422,7 +1451,7 @@ def try_fetch_usage_for_account(
         if refresh_via is not None:
             refresh = refresh_via(account_num, email, working_credentials)
         else:
-            refresh = try_refresh_oauth_credentials(working_credentials)
+            refresh = try_refresh_oauth_credentials(working_credentials, route=route)
         if refresh.credentials:
             working_credentials = refresh.credentials
             if refresh_via is None:
@@ -1456,7 +1485,7 @@ def try_fetch_usage_for_account(
         # the 401 path below retries the refresh.
 
     try:
-        data = request_usage_data(access_token)
+        data = request_usage_data(access_token, route)
         return UsageOutcome(build_usage_result(data))
     except urllib.error.HTTPError as e:
         kind, retry_after = _classify_usage_error(e)
@@ -1477,7 +1506,7 @@ def try_fetch_usage_for_account(
         if refresh_via is not None:
             refresh = refresh_via(account_num, email, working_credentials)
         else:
-            refresh = try_refresh_oauth_credentials(working_credentials)
+            refresh = try_refresh_oauth_credentials(working_credentials, route=route)
         if not refresh.credentials:
             _log_usage_failure(context, e, kind)
             dead = refresh.error in ("invalid_grant", "no_refresh_token")
@@ -1505,7 +1534,7 @@ def try_fetch_usage_for_account(
             return UsageOutcome(None, error="refresh-failed")
 
         try:
-            data = request_usage_data(new_token)
+            data = request_usage_data(new_token, route)
             return UsageOutcome(build_usage_result(data))
         except Exception as retry_error:
             kind, retry_after = _classify_usage_error(retry_error)

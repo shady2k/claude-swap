@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from claude_swap import __version__
+from claude_swap import __version__, account_proxy
 from claude_swap.credentials import looks_like_api_key
 from claude_swap.exceptions import (
     ConfigError,
@@ -23,6 +23,7 @@ from claude_swap.exceptions import (
 from claude_swap.fsutil import atomic_write_text
 from claude_swap.json_output import SCHEMA_VERSION as JSON_SCHEMA_VERSION
 from claude_swap.json_output import usage_from_json
+from claude_swap.locking import FileLock
 from claude_swap.models import Platform, get_timestamp, normalize_alias
 from claude_swap.oauth import credential_fingerprint
 
@@ -154,6 +155,30 @@ def _slim_credentials(creds_obj: dict) -> dict:
     return {"claudeAiOauth": creds_obj["claudeAiOauth"]}
 
 
+def _remind_about_proxies(
+    accounts_map: dict[str, Any], numbers: list[int]
+) -> None:
+    """Tell the operator which exported accounts had a proxy (masked).
+
+    The export itself carries none, so the target machine's requests would go
+    direct unless someone configures it. Printed for both destinations,
+    including stdout-as-JSON, because stderr is not the payload.
+    """
+    rows = [
+        (str(num), account_proxy.describe(accounts_map.get(str(num))))
+        for num in numbers
+    ]
+    rows = [(num, described) for num, described in rows if described]
+    if not rows:
+        return
+    listed = "; ".join(f"Account-{num} ({described})" for num, described in rows)
+    _eprint(
+        f"Note: {listed} use{'s' if len(rows) == 1 else ''} a proxy, which is "
+        "not exported. On the target machine, set it there with: "
+        "cswap proxy <num> <url>"
+    )
+
+
 def export_accounts(
     switcher: ClaudeAccountSwitcher,
     destination: str,
@@ -170,6 +195,12 @@ def export_accounts(
             entire credential object per account (same-PC backup). Default
             False writes only oauthAccount and the account's own
             claudeAiOauth login.
+
+    An account's proxy is never exported, in either mode: the URL can carry a
+    password, the target machine may not reach that proxy, and an import that
+    silently restored one would send another machine's requests through it. The
+    reminder printed to stderr names the accounts that had one so the target
+    can be configured deliberately (``cswap proxy <num> <url>``).
 
     Raises:
         TransferError: malformed/missing data, unknown account.
@@ -299,11 +330,15 @@ def export_accounts(
         sys.stdout.write(serialized)
         sys.stdout.write("\n")
         sys.stdout.flush()
+        _remind_about_proxies(
+            accounts_map, [a["number"] for a in accounts_payload]
+        )
         return
 
     out_path = Path(destination).expanduser()
     _atomic_write_file(out_path, serialized + "\n")
     _eprint(f"Exported {len(accounts_payload)} account(s) to {out_path}")
+    _remind_about_proxies(accounts_map, [a["number"] for a in accounts_payload])
 
 
 def import_accounts(
@@ -571,25 +606,52 @@ def import_accounts(
             [target_num], {target_num: (entry["email"], entry["org_uuid"])}
         )
 
-        data.setdefault("accounts", {})
-        data.setdefault("sequence", [])
-        new_record = {
-            "email": entry["email"],
-            "uuid": entry["uuid"],
-            "organizationUuid": entry["org_uuid"],
-            "organizationName": entry["org_name"],
-            "added": entry["added"],
-        }
-        if entry["kind"] == "api_key":
-            new_record["kind"] = "api_key"
-        if entry.get("alias"):
-            new_record["alias"] = entry["alias"]
-        data["accounts"][target_num] = new_record
-        if int(target_num) not in data["sequence"]:
-            data["sequence"].append(int(target_num))
-            data["sequence"].sort()
-        data["lastUpdated"] = get_timestamp()
-        switcher._write_json(switcher.sequence_file, data)
+        # The export never carries a proxy, so an import must not clear the
+        # one this machine holds for the same account: that setting describes
+        # THIS host's route, and the credentials being replaced do not change
+        # it. Read under the account lock from a fresh registry, for two
+        # reasons: another command's proxy write must survive this whole-file
+        # write, and the value is copied by KEY PRESENCE — an explicit null is
+        # damage this import carries over (so it keeps failing closed) rather
+        # than being read as "no proxy set".
+        with FileLock(switcher.lock_file):
+            data = switcher._get_sequence_data_migrated() or data
+            previous = (data.get("accounts") or {}).get(target_num) or {}
+            if previous and not switcher._record_is(
+                previous, entry["email"], entry["org_uuid"]
+            ):
+                # The slot changed hands between the credential write and this
+                # commit: another account's record must not be replaced, and
+                # its proxy must not be carried onto this one. The backups
+                # written above are keyed to this account's email and are
+                # left for it to adopt on its next slot.
+                _eprint(
+                    f"Skipped {entry['email']} (slot {target_num} changed "
+                    "owner during the import; its record was not written)"
+                )
+                skipped += 1
+                continue
+            data.setdefault("accounts", {})
+            data.setdefault("sequence", [])
+            new_record = {
+                "email": entry["email"],
+                "uuid": entry["uuid"],
+                "organizationUuid": entry["org_uuid"],
+                "organizationName": entry["org_name"],
+                "added": entry["added"],
+            }
+            if entry["kind"] == "api_key":
+                new_record["kind"] = "api_key"
+            if entry.get("alias"):
+                new_record["alias"] = entry["alias"]
+            if account_proxy.FIELD in previous:
+                new_record[account_proxy.FIELD] = previous[account_proxy.FIELD]
+            data["accounts"][target_num] = new_record
+            if int(target_num) not in data["sequence"]:
+                data["sequence"].append(int(target_num))
+                data["sequence"].sort()
+            data["lastUpdated"] = get_timestamp()
+            switcher._write_json(switcher.sequence_file, data)
 
         if is_envelope_active:
             resolved_active_slot = target_num

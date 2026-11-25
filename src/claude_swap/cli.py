@@ -9,7 +9,7 @@ import math
 import os
 import sys
 
-from claude_swap import __version__, paths, printer
+from claude_swap import __version__, account_proxy, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
 from claude_swap.models import (
@@ -623,6 +623,146 @@ Examples:
             print(f"{accent('Set alias')} '{normalized}' for Account {account_num}")
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+class _DiagnosticsParser(argparse.ArgumentParser):
+    """A parser whose errors never echo a proxy URL.
+
+    The two commands that take a proxy URL are the only ones whose arguments
+    can carry a password, and argparse formats the offending value into every
+    shape it refuses: a value attached to a boolean flag
+    (``--unset=http://user:pass@host``), a second positional, a ``--slot`` that
+    failed its integer conversion, an abbreviated flag. Redacting at ``error``
+    covers all of them from one place instead of enumerating the shapes; the
+    whole tokens of the command line are dropped too, because a password may
+    hold a space and the URL pattern ends at one.
+    """
+
+    redact_urls = False
+    #: The tokens of this command line, captured by :meth:`parse_args`.
+    argv: tuple[str, ...] = ()
+
+    def parse_args(self, args=None, namespace=None):
+        self.argv = tuple(sys.argv[1:] if args is None else args)
+        return super().parse_args(args, namespace)
+
+    def error(self, message: str) -> None:
+        if self.redact_urls:
+            message = account_proxy.redact_urls(message, self.argv)
+        super().error(message)
+
+
+#: Every spelling argparse accepts for the main parser's ``--proxy``: it
+#: expands any unambiguous prefix of a long option. ``--purge`` is the only
+#: other option starting with ``--p``, so ``--p`` alone is refused as
+#: ambiguous, while ``--pr``, ``--pro`` and ``--prox`` reach ``--proxy``.
+_PROXY_FLAGS = ("--proxy", "--prox", "--pro", "--pr")
+
+
+def _carries_proxy(argv: list[str]) -> bool:
+    """Whether this invocation gives a proxy URL, by flag or ``--proxy=URL``."""
+    return any(
+        a == flag or a.startswith(flag + "=")
+        for a in argv
+        for flag in _PROXY_FLAGS
+    )
+
+
+def _proxy_command(argv: list[str]) -> None:
+    """Handle `cswap proxy [NUM|EMAIL] [URL] [--unset]`.
+
+    With no arguments, lists every account that has a proxy, password masked.
+    Otherwise attaches (or, with --unset, removes) one account's HTTP proxy.
+    Pre-dispatched before the main parser for the same reason as `alias`: the
+    main parser's required mutually-exclusive group can't hold a positional
+    subcommand.
+
+    The URL is validated inside `set_account_proxy`, before any file is
+    touched, so a rejected value leaves `sequence.json` byte-identical. What
+    the setting does, and the cases in which it refuses to send at all, is in
+    `account_proxy`.
+    """
+    parser = _DiagnosticsParser(
+        prog="cswap proxy",
+        description=(
+            "Set, remove, or list the HTTP proxy of an account. Every request "
+            "cswap makes for that account then goes through it, and never "
+            "directly: if the proxy is unreachable, asks for credentials it "
+            "rejects, or the stored value is unusable, the request fails "
+            "instead of falling back. The rules are in `docs/proxy.md` and "
+            "the module docstring of `account_proxy`."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap proxy 2 http://127.0.0.1:3128
+  cswap proxy 2 http://user:pass@proxy.example:3128
+  cswap proxy user@example.com http://127.0.0.1:3128
+  cswap proxy 2 --unset               # back to a direct connection
+  cswap proxy                         # list accounts that use a proxy
+
+Only http:// proxies are supported; HTTPS tunnels through them (CONNECT).
+        """,
+    )
+    parser.add_argument(
+        "account",
+        nargs="?",
+        metavar="NUM|EMAIL",
+        help="Account to set (number, email, or alias). Omit to list.",
+    )
+    parser.add_argument(
+        "url",
+        nargs="?",
+        metavar="URL",
+        help="Proxy URL: http://[user:pass@]host[:port]",
+    )
+    parser.add_argument(
+        "--unset", action="store_true", help="Remove the account's proxy"
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    # Every shape argparse refuses here — an extra positional, a value attached
+    # to a boolean flag, an abbreviated flag — echoes the offending value, and
+    # on this command that value may hold a password. One redaction at the
+    # parser's ``error`` covers them all; the identifier-resolution errors
+    # below go through the same helper.
+    parser.redact_urls = True
+    args = parser.parse_args(argv)
+
+    if args.unset and args.url:
+        parser.error("--unset does not take a URL argument")
+    if args.unset and args.account is None:
+        parser.error("NUM|EMAIL is required with --unset")
+    if args.account is not None and not args.unset and args.url is None:
+        parser.error("URL is required (or pass --unset to remove the proxy)")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        if args.account is None:
+            rows = switcher.list_account_proxies()
+            if not rows:
+                print(dimmed("No account proxies set"))
+                return
+            print(bolded("Account proxies:"))
+            for num, described, email in rows:
+                print(f"  {num}: {described} {muted(f'({email})')}")
+            return
+
+        if args.unset:
+            account_num = switcher.clear_account_proxy(args.account)
+            print(f"{accent('Cleared')} proxy for Account-{account_num}")
+        else:
+            account_num, described = switcher.set_account_proxy(
+                args.account, args.url
+            )
+            print(f"{accent('Set')} proxy {described} for Account-{account_num}")
+    except ClaudeSwitchError as e:
+        error(f"Error: {account_proxy.redact_urls(str(e))}")
         sys.exit(1)
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
@@ -1475,6 +1615,9 @@ def main() -> None:
     if argv and argv[0] == "threshold":
         _threshold_command(argv[1:])
         return
+    if argv and argv[0] == "proxy":
+        _proxy_command(argv[1:])
+        return
     if argv and argv[0] == "priority":
         _priority_command(argv[1:])
         return
@@ -1496,7 +1639,7 @@ def main() -> None:
     # keeps working unchanged.
     argv = _translate_subcommand(argv)
 
-    parser = argparse.ArgumentParser(
+    parser = _DiagnosticsParser(
         prog=_prog_name(),
         usage="%(prog)s <command> [args] [options]",
         description="""Multi-Account Switcher for Claude Code
@@ -1515,6 +1658,9 @@ Commands:
   %(prog)s threshold <num|email> <pct>  set one account's switch-away point
   %(prog)s threshold <num|email> --unset  clear it (use the global default)
   %(prog)s threshold                  list the global default and overrides
+  %(prog)s proxy <num|email> <url>    send that account's requests via a proxy
+  %(prog)s proxy <num|email> --unset  remove the account's proxy
+  %(prog)s proxy                      list the accounts that use a proxy
   %(prog)s priority <num|email> <tier>  set priority (higher first; default 0)
   %(prog)s priority                   list account priorities
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
@@ -1550,6 +1696,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s list --json
   %(prog)s import-usage usage.json --hold 600  # adopt another machine's list --json
   %(prog)s add --slot 3                      # add to a specific slot
+  %(prog)s add --proxy http://127.0.0.1:3128  # add it with its own proxy
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
   %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
@@ -1627,6 +1774,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         "--alias",
         metavar="NAME",
         help="Set a short display alias for the account (use with 'add')",
+    )
+    parser.add_argument(
+        "--proxy",
+        metavar="URL",
+        help=(
+            "Set the account's HTTP proxy, through which every request cswap "
+            "makes for it goes (use with 'add'): "
+            "http://[user:pass@]host[:port]"
+        ),
     )
     parser.add_argument(
         "--force",
@@ -1801,6 +1957,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=argparse.SUPPRESS,
     )
 
+    # ``add --proxy URL`` takes the only argument of this parser that can
+    # carry a password. Every refusal argparse formats for it echoes the
+    # value — an extra positional, ``--slot=<URL>``, ``--alias=<URL>`` — so
+    # redaction is on for exactly those invocations and off otherwise.
+    parser.redact_urls = _carries_proxy(argv)
     args = parser.parse_args(argv)
 
     # No action selected: emit a clean, subcommand-oriented message rather than
@@ -1881,6 +2042,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.alias is not None and not args.add_account:
         parser.error("--alias can only be used with 'add'")
 
+    if args.proxy is not None and not args.add_account:
+        parser.error("--proxy can only be used with 'add'")
+
     if args.force and not (args.import_ or args.switch_to):
         parser.error("--force can only be used with 'import' or 'switch <num|email>'")
 
@@ -1945,7 +2109,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 sys.exit(1)
 
         if args.add_account:
-            switcher.add_account(slot=args.slot, alias=args.alias)
+            switcher.add_account(
+                slot=args.slot, alias=args.alias, proxy=args.proxy
+            )
         elif args.add_token is not None:
             switcher.add_account_from_token(
                 token=args.add_token,
@@ -2043,12 +2209,21 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 sys.exit(_menubar_foreground(switcher, service_pid, worker=worker))
             sys.exit(_menubar_start(args))
     except ClaudeSwitchError as e:
+        # `add --proxy` is the one path through this handler whose error may
+        # name a URL (an identifier that is one, a slot conflict): the same
+        # redaction the parser uses, so the value never reaches stderr or a
+        # log line.
+        message = (
+            account_proxy.redact_urls(str(e))
+            if _carries_proxy(argv)
+            else str(e)
+        )
         # In JSON mode keep stdout pure JSON: emit the structured error envelope
         # there (exit 1) instead of a red stderr line.
         if args.json:
             print(json.dumps(error_envelope(e), indent=2))
         else:
-            error(f"Error: {e}")
+            error(f"Error: {message}")
         sys.exit(1)
     except KeyboardInterrupt:
         # Route the cancellation note to stderr in JSON mode so stdout stays

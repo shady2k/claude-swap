@@ -405,7 +405,7 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
             "credential does not prove the slot is genuinely empty"
         )
         verdict = macos_switcher._static_usage_sentinel(
-            ("2", "b@example.com", None, None, False, "", None)
+            ("2", "b@example.com", None, None, False, "", None, None)
         )
         assert verdict == USAGE_KEYCHAIN_UNAVAILABLE, (
             f"sentinel says {verdict!r} — sends the user to re-add a slot "
@@ -786,7 +786,7 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
             seen["degraded"] = s._active_verdict().degraded
             return FetchRecord(error="timeout")
 
-        info = (2, "b@example.com", "", "", False, "", "")
+        info = (2, "b@example.com", "", "", False, "", "", None)
         with patch.object(s, "_fetch_account_usage", spy):
             s._run_usage_fetches([info])   # the real pool boundary
 
@@ -1125,7 +1125,7 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
         monkeypatch.setattr(_kc, "get_password", denied)
 
         verdict = s._static_usage_sentinel(
-            ("2", "b@e.com", None, None, False, "", None)
+            ("2", "b@e.com", None, None, False, "", None, None)
         )
         assert verdict == USAGE_KEYCHAIN_UNAVAILABLE, (
             f"slot 2 reported {verdict!r} while its backup sat unread in the "
@@ -1173,7 +1173,7 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
         """Same conflation on the display path."""
         macos_switcher._store._pin_file_mode(residual_cleared=True)
         verdict = macos_switcher._static_usage_sentinel(
-            ("9", "x@e.com", None, None, False, "", None)
+            ("9", "x@e.com", None, None, False, "", None, None)
         )
         assert verdict == USAGE_NO_CREDENTIALS, verdict
 

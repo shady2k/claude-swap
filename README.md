@@ -227,6 +227,9 @@ cswap priority                  # Show every account's tier
 cswap alias 2 dev               # Give an account a short alias (usable anywhere NUM|EMAIL is)
 cswap alias 2 --unset           # Remove an account's alias
 cswap alias                     # List all aliases
+cswap proxy 2 http://127.0.0.1:3128  # Send account 2's cswap requests via a proxy
+cswap proxy 2 --unset           # Remove account 2's proxy
+cswap proxy                     # List the accounts that use a proxy
 cswap move 2 1                  # Assign an account to a slot (relocates to an empty slot, swaps if taken)
 cswap swap 2 3                  # Exchange two accounts' slot numbers
 cswap unclaimed                 # List stashed credential entries (slot + why they were stashed)
@@ -336,9 +339,17 @@ cswap import backup.cswap                    # Skips accounts that already exist
 cswap import backup.cswap --force            # Overwrite existing
 ```
 
+An account's proxy is never exported, so set it again on the target machine with `cswap proxy <num> <url>` if that machine needs one.
+
 The export file is plaintext JSON and, by default, carries only each account's own login — machine-shared MCP/plugin OAuth tokens and the device token stay on the source machine (`--full` keeps everything, for same-PC backups). If you need encryption, pipe through your tool of choice (e.g. `cswap export - | gpg -c > backup.gpg`).
 
 If an imported account is the one you're currently logged in as, activate the imported credentials with `cswap switch N --force` (a plain `switch` to the current account is a safe no-op and won't touch the import).
+
+### Per-account proxy
+
+`cswap proxy <num|email> <url>` sends every request cswap makes for that account through an HTTP proxy, with no direct fallback, and `cswap add --proxy <url>` sets one while adding. A launch of that account (`cswap run`) also checks the proxy with one `CONNECT` before Claude Code starts and hands Claude Code the same proxy through `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` (and `NO_PROXY` from `run.noProxy`), so an unusable proxy refuses the launch instead of running direct. The setting follows the account through `swap`, `move` and a re-add; before rolling back to a version without proxy support, save the URLs, because that version would talk to the internet directly again. The exact rules are in [proxy.md](https://github.com/realiti4/claude-swap/blob/main/docs/proxy.md).
+
+Known risk, accepted for now: the route belongs to the slot `~/.claude.json` names. If the live login actually belongs to a *different* managed account, the ownership check cswap makes for that login travels the named slot's route — direct when that slot has no proxy. A login the check proves to be another account's is never written into a slot; when ownership cannot be determined at all (offline, a malformed reply), the switch keeps its pre-proxy behavior and reserves the slot for its stored credential instead.
 
 ### Share usage readings between machines
 
@@ -421,6 +432,7 @@ cswap add-token --email user@example.com     # optional label override
 - [docs/auto-switch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-switch.md) — the exact auto-switch rules: hysteresis margins, landing rules, per-account thresholds and tiers, polling cadence. Read it to find out why it did or didn't switch.
 - [docs/json-output.md](https://github.com/realiti4/claude-swap/blob/main/docs/json-output.md) — every field in `--json` output, including the optional ones. Read it before writing a script against `cswap list --json` or `cswap auto --json`.
 - [docs/menubar.md](https://github.com/realiti4/claude-swap/blob/main/docs/menubar.md) — how the macOS menu bar runs under launchd: start at login, the wrapper app in `/Applications`, file locations, upgrades, the Login Items switch. Read it when the icon is missing or the service misbehaves.
+- [docs/proxy.md](https://github.com/realiti4/claude-swap/blob/main/docs/proxy.md) — the per-account proxy: the URL forms, what it routes, the fail-closed cases and how they are reported, storage, export and rollback.
 
 `cswap --help` and `cswap <command> --help` document every flag.
 

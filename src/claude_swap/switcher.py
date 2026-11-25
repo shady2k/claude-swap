@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import json
 import logging
 import os
@@ -25,7 +26,7 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import oauth, pace, subscription
+from claude_swap import account_proxy, oauth, pace, subscription
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -33,6 +34,7 @@ from claude_swap.json_output import (
     USAGE_FOREIGN_CREDENTIAL,
     USAGE_KEYCHAIN_UNAVAILABLE,
     USAGE_NO_CREDENTIALS,
+    USAGE_OWNER_CHANGED,
     USAGE_RELOGIN_REQUIRED,
     USAGE_TOKEN_EXPIRED,
     account_ref,
@@ -142,6 +144,16 @@ _LOCKSTEP_RESET_TOLERANCE_S = 5.0
 # serve TTL the data is current by design (that is the polling cadence), so
 # an age note there would be permanent noise.
 _USAGE_AGE_NOTE_S = poll_policy.SERVE_TTL_S
+
+#: One account's read snapshot: ``(num, email, org_name, org_uuid, is_active,
+#: creds, alias, route)``. The route is the proxy read by the same pass as the
+#: credential and the identity, so a request made for that credential cannot
+#: pick up the route of whichever account holds the slot number later — a
+#: concurrent ``swap``/``move`` must not turn a proxied account into a direct
+#: one (see ``account_proxy``).
+AccountInfo = tuple[
+    int, str, str, str, bool, str, str, "account_proxy.ProxyRoute | None"
+]
 
 
 def _pace_marker(window: dict, fetched_at: float | None) -> str:
@@ -275,6 +287,10 @@ ERROR_NOTES = {
         "the live login is this account's, so Claude Code renews it — "
         "switch to this account to realign"
     ),
+    "slot-moved": (
+        "the account moved out of its slot before its grant was used — "
+        "no request was sent; retries next pass"
+    ),
     "oauth_not_allowed_for_organization": (
         "this account's organization does not allow OAuth sign-in (a lapsed "
         "plan or an org policy), so its usage cannot be read — renewing the "
@@ -290,7 +306,26 @@ ERROR_NOTES = {
         "setup-tokens cannot read the usage endpoint — "
         "`cswap config set usage.headerProbe true` reads it from a 1-token request"
     ),
+    account_proxy.PROXY_AUTH: (
+        "the account's proxy refused its URL credentials (HTTP 407) — "
+        "correct them with `cswap proxy <num> <url>`"
+    ),
+    account_proxy.PROXY_REDIRECT: (
+        "the account's proxy redirected instead of forwarding, and a redirect "
+        "would leave the proxy — check the proxy URL"
+    ),
+    account_proxy.PROXY_INVALID: (
+        "the account's stored proxy cannot be used — set it again with "
+        "`cswap proxy <num> <url>`, or clear it with --unset to go direct"
+    ),
 }
+
+#: Reason carried by a route whose owner could not be confirmed because the
+#: account lock was taken by another cswap process. Such a row must not send.
+_ROUTE_UNCONFIRMED = (
+    "the account lock was held by another cswap process, so this account's "
+    "owner and route are not confirmed"
+)
 
 SENTINEL_NOTES = {
     USAGE_TOKEN_EXPIRED: "token expired — refresh deferred this pass; retries automatically",
@@ -298,6 +333,9 @@ SENTINEL_NOTES = {
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
     USAGE_RELOGIN_REQUIRED: "re-login needed — refresh token dead; log in with Claude Code, then run: cswap add",
+    USAGE_OWNER_CHANGED: (
+        "the account moved between reads — no request sent; retries next pass"
+    ),
 }
 
 
@@ -508,6 +546,10 @@ class ClaudeAccountSwitcher:
         self._probe_verdicts: dict[
             tuple[str, str, str, str, str, str], bool
         ] = {}
+
+        # Managed accounts in the last snapshot, for `status`'s tag suffix and
+        # its account total — the same capture as the rows, no extra read.
+        self._snapshot_records: dict[str, dict] = {}
 
         # Run any pending one-time data migrations (e.g. relocating Windows
         # backup credentials out of Credential Manager into files). Imported
@@ -1099,6 +1141,48 @@ class ClaudeAccountSwitcher:
             record.get("organizationUuid", "") or "",
         )
 
+    def account_route(
+        self, account_num: str, email: str, org_uuid: str
+    ) -> "account_proxy.ProxyRoute | None":
+        """The proxy route pinned to one account, or ``None`` without a proxy.
+
+        Read from ``sequence.json`` and accepted only while the record still
+        names this account, so a slot a concurrent ``swap``/``move`` has
+        already given to another account yields an unusable route rather than
+        a neighbour's proxy. ``None`` means the account has no proxy — the
+        absent field ``account_proxy.route_for`` reads as a direct connection.
+
+        For a launch, which must decide its route once (``session.py``): a
+        proxied account whose record moved is refused, never launched direct.
+        No lock is held across the launch, so the identity check is what makes
+        a move between the resolution and this read an error rather than a
+        neighbour's proxy.
+        """
+        data = self._get_sequence_data_migrated() or {}
+        record = (data.get("accounts") or {}).get(account_num)
+        if not self._record_is(record, email, org_uuid):
+            return account_proxy.unusable(
+                "the slot no longer names this account"
+            )
+        return account_proxy.route_for(record)
+
+    def live_login_route(self) -> "account_proxy.ProxyRoute | None":
+        """The route of the slot the live default login belongs to.
+
+        ``None`` when the live login names no slot: it is not an account cswap
+        manages, so no route can be imposed on it and a launch keeps the proxy
+        variables it inherited. ``cswap run`` uses this for the launch that
+        runs plain claude on the default login.
+        """
+        identity = self._get_current_account()
+        if identity is None:
+            return None
+        data = self._get_sequence_data_migrated() or {}
+        account_num = self._find_account_slot(data, *identity)
+        if account_num is None:
+            return None
+        return self.account_route(account_num, *identity)
+
     def set_alias(self, identifier: str, alias: str) -> tuple[str, str]:
         """Set (or rename) the alias for the account matching identifier.
 
@@ -1174,6 +1258,77 @@ class ClaudeAccountSwitcher:
             for num, acc in accounts.items()
             if acc.get("alias")
         ]
+        return sorted(rows, key=lambda r: int(r[0]))
+
+    def set_account_proxy(self, identifier: str, url: str) -> tuple[str, str]:
+        """Attach an HTTP proxy to one account, or replace the one it has.
+
+        The URL is validated before anything is read, so a rejected value
+        leaves ``sequence.json`` byte-identical. Resolving the identifier,
+        reading the record and writing the new value are one step under the
+        account lock: another writer's snapshot of this file (switch, swap,
+        a threshold change) can neither lose this setting nor have its own
+        change republished from a stale copy here.
+
+        Returns ``(account_num, masked_url)`` — the stored value keeps its
+        password, the returned one never does.
+
+        Raises:
+            AccountNotFoundError: identifier doesn't match any account.
+            ValidationError: the URL cannot be used as an HTTP proxy.
+            LockError: the account lock stayed held by another process.
+        """
+        self._refuse_session_shell()
+        try:
+            route = account_proxy.parse(url)
+        except account_proxy.ProxyUrlError as e:
+            raise ValidationError(str(e)) from e
+
+        with FileLock(self.lock_file):
+            account_num, email, data, record = (
+                self._resolve_for_policy_write(identifier)
+            )
+            stored = route.text()
+            if record.get(account_proxy.FIELD) != stored:
+                record[account_proxy.FIELD] = stored
+                data["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, data)
+                # Masked: this line lands in the log file.
+                self._logger.info(
+                    f"Set proxy {route.display()} for account {account_num}: {email}"
+                )
+        return account_num, route.display()
+
+    def clear_account_proxy(self, identifier: str) -> str:
+        """Remove one account's proxy, returning its requests to a direct connection.
+
+        Idempotent, like :meth:`unset_alias`: an account that already has none
+        is not an error. The read and the write run under the account lock for
+        the reason :meth:`set_account_proxy` gives. Returns the account number.
+        """
+        self._refuse_session_shell()
+        with FileLock(self.lock_file):
+            account_num, email, data, record = (
+                self._resolve_for_policy_write(identifier)
+            )
+            if account_proxy.FIELD in record:
+                del record[account_proxy.FIELD]
+                data["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, data)
+                self._logger.info(
+                    f"Cleared proxy for account {account_num}: {email}"
+                )
+        return account_num
+
+    def list_account_proxies(self) -> list[tuple[str, str, str]]:
+        """Every set proxy as ``(account_num, masked_url, email)``, slot order."""
+        data = self._get_sequence_data_migrated()
+        accounts = (data or {}).get("accounts", {})
+        rows = []
+        for num, acc in accounts.items():
+            described = account_proxy.describe(acc)
+            if described is not None:
+                rows.append((num, described, acc.get("email", "")))
         return sorted(rows, key=lambda r: int(r[0]))
 
     def swap_accounts(self, first: str, second: str) -> tuple[str, str]:
@@ -1916,12 +2071,14 @@ class ClaudeAccountSwitcher:
         )
 
     def _stored_subscription_plans(
-        self, accounts_info: list[tuple[int, str, str, str, bool, str, str]]
+        self, accounts_info: list[AccountInfo]
     ) -> dict[str, dict]:
         """Per-slot plan records as stored. Touches no credential or network."""
         records = self._subscription_store().load()
         plans: dict[str, dict] = {}
-        for num, email, _org_name, org_uuid, _active, _creds, _alias in accounts_info:
+        for num, email, _org_name, org_uuid, _active, _creds, _alias, _route in (
+            accounts_info
+        ):
             record = records.get(subscription.identity_key(email, org_uuid))
             if subscription.valid_record(record):
                 plans[str(num)] = record
@@ -1929,7 +2086,7 @@ class ClaudeAccountSwitcher:
 
     def _plans_for_pass(
         self,
-        accounts_info: list[tuple[int, str, str, str, bool, str, str]],
+        accounts_info: list[AccountInfo],
         fetch: set[str] | None,
     ) -> dict[str, dict]:
         """An empty ``fetch`` set means no network eligibility, for plans too."""
@@ -1942,7 +2099,7 @@ class ClaudeAccountSwitcher:
         self._collect_subscription_plans(self._build_accounts_info())
 
     def _collect_subscription_plans(
-        self, accounts_info: list[tuple[int, str, str, str, bool, str, str]]
+        self, accounts_info: list[AccountInfo]
     ) -> dict[str, dict]:
         """Per-slot subscription plan record, refreshed on its own clock (#350).
 
@@ -1954,16 +2111,36 @@ class ClaudeAccountSwitcher:
 
         A read that fails, or that belongs to some other account, records when
         it may be repeated and changes nothing else. Network happens here with
-        no lock held. Returns only slots that have a usable record, so a slot
-        never fetched is simply absent.
+        no lock held. The token and the route both come from ``accounts_info``,
+        the same read, so a slot that moved cannot send this token through
+        another account's proxy. Returns only slots that have a usable record,
+        so a slot never fetched is simply absent.
         """
         store = self._subscription_store()
         records = store.load()
-        accounts = (self._get_sequence_data() or {}).get("accounts", {})
+        accounts = self._snapshot_records
+        # Rows that came from a locked snapshot are checked against that
+        # snapshot's records; a direct caller (tests, an internal helper)
+        # passes rows that already carry the identity they were read with.
+        verified = bool(accounts)
+        if not verified:
+            accounts = (self._get_sequence_data() or {}).get("accounts", {})
         updates: dict[str, dict] = {}
-        for num, email, _org_name, org_uuid, is_active, creds, _alias in accounts_info:
+        for num, email, _org_name, org_uuid, is_active, creds, _alias, route in (
+            accounts_info
+        ):
             key = subscription.identity_key(email, org_uuid)
             if not subscription.is_due(records.get(key), store.clock()):
+                continue
+            # The snapshot's own record, not a second registry read: it carries
+            # the uuid the answer is checked against, and it is the record the
+            # route above came from. A row whose owner could not be pinned (a
+            # slot mutation or another process held the lock) sends nothing.
+            record = accounts.get(str(num)) or {}
+            if verified and (
+                self._route_unconfirmed(route)
+                or not self._record_is(record, email, org_uuid)
+            ):
                 continue
             token = subscription.usable_access_token(creds)
             if token is None and not is_active:
@@ -1976,8 +2153,8 @@ class ClaudeAccountSwitcher:
             if token is None:
                 continue
             started_at = store.clock()
-            fetched = subscription.fetch_plan(token)
-            slot_uuid = (accounts.get(str(num), {}).get("uuid") or "").strip()
+            fetched = subscription.fetch_plan(token, route=route)
+            slot_uuid = (record.get("uuid") or "").strip()
             if fetched.plan is not None and subscription.matches_slot(
                 fetched, slot_uuid, org_uuid
             ):
@@ -2013,7 +2190,9 @@ class ClaudeAccountSwitcher:
         seq_data = self._get_sequence_data() or {}
         active_number: str | None = None
         accounts: list[AccountSnapshot] = []
-        for num, email, org_name, org_uuid, is_active, creds, alias in accounts_info:
+        for num, email, org_name, org_uuid, is_active, creds, alias, _route in (
+            accounts_info
+        ):
             n = str(num)
             if is_active:
                 active_number = n
@@ -2151,7 +2330,12 @@ class ClaudeAccountSwitcher:
     #: rewrites from the new credential. ``add_account`` and
     #: ``add_account_from_token`` rebuild a ``--slot`` record wholesale and
     #: carry exactly these across; a new per-account setting belongs here.
-    USER_ACCOUNT_SETTINGS: tuple[str, ...] = ("alias", "disabled", "threshold", "priority")
+    #: ``proxy`` is here for the same reason as the rest: the proxy belongs to
+    #: the account, so swapping or moving a slot keeps it (the records move
+    #: whole), and a re-login into the same slot keeps it too.
+    USER_ACCOUNT_SETTINGS: tuple[str, ...] = (
+        "alias", "disabled", "threshold", "priority", "proxy",
+    )
 
     @classmethod
     def _carried_settings(cls, record: dict | None) -> dict:
@@ -2167,7 +2351,8 @@ class ClaudeAccountSwitcher:
         return {
             key: record[key]
             for key in cls.USER_ACCOUNT_SETTINGS
-            if record.get(key) is not None
+            if key in record
+            and (key == account_proxy.FIELD or record[key] is not None)
         }
 
     @staticmethod
@@ -2496,7 +2681,11 @@ class ClaudeAccountSwitcher:
                 self._write_json(self.sequence_file, data)
 
     def consume_backup_grant(
-        self, account_num: str, email: str, snapshot: str
+        self,
+        account_num: str,
+        email: str,
+        snapshot: str,
+        expected_org: str | None = None,
     ) -> "oauth.RefreshOutcome":
         """The gate through which a backup refresh token is consumed.
 
@@ -2531,6 +2720,13 @@ class ClaudeAccountSwitcher:
         the gate actually POSTed, which may differ from the caller's snapshot.
 
         The caller must NOT hold ``self.lock_file`` (non-reentrant).
+
+        ``org_uuid`` is the organization the caller's snapshot attributed this
+        slot to (the collect pass passes it; the callers that have only a slot
+        number leave it None). The gate verifies it against the slot record
+        under the lock before it reads the grant, and writes the successor by
+        the slot the account owns AFTER the POST — a `move`/`swap` in flight
+        must neither spend another account's grant nor lose this successor.
         """
         # Store-resolution parity: CC ≥2.1.220 honors
         # CLAUDE_SECURESTORAGE_CONFIG_DIR for its credential store. cswap
@@ -2578,13 +2774,17 @@ class ClaudeAccountSwitcher:
             return oauth.RefreshOutcome(None, "consume-busy")
         try:
             return self._consume_backup_grant_locked(
-                account_num, email, snapshot
+                account_num, email, snapshot, expected_org=expected_org
             )
         finally:
             consume_lock.release()
 
     def _consume_backup_grant_locked(
-        self, account_num: str, email: str, snapshot: str
+        self,
+        account_num: str,
+        email: str,
+        snapshot: str,
+        expected_org: str | None = None,
     ) -> "oauth.RefreshOutcome":
         """Body of ``consume_backup_grant``; caller holds the consume lock."""
         from claude_swap.session import (
@@ -2593,6 +2793,10 @@ class ClaudeAccountSwitcher:
             session_dir_for,
             session_identity_drifted,
         )
+
+        # Set by the locked read below before any POST. Never left as
+        # "direct": if the route cannot be placed, the request refuses.
+        route = account_proxy.unusable("the slot record could not be read")
 
         try:
             with FileLock(self.lock_file):
@@ -2664,13 +2868,34 @@ class ClaudeAccountSwitcher:
                 # the profile (a live claude rotates its own tokens — #97's
                 # rule) and the profile identity — org included: two slots
                 # may share an email across orgs — still matches the slot.
-                org_uuid = (
+                slot_record = (
                     (self._get_sequence_data() or {})
                     .get("accounts", {})
                     .get(account_num, {})
-                    .get("organizationUuid", "")
-                    or ""
+                    or {}
                 )
+                org_uuid = slot_record.get("organizationUuid", "") or ""
+                # The slot must still be the account the caller's snapshot
+                # named, checked under the lock BEFORE a grant is chosen: a
+                # `swap` moves the backup files by slot first, so a slot that
+                # now holds another organization's record (same email) offers
+                # this gate a grant that is not the one it means to spend.
+                if slot_record.get("email") != email or (
+                    expected_org is not None and org_uuid != expected_org
+                ):
+                    self._logger.info(
+                        "Account %s is no longer the account in this slot; "
+                        "refusing its backup refresh.",
+                        account_num,
+                    )
+                    return oauth.RefreshOutcome(None, "slot-moved")
+                # The route belongs to the account whose grant this gate is
+                # about to POST, so it is taken from the same locked read as
+                # the credential — not by slot number at send time. A swap or
+                # move landing while the POST is being sent must not pair
+                # this grant with the route of whichever account holds the
+                # slot afterwards (see ``AccountInfo``).
+                route = account_proxy.route_for(slot_record)
                 if not self._live_session_pids(account_num, email):
                     sdir = session_dir_for(self.backup_dir, account_num, email)
                     profile = read_session_credentials(sdir)
@@ -2798,7 +3023,9 @@ class ClaudeAccountSwitcher:
             "Refresh starting for account %s (%s).",
             account_num, _fingerprint_head(consumed_fp),
         )
-        result = oauth.try_refresh_oauth_credentials(refresh_input)
+        result = oauth.try_refresh_oauth_credentials(
+            refresh_input, route=route
+        )
         if result.error is not None or not result.credentials:
             self._logger.info(
                 "Refresh for account %s ended without a successor (%s).",
@@ -2822,6 +3049,12 @@ class ClaudeAccountSwitcher:
                 {
                     "reason": reason,
                     "configSlot": account_num,
+                    # The account's identity, not only the slot number it held
+                    # before the POST: adoption after a `move`/`swap` looks the
+                    # successor up by identity (see ``_adopt_stashed_successor``),
+                    # since the slot number no longer names this account.
+                    "email": email,
+                    "organizationUuid": org_uuid,
                     "consumedFp": consumed_fp,
                     "fingerprint": oauth.credential_fingerprint(
                         result.credentials
@@ -2836,9 +3069,29 @@ class ClaudeAccountSwitcher:
         try:
             try:
                 with FileLock(self.lock_file):
-                    store_now, store_unreadable = (
-                        self._read_account_credentials_ex(account_num, email)
-                    )
+                    # The POST ran outside the lock, so `move`/`swap` may have
+                    # taken this account away from the number the snapshot
+                    # named — and the number it left may already hold another
+                    # organization with the same email. The successor belongs
+                    # to the ACCOUNT, so the write target is resolved by
+                    # identity now; writing to the old number would overwrite
+                    # a stranger's backup, and its CAS would adopt that
+                    # stranger's generation as this account's.
+                    owner_slot = self._slot_holding(email, org_uuid)
+                    store_now, store_unreadable = "", False
+                    if owner_slot is None:
+                        # The account is no longer managed (removed during the
+                        # POST): writing the successor back would resurrect
+                        # credentials the user just deleted. Park it.
+                        stash_successor(
+                            "consume-gate-slot-removed",
+                            "Account %s left its slot during a refresh "
+                            "POST; successor stashed, nothing rewritten.",
+                        )
+                    else:
+                        store_now, store_unreadable = (
+                            self._read_account_credentials_ex(owner_slot, email)
+                        )
                     if store_unreadable:
                         # The Keychain locked during the POST (macOS screen
                         # lock is ~1s away at any moment). The CAS cannot be
@@ -2854,7 +3107,7 @@ class ClaudeAccountSwitcher:
                             "(keychain) after a refresh POST; successor "
                             "stashed, nothing rewritten.",
                         )
-                    elif not store_now:
+                    elif owner_slot is not None and not store_now:
                         # The slot was emptied mid-POST (remove-account):
                         # writing the successor back would resurrect
                         # credentials the user just deleted. Park it
@@ -2865,7 +3118,7 @@ class ClaudeAccountSwitcher:
                             "during a refresh POST; successor stashed, "
                             "nothing rewritten.",
                         )
-                    elif (
+                    elif owner_slot is not None and (
                         oauth.credential_fingerprint(store_now) != consumed_fp
                     ):
                         # A writer replaced the lineage while our POST was in
@@ -2878,9 +3131,9 @@ class ClaudeAccountSwitcher:
                             "newer store credential.",
                         )
                         outcome_creds = store_now
-                    else:
+                    elif owner_slot is not None:
                         self._write_account_credentials(
-                            account_num, email, result.credentials
+                            owner_slot, email, result.credentials
                         )
                         self._logger.info(
                             "Refresh for account %s saved its successor (%s).",
@@ -3063,8 +3316,21 @@ class ClaudeAccountSwitcher:
                 "successor may already have superseded (`cswap unclaimed` "
                 "lists them, `--purge` drops one)"
             )
+        own_org = self.account_identity(account_num).get("organizationUuid") or ""
         for entry_id, meta in manifest.items():
-            if meta.get("configSlot") != account_num:
+            # ``consumedFp`` is the adoption key. The slot number is only a
+            # filter for entries that cannot name their owner (written before
+            # ``email`` was recorded): a successor stashed just before a
+            # `move`/`swap` must still be found under the account's new
+            # number, and can never be adopted by the slot's next occupant.
+            if meta.get("configSlot") != account_num and not (
+                meta.get("email") == email
+                and (
+                    not meta.get("organizationUuid")
+                    or not own_org
+                    or meta.get("organizationUuid") == own_org
+                )
+            ):
                 continue
             if meta.get("consumedFp") != cur_fp:
                 if meta.get("reason") == "consume-gate-cas-conflict":
@@ -3245,10 +3511,12 @@ class ClaudeAccountSwitcher:
         return session_dir_for(self.backup_dir, account_num, email)
 
     def _token_status_lines(
-        self, account_info: tuple[int, str, str, str, bool, str, str]
+        self, account_info: "AccountInfo"
     ) -> list[str]:
         """Source-labelled token-status lines for one account's display row."""
-        num, email, _org_name, org_uuid, is_active, creds, _alias = account_info
+        num, email, _org_name, org_uuid, is_active, creds, _alias, _route = (
+            account_info
+        )
         if looks_like_api_key(creds):
             return []
         if is_active:
@@ -3635,6 +3903,52 @@ class ClaudeAccountSwitcher:
         identity = self._get_current_account()
         return identity is not None and identity == (email, org_uuid or "")
 
+    @staticmethod
+    def _record_is(record, email: str, org_uuid: str) -> bool:
+        """Whether a registry record still names ``(email, organization)``.
+
+        Every slot mutation moves the record, keyed by this composite, so a
+        mismatch means the slot now holds another account — an email alone is
+        not identity, since sibling accounts share one across organizations.
+        Used wherever a snapshot taken earlier is about to be written or sent.
+        """
+        if not isinstance(record, dict) or not record:
+            return False
+        return (
+            record.get("email") == email
+            and (record.get("organizationUuid", "") or "") == (org_uuid or "")
+        )
+
+    @staticmethod
+    def _route_unconfirmed(route: "account_proxy.ProxyRoute | None") -> bool:
+        """Whether this row's route was withheld because its owner could not be
+        pinned: the prohibition travels in the row itself, so no consumer has
+        to keep a parallel set of slot numbers in step."""
+        return route is not None and route.invalid == _ROUTE_UNCONFIRMED
+
+    @staticmethod
+    def _identity_is(
+        identity: tuple[str, str, str] | None, email: str, org_uuid: str
+    ) -> bool:
+        """Whether a ``.claude.json`` identity is the account a snapshot names.
+
+        The composite every slot mutation keys on: an email alone is not
+        identity, since sibling accounts share one across organizations.
+        """
+        return identity is not None and identity[:2] == (email, org_uuid or "")
+
+    def _slot_holding(self, email: str, org_uuid: str) -> str | None:
+        """The slot that holds ``(email, organization)`` in a FRESH registry
+        read, or None when the account is no longer managed.
+
+        The counterpart of a stored slot number after a POST: `move`/`swap`
+        can take the account away from the number a snapshot named, and the
+        number it left may already hold another account.
+        """
+        return self._find_account_slot(
+            self._get_sequence_data() or {}, email, org_uuid or ""
+        )
+
     def _is_default_login_from_another_profile(
         self, email: str, org_uuid: str
     ) -> bool:
@@ -3825,7 +4139,8 @@ class ClaudeAccountSwitcher:
         )
 
     def _reject_foreign_credential_capture(
-        self, creds: str, email: str, org_uuid: str, account_uuid: str
+        self, creds: str, email: str, org_uuid: str, account_uuid: str,
+        route: "account_proxy.ProxyRoute | None" = None,
     ) -> str:
         """Guard for ``add_account``: the stored token must be THIS account's.
 
@@ -3858,6 +4173,13 @@ class ClaudeAccountSwitcher:
         only live copy of that lineage. Detecting an expired FOREIGN
         credential is real and belongs on that machinery, not here; the field
         incident's shape is a live token, which this still catches.
+
+        The lookup travels the route the account will use: the explicit
+        ``--proxy`` of this ``cswap add``, or the proxy already stored on the
+        slot it lands in (see ``account_proxy``). A proxied account therefore
+        never has its ownership checked over a direct connection; when that
+        route fails the answer is UNRESOLVABLE, which the advisory contract
+        below already covers.
 
         ADVISORY, in the same direction the oracle is everywhere else: a
         ``None`` answer means UNRESOLVABLE (offline, 401, schema drift), never
@@ -3906,7 +4228,7 @@ class ClaudeAccountSwitcher:
             # spent generation, and on the refusal path would discard the only
             # live copy of that lineage.
             return unverified("the access token is expired")
-        profile = oauth.fetch_oauth_profile(token)
+        profile = oauth.fetch_oauth_profile(token, route=route)
         if not profile:
             return unverified("the identity lookup did not resolve")
         # Uuid first, like ``_resolved_matches_slot_identity``: uuids are
@@ -4164,6 +4486,7 @@ class ClaudeAccountSwitcher:
         slot: int | None = None,
         assume_yes: bool = False,
         alias: str | None = None,
+        proxy: str | None = None,
     ) -> None:
         """Add current account to managed accounts.
 
@@ -4180,6 +4503,10 @@ class ClaudeAccountSwitcher:
                   confirmation UI, e.g. the TUI, confirm before calling).
             alias: Optional short display alias to set on this account.
                   When omitted, an existing alias on the slot is preserved.
+            proxy: Optional ``http://`` proxy URL for this account
+                  (``--proxy``). Validated before anything is read or sent.
+                  When omitted, the proxy already stored on the slot holding
+                  this account is kept.
         """
         self._refuse_session_shell()
         self._setup_directories()
@@ -4190,6 +4517,13 @@ class ClaudeAccountSwitcher:
             try:
                 alias = normalize_alias(alias)
             except ValueError as e:
+                raise ValidationError(str(e)) from e
+
+        explicit_route: "account_proxy.ProxyRoute | None" = None
+        if proxy is not None:
+            try:
+                explicit_route = account_proxy.parse(proxy)
+            except account_proxy.ProxyUrlError as e:
                 raise ValidationError(str(e)) from e
 
         identity = self._get_current_identity_triple()
@@ -4210,7 +4544,12 @@ class ClaudeAccountSwitcher:
                         f"Alias '{alias}' is already used by account {conflict}"
                     )
 
-            current_creds = self._read_capture_credentials()
+            # The token and the identity that labels it are read under ONE
+            # short lock: the profile request below must never send another
+            # account's token after a switch landed while add waited for input.
+            with FileLock(self.lock_file):
+                current_creds = self._read_capture_credentials()
+                self._reject_identity_drift_since_verify(identity)
             if current_creds is None:
                 raise CredentialReadError("Failed to read credentials for current account")
             if not current_creds:
@@ -4219,6 +4558,9 @@ class ClaudeAccountSwitcher:
             current_creds = self._reject_foreign_credential_capture(
                 current_creds, current_email, current_org_uuid,
                 current_account_uuid,
+                route=explicit_route or account_proxy.route_for(
+                    seq["accounts"][account_num]
+                ),
             )
             self._reject_credential_drift_since_verify(current_creds)
 
@@ -4249,12 +4591,23 @@ class ClaudeAccountSwitcher:
                 [account_num], {account_num: (current_email, current_org_uuid)}
             )
 
-            if alias is not None:
-                seq["accounts"][account_num]["alias"] = alias
+            # Under the account lock and from a fresh read: this writes the
+            # whole registry, so a proxy (or a switch's activeAccountNumber)
+            # committed while the credential above was being written must
+            # survive here rather than be rolled back to this snapshot.
+            with FileLock(self.lock_file):
+                seq = self._get_sequence_data() or seq
+                record = seq.setdefault("accounts", {}).setdefault(
+                    account_num, {}
+                )
+                if alias is not None:
+                    record["alias"] = alias
+                if explicit_route is not None:
+                    record[account_proxy.FIELD] = explicit_route.text()
 
-            seq["activeAccountNumber"] = int(account_num)
-            seq["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, seq)
+                seq["activeAccountNumber"] = int(account_num)
+                seq["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, seq)
 
             tag = self._get_display_tag(current_email, matched_org_name, current_org_uuid)
             self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
@@ -4342,15 +4695,21 @@ class ClaudeAccountSwitcher:
                     f"Alias '{alias}' is already used by account {conflict}"
                 )
 
-        # Read new account credentials BEFORE any destructive operations
-        current_creds = self._read_capture_credentials()
+        # Read new account credentials BEFORE any destructive operations. The
+        # token and the identity that labels it are read under ONE short lock:
+        # the profile request below must never send another account's token
+        # after a switch landed while add waited for the overwrite answer.
+        with FileLock(self.lock_file):
+            current_creds = self._read_capture_credentials()
+            self._reject_identity_drift_since_verify(identity)
         if current_creds is None:
             raise CredentialReadError("Failed to read credentials for current account")
         if not current_creds:
             raise CredentialReadError("No credentials found for current account")
         self._reject_live_api_key_capture(current_creds)
         current_creds = self._reject_foreign_credential_capture(
-            current_creds, current_email, current_org_uuid, current_account_uuid
+            current_creds, current_email, current_org_uuid, current_account_uuid,
+            route=explicit_route or account_proxy.route_for(carried),
         )
         self._reject_credential_drift_since_verify(current_creds)
 
@@ -4409,25 +4768,58 @@ class ClaudeAccountSwitcher:
             [account_num], {account_num: (current_email, organization_uuid)}
         )
 
-        # Update sequence.json
-        data = self._get_sequence_data()
-        data["accounts"][account_num] = {
-            "email": current_email,
-            "uuid": account_uuid,
-            "organizationUuid": organization_uuid,
-            "organizationName": organization_name,
-            "added": get_timestamp(),
-        }
-        if alias is not None:
-            carried["alias"] = alias  # an explicit --alias wins over the carried one
-        data["accounts"][account_num].update(carried)
-        if int(account_num) not in data["sequence"]:
-            data["sequence"].append(int(account_num))
-            data["sequence"].sort()
-        data["activeAccountNumber"] = int(account_num)
-        data["lastUpdated"] = get_timestamp()
+        # Update sequence.json — under the account lock every slot mutation
+        # takes, from a fresh read. Two things are decided here and nowhere
+        # earlier: that the slot still belongs to (or is free for) this
+        # account, and which proxy it keeps — the setting on the record the
+        # account holds now, losing only to an explicit --proxy.
+        with FileLock(self.lock_file):
+            data = self._get_sequence_data() or {}
+            occupant = (data.get("accounts") or {}).get(str(account_num)) or {}
+            if occupant and not self._record_is(
+                occupant, current_email, organization_uuid
+            ):
+                raise ConfigError(
+                    f"Slot {account_num} was taken by another account while "
+                    "this add was running; the registry was not changed. "
+                    "Run the command again."
+                )
+            # The proxy belongs to the ACCOUNT, not to the number. An ordinary
+            # `add --slot` to a free slot finds the target record empty, and
+            # the cleanup above has already deleted the record the account is
+            # leaving — so the setting is taken from whichever of the two
+            # still has it, and only then loses to an explicit --proxy.
+            previous = occupant
+            if not self._record_is(previous, current_email, organization_uuid):
+                owner_slot = self._find_account_slot(
+                    data, current_email, organization_uuid
+                )
+                previous = (
+                    (data.get("accounts") or {}).get(owner_slot) or {}
+                    if owner_slot
+                    else {}
+                )
+            if account_proxy.FIELD in previous:
+                carried[account_proxy.FIELD] = previous[account_proxy.FIELD]
+            data["accounts"][account_num] = {
+                "email": current_email,
+                "uuid": account_uuid,
+                "organizationUuid": organization_uuid,
+                "organizationName": organization_name,
+                "added": get_timestamp(),
+            }
+            if alias is not None:
+                carried["alias"] = alias  # an explicit --alias wins over the carried one
+            if explicit_route is not None:
+                carried[account_proxy.FIELD] = explicit_route.text()
+            data["accounts"][account_num].update(carried)
+            if int(account_num) not in data["sequence"]:
+                data["sequence"].append(int(account_num))
+                data["sequence"].sort()
+            data["activeAccountNumber"] = int(account_num)
+            data["lastUpdated"] = get_timestamp()
 
-        self._write_json(self.sequence_file, data)
+            self._write_json(self.sequence_file, data)
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
         if migrate_from:
@@ -4751,14 +5143,44 @@ class ClaudeAccountSwitcher:
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
 
-    def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str, str]]:
-        """Build per-account (num, email, org_name, org_uuid, is_active, creds, alias).
+    def _build_accounts_info(self, active_only: bool = False) -> list[AccountInfo]:
+        """Build per-account ``(num, email, org_name, org_uuid, is_active, creds, alias, route)``.
 
         Shared by list_accounts and the usage-aware switch helpers so the active
-        slot is detected and credentials are read in exactly one place. The
-        active account's credentials come from Claude Code's live store; every
-        other slot reads its backup copy.
+        slot is detected, credentials are read and the proxy route is pinned in
+        exactly one place. The whole collection — registry, live identity,
+        credentials, routes — runs under the account lock that every slot
+        mutation takes, so a `switch`, `swap` or `move` cannot move a record
+        between what named the slot and what was read for it. The route is the
+        record's proxy from this same capture.
+
+        ``active_only`` limits the rows to the live login's slot: `status`
+        needs one row and must not read every other slot's backup.
+
+        A lock this process cannot take is not permission to read anyway: the
+        owner cannot be pinned, so every row is marked owner-moved — the
+        collect pass sends no request and the subscription pass skips them,
+        while the stored usage stays on screen. See ``account_proxy``.
         """
+        try:
+            with FileLock(self.lock_file):
+                return self._build_accounts_info_locked(
+                    active_only=active_only, routes_confirmed=True
+                )
+        except LockError:
+            self._logger.debug(
+                "Account lock held elsewhere; rendering stored usage without "
+                "confirming any account's route this pass.", exc_info=True,
+            )
+            return self._build_accounts_info_locked(
+                active_only=active_only, routes_confirmed=False
+            )
+
+    def _build_accounts_info_locked(
+        self, *, active_only: bool, routes_confirmed: bool
+    ) -> list[AccountInfo]:
+        """Body of :meth:`_build_accounts_info`; caller holds ``self.lock_file``
+        unless ``routes_confirmed`` is False."""
         data = self._get_sequence_data_migrated() or {}
         current_identity = self._get_current_account()
 
@@ -4768,7 +5190,11 @@ class ClaudeAccountSwitcher:
             current_email, current_org_uuid = current_identity
             active_num = self._find_account_slot(data, current_email, current_org_uuid)
 
-        accounts_info: list[tuple[int, str, str, str, bool, str, str]] = []
+        self._snapshot_records = {
+            str(num): dict(account)
+            for num, account in (data.get("accounts") or {}).items()
+        }
+        accounts_info: list[AccountInfo] = []
         # Reset each build; set below only when the active slot's OAuth Keychain
         # read failed with no fallback. Read by _static_usage_sentinel (main
         # thread writes it here before the fetch pool starts → no data race).
@@ -4780,11 +5206,28 @@ class ClaudeAccountSwitcher:
             org_uuid = account.get("organizationUuid", "") or ""
             alias = account.get("alias", "") or ""
             is_active = str(num) == active_num
+            if active_only and not is_active:
+                continue
+            route = (
+                account_proxy.route_for(account)
+                if routes_confirmed
+                else account_proxy.unusable(_ROUTE_UNCONFIRMED)
+            )
 
             if is_active:
                 active = self._read_active_credentials()
                 creds = active.value or ""
                 self._record_active_verdict(active)
+                # The identity that named this slot is read again AFTER the
+                # credential: ``~/.claude.json`` and the live store have
+                # independent writers, so a `switch` or `/login` landing in
+                # between hands another account's token to this row, whose
+                # route is this slot's. Mismatch → no request for this slot
+                # this pass (a switch is the thing that repairs it).
+                if not self._identity_is(
+                    self._get_current_identity_triple(), email, org_uuid
+                ):
+                    route = account_proxy.unusable(_ROUTE_UNCONFIRMED)
             else:
                 # Display read cache: this value feeds sentinels, token-status
                 # lines and the usage GET. Nothing writes or POSTs it — the
@@ -4793,7 +5236,24 @@ class ClaudeAccountSwitcher:
                 # strike binding re-reads before any heal (_entry_token_dead).
                 creds = self._read_account_credentials(str(num), email, cached=True)
 
-            accounts_info.append((num, email, org_name, org_uuid, is_active, creds, alias))
+            accounts_info.append(
+                (num, email, org_name, org_uuid, is_active, creds, alias, route)
+            )
+
+        # One more registry read while still under the same lock: `swap`
+        # moves the backup files by slot before it publishes the registry, so a
+        # record that no longer names (email, organization) means the bytes
+        # read for that slot may already be the other account's — and the
+        # route is this slot's.
+        if routes_confirmed:
+            published = self._get_sequence_data() or {}
+            for index, row in enumerate(accounts_info):
+                num, email, _org_name, org_uuid = row[0], row[1], row[2], row[3]
+                record = (published.get("accounts") or {}).get(str(num)) or {}
+                if not self._record_is(record, email, org_uuid):
+                    accounts_info[index] = row[:7] + (
+                        account_proxy.unusable(_ROUTE_UNCONFIRMED),
+                    )
         return accounts_info
 
     def _fetch_active_usage(
@@ -4803,6 +5263,7 @@ class ClaudeAccountSwitcher:
         creds: str,
         org_uuid: str = "",
         last_usage: dict | None = None,
+        route: "account_proxy.ProxyRoute | None" = None,
     ) -> FetchRecord:
         """Usage fetch for the active/default account, refreshing an expired
         token under Claude Code's own lock protocol.
@@ -4870,6 +5331,7 @@ class ClaudeAccountSwitcher:
         if not oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
             outcome = oauth.try_fetch_usage_for_account(
                 account_num, email, creds, is_active=True,
+                route=route,
                 **self._probe_options(last_usage),
             )
             if outcome.error != "http-401":
@@ -4889,7 +5351,7 @@ class ClaudeAccountSwitcher:
                     # fine; writing waits for a non-degraded pass.
                     if not self._active_read_degraded:
                         self._resync_rotated_backup(
-                            account_num, email, org_uuid, creds
+                            account_num, email, org_uuid, creds, route
                         )
                     if self._probe_verdicts and self._probe_verdicts.get(
                         self._lineage_key(
@@ -5086,10 +5548,15 @@ class ClaudeAccountSwitcher:
                     if live_verdict or (
                         oauth.credential_fingerprint(live) == backup_fp
                     ):
+                        # Same rule as the successor write below: the account's
+                        # slot, resolved now, not the number the snapshot
+                        # named.
+                        resync_slot = self._slot_holding(email, org_uuid)
                         try:
-                            self._write_account_credentials(
-                                account_num, email, live
-                            )
+                            if resync_slot is not None:
+                                self._write_account_credentials(
+                                    resync_slot, email, live
+                                )
                         except Exception:
                             self._logger.warning(
                                 "Backup resync after adopting a rotated "
@@ -5221,7 +5688,7 @@ class ClaudeAccountSwitcher:
                             ),
                         )
                         result = oauth.try_refresh_oauth_credentials(
-                            refresh_input, timeout_s=6.0
+                            refresh_input, timeout_s=6.0, route=route,
                         )
                         if result.error is not None or not result.credentials:
                             self._logger.info(
@@ -5312,18 +5779,32 @@ class ClaudeAccountSwitcher:
                     # it; only the live store needs the write.)
                     backup_ok = live_ok = True
                     if restore_source is None:
-                        try:
-                            self._write_account_credentials(
-                                account_num, email, working
-                            )
-                        except Exception:
-                            backup_ok = False
-                            self._logger.warning(
-                                "Backup write failed after a consumed "
-                                "refresh for account %s; attempting the "
-                                "active store.",
+                        # The POST ran after the lock was released only in the
+                        # backup gate; here the slot lock is still held, but a
+                        # `move` may have completed BEFORE it was taken. Write
+                        # the successor to the slot the account owns now, so it
+                        # never lands on the number's next occupant.
+                        successor_slot = self._slot_holding(email, org_uuid)
+                        if successor_slot is None:
+                            self._logger.info(
+                                "Account %s left its slot during an active "
+                                "refresh POST; its successor goes to the live "
+                                "store only.",
                                 account_num,
                             )
+                        else:
+                            try:
+                                self._write_account_credentials(
+                                    successor_slot, email, working
+                                )
+                            except Exception:
+                                backup_ok = False
+                                self._logger.warning(
+                                    "Backup write failed after a consumed "
+                                    "refresh for account %s; attempting the "
+                                    "active store.",
+                                    account_num,
+                                )
                     try:
                         # _write_credentials can touch ~/.claude.json (via
                         # _clear_managed_key) — the config lock covers just
@@ -5389,6 +5870,7 @@ class ClaudeAccountSwitcher:
 
         outcome = oauth.try_fetch_usage_for_account(
             account_num, email, working, is_active=True,
+            route=route,
             **self._probe_options(last_usage),
         )
         return FetchRecord(
@@ -5398,7 +5880,8 @@ class ClaudeAccountSwitcher:
         )
 
     def _resync_rotated_backup(
-        self, account_num: str, email: str, org_uuid: str, creds: str
+        self, account_num: str, email: str, org_uuid: str, creds: str,
+        route: "account_proxy.ProxyRoute | None" = None,
     ) -> None:
         """Resync the slot backup after a rotation that completed elsewhere.
 
@@ -5449,7 +5932,7 @@ class ClaudeAccountSwitcher:
                 return  # known-foreign lineage; already warned
             if verdict is not True:
                 resolved = oauth.fetch_oauth_profile(
-                    oauth.extract_access_token(creds) or ""
+                    oauth.extract_access_token(creds) or "", route,
                 )
                 if resolved is None:
                     self._logger.debug(
@@ -5536,14 +6019,19 @@ class ClaudeAccountSwitcher:
             )
 
     def _static_usage_sentinel(
-        self, account_info: tuple[int, str, str, str, bool, str, str]
+        self, account_info: "AccountInfo"
     ) -> str | None:
         """Sentinel state derivable without any network call, or ``None``.
 
         Re-derived on every collect pass (never persisted), so it can't
         outlive the condition that produced it.
         """
-        num, email, _, _, is_active, creds, _alias = account_info
+        num, email, _, _, is_active, creds, _alias, route = account_info
+        if self._route_unconfirmed(route):
+            # The snapshot could not pin this slot's owner (a slot mutation or
+            # another process held the lock while it was read): send nothing
+            # and show the stored reading. Re-derived next pass.
+            return USAGE_OWNER_CHANGED
         if looks_like_api_key(creds):
             # Managed API-key account: no subscription quota to fetch.
             return USAGE_API_KEY
@@ -5579,21 +6067,21 @@ class ClaudeAccountSwitcher:
 
     def _fetch_account_usage(
         self,
-        account_info: tuple[int, str, str, str, bool, str, str],
+        account_info: "AccountInfo",
         rejected_fp: str | None = None,
         last_usage: dict | None = None,
     ) -> FetchRecord:
         """One network fetch for one account. Never raises. ``rejected_fp``
         is the row's refused-credential stamp, if any, and ``last_usage`` its
         stored reading (see ``_probe_options``)."""
-        num, email, _, org_uuid, is_active, creds, _alias = account_info
+        num, email, _, org_uuid, is_active, creds, _alias, route = account_info
 
         # The active/default account owns the live credential — route it
         # through the locked-refresh path (refreshes an expired token under
         # Claude Code's own lock protocol, owner or not).
         if is_active:
             return self._fetch_active_usage(
-                str(num), email, creds, org_uuid, last_usage
+                str(num), email, creds, org_uuid, last_usage, route=route
             )
 
         from claude_swap.session import (
@@ -5670,7 +6158,8 @@ class ClaudeAccountSwitcher:
                 if oauth.is_oauth_token_expired(session_oauth.get("expiresAt")):
                     return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
                 return self._read_only_fetch(
-                    str(num), email, session_creds, rejected_fp, last_usage
+                    str(num), email, session_creds, rejected_fp, last_usage,
+                    route,
                 )
 
         if has_live_session or self._is_default_login_from_another_profile(
@@ -5691,13 +6180,16 @@ class ClaudeAccountSwitcher:
             if oauth.is_oauth_token_expired(backup_oauth.get("expiresAt")):
                 return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
             return self._read_only_fetch(
-                str(num), email, creds, rejected_fp, last_usage
+                str(num), email, creds, rejected_fp, last_usage, route
             )
 
         outcome = oauth.try_fetch_usage_for_account(
             str(num), email, creds,
             is_active=False,
-            refresh_via=self.consume_backup_grant,
+            refresh_via=functools.partial(
+                self.consume_backup_grant, expected_org=org_uuid
+            ),
+            route=route,
             **self._probe_options(last_usage),
         )
         return FetchRecord(
@@ -5714,6 +6206,7 @@ class ClaudeAccountSwitcher:
         creds: str,
         rejected_fp: str | None,
         last_usage: dict | None = None,
+        route: "account_proxy.ProxyRoute | None" = None,
     ) -> FetchRecord:
         """A fetch with a live session's credential, which cswap must never
         refresh. A 401 is the live claude having rotated past the copy we
@@ -5727,6 +6220,7 @@ class ClaudeAccountSwitcher:
             return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
         outcome = oauth.try_fetch_usage_for_account(
             num, email, creds, is_active=True,
+            route=route,
             **self._probe_options(last_usage),
         )
         if outcome.error == "http-401":
@@ -5739,7 +6233,7 @@ class ClaudeAccountSwitcher:
 
     def _run_usage_fetches(
         self,
-        infos: list[tuple[int, str, str, str, bool, str, str]],
+        infos: list[AccountInfo],
         entries: dict[str, UsageEntry] | None = None,
     ) -> dict[str, FetchRecord]:
         """Fetch the given accounts in parallel, staggering request starts so
@@ -5747,7 +6241,7 @@ class ClaudeAccountSwitcher:
         is the pre-fetch snapshot, for each row's refused-credential stamp
         and stored reading."""
         def fetch_one(
-            idx_info: tuple[int, tuple[int, str, str, str, bool, str, str]]
+            idx_info: tuple[int, AccountInfo]
         ) -> tuple[str, FetchRecord]:
             idx, info = idx_info
             if idx and _FETCH_STAGGER_S:
@@ -5767,7 +6261,7 @@ class ClaudeAccountSwitcher:
 
     def _collect_usage_entries(
         self,
-        accounts_info: list[tuple[int, str, str, str, bool, str, str]],
+        accounts_info: list[AccountInfo],
         fetch: set[str] | None = None,
         *,
         scheduled: bool = False,
@@ -5791,7 +6285,8 @@ class ClaudeAccountSwitcher:
         store = self._usage_store
         identities = {
             str(num): (email, org_uuid or "")
-            for num, email, _org_name, org_uuid, _active, _creds, _alias in accounts_info
+            for num, email, _org_name, org_uuid, _active, _creds, _alias, _route
+            in accounts_info
         }
         info_by_num = {str(info[0]): info for info in accounts_info}
         # Scoped-window models so the 429-stale trust bound honors per-model
@@ -6187,7 +6682,7 @@ class ClaudeAccountSwitcher:
         return None, "stay"
 
     def _duplicate_account_warnings(
-        self, accounts_info: list[tuple[int, str, str, str, bool, str, str]]
+        self, accounts_info: list[AccountInfo]
     ) -> list[str]:
         """Slots that provably authenticate as the same account.
 
@@ -6211,7 +6706,7 @@ class ClaudeAccountSwitcher:
         by_fp: dict[str, str] = {}
         by_identity: dict[tuple[str, str], str] = {}
         out: list[str] = []
-        for num, email, _org_name, org_uuid, _is_active, creds, _alias in accounts_info:
+        for num, email, _org_name, org_uuid, _is_active, creds, _alias, _route in accounts_info:
             snum = str(num)
             fp = oauth.credential_fingerprint(creds) if creds else None
             if fp:
@@ -6240,7 +6735,7 @@ class ClaudeAccountSwitcher:
 
     def _lockstep_usage_warnings(
         self,
-        accounts_info: list[tuple[int, str, str, str, bool, str, str]],
+        accounts_info: list[AccountInfo],
         entries: dict[str, UsageEntry],
     ) -> list[str]:
         """Heuristic: slots whose usage moves in perfect lockstep.
@@ -6267,7 +6762,7 @@ class ClaudeAccountSwitcher:
         """
         rows: list[tuple[str, object, float, object, float]] = []
         out: list[str] = []
-        for num, _email, _org_name, _org_uuid, _is_active, _creds, _alias in accounts_info:
+        for num, _email, _org_name, _org_uuid, _is_active, _creds, _alias, _route in accounts_info:
             snum = str(num)
             entry = entries.get(snum)
             usage = entry.decision_value() if entry else None
@@ -6307,7 +6802,7 @@ class ClaudeAccountSwitcher:
 
     def _build_list_payload(
         self,
-        accounts_info: list[tuple[int, str, str, str, bool, str, str]],
+        accounts_info: list[AccountInfo],
         entries: dict[str, UsageEntry],
         plans: dict[str, dict] | None = None,
     ) -> dict:
@@ -6316,7 +6811,9 @@ class ClaudeAccountSwitcher:
         accounts = []
         seq_data = self._get_sequence_data() or {}
         now = self._usage_store.clock()
-        for num, email, org_name, org_uuid, is_active, creds, alias in accounts_info:
+        for num, email, org_name, org_uuid, is_active, creds, alias, _route in (
+            accounts_info
+        ):
             if is_active:
                 active_num = num
             entry = entries[str(num)]
@@ -6340,6 +6837,9 @@ class ClaudeAccountSwitcher:
                     policy=self._policy_from_data(seq_data, str(num)),
                     login_expires_at=oauth.login_expires_at_iso(creds),
                     subscription_plan=(plans or {}).get(str(num)),
+                    proxy=account_proxy.describe(
+                        (seq_data.get("accounts") or {}).get(str(num))
+                    ) or "",
                 )
             )
         payload = {
@@ -6399,7 +6899,9 @@ class ClaudeAccountSwitcher:
         tag_mode = load_ui_settings(self.backup_dir).org_tag
         emails = [info[1] for info in accounts_info]
         print(bolded("Accounts:"))
-        for i, (num, email, org_name, org_uuid, is_active, creds, alias) in enumerate(accounts_info):
+        for i, (num, email, org_name, org_uuid, is_active, creds, alias, _route) in (
+            enumerate(accounts_info)
+        ):
             tag = self._tag_suffix(tag_mode, emails, email, org_name, org_uuid)
             label = f"{accent(alias)} ({email})" if alias else email
             markers = ""
@@ -6466,56 +6968,55 @@ class ClaudeAccountSwitcher:
             self._logger.debug("Failed to detect running instances", exc_info=True)
 
     def _active_account_usage(
-        self, account_num: str, current_email: str, org_uuid: str
+        self, row: "AccountInfo"
     ) -> tuple[UsageEntry, float | None]:
-        """Store-backed usage entry (+ login expiry) for just the active account.
+        """Store-backed usage entry (+ login expiry) for the live login's row.
 
-        Builds a single-account info row instead of the full accounts list
-        (``--status`` touches one slot) and runs it through the shared
+        The row comes from ``_build_accounts_info(active_only=True)`` — one
+        locked capture that also names its route — and runs through the shared
         collector, so freshness/backoff/claim gating and the shared
-        ``cache/usage.json`` table behave exactly as in ``--list``.
+        ``cache/usage.json`` table behave exactly as in ``--list``. Resolving
+        the slot a second time from a fresh registry is what let a `move`
+        between the two reads send this token through a direct route.
         """
-        active = self._read_active_credentials()
-        creds = active.value or ""
-        self._record_active_verdict(active)
-        info = (int(account_num), current_email, "", org_uuid or "", True, creds, "")
-        entry = self._collect_usage_entries([info])[str(account_num)]
+        num, _email, _org_name, _org_uuid, _is_active, creds, _alias, _route = row
+        entry = self._collect_usage_entries([row])[str(num)]
         return entry, oauth.login_expires_at_epoch(creds)
 
+    def _active_snapshot_row(self) -> "AccountInfo | None":
+        """The live login's row, or None when it is not a managed slot."""
+        rows = self._build_accounts_info(active_only=True)
+        return next((row for row in rows if row[4]), None)
+
     def _build_status_payload(self) -> dict:
-        """Build the ``--status --json`` payload (no active / unmanaged / managed)."""
+        """Build the ``--status --json`` payload (no active / unmanaged / managed).
+
+        Everything comes from the same locked snapshot as ``--list``: the slot,
+        the credential the request uses and the record its route was taken
+        from. The reported `proxy` is that record's stored setting even when
+        the pass had to skip the request (a lock held elsewhere, an owner that
+        moved), which `usageStatus` reports instead.
+        """
         identity = self._get_current_account()
         if identity is None:
             return {"schemaVersion": SCHEMA_VERSION, "active": None}
-        current_email, current_org_uuid = identity
+        current_email, _current_org_uuid = identity
 
-        data = self._get_sequence_data_migrated()
-        if not data:
+        row = self._active_snapshot_row()
+        if row is None:
             return {
                 "schemaVersion": SCHEMA_VERSION,
                 "active": {"email": current_email, "managed": False},
             }
 
-        account_num = self._find_account_slot(data, current_email, current_org_uuid)
-        if not account_num:
-            return {
-                "schemaVersion": SCHEMA_VERSION,
-                "active": {"email": current_email, "managed": False},
-            }
-
-        acct = data["accounts"][account_num]
-        org_name = acct.get("organizationName", "") or ""
-        org_uuid = acct.get("organizationUuid", "") or ""
-        alias = acct.get("alias", "") or ""
-        entry, _login_expires_at = self._active_account_usage(
-            account_num, current_email, org_uuid
-        )
+        account_num, email, org_name, org_uuid, _active, _creds, alias, _route = row
+        entry, _login_expires_at = self._active_account_usage(row)
         # Decision-grade projection, same rule as the --list payload: stale
         # beyond STALE_OK_S reports unavailable, not "ok" with old numbers.
         status, usage = usage_fields(entry.decision_value(), entry.fetched_at)
         active: dict = {
             "number": int(account_num),
-            "email": current_email,
+            "email": email,
             "organizationName": org_name,
             "organizationUuid": org_uuid,
             "isOrganization": bool(org_uuid),
@@ -6525,6 +7026,15 @@ class ClaudeAccountSwitcher:
         }
         if alias:
             active["alias"] = alias
+        # From the record, not from the route: a lock another process holds
+        # makes the route unusable for this pass, and that is a property of the
+        # REQUEST, reported through `usageStatus` — the stored setting is still
+        # what the account has, and must not read as a proxy error.
+        proxy = account_proxy.describe(
+            self._snapshot_records.get(str(account_num))
+        )
+        if proxy:
+            active["proxy"] = proxy
         if usage is not None:
             active.update(usage_freshness_fields(entry.fetched_at, entry.age_s))
         else:
@@ -6541,7 +7051,7 @@ class ClaudeAccountSwitcher:
         return {
             "schemaVersion": SCHEMA_VERSION,
             "active": active,
-            "totalManagedAccounts": len(data.get("accounts", {})),
+            "totalManagedAccounts": len(self._snapshot_records),
         }
 
     def status(self, json_output: bool = False) -> dict | None:
@@ -6555,35 +7065,26 @@ class ClaudeAccountSwitcher:
             return None
         current_email, current_org_uuid = identity
 
-        data = self._get_sequence_data_migrated()
-        if not data:
+        row = self._active_snapshot_row()
+        if row is None:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
             return None
 
-        account_num = self._find_account_slot(data, current_email, current_org_uuid)
-        org_name = ""
-        if account_num is not None:
-            org_name = data["accounts"][account_num].get("organizationName", "") or ""
-
-        if account_num:
-            emails = [a.get("email", "") for a in data.get("accounts", {}).values()]
-            tag = self._tag_suffix(
-                load_ui_settings(self.backup_dir).org_tag,
-                emails, current_email, org_name, current_org_uuid,
-            )
-            total = len(data.get("accounts", {}))
-            print(
-                f"{bolded('Status:')} {accent(f'Account-{account_num}')} "
-                f"({current_email}{tag})"
-            )
-            print(f"  {dimmed(f'Total managed accounts: {total}')}")
-            entry, login_expires_at = self._active_account_usage(
-                account_num, current_email, current_org_uuid
-            )
-            for line in _usage_entry_lines(entry, login_expires_at):
-                print(f"  {line}")
-        else:
-            print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
+        account_num, email, org_name, _org_uuid, _active, _creds, _alias, _route = row
+        emails = [a.get("email", "") for a in self._snapshot_records.values()]
+        tag = self._tag_suffix(
+            load_ui_settings(self.backup_dir).org_tag,
+            emails, email, org_name, current_org_uuid,
+        )
+        total = len(self._snapshot_records)
+        print(
+            f"{bolded('Status:')} {accent(f'Account-{account_num}')} "
+            f"({email}{tag})"
+        )
+        print(f"  {dimmed(f'Total managed accounts: {total}')}")
+        entry, login_expires_at = self._active_account_usage(row)
+        for line in _usage_entry_lines(entry, login_expires_at):
+            print(f"  {line}")
         return None
 
     def _first_run_setup(self) -> None:
@@ -7246,24 +7747,53 @@ class ClaudeAccountSwitcher:
         Returns ``{"live": str|None, "resolved": dict|None}``. ``resolved`` is
         only trustworthy while the live bytes haven't moved — the under-lock
         classifier re-checks byte equality before using it.
+
+        The request travels the proxy of the slot ``~/.claude.json`` names, and
+        that is the account the answer is about — the route, like the slot, is
+        chosen by that file. The residual case is a live credential that
+        actually belongs to a DIFFERENT slot which has its own proxy: the
+        lookup then goes over this slot's route (direct when this slot has no
+        proxy), and a mismatch it reports is still resolved against the slots'
+        own identities before any write. Nothing is written into a slot on the
+        strength of this call alone — ``_classify_outgoing_credential`` decides
+        that under the locks.
+
+        The live bytes, the identity that names the slot, that slot's record
+        and its backup are read in ONE short lock acquisition, and the route
+        comes from that same record: resolving the route by slot number after
+        the lock was the window in which a `move` could send this token through
+        a freed slot's direct path. A lock that cannot be taken yields no
+        request at all.
         """
         result: dict = {"live": None, "resolved": None}
         try:
-            live = self._read_credentials()
+            with FileLock(self.lock_file):
+                live = self._read_credentials()
+                result["live"] = live
+                if not live:
+                    return result
+                identity = self._get_current_account()
+                if identity is None:
+                    return result
+                data = self._get_sequence_data() or {}
+                slot = self._find_account_slot(data, identity[0], identity[1])
+                if slot is None:
+                    return result
+                record = (data.get("accounts") or {}).get(slot) or {}
+                backup = self._read_account_credentials(slot, identity[0])
+                route = account_proxy.route_for(record)
+        except LockError:
+            # Another cswap write owns the registry: this slot cannot be shown
+            # to still be the account the config names, so nothing is sent.
+            # The oracle is advisory; the switch proceeds as it did before it.
+            self._logger.debug(
+                "Account lock held elsewhere; skipping the live identity "
+                "probe rather than sending it over an unpinned route."
+            )
+            return result
         except Exception as e:
             self._logger.debug(f"Pre-lock live credential read failed: {e!r}")
             return result
-        result["live"] = live
-        if not live:
-            return result
-        identity = self._get_current_account()
-        if identity is None:
-            return result
-        data = self._get_sequence_data() or {}
-        slot = self._find_account_slot(data, identity[0], identity[1])
-        if slot is None:
-            return result
-        backup = self._read_account_credentials(slot, identity[0])
         if backup == live or (
             oauth.credential_fingerprint(backup)
             == oauth.credential_fingerprint(live)
@@ -7273,7 +7803,9 @@ class ClaudeAccountSwitcher:
         if not access_token:
             return result  # raw API key / garbled JSON — nothing to resolve
         try:
-            result["resolved"] = oauth.fetch_oauth_profile(access_token)
+            result["resolved"] = oauth.fetch_oauth_profile(
+                access_token, route=route
+            )
         except Exception as e:
             # fetch_oauth_profile swallows its own failures; this belt keeps
             # the invariant structural — the oracle is advisory and must

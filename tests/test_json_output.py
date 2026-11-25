@@ -260,6 +260,37 @@ class TestListJson:
         assert by_num[1]["alias"] == "dev"
         assert "alias" not in by_num[2]
 
+    def test_list_payload_shows_a_masked_proxy_and_never_the_password(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """The account's proxy is an additive field, masked, absent when unset.
+
+        The password has to stay out of a document people paste into bug
+        reports, so the row carries the display form only.
+        """
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        sample_sequence_data["accounts"]["2"]["proxy"] = (
+            "http://user:secret@127.0.0.1:3128"
+        )
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=""), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(None)):
+            payload = switcher.list_accounts(json_output=True)
+
+        by_num = {a["number"]: a for a in payload["accounts"]}
+        assert by_num[2]["proxy"] == "http://user:***@127.0.0.1:3128"
+        assert "proxy" not in by_num[1]
+        assert "secret" not in json.dumps(payload)
+
     def test_list_payload_reports_login_expiry_from_the_stored_credential(
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict,
