@@ -140,7 +140,11 @@ def normalize_ip(value: object) -> str:
 
     ``str(ipaddress.ip_address(...))`` is the canonical form: an IPv6 address
     is compressed and lower-cased, and an IPv4 address keeps no leading
-    zeros, so two spellings of one address compare equal.
+    zeros, so two spellings of one address compare equal. An IPv6 address
+    that maps an IPv4 one is the exception: 3.12.10 and earlier spell
+    ``::ffff:1.2.3.4`` as ``::ffff:102:304``, where 3.12.11 and 3.13 on
+    write the dotted quad (RFC 5952 section 5), so the quad is built here
+    and every supported version stores the same text.
 
     An address carrying an IPv6 zone (``fe80::1%eth0``) is refused rather
     than canonicalised: ``ipaddress`` keeps the zone's text, and that text
@@ -152,11 +156,14 @@ def normalize_ip(value: object) -> str:
             "the expected IP must be a valid IPv4 or IPv6 address"
         )
     try:
-        return str(ipaddress.ip_address(value.strip()))
+        addr = ipaddress.ip_address(value.strip())
     except ValueError:
         raise ExpectationError(
             "the expected IP must be a valid IPv4 or IPv6 address"
         ) from None
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        return f"::ffff:{addr.ipv4_mapped}"
+    return str(addr)
 
 
 @dataclass(frozen=True)

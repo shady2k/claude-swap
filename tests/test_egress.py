@@ -190,6 +190,7 @@ class TestNormalisation:
             ("1.2.3.4", "1.2.3.4"),
             (" 2001:0db8:0000:0000:0000:0000:0000:0001 ", "2001:db8::1"),
             ("::FFFF:1.2.3.4", "::ffff:1.2.3.4"),
+            ("::ffff:102:304", "::ffff:1.2.3.4"),
         ],
     )
     def test_an_ip_is_stored_canonically(self, value, canonical):
