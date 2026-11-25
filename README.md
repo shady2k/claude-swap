@@ -28,6 +28,20 @@ uv sync
 uv run cswap help
 ```
 
+### From this fork
+
+Releases of this fork are published as GitHub Release assets, not on PyPI:
+
+```bash
+uv tool install --force https://github.com/shady2k/claude-swap/releases/download/v1.2.0-shady2k.1/claude_swap-1.2.0.post1-py3-none-any.whl
+```
+
+Or install straight from the release tag:
+
+```bash
+uv tool install --force "git+https://github.com/shady2k/claude-swap.git@v1.2.0-shady2k.1"
+```
+
 ### Updating
 
 ```bash
@@ -36,6 +50,8 @@ cswap upgrade          # uv/pipx installs on macOS/Linux: auto-detects and upgra
 uv tool upgrade claude-swap
 pipx upgrade claude-swap
 ```
+
+For a fork install above, re-run the same `uv tool install --force` command with the new tag: `cswap upgrade` and `uv tool upgrade` follow PyPI, not the fork.
 
 ## Usage
 
