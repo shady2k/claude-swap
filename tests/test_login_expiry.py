@@ -153,14 +153,22 @@ class TestCliList:
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
-        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
-             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+        with patch.object(
+                 switcher, "_read_account_credentials",
+                 side_effect=lambda num, email, **_kw: (
+                     active_creds if str(num) == "1" else backup_creds
+                 ),
+             ), \
              patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response):
             switcher.list_accounts()
 
         lines = capsys.readouterr().out.splitlines()
-        line_7d = next(line for line in lines if "7d:" in line)
-        (line_login,) = [line for line in lines if "login:" in line]
+        # The login row sits under the 7d row of ITS OWN account block.
+        login_idx = next(i for i, line in enumerate(lines) if "login:" in line)
+        (line_login,) = [lines[login_idx]]
+        line_7d = next(
+            line for line in reversed(lines[:login_idx]) if "7d:" in line
+        )
         assert line_login.lstrip().startswith("└ login:")
         assert line_login.endswith("in 5d 12h")
         # Clock under clock, countdown under countdown.

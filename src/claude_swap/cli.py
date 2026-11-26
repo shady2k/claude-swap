@@ -69,6 +69,7 @@ _SUBCOMMAND_FLAGS = {
     "list": "--list",
     "ls": "--list",
     "status": "--status",
+    "current": "--status",
     "add": "--add-account",
     "add-token": "--add-token",
     "remove": "--remove-account",
@@ -107,6 +108,12 @@ def _translate_subcommand(argv: list[str]) -> list[str]:
         if rest and not rest[0].startswith("-"):
             return ["--switch-to", *rest]
         return ["--switch", *rest]
+
+    # `next`/`prev` are the two directions of that rotation.
+    if verb == "next":
+        return ["--switch", *rest]
+    if verb == "prev":
+        return ["--switch", "--previous", *rest]
 
     flag = _SUBCOMMAND_FLAGS.get(verb)
     if flag is not None:
@@ -165,8 +172,20 @@ Examples:
         "account",
         nargs="?",
         metavar="NUM|EMAIL",
-        help="Account to run (number or email). Omit to use the current "
-        "directory's mapping (see `cswap map`).",
+        help="Account to run (number or email). Omit to run the current "
+        "directory's mapping (see `cswap map`), or the active slot when "
+        "nothing is mapped.",
+    )
+    parser.add_argument(
+        "--active",
+        action="store_true",
+        help=(
+            "Launch the active account — sequence.json's activeAccountNumber — "
+            "in its own profile, with its proxy. This is what the thin "
+            "`claude` wrapper runs. Refuses when no account is active or the "
+            "slot has no stored credentials; never falls back to a plain "
+            "claude on ~/.claude."
+        ),
     )
     parser.add_argument(
         "--auto",
@@ -223,11 +242,31 @@ Examples:
     args = parser.parse_args(head)
     if args.auto and args.account is not None:
         parser.error("--auto chooses the account itself: give no NUM|EMAIL with it")
+    if args.active and (args.account is not None or args.auto):
+        parser.error("--active launches the recorded active account: give no "
+                     "NUM|EMAIL and not --auto with it")
 
     # The parser's --help belongs on stdout. Nothing printed after it does:
     # see _run_launch.
     with contextlib.redirect_stdout(sys.stderr):
         _run_launch(args, tail)
+
+
+def _active_account(
+    switcher: ClaudeAccountSwitcher,
+) -> tuple[str, tuple[str, str, str]]:
+    """The slot and account triple `cswap run --active` hands to a launch.
+
+    ``isolated_mode.require_active_slot`` refuses — with the remedy in the
+    message — when no slot is recorded or the recorded one lost its stored
+    credential or config. The triple then pins the launch to the account that
+    was resolved, so a ``swap``/``move`` in between refuses instead of running
+    the account that took the number.
+    """
+    from claude_swap import isolated_mode
+
+    num = isolated_mode.require_active_slot(switcher)
+    return num, switcher.resolve_account(num)
 
 
 def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
@@ -324,6 +363,18 @@ def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
                 )
             raise SessionError(why or "Nothing was launched.")
 
+        if args.active:
+            slot, account = _active_account(switcher)
+            manager.run(
+                slot,
+                tail,
+                share=not args.no_share,
+                share_history=args.share_history,
+                require_session=args.require_session,
+                account=account,
+            )
+            return  # only reachable in tests where exec/exit is mocked
+
         if args.account is not None:
             manager.run(
                 args.account,
@@ -345,19 +396,31 @@ def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
                 require_session=args.require_session,
             )
             return  # only reachable in tests
+        # Nothing mapped, or the mapped account is gone: launch the active
+        # slot. Never a plain claude on the global profile — this fork keeps
+        # no login there (``isolated_mode``), so a fallback would silently run
+        # an account cswap does not manage.
         if email is not None:
             warning(
-                f"Mapped account {email} no longer exists — "
-                "launching the default account."
+                f"Mapped account {email} no longer exists — launching the "
+                "active account."
             )
         else:
             print(
                 dimmed(
-                    f"No account mapped for {os.getcwd()} — "
-                    "launching the default account."
+                    f"No account mapped for {os.getcwd()} — launching the "
+                    "active account."
                 )
             )
-        manager.exec_default(tail)
+        slot, account = _active_account(switcher)
+        manager.run(
+            slot,
+            tail,
+            share=not args.no_share,
+            share_history=args.share_history,
+            require_session=args.require_session,
+            account=account,
+        )
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -2206,6 +2269,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=argparse.SUPPRESS,
     )
     group.add_argument(
+        "--previous",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
         "--status",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -2323,6 +2391,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
 
     if args.strategy is not None and not args.switch:
         parser.error("--strategy can only be used with bare 'switch'")
+
+    if args.previous and not args.switch:
+        parser.error("--previous can only be used with bare 'switch'")
 
     if args.model is not None and args.strategy is None:
         # Meaningless on a direct-target switch or plain rotation — nothing
@@ -2480,6 +2551,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 json_output=args.json,
                 models=models,
                 model_source=model_source,
+                previous=args.previous,
             )
             if payload is not None and models:
                 payload["models"] = list(models)

@@ -3,25 +3,88 @@
 #
 # Every `claude` runs
 #
-#     cswap run --auto -- "$@"
+#     cswap run --active -- "$@"
 #
-# so the account with the most quota left is chosen and started as its own
-# session profile, with its own proxy, and the default login is never
-# switched. Install it as a symlink in a directory of its own, ahead of the
-# real Claude Code in PATH — not in the directory Claude Code's own installer
-# keeps its launcher in:
+# so the account recorded as active in cswap's own state (sequence.json's
+# activeAccountNumber) is started as its own session profile, with its own
+# proxy, and the global ~/.claude login is never used or switched. Install it
+# as a symlink in a directory of its own, ahead of the real Claude Code in
+# PATH — not in the directory Claude Code's own installer keeps its launcher
+# in:
 #
 #     mkdir -p ~/.local/claude-swap/bin
 #     ln -s "$(cswap wrapper)" ~/.local/claude-swap/bin/claude
 #     export PATH="$HOME/.local/claude-swap/bin:$PATH"
 #
+# `--version`, `-v`, `--help` and `-h` go straight to the real binary, with no
+# quota check and no network: a caller asking what version is installed (an
+# SDK, a package manager, a person) must get an answer without an account.
+#
 # Rules: docs/auto-launch.md. Mechanism: claude_swap/wrapper.py.
 set -u
 
+# Claude Code's own updater would install a second, unwrapped launcher under
+# ~/.local/bin or ~/.claude/local, and every update would then bypass this
+# wrapper. cswap's sessions turn it off the same way.
+export DISABLE_AUTOUPDATER=1
+
+# Is this file the wrapper? The marker is in the first line, and the real
+# binary is far too big to read whole — only its head is looked at. The
+# identity check comes first because the walk must never hand the terminal
+# back to this same file: on a PATH without head/grep the marker cannot be
+# read, and without this line the wrapper would exec itself in a loop.
+is_wrapper() {
+    if [ "$1" -ef "$0" ] 2>/dev/null; then
+        return 0
+    fi
+    head -c 4096 -- "$1" 2>/dev/null | grep -q 'claude-swap thin wrapper'
+}
+
+# The real Claude Code: CSWAP_CLAUDE_BIN when it names a usable one, else the
+# first non-wrapper `claude` on PATH, walking past this wrapper.
+find_real_claude() {
+    if [ -n "${CSWAP_CLAUDE_BIN:-}" ]; then
+        if [ -f "$CSWAP_CLAUDE_BIN" ] && [ -x "$CSWAP_CLAUDE_BIN" ] \
+            && ! is_wrapper "$CSWAP_CLAUDE_BIN"; then
+            printf '%s' "$CSWAP_CLAUDE_BIN"
+            return 0
+        fi
+        return 1
+    fi
+    old_ifs=$IFS
+    IFS=:
+    for dir in $PATH; do
+        [ -n "$dir" ] || continue
+        candidate="$dir/claude"
+        if [ -f "$candidate" ] && [ -x "$candidate" ] \
+            && ! is_wrapper "$candidate"; then
+            printf '%s' "$candidate"
+            IFS=$old_ifs
+            return 0
+        fi
+    done
+    IFS=$old_ifs
+    return 1
+}
+
+case "${1:-}" in
+    --version|-v|--help|-h)
+        real=$(find_real_claude) || real=
+        if [ -n "$real" ]; then
+            exec "$real" "$@"
+        fi
+        {
+            echo "claude: this wrapper cannot find the real Claude Code binary."
+            echo "claude: set CSWAP_CLAUDE_BIN to it, or put it on PATH."
+        } >&2
+        exit 127
+        ;;
+esac
+
 if ! command -v cswap >/dev/null 2>&1; then
-    echo "claude: cswap is not on PATH, so this wrapper cannot choose an account." >&2
+    echo "claude: cswap is not on PATH, so this wrapper cannot launch an account." >&2
     echo "claude: install claude-swap (uv tool install claude-swap) and put it on PATH." >&2
     exit 127
 fi
 
-exec cswap run --auto -- "$@"
+exec cswap run --active -- "$@"

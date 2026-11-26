@@ -1805,6 +1805,7 @@ class TestAccountsSnapshot:
         switcher._init_sequence_file()
         data = switcher._get_sequence_data()
         data["sequence"] = [1, 2]
+        data["activeAccountNumber"] = 1
         data["accounts"] = {
             "1": {"email": "test@example.com", "uuid": "test-uuid-1234"},
             "2": {"email": "other@example.com", "uuid": "uuid-2"},

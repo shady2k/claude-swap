@@ -1,11 +1,17 @@
-# Launch on the account with the most quota
+# Launching Claude Code on a managed account
 
-`cswap run --auto -- <arguments>` starts Claude Code as the managed account with
-the most remaining quota. The account is chosen for that one process: the
-default login is read, never switched, so another terminal and the VS Code
-extension keep the account they had.
+`cswap run --active -- <arguments>` starts Claude Code as the account recorded as
+active (`sequence.json`'s `activeAccountNumber`), in that account's own session
+profile with its own proxy. Every `claude` launch goes through it, so the account
+is chosen by `cswap switch` — a switch writes that one field and nothing in
+`~/.claude`, which means a running Claude Code is never pulled out from under and
+another terminal keeps the account it started with.
 
-The thin `claude` wrapper runs it for every launch. Put a symlink to it in a
+`cswap run --auto -- <arguments>` is still there for a launch that picks for
+itself: the managed account with the most remaining quota, without changing the
+recorded active slot. The rest of this page describes it.
+
+The thin `claude` wrapper runs `--active` for every launch. Put a symlink to it in a
 directory of its own, ahead of the real Claude Code in `PATH` — **not** in the
 directory Claude Code's own installer keeps its launcher in (`~/.local/bin` on
 Linux and macOS, which it links into `versions/`, so a symlink there either
@@ -36,10 +42,8 @@ reads:
   usual poll plan — a launch can fetch usage for accounts that are due.
 - **Ranking**, best first: a reading with quota left (headroom above 0) before
   none; an account Claude Code has not just reported a rate-limit stop on before
-  one it has (see below); more headroom before less; and the login the terminal
-  already has before another slot at equal headroom — that one is launched on the
-  default login itself (the same-account fast path), not in a session profile.
-  Ties are otherwise settled in rotation order.
+  one it has (see below); more headroom before less. Ties are settled in rotation
+  order.
 - **The winner is confirmed once** before the launch: its usage is read again
   through the store's own rules. A reading may be up to 180 s old
   (`SERVE_TTL_S`, derived from the usage endpoint's request budget) and the
@@ -62,18 +66,18 @@ not rejected have spent their quota — when the nearest reset is. The whole wal
 comes from one capture of the account list and one pass over the readings, so a
 rejected candidate costs one row of the ranking, not a fresh list.
 
-The choice is not a switch: `sequence.json` and the default login keep the
-account they had, so `cswap status`, the menu bar and auto-switching see no
-change. The launch is the ordinary session-mode one — that account's profile,
-its proxy checked and handed to Claude Code, and the usual shared settings,
-skills, MCP servers, `CLAUDE.md` and chat history, so `--resume` lists the same
-conversations. The chosen slot is carried into the launch as the
-(slot, email, organization) it was read with, and a `swap` or `move` that gives
-the slot to another account between the choice and the start refuses the launch
-with a reason instead of running the newcomer.
+The choice is not a switch: `sequence.json` keeps the account it had, so
+`cswap status`, the menu bar and auto-switching see no change. The launch is the
+ordinary session-mode one — that account's profile, its proxy checked and handed
+to Claude Code, and the usual shared settings, skills, MCP servers, `CLAUDE.md`
+and chat history, so `--resume` lists the same conversations. The chosen slot is
+carried into the launch as the (slot, email, organization) it was read with, and
+a `swap` or `move` that gives the slot to another account between the choice and
+the start refuses the launch with a reason instead of running the newcomer.
 
-With `--require-session` the current-login case still refuses, as it does for a
-named account: `--auto` then reports it instead of choosing another account.
+Every launch is a session profile — for `--active` and for a named account too.
+There is no plain `claude` on a login in `~/.claude`, so `--require-session` has
+nothing left to refuse: isolation is unconditional.
 
 ## After an account runs out
 
@@ -157,18 +161,30 @@ package); install it as a symlink, because a symlink is what the documentation
 below is written for and what keeps the package's copy a single file to update.
 What it does:
 
+- `export DISABLE_AUTOUPDATER=1` before anything else: Claude Code's own updater
+  would otherwise install a second, unwrapped launcher under `~/.local/bin` or
+  `~/.claude/local`, and every update after that would bypass the wrapper;
+- `--version`, `-v`, `--help` and `-h` as the first argument hand over to the
+  real Claude Code directly, with no quota check and no network — an SDK, a
+  package manager or a person asking which version is installed gets an answer
+  without an account;
 - with `cswap` missing from `PATH`, it prints that to stderr and exits `127`;
-- otherwise it replaces itself with `cswap run --auto -- "$@"` (`exec`), so the
+- otherwise it replaces itself with `cswap run --active -- "$@"` (`exec`), so the
   launch's notices go to stderr, stdout stays Claude Code's, and the exit code is
-  `cswap`'s and therefore Claude Code's.
+  `cswap`'s and therefore Claude Code's. A refusal (no active slot, a disabled
+  one, a proxy or exit check that fails) is a non-zero exit — never a bare
+  `claude` on `~/.claude`.
 
-It searches for nothing. `session.find_claude` is the only place that resolves
-the real Claude Code, and it never returns the wrapper: a `claude` on `PATH` that
-is the wrapper is walked past, so an explicit `cswap run 3` is not replaced by
-an automatic choice and the `claude auth status` probe does not become a second
-cswap. cswap knows its own script by a marker line near its top, so an edited
-copy or another version is recognised too, and it reads only the first
-kilobytes of a candidate — Claude Code's own binary is 377 MB.
+The real binary is resolved by `CSWAP_CLAUDE_BIN` first when it names an
+executable that is not the wrapper, then by walking `PATH`; a bare `claude` need
+not be on `PATH` at all. Inside cswap the same variable is read first by
+`session.find_claude`, the only place that resolves the binary a launch hands the
+terminal to, and it never returns the wrapper: a `claude` on `PATH` that is the
+wrapper is walked past, so an explicit `cswap run 3` is not replaced by the
+active account and the `claude auth status` probe does not become a second cswap.
+cswap knows its own script by a marker line near its top, so an edited copy or
+another version is recognised too, and it reads only the first kilobytes of a
+candidate — Claude Code's own binary is 377 MB.
 
 ## Non-essential traffic
 
@@ -182,7 +198,8 @@ run.disableNonessentialTraffic false` stops cswap from setting the variable (it
 never unsets an inherited one), giving those features back; the proxy settings an
 account carries are unaffected either way.
 
-`--auto` also drops the shell's auth overrides (`ANTHROPIC_API_KEY`,
-`ANTHROPIC_AUTH_TOKEN` and the rest of `AUTH_OVERRIDE_ENV_VARS`) on the
-same-account fast path, where an explicit `cswap run` keeps its environment: the
-account, and the proxy it was checked with, were chosen for the user.
+A launch on an account the wrapper (or `--auto`) chose drops the shell's auth
+overrides (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and the rest of
+`AUTH_OVERRIDE_ENV_VARS`): the account, and the proxy it was checked with, were
+chosen for the user, and an exported key would bill someone else's credential
+through that proxy.

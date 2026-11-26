@@ -962,19 +962,13 @@ class TestCleanHomeActivation:
                 config_path = dst._get_claude_config_path()
                 assert not config_path.exists()
 
-                # Stub list_accounts (post-switch network call) to keep test offline
                 with patch.object(dst, "list_accounts"):
                     dst.switch_to("1")
 
-                # Live config + live credentials now exist for alice
-                assert config_path.exists()
-                live_config = json.loads(config_path.read_text())
-                assert live_config["oauthAccount"]["emailAddress"] == "alice@example.com"
-
-                live_creds_path = dst_home / ".claude" / ".credentials.json"
-                assert live_creds_path.exists()
-                live_creds = json.loads(live_creds_path.read_text())
-                assert live_creds["_marker"] == "alice@example.com"
+                # The switch records the slot and writes nothing into
+                # ~/.claude: no live config, no live credential.
+                assert not config_path.exists()
+                assert not (dst_home / ".claude" / ".credentials.json").exists()
 
                 seq = dst._get_sequence_data()
                 assert seq["activeAccountNumber"] == 1
@@ -1006,10 +1000,12 @@ class TestCleanHomeActivation:
                 with patch.object(dst, "list_accounts"):
                     dst.switch()
 
-                live_config = json.loads(config_path.read_text())
-                assert live_config["oauthAccount"]["emailAddress"] == "bob@example.com"
+                # Rotation from the imported active slot (2) lands on 1, and
+                # still writes no login: the fresh machine keeps an untouched
+                # ~/.claude until a `claude` launch starts a session profile.
+                assert not config_path.exists()
                 seq = dst._get_sequence_data()
-                assert seq["activeAccountNumber"] == 2
+                assert seq["activeAccountNumber"] == 1
 
     def test_import_preserves_existing_active_account(self, temp_home: Path):
         """If destination already has an active selection, import must NOT
@@ -1100,15 +1096,9 @@ class TestCleanHomeActivation:
                     dst.switch_to("1")
 
                 merged = json.loads(config_path.read_text())
-                # Local settings preserved
-                assert merged["tipsHistory"] == {"shown": ["welcome"]}
-                assert merged["projects"]["/path/to/project"]["mcpServers"] == {
-                    "memory": {"type": "stdio"}
-                }
-                assert merged["userID"] == "local-user-id"
-                assert merged["numStartups"] == 42
-                # oauthAccount overlaid from imported config
-                assert merged["oauthAccount"]["emailAddress"] == "alice@example.com"
+                # The file is left exactly as it was: a switch writes no login,
+                # so there is nothing to splice into it.
+                assert merged == local_config
 
     def test_clean_switch_fallback_when_local_config_malformed(self, temp_home: Path):
         """If ~/.claude.json exists but is malformed/empty, fall back to the
@@ -1130,9 +1120,9 @@ class TestCleanHomeActivation:
                 with patch.object(dst, "list_accounts"):
                     dst.switch_to("1")
 
-                # Imported config wholesale (the malformed file is replaced)
-                merged = json.loads(config_path.read_text())
-                assert merged["oauthAccount"]["emailAddress"] == "alice@example.com"
+                # The malformed file is neither repaired nor replaced by a
+                # switch — that is not its job any more.
+                assert config_path.read_text() == "{not valid json"
 
     def test_a_valid_empty_config_is_spliced_not_called_unparseable(
         self, temp_home: Path
@@ -1162,8 +1152,7 @@ class TestCleanHomeActivation:
                 with patch.object(dst, "list_accounts"):
                     dst.switch_to("1")
 
-                merged = json.loads(config_path.read_text())
-                assert merged["oauthAccount"]["emailAddress"] == "alice@example.com"
+                assert config_path.read_text() == "{}"
                 assert not list(config_path.parent.glob("*.unreadable-*")), (
                     "a valid empty config was salvaged and reported as "
                     "unparseable"
@@ -1260,9 +1249,9 @@ class TestSlimVsFullConfig:
             export_accounts(s, str(temp_home / "x.cswap"))
 
     def test_slim_export_round_trip_to_fresh_machine(self, temp_home: Path):
-        """End-to-end: bloated source config → slim export → import on
-        clean home → switch_to → live ~/.claude.json contains oauthAccount,
-        and the source machine's userID/anonymousId did NOT cross over."""
+        """End-to-end: bloated source config → slim export → import on a
+        clean home → switch_to records the slot, and no ~/.claude file of the
+        source machine (userID, anonymousId, terminal paths) appears there."""
         src_home = temp_home.parent / "src"
         src_home.mkdir()
         with patch("pathlib.Path.home", return_value=src_home):
@@ -1284,12 +1273,15 @@ class TestSlimVsFullConfig:
                 with patch.object(dst, "list_accounts"):
                     dst.switch_to("1")
 
-                live = json.loads(dst._get_claude_config_path().read_text())
-                assert live["oauthAccount"]["emailAddress"] == "alice@example.com"
-                # Source machine identity must NOT have leaked over
-                assert live.get("userID") != "host-machine-identity"
-                assert live.get("anonymousId") != "anon-host-id"
-                assert "appleTerminalBackupPath" not in live
+                # Nothing of the source machine's config crosses over, because
+                # a switch writes no ~/.claude at all.
+                config_path = dst._get_claude_config_path()
+                assert not config_path.exists()
+                # The slot itself carries the account, slim as exported.
+                blob = json.loads(dst.read_account_config("1", "alice@example.com"))
+                assert blob["oauthAccount"]["emailAddress"] == "alice@example.com"
+                assert "userID" not in blob and "anonymousId" not in blob
+                assert "appleTerminalBackupPath" not in blob
 
 
 class TestSlimVsFullCredentials:
@@ -1773,22 +1765,15 @@ class TestImportClearsDeadTokenQuarantine:
             "org-scoped account's quarantine is invisible to the import heal"
         )
 
-    def test_import_heals_an_active_slot_struck_on_its_live_generation(
+    def test_import_heals_a_slot_struck_on_its_stored_generation(
         self, temp_home: Path, capsys
     ):
         """The heal must ask the same question the collectors ask.
 
-        _entry_token_dead treats an ACTIVE slot as having TWO stored sources:
-        the live credential and the backup. A strike holds while EITHER still
-        matches the struck generation, because _fetch_active_usage's recovery
-        branch legitimately POSTs the backup while ordinary passes POST the
-        live bytes.
-
-        The import heal compares only against the backup. So when the strike is
-        bound to the LIVE generation and the backup has since moved, the
-        collectors correctly read the slot as quarantined while the import
-        reads it as healthy and refuses to replace it — and `cswap import` is
-        exactly what the "re-login needed" message tells the user to run.
+        A slot has ONE stored source in this fork — its backup — and a strike
+        holds exactly while the backup still carries the struck generation.
+        `cswap import` is what the "re-login needed" message tells the user to
+        run, so the two must agree on that verdict or the remedy does nothing.
         """
         from claude_swap import oauth
 
@@ -1796,30 +1781,17 @@ class TestImportClearsDeadTokenQuarantine:
         _seed_account(s, 2, "bob@example.com")
         ident = {"2": ("bob@example.com", "")}
 
-        live = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-live", "refreshToken": "rt-live",
-            "expiresAt": 9999999999000}})
-        newer_backup = json.dumps({"claudeAiOauth": {
+        stored = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-bk", "refreshToken": "rt-bk",
             "expiresAt": 9999999999000}})
-        # Slot 2 is ACTIVE and its live bytes are what got struck; the backup
-        # has since been rewritten to a different lineage.
-        # current_account_number() resolves the active slot from the LIVE
-        # login's identity in .claude.json, not from activeAccountNumber.
-        cfg = s._get_claude_config_path()
-        cfg.parent.mkdir(parents=True, exist_ok=True)
-        s._write_json(cfg, {"oauthAccount": {
-            "emailAddress": "bob@example.com",
-            "accountUuid": "acct-2",
-            "organizationUuid": "",
-            "organizationName": "",
-        }})
-        s._store._write_active_credentials_file(live)
-        s._write_account_credentials("2", "bob@example.com", newer_backup)
+        s._write_account_credentials("2", "bob@example.com", stored)
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 2
+        s._write_json(s.sequence_file, data)
         s._usage_store.record(
             {"2": FetchRecord(
                 error="invalid_grant",
-                struck_fp=oauth.credential_fingerprint(live),
+                struck_fp=oauth.credential_fingerprint(stored),
             )},
             ident,
         )
@@ -1830,21 +1802,16 @@ class TestImportClearsDeadTokenQuarantine:
         env["accounts"][0]["credentials"]["_marker"] = "BOB_HEALED"
         out.write_text(json.dumps(env))
 
-        # Probe the verdict itself before the import, so a failure names
-        # which half is wrong.
         assert s.current_account_number() == "2"
         assert s._slot_token_dead("2", "bob@example.com"), (
-            "the strike is bound to the live generation and slot 2 is active, "
-            "so the collectors' rule says dead"
+            "the strike is bound to the slot's stored generation, so both the "
+            "collectors and the import must read the slot as dead"
         )
 
         import_accounts(s, str(out), force=False)
 
         err = capsys.readouterr().err
-        assert "was quarantined: refresh token dead" in err, (
-            "the import compared the strike only against the backup, so an "
-            "active slot struck on its live generation is never healed"
-        )
+        assert "was quarantined: refresh token dead" in err
 
     def test_plain_import_skips_healthy_slot(self, temp_home: Path, capsys):
         """The heal is scoped to token_dead() only: a healthy existing account
@@ -2220,10 +2187,7 @@ class TestImportUsage:
         it was handed is current — so the row shows the reading."""
         s = _linux_switcher(temp_home)
         _seed_account(s, 1, "alice@example.com")
-        (temp_home / ".claude.json").write_text(json.dumps(
-            {"oauthAccount": {"emailAddress": "alice@example.com", "accountUuid": "acct-1"}}
-        ))
-        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+        s._write_account_credentials("1", "alice@example.com", json.dumps(
             {"claudeAiOauth": {"accessToken": "tok", "refreshToken": "rtok", "expiresAt": 1000}}
         ))
         self._import(

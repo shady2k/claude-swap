@@ -212,7 +212,8 @@ class TestCLI:
             cli.main()
 
         switcher_cls.return_value.switch.assert_called_once_with(
-            strategy="best", json_output=False, models=(), model_source=None
+            strategy="best", json_output=False, models=(), model_source=None,
+            previous=False,
         )
 
     def test_switch_strategy_falls_back_to_configured_model(self):
@@ -231,6 +232,7 @@ class TestCLI:
         switcher_cls.return_value.switch.assert_called_once_with(
             strategy="best", json_output=False,
             models=("Fable",), model_source="autoswitch.model",
+            previous=False,
         )
 
     def test_switch_model_flag_overrides_setting(self):
@@ -251,6 +253,7 @@ class TestCLI:
         switcher_cls.return_value.switch.assert_called_once_with(
             strategy="next-available", json_output=False,
             models=("Opus", "Fable"), model_source="cli",
+            previous=False,
         )
 
     def test_switch_model_without_strategy_is_rejected(self, capsys):
@@ -270,7 +273,8 @@ class TestCLI:
             cli.main()
 
         switcher_cls.return_value.switch.assert_called_once_with(
-            strategy=None, json_output=False, models=(), model_source=None
+            strategy=None, json_output=False, models=(), model_source=None,
+            previous=False
         )
 
     def test_slot_flag_requires_add_account(self, capsys):
@@ -1781,11 +1785,13 @@ class TestRunCommand:
         "unbuffered", [False, True], ids=["buffered", "unbuffered"]
     )
     def test_real_handoff_leaves_stdout_to_claude(self, tmp_path, unbuffered):
-        """Through the real handoff, a piped stdout carries claude's output
-        and nothing else, and the launch notice still arrives, on stderr.
+        """Through a real subprocess, everything cswap says is on stderr and
+        stdout stays empty.
 
-        Unbuffered is the case that puts a stdout notice in front of claude's
-        output; buffered is the one where a POSIX exec drops it.
+        Buffered is the case that would put a notice in front of claude's
+        output; unbuffered is the one where a POSIX exec drops it. The launch
+        here ends in the fork's fail-closed refusal — there is no account to
+        run — which is the path a user without a recorded slot meets.
         """
         fake_claude = tmp_path / "claude.py"
         fake_claude.write_text(
@@ -1806,8 +1812,7 @@ class TestRunCommand:
                 backup_dir=Path.cwd(),
                 _logger=None,
                 slot_for_directory=lambda cwd: (None, None),
-                default_login=lambda *, primary_profile=False: None,
-                default_login_still_holds=lambda identity, slot, *, primary_profile=False: True,
+                _get_sequence_data=lambda: {"accounts": {}, "sequence": []},
                 _is_running_in_container=lambda: True,
             )
             argv = ["cswap", "run", "--", sys.argv[1], "--output-format", "stream-json"]
@@ -1831,11 +1836,10 @@ class TestRunCommand:
             timeout=60,
         )
 
-        assert result.returncode == 0, result.stderr
-        assert [json.loads(line) for line in result.stdout.splitlines()] == [
-            {"args": ["--output-format", "stream-json"]}
-        ]
+        assert result.returncode == 1, result.stderr
+        assert result.stdout == ""
         assert "No account mapped" in result.stderr
+        assert "No active account is recorded" in result.stderr
 
 
 class TestSubcommandAliases:
@@ -1900,7 +1904,8 @@ class TestSubcommandAliases:
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
         switcher_cls.return_value.switch.assert_called_once_with(
-            strategy=None, json_output=False, models=(), model_source=None
+            strategy=None, json_output=False, models=(), model_source=None,
+            previous=False
         )
 
     def test_list_subcommand_with_json(self):
@@ -2000,6 +2005,7 @@ class TestJsonOutputCli:
 
         switcher_cls.return_value.switch.assert_called_once_with(
             strategy=None, json_output=True, models=(), model_source=None,
+            previous=False,
         )
         assert json.loads(capsys.readouterr().out) == payload
 
@@ -2979,7 +2985,11 @@ class TestRunAutoResolve:
             cli.main()
         assert ("run", "2", [], True, None) in calls
 
-    def test_unmapped_dir_falls_back_to_default(self, tmp_path, monkeypatch, capsys):
+    def test_unmapped_dir_without_an_active_slot_refuses(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """No mapping and no recorded slot is a refusal, never a plain claude:
+        this fork keeps no login in the global ``~/.claude`` to fall back to."""
         backup = tmp_path / "backup"
         backup.mkdir()
         scratch = tmp_path / "scratch"
@@ -2991,13 +3001,18 @@ class TestRunAutoResolve:
                    return_value=self._fake_switcher(backup, {"accounts": {}, "sequence": []})), \
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run"]):
-            cli.main()
-        assert ("exec_default", [], False) in calls
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 1
+        assert calls == []
         captured = capsys.readouterr()
         assert captured.out == ""
         assert "No account mapped" in captured.err
+        assert "No active account is recorded" in captured.err
 
-    def test_removed_account_falls_back_with_warning(self, tmp_path, monkeypatch, capsys):
+    def test_removed_account_is_a_warning_before_the_active_launch(
+        self, tmp_path, monkeypatch, capsys
+    ):
         from claude_swap.mappings import MappingStore
 
         repo = tmp_path / "repo"
@@ -3012,8 +3027,10 @@ class TestRunAutoResolve:
                    return_value=self._fake_switcher(backup, {"accounts": {}, "sequence": []})), \
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run"]):
-            cli.main()
-        assert ("exec_default", [], False) in calls
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 1
+        assert calls == []
         captured = capsys.readouterr()
         assert captured.out == ""
         assert "no longer exists" in captured.err

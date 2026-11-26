@@ -158,25 +158,6 @@ def _a_claude_on_path(monkeypatch):
     )
 
 
-@pytest.fixture(autouse=True)
-def _default_login_signed_in(request, monkeypatch):
-    """The default login holds a working token unless a test says otherwise.
-
-    The fast-path tests name the default login's account through its identity
-    and never seed a credential for it, which the real check reads as signed
-    out. Tests of that check ask for ``real_default_login_check``."""
-    if "real_default_login_check" in request.fixturenames:
-        return
-    monkeypatch.setattr(
-        session_mod.SessionManager, "_default_login_signed_out", lambda self: False
-    )
-
-
-@pytest.fixture
-def real_default_login_check():
-    """Run ``SessionManager._default_login_signed_out`` as it is."""
-
-
 @pytest.fixture
 def windows_symlinks(monkeypatch, tmp_path):
     """Windows with Developer Mode (or an elevated terminal): file symlinks
@@ -187,8 +168,6 @@ def windows_symlinks(monkeypatch, tmp_path):
     monkeypatch.setattr(session_mod, "can_symlink", lambda _dir: True)
 
 
-# ---------------------------------------------------------------------------
-# fixtures
 # ---------------------------------------------------------------------------
 
 
@@ -1673,31 +1652,7 @@ class TestRun:
         )
         assert call.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
 
-    def test_fast_path_for_active_account(
-        self, manager, capture_exec, monkeypatch, capsys
-    ):
-        monkeypatch.setattr(
-            manager.switcher,
-            "_get_current_account",
-            lambda: (ACCOUNT_EMAIL, ORG_UUID),
-        )
-        with pytest.raises(_ExecCalled) as exc:
-            manager.run("2", [])
 
-        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
-        assert "already the active default login" in capsys.readouterr().out
-
-    def test_require_session_refuses_fast_path(
-        self, manager, capture_exec, monkeypatch
-    ):
-        monkeypatch.setattr(
-            manager.switcher,
-            "_get_current_account",
-            lambda: (ACCOUNT_EMAIL, ORG_UUID),
-        )
-        # SessionError, not _ExecCalled: nothing may launch.
-        with pytest.raises(SessionError, match="active default login"):
-            manager.run("2", [], require_session=True)
 
     def test_require_session_is_inert_off_the_active_account(
         self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates
@@ -1735,122 +1690,8 @@ class TestRun:
         assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
         assert "overriding it for this launch" in capsys.readouterr().out
 
-    def test_preset_config_dir_fast_paths_for_active_default_account(
-        self, manager, capture_exec, monkeypatch, capsys
-    ):
-        # A session for the active default account would consume the live
-        # login's refresh token and log out every claude running on it.
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
-        monkeypatch.setattr(
-            session_mod.SessionManager,
-            "_default_login_identity",
-            staticmethod(lambda: (ACCOUNT_EMAIL, ORG_UUID)),
-        )
-        # The re-check before the handoff reads the default profile itself,
-        # whatever CLAUDE_CONFIG_DIR says.
-        get_default_global_config_path().write_text(json.dumps({
-            "oauthAccount": {
-                "emailAddress": ACCOUNT_EMAIL,
-                "organizationUuid": ORG_UUID,
-            },
-        }))
-        with pytest.raises(_ExecCalled) as exc:
-            manager.run("2", [])
 
-        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
-        assert "already the active default login" in capsys.readouterr().out
 
-    def test_preset_config_dir_require_session_refuses_active_default(
-        self, manager, capture_exec, monkeypatch
-    ):
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
-        monkeypatch.setattr(
-            session_mod.SessionManager,
-            "_default_login_identity",
-            staticmethod(lambda: (ACCOUNT_EMAIL, ORG_UUID)),
-        )
-        with pytest.raises(SessionError, match="active default"):
-            manager.run("2", [], require_session=True)
-
-    @pytest.mark.parametrize("preset", [False, True])
-    def test_signed_out_default_login_launches_the_session_profile(
-        self,
-        manager,
-        capture_exec,
-        monkeypatch,
-        auth_status_tracks_seed,
-        refresh_rotates,
-        capsys,
-        real_default_login_check,
-        preset,
-    ):
-        # ~/.claude.json still names account 2, but its login was signed out:
-        # plain claude would stop at "Not logged in" on every launch.
-        if preset:
-            monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
-            monkeypatch.setattr(
-                session_mod.SessionManager,
-                "_default_login_identity",
-                staticmethod(lambda: (ACCOUNT_EMAIL, ORG_UUID)),
-            )
-        else:
-            monkeypatch.setattr(
-                manager.switcher,
-                "_get_current_account",
-                lambda: (ACCOUNT_EMAIL, ORG_UUID),
-            )
-        with pytest.raises(_ExecCalled) as exc:
-            manager.run("2", [])
-
-        session_dir = session_dir_for(
-            manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
-        )
-        assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
-        out = capsys.readouterr().out
-        assert "holds no usable token" in out
-        assert "already the active default login" not in out
-
-    def test_signed_out_default_login_is_not_refused_by_require_session(
-        self,
-        manager,
-        capture_exec,
-        monkeypatch,
-        auth_status_tracks_seed,
-        refresh_rotates,
-        real_default_login_check,
-    ):
-        monkeypatch.setattr(
-            manager.switcher,
-            "_get_current_account",
-            lambda: (ACCOUNT_EMAIL, ORG_UUID),
-        )
-        with pytest.raises(_ExecCalled) as exc:
-            manager.run("2", [], require_session=True)
-
-        assert "CLAUDE_CONFIG_DIR" in exc.value.env
-
-    def test_working_default_login_keeps_the_fast_path(
-        self,
-        manager,
-        temp_home,
-        capture_exec,
-        monkeypatch,
-        capsys,
-        real_default_login_check,
-    ):
-        # The check itself runs here: a login that still holds a refresh
-        # token must never be copied into a session profile.
-        (temp_home / ".claude" / ".credentials.json").write_text(CREDS)
-        monkeypatch.setattr(
-            manager.switcher,
-            "_get_current_account",
-            lambda: (ACCOUNT_EMAIL, ORG_UUID),
-        )
-        with pytest.raises(_ExecCalled) as exc:
-            manager.run("2", [])
-
-        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
-        assert "already the active default login" in capsys.readouterr().out
 
     def test_auth_override_vars_scrubbed_from_session_env(
         self,
@@ -1875,45 +1716,7 @@ class TestRun:
         assert "ANTHROPIC_AUTH_TOKEN" not in exc.value.env
         assert exc.value.env["UNRELATED_VAR"] == "kept"
 
-    def test_fast_path_keeps_env_untouched(
-        self, manager, capture_exec, monkeypatch
-    ):
-        """Plain-claude fast path must NOT scrub: it's normal claude behavior."""
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-key")
-        monkeypatch.setattr(
-            manager.switcher,
-            "_get_current_account",
-            lambda: (ACCOUNT_EMAIL, ORG_UUID),
-        )
-        with pytest.raises(_ExecCalled) as exc:
-            manager.run("2", [])
 
-        assert exc.value.env["ANTHROPIC_API_KEY"] == "sk-ant-key"
-
-    def test_an_automatic_fast_path_drops_the_shell_auth_overrides(
-        self, manager, capture_exec, monkeypatch, capsys
-    ):
-        """``--auto`` chose this account, so the shell's override goes.
-
-        The fast path runs plain claude on the default login, whose proxy is
-        the chosen account's. An ``ANTHROPIC_API_KEY`` from the terminal would
-        make Claude Code bill a different credential than the account the
-        proxy belongs to.
-        """
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-key")
-        monkeypatch.setenv("UNRELATED_VAR", "kept")
-        monkeypatch.setattr(
-            manager.switcher,
-            "_get_current_account",
-            lambda: (ACCOUNT_EMAIL, ORG_UUID),
-        )
-        choice = (ACCOUNT_NUM, ACCOUNT_EMAIL, ORG_UUID)
-        with pytest.raises(_ExecCalled) as exc:
-            manager.run(choice[0], [], account=choice)
-
-        assert "ANTHROPIC_API_KEY" not in exc.value.env
-        assert exc.value.env["UNRELATED_VAR"] == "kept"
-        assert "Ignoring ANTHROPIC_API_KEY" in capsys.readouterr().out
 
     def test_an_automatic_launch_refuses_a_slot_that_moved(
         self, manager, capture_exec, monkeypatch
@@ -2270,26 +2073,6 @@ class TestTheLaunchTakesTheAccountsProxy:
             assert probe_env["NO_PROXY"] != "*"
             assert probe_env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
 
-    def test_the_fast_path_carries_the_proxy_too(
-        self, manager, capture_exec, stream_proxy, monkeypatch
-    ):
-        """Plain claude on the default login is the same account's traffic."""
-        manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
-        _active_default_login(monkeypatch, manager)
-        monkeypatch.setenv("https_proxy", "http://shell.invalid:1")
-        monkeypatch.setenv("NO_PROXY", "*")
-
-        with pytest.raises(_ExecCalled) as exc:
-            manager.run("2", [])
-
-        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
-        assert exc.value.env["HTTPS_PROXY"] == stream_proxy.url
-        assert exc.value.env["https_proxy"] == stream_proxy.url
-        assert "shell.invalid" not in " ".join(exc.value.env.values())
-        assert exc.value.env["NO_PROXY"] != "*"
-        assert [path for path, _ in stream_proxy.requests] == [
-            "api.anthropic.com:443"
-        ]
 
     def test_exec_default_carries_the_live_logins_proxy(
         self, manager, capture_exec, stream_proxy, monkeypatch
@@ -2380,38 +2163,6 @@ class TestTheLaunchTakesTheAccountsProxy:
     @pytest.mark.parametrize(
         "primary_profile", [False, True], ids=["live_login", "default_profile"]
     )
-    def test_exec_default_refuses_a_login_that_switched_during_the_check(
-        self, manager, capture_exec, stream_proxy, monkeypatch, primary_profile
-    ):
-        """A ``switch`` while the check runs replaces the login itself.
-
-        The launch pinned its route and rule to the login it read; the login
-        that would run is another account now, so it stops before ``_exec``.
-        """
-        manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
-        manager.switcher._write_account_credentials(
-            "1", "account1@example.com", CREDS
-        )
-        manager.switcher._write_account_config(
-            "1", "account1@example.com", CONFIG_1
-        )
-        _default_login_is(ACCOUNT_EMAIL, ORG_UUID)
-        real_probe = account_proxy.probe
-
-        def switch_then_probe(route, timeout=account_proxy.PROBE_TIMEOUT_S):
-            # Activation only: the backup of the outgoing login is not what
-            # this test is about, and the live store here is a temp home's.
-            manager.switcher.switch_to("1", force=True)
-            real_probe(route, timeout=timeout)
-
-        monkeypatch.setattr(account_proxy, "probe", switch_then_probe)
-
-        with pytest.raises(SessionError, match="changed or could not be confirmed"):
-            manager.exec_default(["--resume"], primary_profile=primary_profile)
-
-    @pytest.mark.parametrize(
-        "primary_profile", [False, True], ids=["live_login", "default_profile"]
-    )
     def test_exec_default_refuses_a_slot_that_moved_during_the_check(
         self, manager, capture_exec, stream_proxy, monkeypatch, primary_profile
     ):
@@ -2429,102 +2180,6 @@ class TestTheLaunchTakesTheAccountsProxy:
         with pytest.raises(SessionError, match="changed or could not be confirmed"):
             manager.exec_default(["--resume"], primary_profile=primary_profile)
 
-    def test_the_final_check_waits_for_a_switch_that_holds_the_lock(
-        self, manager, capture_exec, monkeypatch
-    ):
-        """A ``switch`` is invisible halfway through, and the re-check waits.
-
-        A switch writes the live credentials first and the ``.claude.json``
-        naming them second, both under ``lock_file``. A re-check landing in
-        between sees the outgoing login in its old slot, so without the lock it
-        would confirm a launch that in fact runs the incoming account's
-        credentials through the outgoing login's route. Here account 1 is the
-        login and the launch's snapshot; the switch to account 2 is held after
-        its credential write until the launch has asked for the lock.
-        """
-        switcher = manager.switcher
-        switcher.set_account_proxy("1", "http://127.0.0.1:3128")
-        monkeypatch.setattr(
-            account_proxy,
-            "probe",
-            lambda route, timeout=account_proxy.PROBE_TIMEOUT_S: None,
-        )
-        _default_login_is("account1@example.com", "org-uuid-1")
-
-        executed: list[list[str]] = []
-        monkeypatch.setattr(
-            session_mod.SessionManager,
-            "_exec",
-            lambda self, binary, argv, env: executed.append(list(argv)),
-        )
-
-        # The switch pauses under its locks between the two writes.
-        credentials_written = threading.Event()
-        switch_may_finish = threading.Event()
-        real_write_credentials = ClaudeAccountSwitcher._write_credentials
-
-        def write_credentials_then_pause(self, creds):
-            real_write_credentials(self, creds)
-            credentials_written.set()
-            switch_may_finish.wait(10)
-
-        monkeypatch.setattr(
-            ClaudeAccountSwitcher, "_write_credentials", write_credentials_then_pause
-        )
-
-        # A readiness signal for the re-check's own lock request. The switch's
-        # acquisition comes before the credential write, so only the re-check
-        # signals; while the switch holds the lock it cannot get in.
-        checking = threading.Event()
-        real_lock = switcher_mod.FileLock
-
-        class SignallingLock(real_lock):
-            def acquire(self, timeout=None):
-                if credentials_written.is_set():
-                    checking.set()
-                return super().acquire(timeout)
-
-        monkeypatch.setattr(switcher_mod, "FileLock", SignallingLock)
-
-        switch_errors: list[BaseException] = []
-        launch_errors: list[BaseException] = []
-
-        def run_switch():
-            try:
-                switcher.switch_to(ACCOUNT_NUM, force=True)
-            except BaseException as e:  # noqa: BLE001 - reported below
-                switch_errors.append(e)
-
-        def run_launch():
-            try:
-                manager.exec_default(["--resume"])
-            except BaseException as e:  # noqa: BLE001 - reported below
-                launch_errors.append(e)
-
-        switch_thread = threading.Thread(target=run_switch, daemon=True)
-        switch_thread.start()
-        assert credentials_written.wait(10), "the switch never wrote credentials"
-
-        launch_thread = threading.Thread(target=run_launch, daemon=True)
-        launch_thread.start()
-        assert checking.wait(10), "the re-check never asked for the lock"
-        # The switch still holds the lock: the launch waits, it did not run.
-        assert launch_thread.is_alive()
-        assert executed == []
-
-        switch_may_finish.set()
-        switch_thread.join(10)
-        assert not switch_thread.is_alive()
-        assert switch_errors == []
-
-        # Released: the re-check now reads the login the switch wrote and
-        # refuses before _exec, which never saw a launch either.
-        launch_thread.join(10)
-        assert not launch_thread.is_alive()
-        assert len(launch_errors) == 1
-        assert isinstance(launch_errors[0], SessionError)
-        assert "changed or could not be confirmed" in str(launch_errors[0])
-        assert executed == []
 
     def test_a_lock_that_cannot_be_taken_refuses_the_launch(
         self, manager, capture_exec, monkeypatch
@@ -2965,55 +2620,7 @@ class TestTheLaunchChecksTheEgressExpectation:
 
         assert auth_status_tracks_seed == []
 
-    def test_a_swap_during_the_proxy_check_ends_the_fast_path(
-        self, manager, capture_exec, monkeypatch
-    ):
-        """The route is checked before the same-account fast path.
 
-        That path runs plain claude on the default login and never reaches
-        ``setup_session``, so its own owner check is what keeps a ``swap``
-        made while the ``CONNECT`` ran from launching the newcomer.
-        """
-        manager.switcher.set_account_proxy(ACCOUNT_NUM, "http://127.0.0.1:1")
-        _active_default_login(monkeypatch, manager)
-
-        def swap_then_accept(route, timeout=account_proxy.PROBE_TIMEOUT_S):
-            manager.switcher.swap_accounts("1", ACCOUNT_NUM)
-
-        monkeypatch.setattr(account_proxy, "probe", swap_then_accept)
-
-        with pytest.raises(SessionError, match="no longer the login"):
-            manager.run("2", [])
-
-    def test_a_switch_while_the_fast_path_prepares_ends_the_launch(
-        self, manager, capture_exec, monkeypatch
-    ):
-        """A ``switch`` replaces the login itself, which the fast path runs.
-
-        The same-account fast path hands the terminal to plain claude on the
-        default login, after merging that account's history. A switch in that
-        step leaves the route and the rule with the outgoing login and the
-        incoming account's credentials live, so the re-check ends the launch
-        before ``_exec``.
-        """
-        switcher = manager.switcher
-        switcher._write_account_credentials("1", "account1@example.com", CREDS)
-        switcher._write_account_config("1", "account1@example.com", CONFIG_1)
-        _default_login_is(ACCOUNT_EMAIL, ORG_UUID)
-
-        def switch_then_share_history(self, session_dir, share_history):
-            # Activation only: the backup of the outgoing login is not what
-            # this test is about, and the live store here is a temp home's.
-            switcher.switch_to("1", force=True)
-
-        monkeypatch.setattr(
-            session_mod.SessionManager,
-            "_history_on_the_fast_path",
-            switch_then_share_history,
-        )
-
-        with pytest.raises(SessionError, match="no longer the login"):
-            manager.run("2", [])
 
 
 class TestAutoWalksPastAProxyRefusal:
@@ -3064,6 +2671,7 @@ class TestAutoWalksPastAProxyRefusal:
         namespace = argparse.Namespace(
             account=args,
             auto=args is None,
+            active=False,
             no_share=False,
             share_history=None,
             require_session=False,
@@ -5449,72 +5057,9 @@ class TestShareHistoryDecision:
             _turn_sharing(mgr, "false")
         return False if how == "flag" else None
 
-    def test_fast_path_has_nothing_to_add_when_history_is_shared(
-        self, manager, capture_exec, monkeypatch, capsys
-    ):
-        _active_default_login(monkeypatch, manager)
-        with pytest.raises(_ExecCalled):
-            manager.run("2", [])
-        out = capsys.readouterr().out
-        assert "already the active default login" in out
-        assert "chat history" not in out
-
-    @pytest.mark.parametrize("how", ["flag", "setting"])
-    def test_fast_path_says_whose_history_it_uses_when_the_account_has_its_own(
-        self, manager, capture_exec, monkeypatch, capsys, how
-    ):
-        """The one launch of the account whose conversations ``--resume``
-        will not find among the others, and the reverse."""
-        _active_default_login(monkeypatch, manager)
-        session_dir = self._profile_with_its_own_history(manager)
-        requested = self._not_sharing(manager, how)
-
-        with pytest.raises(_ExecCalled) as exc:
-            manager.run("2", [], share_history=requested)
-
-        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
-        assert "default login's chat history" in capsys.readouterr().out
-        # Said, not acted on: the history stays where the user keeps it.
-        assert (
-            session_dir / "projects" / "-home-user-app" / "bbb.jsonl"
-        ).read_text() == "profile-b\n"
-
-    @pytest.mark.parametrize("how", ["flag", "setting"])
-    def test_fast_path_has_nothing_to_add_without_a_history_of_its_own(
-        self, manager, capture_exec, monkeypatch, capsys, how
-    ):
-        """No profile, or one that never held a conversation: there is no
-        second history for this launch to be mistaken for."""
-        _active_default_login(monkeypatch, manager)
-        requested = self._not_sharing(manager, how)
-
-        with pytest.raises(_ExecCalled):
-            manager.run("2", [], share_history=requested)
-
-        out = capsys.readouterr().out
-        assert "already the active default login" in out
-        assert "chat history" not in out
-
-    def test_fast_path_merges_on_windows_too(
-        self, manager, capture_exec, monkeypatch, temp_home
-    ):
-        """Transcripts are linked through a junction, which any Windows user
-        may make, so the default login's profile is merged there as anywhere
-        — on a machine without the symlink privilege included."""
-        _active_default_login(monkeypatch, manager)
-        manager.switcher.platform = Platform.WINDOWS
-        session_dir = self._profile_with_its_own_history(manager)
-
-        with pytest.raises(_ExecCalled):
-            manager.run("2", [], share_history=True)
-
-        assert (
-            temp_home / ".claude" / "projects" / "-home-user-app" / "bbb.jsonl"
-        ).read_text() == "profile-b\n"
-        assert is_link(session_dir / "projects")
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="history sharing is POSIX-only")
+
 class TestShareHistoryIsTheDefault:
     """A launch that names no preference shares history, and a profile that
     kept its own until now is told what happened to it."""
@@ -5610,121 +5155,10 @@ class TestShareHistoryIsTheDefault:
 
     # -- the account that is the default login (the fast path) ------------
 
-    def test_default_login_account_gets_its_own_history_merged_too(
-        self, launch, manager, monkeypatch, temp_home, capsys
-    ):
-        """The account's sessions wrote into its profile; then it became the
-        default login, and ``cswap run`` for it is plain claude on
-        ``~/.claude``. Without a merge on that path the old conversations
-        stay out of ``--resume`` for as long as the account stays the
-        default, however often it is run."""
-        session_dir = launch(share_history=False)  # as the old default left it
-        self._give_own_history(session_dir)
-        credentials = (session_dir / ".credentials.json").read_bytes()
-        _active_default_login(monkeypatch, manager)
-        capsys.readouterr()
 
-        with pytest.raises(_ExecCalled) as exc:
-            manager.run("2", [])
 
-        assert "CLAUDE_CONFIG_DIR" not in exc.value.env  # still plain claude
-        shared = temp_home / ".claude"
-        assert (
-            shared / "projects" / "-home-user-app" / "bbb.jsonl"
-        ).read_text() == "profile-b\n"
-        assert '{"p": "profile"}' in (shared / "history.jsonl").read_text()
-        assert self._is_linked(session_dir, shared)
-        out = capsys.readouterr().out
-        assert "already the active default login" in out
-        assert out.count(OPT_OUT) == 1
-        # History only: the profile's credential copy is what the fast path
-        # exists to leave alone.
-        assert (session_dir / ".credentials.json").read_bytes() == credentials
 
-    def test_fast_path_merge_touches_history_and_nothing_else(
-        self, launch, manager, monkeypatch, temp_home
-    ):
-        """It is the history half of a session launch, run for a profile the
-        launch does not use. ``--no-share`` on such a launch must not strip
-        the profile's customizations: that is the next session launch's
-        business, and its flags may differ."""
-        (temp_home / ".claude" / "settings.json").write_text("{}")
-        session_dir = launch(share_history=False)
-        assert (session_dir / "settings.json").is_symlink()
-        self._give_own_history(session_dir)
-        _active_default_login(monkeypatch, manager)
 
-        with pytest.raises(_ExecCalled):
-            manager.run("2", [], share=False)
-
-        shared = temp_home / ".claude"
-        assert self._is_linked(session_dir, shared)
-        assert (session_dir / "settings.json").readlink() == shared / "settings.json"
-        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
-        assert set(manifest["items"]) == {"settings.json", "projects", "history.jsonl"}
-
-    def test_links_made_on_the_fast_path_are_undone_by_a_later_opt_out(
-        self, launch, manager, monkeypatch, temp_home
-    ):
-        """They are recorded like any other link cswap makes. Unrecorded,
-        ``--no-share-history`` would leave the profile on the shared history."""
-        session_dir = launch(share_history=False)
-        self._give_own_history(session_dir)
-        _active_default_login(monkeypatch, manager)
-        with pytest.raises(_ExecCalled):
-            manager.run("2", [])
-        assert self._is_linked(session_dir, temp_home / ".claude")
-
-        monkeypatch.setattr(manager.switcher, "_get_current_account", lambda: None)
-        assert launch(share_history=False) == session_dir
-        assert not (session_dir / "projects").exists()
-        assert not (session_dir / "history.jsonl").exists()
-        # What was merged stays shared; only the links go.
-        assert (
-            temp_home / ".claude" / "projects" / "-home-user-app" / "bbb.jsonl"
-        ).exists()
-
-    def test_fast_path_merge_waits_for_a_session_still_in_the_profile(
-        self, launch, manager, monkeypatch, temp_home, capsys
-    ):
-        """A session started before the account became the default login is
-        still writing the profile's history. The launch goes ahead on the
-        default login and says why the old conversations are not there."""
-        session_dir = launch(share_history=False)
-        self._give_own_history(session_dir)
-        _active_default_login(monkeypatch, manager)
-        make_live(session_dir)
-        capsys.readouterr()
-
-        with pytest.raises(_ExecCalled) as exc:
-            manager.run("2", [])
-
-        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
-        out = capsys.readouterr().out
-        assert out.count("keeps its own") == 1
-        assert "then relaunch:  cswap run 2\n" in out
-        assert (
-            session_dir / "projects" / "-home-user-app" / "bbb.jsonl"
-        ).read_text() == "profile-b\n"
-        assert not (temp_home / ".claude" / "projects" / "-home-user-app").exists()
-
-    def test_fast_path_launches_even_when_the_merge_cannot_run(
-        self, launch, manager, monkeypatch, capsys
-    ):
-        session_dir = launch(share_history=False)
-        self._give_own_history(session_dir)
-        _active_default_login(monkeypatch, manager)
-
-        class Unopenable(FileLock):
-            def acquire(self, timeout=None):
-                raise PermissionError("read-only file system")
-
-        monkeypatch.setattr(session_mod, "FileLock", Unopenable)
-        with pytest.raises(_ExecCalled):
-            manager.run("2", [])
-
-        assert "could not be locked" in capsys.readouterr().out
-        assert not (session_dir / "projects").is_symlink()
 
     def test_a_partial_sync_leaves_the_rest_of_the_manifest_alone(
         self, history_setup
@@ -5745,18 +5179,6 @@ class TestShareHistoryIsTheDefault:
         after = json.loads((session_dir / SHARE_MANIFEST).read_text())["items"]
         assert set(after) == set(before) - set(session_mod.HISTORY_ITEMS)
 
-    def test_fast_path_never_creates_a_profile(
-        self, manager, capture_exec, monkeypatch, temp_home
-    ):
-        """No profile means no history to bring in, and no reason to make
-        one: a second copy of the default login's credential is what this
-        path exists to avoid."""
-        _active_default_login(monkeypatch, manager)
-        with pytest.raises(_ExecCalled):
-            manager.run("2", [])
-
-        assert not manager.sessions_dir.exists()
-        assert not (temp_home / ".claude" / "projects").exists()
 
     def test_a_profile_with_nothing_of_its_own_is_told_nothing(
         self, history_setup, capsys
@@ -6805,82 +6227,6 @@ class TestSurvivorSelection:
 
 
 # ---------------------------------------------------------------------------
-# _default_login_signed_out
-# ---------------------------------------------------------------------------
-
-
-class TestDefaultLoginSignedOut:
-    """What the same-account fast path reads before it runs plain claude."""
-
-    @pytest.mark.parametrize(
-        ("credential", "signed_out"),
-        [
-            (None, True),  # no credential anywhere
-            ("", True),
-            # Claude Code's reaction to invalid_grant: both tokens emptied.
-            ('{"claudeAiOauth": {"accessToken": "", "refreshToken": ""}}', True),
-            ('{"claudeAiOauth": {"accessToken": "a", "expiresAt": 1}}', True),
-            ('{"claudeAiOauth": {"accessToken": "a", "expiresAt": 9999999999999}}', False),
-            ('{"claudeAiOauth": {"accessToken": "a"}}', False),
-            (CREDS, False),
-            ('{"somethingElse": {}}', False),  # unknown shape: keep the fast path
-        ],
-    )
-    def test_reads_the_default_login(
-        self, manager, temp_home, real_default_login_check, credential, signed_out
-    ):
-        if credential is not None:
-            (temp_home / ".claude" / ".credentials.json").write_text(credential)
-
-        assert manager._default_login_signed_out() is signed_out
-
-    def test_reads_the_default_profile_not_the_preset_one(
-        self, manager, temp_home, tmp_path, monkeypatch, real_default_login_check
-    ):
-        preset = tmp_path / "preset-profile"
-        preset.mkdir()
-        (preset / ".credentials.json").write_text(CREDS)
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(preset))
-
-        assert manager._default_login_signed_out() is True
-        assert os.environ["CLAUDE_CONFIG_DIR"] == str(preset)
-
-    def test_an_unreadable_keychain_keeps_the_fast_path(
-        self, manager, monkeypatch, real_default_login_check
-    ):
-        from claude_swap.credentials import ActiveCredentials
-
-        monkeypatch.setattr(
-            manager.switcher,
-            "_read_active_credentials",
-            lambda: ActiveCredentials(None, True, True),
-        )
-        assert manager._default_login_signed_out() is False
-
-    def test_a_redirected_credential_store_keeps_the_fast_path(
-        self, manager, tmp_path, monkeypatch, real_default_login_check
-    ):
-        # claude reads its plaintext credential from the override directory.
-        # The default profile holds none, and that must not read as signed
-        # out while the login claude would use works.
-        redirected = tmp_path / "redirected-store"
-        redirected.mkdir()
-        (redirected / ".credentials.json").write_text(CREDS)
-        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(redirected))
-
-        assert manager._default_login_signed_out() is False
-
-    def test_an_empty_override_still_reads_the_default_store(
-        self, manager, monkeypatch, real_default_login_check
-    ):
-        # Defined but empty selects the default credential store, which is
-        # the one this check reads, so its answer stands.
-        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
-
-        assert manager._default_login_signed_out() is True
-
-
-# ---------------------------------------------------------------------------
 # a launch whose scheme needs the local bridge
 # ---------------------------------------------------------------------------
 
@@ -7028,25 +6374,6 @@ class TestALaunchThroughTheLocalBridge:
 
         _wait_for_refusal(_bridge_port(seen["url"]))
 
-    def test_the_fast_path_and_the_default_login_use_the_bridge_too(
-        self,
-        manager,
-        foreground,
-        auth_status_tracks_seed,
-        refresh_rotates,
-        monkeypatch,
-    ):
-        with proxy_servers.Socks5Proxy() as upstream:
-            manager.switcher.set_account_proxy(
-                ACCOUNT_NUM, f"socks5h://127.0.0.1:{upstream.port}"
-            )
-            _active_default_login(monkeypatch, manager)
-
-            with pytest.raises(_ExecCalled) as exc:
-                manager.run("2", [])
-
-        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
-        assert exc.value.env["HTTPS_PROXY"].startswith("http://127.0.0.1:")
 
     def test_a_refused_proxy_still_stops_the_launch(
         self, manager, foreground, monkeypatch

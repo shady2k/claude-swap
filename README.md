@@ -82,6 +82,8 @@ cswap add --login --proxy http://127.0.0.1:3128 --expect-country DE --expect-ip 
 
 ### Switch accounts
 
+In this fork the active account is cswap's own record (`activeAccountNumber` in its `sequence.json`) — a switch writes that and nothing else. `~/.claude` is never rewritten and never becomes the active account, so a running Claude Code is untouched by a switch and the next `claude` launch picks the new account.
+
 Rotate to the next account:
 
 ```bash
@@ -94,6 +96,9 @@ Or switch to a specific account:
 cswap switch 2
 cswap switch user@example.com
 cswap switch dev                # or by alias, once set with `cswap alias 2 dev`
+cswap next                      # the same as a bare `cswap switch`
+cswap prev                      # the previous account in the rotation
+cswap current                   # which account is active
 ```
 
 Not sure which one? `cswap list` is the dashboard — every account's plan, 5-hour and 7-day usage and reset times at a glance:
@@ -104,7 +109,7 @@ cswap list
 
 Or let claude-swap auto-pick by remaining quota — `cswap switch --strategy best` (most quota left) or `--strategy next-available` (skip rate-limited accounts).
 
-**Note:** You usually don't need to restart — on Linux/Windows the new account is picked up automatically, and on macOS after the Keychain cache expires. To apply it instantly, restart Claude Code or reopen the VS Code extension tab. See [Tips](#tips) for the per-platform details.
+**Note:** The switch takes effect on your next `claude` launch (the `claude` wrapper and `cswap run` start the active account in its own profile). A Claude Code already running keeps the account it started with, so nothing is pulled out from under it.
 
 ### Automatic switching
 
@@ -170,17 +175,20 @@ Launch Claude Code as a specific account in the current terminal only — every 
 ```bash
 cswap run 2                     # launch Claude Code as account 2, here only
 cswap run user@example.com      # by email
+cswap run --active             # the active account, no switch
 cswap run --auto                # the account with the most quota left, no switch
 cswap run 2 -- --resume         # everything after '--' is forwarded to claude
 cswap run 2 --no-share-history  # keep this account's chat history to itself
 ```
 
-Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP servers, etc.) and share its chat history, so a conversation started under one account shows up in `--resume` under the others.
+Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP servers, etc.) and share its chat history, so a conversation started under one account shows up in `--resume` under the others. Every launch runs in a session profile: nothing is ever started on a login in `~/.claude`.
+
+In this fork `cswap run` with no account and no directory mapping launches the active account, and refuses when none is recorded — it never falls back to a plain `claude` on `~/.claude`.
 
 <details>
 <summary>Pick the account for you — the <code>claude</code> wrapper</summary>
 
-`mkdir -p ~/.local/claude-swap/bin && ln -s "$(cswap wrapper)" ~/.local/claude-swap/bin/claude`, with that directory ahead of the real Claude Code in `PATH`, makes every `claude` (and `claude --resume`) run `cswap run --auto` — the managed account with the most quota left, in its own session profile with its own proxy, while the default login stays where it is. Nothing with quota left is a refusal naming when the nearest one is usable again, not a fallback; once Claude Code reports a rate-limit stop, the next launch prefers another account. The rules are in [docs/auto-launch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-launch.md).
+`mkdir -p ~/.local/claude-swap/bin && ln -s "$(cswap wrapper)" ~/.local/claude-swap/bin/claude`, with that directory ahead of the real Claude Code in `PATH`, makes every `claude` (and `claude --resume`) run `cswap run --active` — the account recorded as active, in its own session profile with its own proxy. Flip accounts with `cswap switch`; nothing about `~/.claude` changes. `--version`/`-v`/`--help`/`-h` go straight to the real binary without a quota check, and `CSWAP_CLAUDE_BIN` names the real Claude Code when it is not on `PATH`. The rules are in [docs/auto-launch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-launch.md).
 
 </details>
 
@@ -191,8 +199,8 @@ Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP ser
 - **On Windows**, conversations are shared through a directory junction, which needs no special rights; the prompt-history file (`history.jsonl`) is shared only when Windows lets cswap create a symlink (Developer Mode, or an elevated terminal) and otherwise stays per-account.
 - **MCP servers.** User-scope MCP servers (`claude mcp add -s user`) are mirrored from your default profile on every launch — manage them there; changes made inside a session don't persist. Definitions are copied as-is (including inline `env`/`headers` values), but MCP OAuth logins are not — HTTP servers may ask you to authenticate once per profile via `/mcp`.
 - `--no-share` stops sharing your `~/.claude` setup (settings, skills, etc.) and removes the mirrored MCP config (profiles that never mirrored are left alone). Chat history is separate: it stays shared unless you also pass `--no-share-history`.
-- **Your default account.** Running the account that is already your default login launches plain `claude` on that login instead of a session (a second copy of the active credential would go stale). Scripts that need the isolation guaranteed can pass `--require-session`, which refuses instead. When that login holds no usable token any more (missing, or emptied by Claude Code after a failed refresh), the account launches in its session profile from its stored login instead, since plain `claude` would only stop at "Not logged in".
-- **Tokens.** A session refreshes its own copy of the account's token; once it exits, the credential it rotated is captured back into the account's stored backup before a switch, swap, move, or usage check uses it. While the session is still running, `cswap switch` refuses to move the default login onto its account if the stored backup has already fallen behind (activating it could only fail) — exit the session first, or pick another account.
+- **No global login.** Every launch runs in a session profile. A login left in the global `~/.claude` (you logged in with a bare `claude`) is reported by `cswap list`/`cswap status` with a hint to import it via `cswap add`; it is never used and never overwritten. `cswap add` imports it into a slot and then clears it there — the credential, and only the `oauthAccount` key of `~/.claude.json` — so its one-time refresh token does not exist twice. Everything else in `~/.claude` (settings, CLAUDE.md, skills, projects, `mcpServers`, …) stays, and stays shared.
+- **Tokens.** A session refreshes its own copy of the account's token; once it exits, the credential it rotated is captured back into the account's stored backup before a switch, swap, move, or usage check uses it. A switch itself writes no credential.
 - **Usage.** While a session runs, its account's usage is read with the session's own credential, which cswap never refreshes. A read the server refuses shows as token expired, and isn't retried, until the session renews the credential on its next call.
 - **Scripting.** cswap writes its own launch notices to stderr, so stdout carries only what claude prints: `cswap run 2 -- -p "…" --output-format json | jq` works.
 
@@ -213,7 +221,7 @@ cd ~/work/client-app/src
 cswap run                       # → account 2, session mode
 ```
 
-Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap run` just launches plain `claude` with your default login. Mappings are per-machine (not part of `cswap export`) and are cleaned up when their account is removed.
+Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap run` launches the active account. Mappings are per-machine (not part of `cswap export`) and are cleaned up when their account is removed.
 
 </details>
 

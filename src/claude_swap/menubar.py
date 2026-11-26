@@ -787,7 +787,9 @@ def run(switcher) -> int:
             self._dirty = False
             self._snapshot_at = 0.0
             self._refreshing = False
-            self._config_path = switcher._get_claude_config_path()
+            # The active slot lives in sequence.json (``isolated_mode``), so
+            # that is the file whose mtime says "an account changed".
+            self._config_path = switcher.sequence_file
             self._config_mtime = 0.0
             self._last_usage_log: dict = {}  # account num -> last-logged (5h, 7d) key
             # Auto-switch engine (the same one `cswap auto` runs), hosted in a
@@ -904,11 +906,10 @@ def run(switcher) -> int:
         def _detect_active_change(self):
             # Reflect account switches from any source (menu, CLI, auto engine)
             # within ~1s. Detecting *which* account is active is a cheap local
-            # read of ~/.claude.json -- no Keychain or usage API -- so we can do
+            # read of sequence.json -- no Keychain or usage API -- so we can do
             # it on every tick. We gate the read on the file's mtime (a cheap
-            # stat) so a large config isn't parsed each second, and only kick a
-            # refresh when the active email actually changed (Claude Code rewrites
-            # this file often for unrelated reasons).
+            # stat) so a large roster isn't parsed each second, and only kick a
+            # refresh when the active email actually changed.
             if self._refreshing:
                 return  # a worker is already in-flight; it refreshes the marker
             try:
@@ -918,8 +919,8 @@ def run(switcher) -> int:
             if mtime == self._config_mtime:
                 return
             self._config_mtime = mtime
-            current = self.switcher._get_current_account()
-            email = current[0] if current else None
+            num = self.switcher.current_account_number()
+            email = self.switcher.account_email(num) if num else None
             if email and email != self.snapshot.get("active_email"):
                 self.refresh_async()
 

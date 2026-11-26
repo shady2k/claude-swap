@@ -73,7 +73,7 @@ def _script(path: Path, body: str) -> Path:
 
 
 class TestTheWrapper:
-    """`claude ...` becomes `cswap run --auto -- ...` and nothing else."""
+    """`claude ...` becomes `cswap run --active -- ...` and nothing else."""
 
     @pytest.fixture
     def layout(self, tmp_path: Path) -> dict[str, Path]:
@@ -121,14 +121,14 @@ class TestTheWrapper:
 
         assert result.returncode == 0, result.stderr
         recorded = json.loads((layout["tmp"] / "cswap.json").read_text())
-        assert recorded["argv"] == ["run", "--auto", "--", *TRICKY_ARGS]
+        assert recorded["argv"] == ["run", "--active", "--", *TRICKY_ARGS]
 
     def test_a_plain_claude_forwards_no_arguments(self, layout):
         result = self._run([str(layout["link"])], self._env(layout))
 
         assert result.returncode == 0, result.stderr
         recorded = json.loads((layout["tmp"] / "cswap.json").read_text())
-        assert recorded["argv"] == ["run", "--auto", "--"]
+        assert recorded["argv"] == ["run", "--active", "--"]
 
     def test_the_real_claude_gets_the_arguments_and_the_exit_code(self, layout):
         """The whole chain: wrapper → cswap → real claude, exit code intact."""
@@ -164,11 +164,12 @@ class TestTheWrapper:
 
         assert result.returncode == 0, result.stderr
         recorded = json.loads((layout["tmp"] / "cswap.json").read_text())
-        assert recorded["argv"] == ["run", "--auto", "--", "--continue"]
+        assert recorded["argv"] == ["run", "--active", "--", "--continue"]
 
     def test_the_wrapper_looks_for_no_binary_of_its_own(self, layout):
-        """Finding Claude Code is cswap's single job: with no real binary on
-        PATH the wrapper still hands over, and `cswap run` is what reports it."""
+        """Finding Claude Code is cswap's single job for a launch: with no
+        real binary on PATH the wrapper still hands over, and `cswap run` is
+        what reports it."""
         env = self._env(layout)
         env["PATH"] = os.pathsep.join(
             str(layout[name]) for name in ("wrapper_dir", "cswap_dir")
@@ -178,7 +179,7 @@ class TestTheWrapper:
 
         assert result.returncode == 0, result.stderr
         recorded = json.loads((layout["tmp"] / "cswap.json").read_text())
-        assert recorded["argv"] == ["run", "--auto", "--", "--resume"]
+        assert recorded["argv"] == ["run", "--active", "--", "--resume"]
 
     def test_no_cswap_is_a_clear_refusal(self, layout):
         env = self._env(layout)
@@ -203,7 +204,7 @@ class TestTheWrapper:
 
         assert result.returncode == 0, result.stderr
         recorded = json.loads((layout["tmp"] / "cswap.json").read_text())
-        assert recorded["argv"] == ["run", "--auto", "--", "-p", "hi"]
+        assert recorded["argv"] == ["run", "--active", "--", "-p", "hi"]
 
 
 class TestIsWrapper:
@@ -280,7 +281,7 @@ class TestIsWrapper:
 
 
 class TestTheRealCliAcceptsIt:
-    """The wrapper's one command line is a real `cswap run --auto`, so the
+    """The wrapper's one command line is a real `cswap run --active`, so the
     real parser takes it (and refuses for a reason, not for a usage error)."""
 
     def test_a_refusal_is_a_reason_not_a_usage_error(self, tmp_path: Path):
@@ -318,6 +319,6 @@ class TestTheRealCliAcceptsIt:
         )
 
         assert result.returncode == 1, result.stderr
-        assert "No accounts are managed yet" in result.stderr
+        assert "No active account is recorded" in result.stderr
         assert "unrecognized arguments" not in result.stderr
         assert not (tmp_path / "real.json").exists()
