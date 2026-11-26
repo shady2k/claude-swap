@@ -360,9 +360,10 @@ class HttpProxy(_Server):
                     client.sendall(chunk)
             finally:
                 try:
-                    socket.socket.shutdown(client, socket.SHUT_RD)
+                    socket.socket.shutdown(client, socket.SHUT_RDWR)
                 except OSError:
                     pass
+                _close(client)
                 upload.join()
 
 
@@ -484,10 +485,9 @@ class Origin:
         *,
         tls: bool = False,
         status: int = 200,
+        location: str | None = None,
         body_gate: threading.Event | None = None,
     ) -> None:
-        self._lock = threading.Lock()
-
         class _Handler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.0"
 
@@ -496,6 +496,8 @@ class Origin:
                     self.server.hits += 1
                 self.send_response(self.server.status)
                 self.send_header("Content-Type", "application/json")
+                if self.server.location is not None:
+                    self.send_header("Location", self.server.location)
                 self.send_header("Content-Length", str(len(self.server.body)))
                 self.end_headers()
                 if self.server.body_gate is not None:
@@ -519,6 +521,7 @@ class Origin:
         self._server.body = body
         self._server.received = []
         self._server.status = status
+        self._server.location = location
         self._server.body_gate = body_gate
         if tls:
             context = server_context()
@@ -541,7 +544,7 @@ class Origin:
 
     @property
     def received(self) -> list[bytes]:
-        with self._lock:
+        with self._server.lock:
             return list(self._server.received)
 
     @property

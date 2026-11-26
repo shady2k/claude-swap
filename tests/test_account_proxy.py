@@ -694,6 +694,35 @@ class TestBridgedOAuth:
         assert origin.hits == 0
 
 
+    def test_a_plaintext_port_on_an_https_proxy_is_network_and_never_sends_refresh(
+        self, monkeypatch, caplog,
+    ):
+        class _PlaintextProxy(proxy_servers.HttpProxy):
+            def _handle(self, connection):
+                # Read the TLS record before answering so closing the socket
+                # does not reset the connection with the response unread.
+                connection.settimeout(5)
+                header = proxy_servers._recv(connection, 5)
+                proxy_servers._recv(connection, int.from_bytes(header[3:], "big"))
+                connection.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+
+        caplog.set_level(logging.DEBUG, logger="claude-swap")
+        with proxy_servers.Origin(tls=True) as origin, _PlaintextProxy() as proxy:
+            _endpoints(monkeypatch, origin.url)
+            route = account_proxy.parse(f"https://127.0.0.1:{proxy.port}")
+            usage = oauth.try_fetch_usage_for_account(
+                "1", "test@example.com", CREDS_OK, is_active=True, route=route,
+            )
+            refresh = oauth.try_refresh_oauth_credentials(CREDS_EXPIRED, route=route)
+
+        assert usage.error == "network"
+        assert refresh.error == "transient"
+        assert "OAuth refresh not sent: SSLError" in caplog.text
+        assert "may now be spent" not in caplog.text
+        assert "whether the request reached the server is unknown" not in caplog.text
+        assert origin.hits == 0
+
+
 # --- the switcher: setting lifecycle ----------------------------------------
 
 

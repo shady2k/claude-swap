@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from claude_swap import account_proxy
+from claude_swap.proxy_bridge import TLSSetupError
 from claude_swap.printer import warning as print_warning
 
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
@@ -375,7 +376,7 @@ def try_refresh_oauth_credentials(
         # reading the reply arrives unwrapped, below.
         reason = e.reason
         what = "URLError" if isinstance(reason, str) else type(reason).__name__
-        if isinstance(reason, (str, *_NEVER_SENT)):
+        if isinstance(e, TLSSetupError) or isinstance(reason, (str, *_NEVER_SENT)):
             # Nothing reached the server, so no grant can have been spent.
             # The ordinary offline case; it stays quiet.
             _logger.debug("OAuth refresh not sent: %s", what)

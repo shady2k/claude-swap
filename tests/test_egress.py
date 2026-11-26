@@ -896,8 +896,9 @@ class TestFailureDiagnostics:
                 proxy.listen()
             port = proxy.getsockname()[1]
             route = account_proxy.parse(f"{scheme}://user:secret@127.0.0.1:{port}")
+            timeout = 0.3 if expected == "timeout" else 5.0
             message = self._expect(
-                route, "https://127.0.0.1:443/json", monkeypatch, timeout=0.3
+                route, "https://127.0.0.1:443/json", monkeypatch, timeout=timeout
             )
 
         assert expected in message

@@ -299,8 +299,8 @@ class ProxyRoute:
 
         The local client only ever sees a status code for an upstream failure,
         so the bridge keeps the typed error for this process. A refused tunnel
-        maps to a proxy error kind, and a refused proxy certificate is wrapped
-        in ``URLError`` for the OAuth classifications.
+        maps to a proxy error kind, and TLS failures use ``URLError`` for the
+        OAuth classifications.
 
         A successful response carries the bridge (see :class:`_BridgedResponse`)
         while its body is read. A target HTTP error is buffered here so its
@@ -386,9 +386,8 @@ def raise_failure(failure: BaseException | None) -> None:
     """Re-raise a bridge's recorded upstream error in this module's terms.
 
     ``proxy_bridge`` keeps the typed failure because a local HTTP client only
-    ever receives a status code. An ``https://`` proxy's refused certificate
-    is wrapped in ``URLError``, just as urllib wraps a target certificate
-    failure (the ``tls-cert`` classification and ``_NEVER_SENT`` read it).
+    ever receives a status code. TLS failures use ``URLError``, as in urllib.
+    ``TLSSetupError`` also tells refresh that the request could not be sent.
     A refused tunnel becomes the same :class:`ProxyRouteError` kind the
     direct path raises, with the proxy's own phrase dropped.
 
@@ -397,10 +396,10 @@ def raise_failure(failure: BaseException | None) -> None:
     """
     if failure is None:
         return
-    if isinstance(failure, ssl.SSLCertVerificationError):
-        raise urllib.error.URLError(failure) from None
+    if isinstance(failure, proxy_bridge.TLSSetupError):
+        raise failure from None
     if isinstance(failure, ssl.SSLError):
-        raise failure
+        raise urllib.error.URLError(failure) from None
     if isinstance(failure, proxy_bridge.BridgeError):
         raise ProxyRouteError(
             _BRIDGE_ERROR_KINDS.get(failure.kind, PROXY_UNREACHABLE),

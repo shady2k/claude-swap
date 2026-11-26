@@ -249,22 +249,50 @@ class TestThroughAnHttpsProxy:
                         assert response.read() == b""
             assert upstream.recorded() == [{"body": body}]
 
-    @pytest.mark.parametrize("status", [302, 407])
-    def test_plain_http_proxy_refusal_carries_only_static_status(self, monkeypatch, status):
+    def test_plain_http_proxy_refusal_carries_only_static_status(self, monkeypatch):
         proxy_servers.trust_fixture_ca(monkeypatch)
-        with proxy_servers.HttpProxy(tls=True, refuse=status) as upstream:
+        with proxy_servers.HttpProxy(tls=True, refuse=407) as upstream:
             route = account_proxy.parse(f"https://127.0.0.1:{upstream.port}")
             with proxy_bridge.Bridge(route) as local:
                 with socket.create_connection((local.host, local.port), timeout=5) as client:
-                    client.sendall(b"GET http://example.test/ HTTP/1.1\r\n\r\n")
+                    client.sendall(
+                        b"POST http://example.test/ HTTP/1.1\r\n"
+                        b"Content-Length: 10\r\nExpect: 100-continue\r\n\r\n"
+                    )
                     with http.client.HTTPResponse(client) as response:
                         response.begin()
-                        assert response.status == status
+                        assert response.status == 407
                         assert response.getheader("Location") is None
                         assert response.read() == b""
                         assert "Refused" not in response.reason
+                    assert client.recv(1) == b""
             assert isinstance(local.failure, proxy_bridge.BridgeError)
-            assert local.failure.status == status
+            assert local.failure.status == 407
+
+    @pytest.mark.parametrize("scheme", ["https", "socks5h"])
+    def test_plain_http_origin_redirect_keeps_headers_and_body(self, monkeypatch, scheme):
+        proxy_servers.trust_fixture_ca(monkeypatch)
+        proxy = (
+            proxy_servers.HttpProxy(tls=True, refuse_plain_connect=True)
+            if scheme == "https" else proxy_servers.Socks5Proxy()
+        )
+        body = b'{"moved": true}'
+        location = "http://example.test/new"
+        with proxy as upstream, proxy_servers.Origin(
+            body=body, status=301, location=location
+        ) as origin:
+            route = account_proxy.parse(f"{scheme}://127.0.0.1:{upstream.port}")
+            with proxy_bridge.Bridge(route) as local:
+                with socket.create_connection((local.host, local.port), timeout=5) as client:
+                    client.sendall(f"GET {origin.url}/old HTTP/1.1\r\n\r\n".encode())
+                    with http.client.HTTPResponse(client) as response:
+                        response.begin()
+                        assert response.status == 301
+                        assert response.getheader("Location") == location
+                        assert response.getheader("Content-Type") == "application/json"
+                        assert response.read() == body
+            assert local.failure is None
+            assert origin.hits == 1
 
     def test_connect_keeps_bytes_from_the_same_write_as_each_head(self, monkeypatch):
         proxy_servers.trust_fixture_ca(monkeypatch)
@@ -693,8 +721,9 @@ def test_an_unexpected_error_from_the_bridge_is_unreachable():
     assert "boom" not in str(err.value)
 
 
-def test_a_certificate_error_from_the_bridge_is_wrapped_like_urllib():
-    failure = ssl.SSLCertVerificationError("fixture refusal")
+@pytest.mark.parametrize("error", [ssl.SSLCertVerificationError, ssl.SSLError])
+def test_a_tls_error_from_the_bridge_is_wrapped_like_urllib(error):
+    failure = error("fixture refusal")
     with pytest.raises(urllib.error.URLError) as err:
         account_proxy.raise_failure(failure)
     assert err.value.reason is failure

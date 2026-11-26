@@ -23,9 +23,9 @@ proxy:
 
 Fail-closed is the whole point: a connection that cannot be opened through
 the account's proxy is refused to the local client — ``407`` for rejected
-credentials, a 3xx the proxy itself answered, ``502``/``504`` otherwise — and
-is never opened directly. The refusals carry static text: the account's URL,
-its credentials and the proxy's own reply text never travel back to a client.
+credentials, a 3xx the proxy answered to ``CONNECT``, ``502``/``504`` otherwise
+— and is never opened directly. The refusals carry static text: the account's
+URL, its credentials and the proxy's own reply text never travel back to a client.
 :func:`connect` is the same tunnel without the local server, for the launch's
 pre-start ``probe`` and for tests.
 
@@ -44,6 +44,7 @@ import ipaddress
 import socket
 import ssl
 import threading
+import urllib.error
 import urllib.parse
 
 #: Seconds one connection to the account's proxy (TLS handshake, ``CONNECT``
@@ -115,6 +116,10 @@ class BridgeError(Exception):
         super().__init__(message)
         self.kind = kind
         self.status = status
+
+
+class TLSSetupError(urllib.error.URLError):
+    """TLS to the proxy failed before the origin request could be sent."""
 
 
 class _BadRequest(Exception):
@@ -293,6 +298,7 @@ class Bridge:
 
     def _handle(self, client: socket.socket) -> None:
         upstream: socket.socket | None = None
+        upload: threading.Thread | None = None
         try:
             # The listener polls, so an accepted socket can carry that timeout
             # in some interpreter/OS combinations; a connection here must
@@ -329,14 +335,23 @@ class Bridge:
                         self._route, host, port, self._timeout, self._context, self
                     )
                 upstream.sendall(head + rest)
-            _relay(client, upstream, forward_absolute)
+            upload = threading.Thread(
+                target=_pump, args=(client, upstream), daemon=True
+            )
+            upload.start()
+            if forward_absolute:
+                _forward_http_response(upstream, client)
+            _pump(upstream, client)
+            if not forward_absolute:
+                upload.join()
+                upload = None
         except _BadRequest:
             _respond(client, 400, "Bad Request")
         except (BridgeError, OSError) as e:
             if self._stop.is_set():
                 return
             if isinstance(e, ssl.SSLError):
-                self._record(e)
+                self._record(TLSSetupError(e) if upstream is None else e)
                 _respond(client, 502, "Bad Gateway")
             else:
                 error = (
@@ -345,8 +360,12 @@ class Bridge:
                 self._record(error)
                 _respond(client, _status_of(error), _reason_of(error))
         finally:
-            _drop(upstream, self)
+            # A final HTTP response can arrive while upload is waiting for
+            # the body. Reply (including any refusal) and close before joining.
             _drop(client, self)
+            _drop(upstream, self)
+            if upload is not None:
+                upload.join()
 
     def _record(self, error: BaseException) -> None:
         with self._lock:
@@ -359,12 +378,18 @@ class Bridge:
                 raise OSError("bridge is closed")
             self._connections.add(connection)
 
-    def _replace(self, raw: socket.socket, tls: ssl.SSLSocket) -> None:
+    def _wrap_tls(
+        self, raw: socket.socket, context: ssl.SSLContext, host: str
+    ) -> ssl.SSLSocket:
         with self._lock:
             if self._stop.is_set():
                 raise OSError("bridge is closed")
+            tls = context.wrap_socket(
+                raw, server_hostname=host, do_handshake_on_connect=False
+            )
             self._connections.remove(raw)
             self._connections.add(tls)
+            return tls
 
     def _untrack(self, connection: socket.socket) -> None:
         with self._lock:
@@ -466,35 +491,13 @@ def _absolute_form(request: _Request, https_route=None) -> tuple[str, int, bytes
     return host, port, ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
 
 
-def _relay(
-    left: socket.socket, right: socket.socket, forward_absolute: bool = False
-) -> None:
-    """Copy bytes in both directions; inspect replies to forwarded HTTP."""
-    upload = threading.Thread(target=_pump, args=(left, right), daemon=True)
-    upload.start()
-    try:
-        if forward_absolute:
-            _forward_http_response(right, left)
-        _pump(right, left)
-    finally:
-        if forward_absolute:
-            # A final response can arrive before the client finishes sending
-            # its body. This connection carries only one HTTP exchange.
-            try:
-                left.shutdown(socket.SHUT_RD)
-            except OSError:
-                pass
-            _close_socket(right)
-        upload.join()
-
-
 def _forward_http_response(source: socket.socket, destination: socket.socket) -> None:
-    """Forward the response head and its tail, except for 407 and 3xx."""
+    """Forward the response head and its tail, except for 407."""
     rest = b""
     while True:
         head, rest, status = _response_head(source, rest)
-        if status == 407 or 300 <= status < 400:
-            raise _refusal(status, "the forwarded request")
+        if status == 407:
+            raise _refusal(status)
         if 100 <= status < 200 and status != 101:
             destination.sendall(head)
             continue
@@ -640,18 +643,15 @@ def _dial_https(
             _close_socket(raw)
             raise
 
-    # Wrapping transfers the descriptor and performs the handshake and trust
-    # checks. Keep a tracked TCP handle that close() can shut down during it.
+    # Transfer the descriptor under the bridge lock, but handshake outside
+    # it so close() can shut down the tracked TLS socket while it waits.
     tls = None
     try:
-        with raw.dup() as duplicate:
-            tls = context.wrap_socket(duplicate, server_hostname=route.host)
-        bridge._replace(raw, tls)
+        tls = bridge._wrap_tls(raw, context, route.host)
+        tls.do_handshake()
     except BaseException:
-        _drop(raw, bridge)
-        _close_socket(tls)
+        _drop(tls if tls is not None else raw, bridge)
         raise
-    raw.close()  # Do not shut down the TCP connection the TLS socket now owns.
     return tls
 
 
@@ -704,7 +704,7 @@ def _response_head(
     return head, rest, int(line[1])
 
 
-def _refusal(status: int, request: str = "CONNECT") -> BridgeError:
+def _refusal(status: int) -> BridgeError:
     """A typed refusal, without any server-supplied text."""
     if status == 407:
         return BridgeError(
@@ -715,7 +715,7 @@ def _refusal(status: int, request: str = "CONNECT") -> BridgeError:
     if 300 <= status < 400:
         return BridgeError(
             "redirect",
-            f"the proxy answered HTTP {status} to {request}",
+            f"the proxy answered HTTP {status} to CONNECT",
             status=status,
         )
     return BridgeError(
