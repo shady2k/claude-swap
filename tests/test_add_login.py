@@ -382,6 +382,187 @@ class TestAddLogin:
         assert checks_pass["egress"] == []
         assert "127.0.0.1:3129" not in record["env"].get("HTTPS_PROXY", "")
 
+    def test_a_login_into_an_empty_slot_warns_when_account_already_has_a_proxy(
+        self, temp_home, claude_bin, checks_pass, monkeypatch, capsys,
+    ):
+        switcher = _switcher()
+        _seed(switcher, {
+            "1": _account("live@example.com"),
+            "2": _account(
+                "new@example.com",
+                org="org-new",
+                org_name="New Org",
+                proxy="http://user:secret@127.0.0.1:3129",
+            ),
+        })
+        record = {}
+        monkeypatch.setattr("claude_swap.login.spawn.run", _login_mock(record))
+
+        switcher.add_account_via_login(slot=5)
+
+        captured = capsys.readouterr()
+        output = captured.out + captured.err
+        assert "already has a saved proxy" in output
+        assert "http://user:***@127.0.0.1:3129" in output
+        assert "went direct" in output
+        assert "cswap add --login --slot 2" in output
+        assert "secret" not in output
+        assert checks_pass["probe"] == []
+        assert "127.0.0.1:3129" not in record["env"].get("HTTPS_PROXY", "")
+
+    def test_email_selects_the_entering_accounts_proxy_over_the_target_slots(
+        self, temp_home, claude_bin, checks_pass, monkeypatch,
+    ):
+        switcher = _switcher()
+        _seed(switcher, {
+            "1": _account("live@example.com"),
+            "2": _account(
+                "a@example.com",
+                org="org-a",
+                proxy="http://127.0.0.1:3128",
+                proxy_expected_country="DE",
+            ),
+            "3": _account(
+                "b@example.com",
+                org="org-b",
+                proxy="http://127.0.0.1:3129",
+                proxy_expected_country="US",
+            ),
+        })
+        record = {}
+        b_config = json.dumps({
+            "oauthAccount": {
+                "emailAddress": "b@example.com",
+                "accountUuid": "uuid-b@example.com",
+                "organizationUuid": "org-b",
+                "organizationName": "Org B",
+            }
+        })
+        monkeypatch.setattr(
+            "claude_swap.login.spawn.run",
+            _login_mock(record, config=b_config),
+        )
+
+        switcher.add_account_via_login(
+            slot=2, email="b@example.com", assume_yes=True
+        )
+
+        route_q = account_proxy.parse("http://127.0.0.1:3129")
+        assert [r.text() for r in checks_pass["probe"]] == [route_q.text()]
+        assert len(checks_pass["egress"]) == 1
+        assert checks_pass["egress"][0][0].text() == route_q.text()
+        assert checks_pass["egress"][0][1] == egress.Expectation(country="US")
+        assert record["env"]["HTTPS_PROXY"] == route_q.text()
+
+        data = switcher._get_sequence_data()
+        assert "3" not in data["accounts"]
+        assert data["accounts"]["2"]["email"] == "b@example.com"
+        assert data["accounts"]["2"]["proxy"] == route_q.text()
+        assert data["accounts"]["2"]["proxy_expected_country"] == "US"
+
+    def test_a_new_email_does_not_inherit_the_target_slots_proxy(
+        self, temp_home, claude_bin, checks_pass, monkeypatch,
+    ):
+        switcher = _switcher()
+        _seed(switcher, {
+            "1": _account("live@example.com"),
+            "2": _account(
+                "a@example.com",
+                org="org-a",
+                proxy="http://127.0.0.1:3128",
+                proxy_expected_country="DE",
+            ),
+        })
+        record = {}
+        c_config = json.dumps({
+            "oauthAccount": {
+                "emailAddress": "c@example.com",
+                "accountUuid": "uuid-c@example.com",
+                "organizationUuid": "org-c",
+                "organizationName": "Org C",
+            }
+        })
+        monkeypatch.setattr(
+            "claude_swap.login.spawn.run",
+            _login_mock(record, config=c_config),
+        )
+
+        switcher.add_account_via_login(
+            slot=2, email="c@example.com", assume_yes=True
+        )
+
+        assert checks_pass["probe"] == []
+        assert checks_pass["egress"] == []
+        assert "HTTPS_PROXY" not in record["env"]
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["2"]["email"] == "c@example.com"
+        assert "proxy" not in data["accounts"]["2"]
+
+    def test_ambiguous_multi_org_email_requires_explicit_proxy_or_own_slot(
+        self, temp_home, claude_bin, checks_pass, monkeypatch,
+    ):
+        switcher = _switcher()
+        _seed(switcher, {
+            "1": _account("live@example.com"),
+            "2": _account(
+                "b@example.com",
+                org="org-1",
+                proxy="http://127.0.0.1:3128",
+            ),
+            "3": _account(
+                "b@example.com",
+                org="org-2",
+                proxy="http://127.0.0.1:3129",
+            ),
+        })
+        spawn_called = []
+        monkeypatch.setattr(
+            "claude_swap.login.spawn.run",
+            lambda *a, **k: spawn_called.append(a),
+        )
+
+        with pytest.raises(ValidationError, match="multiple organizations"):
+            switcher.add_account_via_login(email="b@example.com")
+        assert spawn_called == []
+
+        record = {}
+        b_config = json.dumps({
+            "oauthAccount": {
+                "emailAddress": "b@example.com",
+                "accountUuid": "uuid-b@example.com",
+                "organizationUuid": "org-2",
+                "organizationName": "Org 2",
+            }
+        })
+        monkeypatch.setattr(
+            "claude_swap.login.spawn.run",
+            _login_mock(record, config=b_config),
+        )
+        switcher.add_account_via_login(slot=3, email="b@example.com")
+        assert record["env"]["HTTPS_PROXY"] == "http://127.0.0.1:3129"
+
+    def test_a_stored_expectation_without_a_proxy_refuses_before_claude(
+        self, temp_home, claude_bin, monkeypatch,
+    ):
+        switcher = _switcher()
+        _seed(switcher, {
+            "1": _account("live@example.com"),
+            "2": _account(
+                "new@example.com",
+                org="org-new",
+                proxy_expected_country="DE",
+            ),
+        })
+        spawn_called = []
+        monkeypatch.setattr(
+            "claude_swap.login.spawn.run",
+            lambda *a, **k: spawn_called.append(a),
+        )
+
+        with pytest.raises(EgressCheckError, match="no proxy"):
+            switcher.add_account_via_login(slot=2)
+        assert spawn_called == []
+
     def test_a_wrong_exit_stops_the_login_before_claude(
         self, temp_home, claude_bin, monkeypatch,
     ):
@@ -909,6 +1090,172 @@ class TestLoginCommitSafety:
         assert data["accounts"]["1"]["email"] == "live@example.com"
         assert data["accounts"]["2"]["email"] == "new@example.com"
 
+    def test_post_commit_cleanup_runs_under_the_account_lock_after_sequence_write(
+        self, temp_home, claude_bin, checks_pass, monkeypatch,
+    ):
+        from claude_swap import switcher as switcher_module
+
+        def run_case(use_login: bool):
+            switcher = _switcher()
+            _seed(switcher, {
+                "1": _account("live@example.com"),
+                "2": _account("other@example.com", org="org-other"),
+                "3": _account("moving@example.com", org="org-moving"),
+            })
+            self._seed_files(switcher, "2", "other@example.com")
+            self._seed_files(switcher, "3", "moving@example.com")
+
+            state = {"depth": 0, "seq_written": False, "deletes": []}
+            real_lock = switcher_module.FileLock
+
+            class RecordingLock(real_lock):
+                def __enter__(self):
+                    state["depth"] += 1
+                    return super().__enter__()
+
+                def __exit__(self, *args):
+                    try:
+                        return super().__exit__(*args)
+                    finally:
+                        state["depth"] -= 1
+
+            monkeypatch.setattr(switcher_module, "FileLock", RecordingLock)
+            real_write_json = switcher._write_json
+
+            def record_write(path, data):
+                res = real_write_json(path, data)
+                if path == switcher.sequence_file:
+                    state["seq_written"] = True
+                return res
+
+            monkeypatch.setattr(switcher, "_write_json", record_write)
+            real_delete = switcher._delete_account_files
+
+            def record_delete(num, mail):
+                state["deletes"].append(
+                    (num, mail, state["depth"], state["seq_written"])
+                )
+                return real_delete(num, mail)
+
+            monkeypatch.setattr(switcher, "_delete_account_files", record_delete)
+
+            if use_login:
+                moving_config = json.dumps({
+                    "oauthAccount": {
+                        "emailAddress": "moving@example.com",
+                        "accountUuid": "uuid-moving@example.com",
+                        "organizationUuid": "org-moving",
+                        "organizationName": "Moving Org",
+                    }
+                })
+                monkeypatch.setattr(
+                    "claude_swap.login.spawn.run",
+                    _login_mock({}, config=moving_config),
+                )
+                switcher.add_account_via_login(slot=2, assume_yes=True)
+            else:
+                monkeypatch.setattr(
+                    "claude_swap.switcher.ClaudeAccountSwitcher._read_capture_credentials",
+                    lambda self: NEW_CREDS,
+                )
+                config_path = switcher._get_claude_config_path()
+                config_path.write_text(json.dumps({"oauthAccount": {
+                    "emailAddress": "moving@example.com",
+                    "accountUuid": "uuid-moving",
+                    "organizationUuid": "org-moving",
+                    "organizationName": "",
+                }}), encoding="utf-8")
+                switcher.add_account(slot=2, assume_yes=True)
+
+            assert len(state["deletes"]) == 2
+            assert all(
+                depth >= 1 and seq_written
+                for _, _, depth, seq_written in state["deletes"]
+            )
+
+        run_case(True)
+        run_case(False)
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permissions")
+    def test_an_unreadable_same_email_backup_aborts_before_writing(
+        self, temp_home, claude_bin, checks_pass, monkeypatch,
+    ):
+        switcher = _switcher()
+        _seed(switcher, {
+            "1": _account("live@example.com"),
+            "2": _account("new@example.com", org="org-old", org_name="Old Org"),
+        })
+        monkeypatch.setattr(switcher._store, "_use_keychain", lambda: False)
+        self._seed_files(switcher, "2", "new@example.com")
+        cred_file = switcher._store._backup_enc_path("2", "new@example.com")
+        assert cred_file.exists()
+        before = switcher.sequence_file.read_bytes()
+        monkeypatch.setattr("claude_swap.login.spawn.run", _login_mock({}))
+        monkeypatch.setattr(
+            switcher,
+            "_write_account_config",
+            lambda *a, **k: pytest.fail("config write ran despite unreadable backup"),
+        )
+
+        os.chmod(cred_file, 0o000)
+        try:
+            with pytest.raises(ConfigError, match="could not be read"):
+                switcher.add_account_via_login(slot=2, assume_yes=True)
+            assert switcher.sequence_file.read_bytes() == before
+            assert cred_file.exists()
+        finally:
+            os.chmod(cred_file, 0o600)
+
+        assert switcher._read_account_credentials(
+            "2", "new@example.com"
+        ) == self.OLD_CREDS
+        assert switcher._read_account_config(
+            "2", "new@example.com"
+        ) == self.OLD_CONFIG
+
+    def test_plain_add_same_email_write_failure_restores_the_old_material(
+        self, temp_home, monkeypatch,
+    ):
+        switcher = _switcher()
+        _seed(switcher, {
+            "1": _account("live@example.com"),
+            "2": _account(
+                "new@example.com", org="org-old", org_name="Old Org"
+            ),
+        })
+        self._seed_files(switcher, "2", "new@example.com")
+        before = switcher.sequence_file.read_bytes()
+        monkeypatch.setattr(
+            "claude_swap.switcher.ClaudeAccountSwitcher._read_capture_credentials",
+            lambda self: NEW_CREDS,
+        )
+        config_path = switcher._get_claude_config_path()
+        config_path.write_text(json.dumps({"oauthAccount": {
+            "emailAddress": "new@example.com",
+            "accountUuid": "uuid-new",
+            "organizationUuid": "org-new",
+            "organizationName": "New Org",
+        }}), encoding="utf-8")
+
+        def no_space(num, email, config):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(switcher, "_write_account_config", no_space)
+
+        with pytest.raises(OSError) as exc:
+            switcher.add_account(slot=2, assume_yes=True)
+        assert exc.value.errno == errno.ENOSPC
+
+        assert switcher.sequence_file.read_bytes() == before
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["2"]["organizationUuid"] == "org-old"
+        assert switcher._read_account_credentials(
+            "2", "new@example.com"
+        ) == self.OLD_CREDS
+        assert switcher._read_account_config(
+            "2", "new@example.com"
+        ) == self.OLD_CONFIG
+
 class TestIsolatedProfileCleanup:
     def test_the_directory_is_removed_on_success_and_on_error(self):
         captured = []
@@ -1117,7 +1464,7 @@ class TestAddExpectations:
     def test_a_concurrent_expectation_update_survives_a_rebuild(
         self, temp_home, monkeypatch,
     ):
-        """ALX-1726: the under-lock carry covers the whole rule, not the proxy.
+        """The under-lock carry covers the whole rule, not just the proxy.
 
         A `cswap proxy --expect-*` writes its fields while this add is between
         its first snapshot and the lock that rebuilds the record. Copying only
