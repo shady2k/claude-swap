@@ -847,6 +847,59 @@ class TestTheGlobalCleanupKeepsTheLiveToken:
         assert (temp_home / ".claude" / ".credentials.json").exists()
         assert "could not be removed" in capsys.readouterr().out
 
+    def test_an_unreadable_keychain_is_not_an_absent_login(
+        self, temp_home: Path, capsys
+    ):
+        """The item it could not read may be the only live generation."""
+        s = _switcher()
+        s.platform = Platform.MACOS
+        self._login(temp_home, CREDS_1)
+
+        with patch.object(s._store, "_read_one_oauth_keychain",
+                          return_value=(None, True)), \
+             patch.object(s._store, "_clear_oauth_credential") as cleared:
+            assert isolated_mode.clear_global_login(s, CREDS_1) is False
+
+        cleared.assert_not_called()
+        assert (temp_home / ".claude" / ".credentials.json").exists()
+        config = json.loads((temp_home / ".claude.json").read_text())
+        assert config["oauthAccount"]["emailAddress"] == "a@example.com"
+        assert "Could not read the macOS Keychain" in capsys.readouterr().out
+
+    def test_a_keychain_that_fails_after_the_removal_is_no_verdict(
+        self, temp_home: Path, capsys
+    ):
+        """The re-read is the check: a failure there verifies nothing."""
+        s = _switcher()
+        s.platform = Platform.MACOS
+        self._login(temp_home, CREDS_1)
+        reads = [(None, False), (None, True)]
+
+        with patch.object(s._store, "_read_one_oauth_keychain",
+                          side_effect=lambda service: reads.pop(0)):
+            assert isolated_mode.clear_global_login(s, CREDS_1) is False
+
+        config = json.loads((temp_home / ".claude.json").read_text())
+        assert config["oauthAccount"]["emailAddress"] == "a@example.com"
+        assert "Could not read the macOS Keychain" in capsys.readouterr().out
+
+    def test_a_config_that_refuses_the_write_names_the_manual_step(
+        self, temp_home: Path, capsys
+    ):
+        """The slot is saved either way; the leftover key is the user's to
+        remove, so the console says which one and where."""
+        s = _switcher()
+        self._login(temp_home, CREDS_1)
+
+        with patch.object(s._store, "_update_global_config",
+                          side_effect=PermissionError("read-only file system")):
+            assert isolated_mode.clear_global_login(s, CREDS_1) is False
+
+        out = capsys.readouterr().out
+        assert "oauthAccount" in out
+        assert ".claude.json" in out
+        assert "by hand" in out
+
     def test_another_profile_skips_the_default_cleanup(
         self, temp_home: Path, monkeypatch, capsys
     ):
@@ -866,16 +919,28 @@ class TestTheGlobalCleanupKeepsTheLiveToken:
 
         assert isolated_mode.global_login(s) == {"email": ""}
         notice = isolated_mode.global_login_notice(s)
-        assert notice is not None and "no recorded email" in notice
+        assert notice is not None and ".claude/.credentials.json" in notice
 
-    def test_one_cswap_add_clears_the_orphan_too(self, temp_home: Path):
+    def test_cswap_add_cannot_import_an_orphan(self, temp_home: Path):
+        """`cswap add` reads the identity from `~/.claude.json`, so the file
+        it cannot see is the one the notice has to tell the user to remove."""
         s = _switcher()
         (temp_home / ".claude" / ".credentials.json").write_text(CREDS_1)
-        (temp_home / ".claude.json").write_text(json.dumps({
-            "oauthAccount": {"emailAddress": "a@example.com",
-                             "accountUuid": "uuid-1",
-                             "organizationUuid": ""},
-        }))
+
+        with pytest.raises(ConfigError, match="No active Claude account"):
+            s.add_account()
+
+        assert (temp_home / ".claude" / ".credentials.json").exists()
+        notice = isolated_mode.global_login_notice(s)
+        assert notice is not None
+        assert "remove" in notice and "by hand" in notice
+        assert "log in again" in notice
+
+    def test_the_orphan_goes_once_add_can_reach_the_cleanup(self, temp_home: Path):
+        """Logging in again puts the account beside the file, which is the
+        other route the notice names."""
+        s = _switcher()
+        (temp_home / ".claude" / ".credentials.json").write_text(CREDS_1)
 
         assert isolated_mode.clear_global_login(s, CREDS_1) is True
         assert isolated_mode.global_login(s) is None

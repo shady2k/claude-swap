@@ -5500,7 +5500,7 @@ class ClaudeAccountSwitcher:
         """
         self._refuse_session_shell()
         from claude_swap import login
-        from claude_swap.session import find_claude
+        from claude_swap.session import require_claude_bin
 
         if slot is not None and slot < 1:
             raise ConfigError("Slot number must be >= 1")
@@ -5543,11 +5543,7 @@ class ClaudeAccountSwitcher:
                 )
             expectation = egress.Expectation(country=country, ip=ip)
 
-        claude_bin = find_claude()
-        if not claude_bin:
-            raise SessionError(
-                "'claude' was not found on PATH. Install Claude Code first."
-            )
+        claude_bin = require_claude_bin()
 
         data = self._get_sequence_data() or {}
         if alias is not None:

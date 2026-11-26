@@ -200,8 +200,7 @@ Examples:
             "instead of a named or mapped one, without switching the default "
             "login. The account is chosen by the same comparison `cswap "
             "switch --strategy best` makes; no account with quota left is a "
-            "refusal, not a fallback. This is what the thin `claude` wrapper "
-            "runs (see `cswap wrapper`)."
+            "refusal, not a fallback."
         ),
     )
     parser.add_argument(

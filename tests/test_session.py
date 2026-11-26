@@ -5060,8 +5060,7 @@ class TestShareHistoryDecision:
         return False if how == "flag" else None
 
 
-
-
+@pytest.mark.skipif(sys.platform == "win32", reason="history sharing is POSIX-only")
 class TestShareHistoryIsTheDefault:
     """A launch that names no preference shares history, and a profile that
     kept its own until now is told what happened to it."""

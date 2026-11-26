@@ -37,6 +37,24 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import FetchRecord
 
 
+class _FrozenClock:
+    """A monotonic clock that only moves when a test says so.
+
+    Windows' ``time.monotonic`` steps by ~15.6 ms (``GetTickCount64``), so two
+    cooldowns armed a few milliseconds apart can carry the same deadline.
+    Freezing it reproduces that here on every platform.
+    """
+
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def __getattr__(self, name: str):
+        return getattr(time, name)
+
+
 def _cred(tag: str) -> str:
     return json.dumps({
         "claudeAiOauth": {
@@ -167,12 +185,16 @@ class TestBackupReadCooldown:
         assert keychain.backup_calls(2) == 1
 
     def test_a_cooldown_is_announced_once_and_its_skips_are_silent(
-        self, temp_home: Path, block_real_keychain, keychain: _Keychain, caplog
+        self, temp_home: Path, block_real_keychain, keychain: _Keychain, caplog,
+        monkeypatch,
     ):
         """Skipped reads are expected, not failures: no per-lookup warning
         (31 per snapshot at 11 accounts, ~600/min on the 3 s tick), one info
         line per cooldown, and the verdict stays unreadable."""
         s = _switcher(temp_home, block_real_keychain, 5)
+        store = s._store
+        clock = _FrozenClock()
+        monkeypatch.setattr("claude_swap.credentials.time", clock)
         keychain.fail = lambda *_: True
         with caplog.at_level(logging.INFO, logger="claude-swap"):
             for _ in range(2):
@@ -198,8 +220,9 @@ class TestBackupReadCooldown:
             )
 
             # The cooldown lapses, the re-probe fails again: a new cooldown,
-            # announced again — once.
-            s._store._keychain_disabled_until = time.monotonic() - 1
+            # announced again — once, even though this clock gives it the very
+            # deadline the first line recorded (the Windows tick).
+            store._keychain_disabled_until = clock.now - 1
             s.accounts_snapshot(fetch=set())
             s.accounts_snapshot(fetch=set())
             announced = [

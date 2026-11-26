@@ -53,7 +53,7 @@ pipx upgrade claude-swap
 
 For a fork install above, re-run the same `uv tool install --force` command with the new tag: `cswap upgrade` and `uv tool upgrade` follow PyPI, not the fork.
 
-Coming from `v1.2.0-shady2k.4` (which kept the active login in `~/.claude`), run `cswap add` once after updating: the active account's login is already saved, and `cswap add` now also removes that global copy, which nothing reads any more. The first `claude` before it refuses with that instruction.
+Coming from `v1.2.0-shady2k.4` (which kept the active login in `~/.claude`), run `cswap add` once after updating, when no `claude` is running: the active account's login is already saved, and `cswap add` now also removes that global copy, which nothing reads any more. The first `claude` before it refuses with that instruction.
 
 ## Usage
 

@@ -251,11 +251,20 @@ def global_login_notice(switcher: "ClaudeAccountSwitcher") -> str | None:
     login = global_login(switcher)
     if login is None:
         return None
-    email = login["email"] or "an account with no recorded email"
+    if not login["email"]:
+        # Only the credential file is there, so there is no account for
+        # `cswap add` to import (it reads the identity from `~/.claude.json`)
+        # and it would refuse: the file is the step that has to be undone.
+        return (
+            "Global ~/.claude holds a credential file with no account beside "
+            "it. cswap neither uses it nor overwrites it: remove "
+            "~/.claude/.credentials.json by hand, or log in again and run "
+            "`cswap add`, so the wrapper's login stays isolated."
+        )
     return (
-        f"Global ~/.claude holds a login for {email}. cswap neither uses it "
-        "nor overwrites it: import it with `cswap add`, or remove it and keep "
-        "the wrapper's login isolated."
+        f"Global ~/.claude holds a login for {login['email']}. cswap neither "
+        "uses it nor overwrites it: import it with `cswap add`, or remove it "
+        "and keep the wrapper's login isolated."
     )
 
 
@@ -292,6 +301,13 @@ def _default_credential_state(switcher: "ClaudeAccountSwitcher") -> dict[str, An
     return state
 
 
+_KEYCHAIN_UNREADABLE = (
+    "Could not read the macOS Keychain, so cswap cannot tell whether the "
+    "global ~/.claude login is gone. Nothing more was removed: remove the "
+    "login by hand, or run 'cswap add' again once the Keychain answers."
+)
+
+
 def clear_global_login(
     switcher: "ClaudeAccountSwitcher", saved_credentials: str | None
 ) -> bool:
@@ -316,9 +332,11 @@ def clear_global_login(
     says so in one line and does nothing.
 
     Returns False when a global copy is still there (unreadable, unremovable,
-    refreshed, or skipped as another profile). The reason is already on screen
-    at that point — the caller has nothing further to say, and the add itself
-    has succeeded either way.
+    refreshed, or skipped as another profile). A Keychain that could not be
+    read is one of those: "could not ask" is not "no item", so the cleanup
+    stops instead of deleting a login it cannot see. The reason is already on
+    screen at that point — the caller has nothing further to say, and the add
+    itself has succeeded either way.
     Nothing else in ``~/.claude`` is touched: ``settings.json``, ``CLAUDE.md``,
     ``skills/``, ``projects/``, ``mcpServers`` and the rest are the single
     shared source every session profile links from there.
@@ -342,6 +360,11 @@ def clear_global_login(
     try:
         with claude_credentials_lock():
             state = _default_credential_state(switcher)
+            if state["keychain_failed"]:
+                # The item may be the live login of another generation, and
+                # deleting it blind could be the only copy left.
+                warning(_KEYCHAIN_UNREADABLE)
+                return False
             live = [text for text in (state["file"], state["keychain"]) if text]
             if live and (
                 expected is None
@@ -364,6 +387,9 @@ def clear_global_login(
         warning(f"Could not take Claude Code's credential lock: {e}")
         return False
 
+    if state.get("keychain_failed"):
+        warning(_KEYCHAIN_UNREADABLE)
+        return False
     if state.get("file") or state.get("keychain"):
         warning(
             "The global ~/.claude login is still there: it could not be "
@@ -381,14 +407,15 @@ def clear_global_login(
         with claude_config_lock():
             if config_path.exists():
                 switcher._store._update_global_config(drop_oauth_account)
-    except LockError as e:
-        switcher._logger.warning(
-            f"Could not remove the global oauthAccount from {config_path}: {e}"
-        )
-        return False
     except Exception as e:
         switcher._logger.warning(
             f"Could not remove the global oauthAccount from {config_path}: {e}"
+        )
+        warning(
+            f"Could not remove the 'oauthAccount' key from {config_path} "
+            f"({e}). The account is saved, but cswap still sees this login as "
+            "a global one: delete the 'oauthAccount' key from ~/.claude.json "
+            "by hand."
         )
         return False
     return True

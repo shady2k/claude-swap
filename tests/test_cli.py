@@ -1833,6 +1833,7 @@ class TestRunCommand:
             from unittest.mock import patch
 
             from claude_swap import cli
+            from claude_swap.session import SessionManager
 
             fake = sys.argv[1]
             recorded = {
@@ -1860,7 +1861,12 @@ class TestRunCommand:
                     # Everything cswap says on the way must land on stderr.
                     print(f"Launching Account-{identifier} [session mode]")
                     print("a bootstrap warning", file=sys.stderr)
-                    os.execv(sys.executable, [sys.executable, *claude_args])
+                    # The launch's own handover: execvpe on POSIX, and on
+                    # Windows a resident child, where os.execv would have to
+                    # quote arguments carrying spaces itself.
+                    SessionManager._exec(
+                        self, sys.executable, claude_args, dict(os.environ)
+                    )
 
             argv = [
                 "cswap", "run", "--active", "--",

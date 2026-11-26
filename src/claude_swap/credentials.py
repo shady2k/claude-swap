@@ -439,6 +439,8 @@ class CredentialStore:
         self._backup_read_cache_gen: tuple[int, int, int] | None = None
         # The cooldown deadline already announced in the log (see
         # KeychainBackedOff): one line per cooldown, not one per skipped read.
+        # Zeroed whenever a cooldown is armed, so the line counts cooldowns and
+        # not distinct deadline values.
         self._backoff_announced_until: float = 0.0
 
     def _kc_call(self, fn, *args):
@@ -469,6 +471,12 @@ class CredentialStore:
             self._keychain_disabled_until = (
                 time.monotonic() + KEYCHAIN_RECHECK_COOLDOWN_S
             )
+            # This is a NEW cooldown, so it is announced again. Arming is what
+            # identifies a cooldown; its deadline cannot, because a coarse
+            # monotonic clock (Windows steps by ~15.6 ms, GetTickCount64) hands
+            # two cooldowns the same float, and the comparison in
+            # `_kc_read_backup` then swallows the second line.
+            self._backoff_announced_until = 0.0
             raise
         # A SUCCESS is an observation too, and it is the newer one. Recording
         # only failures made `_keychain_op_failed` monotone, and the cooldown
