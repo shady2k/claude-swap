@@ -26,19 +26,21 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from claude_swap import oauth, spawn
+from claude_swap import macos_keychain, oauth, spawn
 from claude_swap.account_proxy import ProxyRoute
 from claude_swap.exceptions import CredentialReadError, LoginError
+from claude_swap.models import Platform
 from claude_swap.session import (
-    AUTH_OVERRIDE_ENV_VARS,
-    _claude_env,
-    delete_macos_keychain_entry,
+    _keychain_account_name,
+    _probe_env,
+    keychain_service_name,
     read_config_dir_credentials,
 )
 from claude_swap.settings import DEFAULT_NO_PROXY, load_run_settings
@@ -56,6 +58,30 @@ class LoginResult:
     organization_name: str
 
 
+def _delete_profile_keychain(config_dir: Path) -> None:
+    """Delete the temporary profile's Keychain item, warning when that fails.
+
+    Claude Code stores the isolated profile's credential under the service
+    name ``keychain_service_name`` derives from ``CLAUDE_CONFIG_DIR``. An
+    absent item is success (rc 44, which ``delete_password`` already treats
+    as such). Any other failure leaves an item behind for a directory that is
+    about to disappear, so it is reported and the command continues. The
+    warning names neither the credential nor anything read from the item.
+    """
+    if Platform.detect() != Platform.MACOS:
+        return
+    try:
+        macos_keychain.delete_password(
+            keychain_service_name(config_dir), _keychain_account_name()
+        )
+    except macos_keychain.KEYCHAIN_ERRORS:
+        print(
+            "warning: could not delete the temporary login Keychain entry; "
+            "it may remain in the Keychain.",
+            file=sys.stderr,
+        )
+
+
 @contextmanager
 def isolated_profile() -> Iterator[Path]:
     """A private ``CLAUDE_CONFIG_DIR`` that holds nothing once the block ends.
@@ -63,6 +89,11 @@ def isolated_profile() -> Iterator[Path]:
     ``tempfile.mkdtemp`` already creates a 0700 directory on POSIX; the
     explicit ``chmod`` states the requirement rather than relying on it.
     Windows has no POSIX mode bits, so the call is POSIX-only.
+
+    Both cleanups run in ``finally`` even when the body raised. A failure to
+    delete the Keychain item or to remove the directory is reported on
+    ``stderr`` and never replaces the body's own exception or hides the other
+    cleanup.
     """
     config_dir = Path(tempfile.mkdtemp(prefix="cswap-login-"))
     try:
@@ -70,8 +101,17 @@ def isolated_profile() -> Iterator[Path]:
             os.chmod(config_dir, 0o700)
         yield config_dir
     finally:
-        delete_macos_keychain_entry(config_dir)
-        shutil.rmtree(config_dir, ignore_errors=True)
+        _delete_profile_keychain(config_dir)
+        try:
+            shutil.rmtree(config_dir)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            print(
+                f"warning: could not remove the temporary login profile at "
+                f"{config_dir}; check for leftover files.",
+                file=sys.stderr,
+            )
 
 
 def login_environment(
@@ -84,15 +124,12 @@ def login_environment(
     second copy of those rules.
     """
     run = load_run_settings(backup_dir)
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in AUTH_OVERRIDE_ENV_VARS
-    }
-    env.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
-    env["CLAUDE_CONFIG_DIR"] = str(config_dir)
     no_proxy = DEFAULT_NO_PROXY if route is None else run.no_proxy
-    return _claude_env(env, route, no_proxy, run.disable_nonessential_traffic)
+    env = _probe_env(
+        config_dir, route, no_proxy, run.disable_nonessential_traffic
+    )
+    env.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
+    return env
 
 
 def run_login(

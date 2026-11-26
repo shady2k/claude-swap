@@ -1273,6 +1273,22 @@ class ClaudeAccountSwitcher:
             config_file.unlink()
         self._delete_session_profile(account_num, email)
 
+    def _best_effort_cleanup(
+        self, account_num: str, email: str, what: str
+    ) -> None:
+        """Drop a slot's files after its record left the registry, or log.
+
+        Post-commit cleanup must not turn a completed write into a failure: a
+        stale file only wastes space, while a raised error would report the
+        slot as unwritten.
+        """
+        try:
+            self._delete_account_files(account_num, email)
+        except Exception as e:
+            self._logger.error(
+                f"Stale {what} files left under {account_num} ({email}): {e}"
+            )
+
     def _prune_mappings(self, email: str, org_uuid: str) -> None:
         """Drop directory mappings for an identity that no longer has a slot.
 
@@ -5208,87 +5224,103 @@ class ClaudeAccountSwitcher:
 
         self._reject_identity_drift_since_verify(identity)
 
-        # Now safe to perform destructive cleanup (new account data is in memory)
-        if displace_slot:
-            d_num, d_email, d_org = displace_slot
-            self._delete_account_files(d_num, d_email)
-            data = self._get_sequence_data()
-            if int(d_num) in data["sequence"]:
-                data["sequence"].remove(int(d_num))
-            del data["accounts"][d_num]
-            self._write_json(self.sequence_file, data)
-            self._prune_mappings(d_email, d_org)
-
-        if migrate_from:
-            data = self._get_sequence_data()
-            old_email = data["accounts"][migrate_from].get("email", "")
-            self._delete_account_files(migrate_from, old_email)
-            if int(migrate_from) in data["sequence"]:
-                data["sequence"].remove(int(migrate_from))
-            del data["accounts"][migrate_from]
-            self._write_json(self.sequence_file, data)
-
-        # Store backups
-        self._write_account_credentials(account_num, current_email, current_creds)
-        self._write_account_config(account_num, current_email, current_config)
-        self._usage_store.clear_dead_token(
-            [account_num], {account_num: (current_email, organization_uuid)}
-        )
-
-        # Update sequence.json — under the account lock every slot mutation
-        # takes, from a fresh read. Two things are decided here and nowhere
-        # earlier: that the slot still belongs to (or is free for) this
-        # account, and which proxy it keeps — the setting on the record the
-        # account holds now, losing only to an explicit --proxy.
+        # The write happens under the account lock from a fresh read. Both the
+        # record this add leaves and the three proxy fields it carries are
+        # decided there: a concurrent `cswap proxy --expect-*` (or
+        # `--unset-expect`) must survive, and the record it targets may still
+        # be the migration source until this lock removes it.
         with FileLock(self.lock_file):
             data = self._get_sequence_data() or {}
             occupant = (data.get("accounts") or {}).get(str(account_num)) or {}
+            displaced: tuple[str, str] | None = None
             if occupant and not self._record_is(
                 occupant, current_email, organization_uuid
             ):
-                raise ConfigError(
-                    f"Slot {account_num} was taken by another account while "
-                    "this add was running; the registry was not changed. "
-                    "Run the command again."
+                if displace_slot is None or not self._record_is(
+                    occupant, displace_slot[1], displace_slot[2]
+                ):
+                    raise ConfigError(
+                        f"Slot {account_num} was taken by another account while "
+                        "this add was running; the registry was not changed. "
+                        "Run the command again."
+                    )
+                displaced = (
+                    occupant.get("email", ""),
+                    occupant.get("organizationUuid", "") or "",
                 )
-            # The proxy belongs to the ACCOUNT, not to the number. An ordinary
-            # `add --slot` to a free slot finds the target record empty, and
-            # the cleanup above has already deleted the record the account is
-            # leaving — so the setting is taken from whichever of the two
-            # still has it, and only then loses to an explicit --proxy.
-            previous = occupant
-            if not self._record_is(previous, current_email, organization_uuid):
-                owner_slot = self._find_account_slot(
-                    data, current_email, organization_uuid
-                )
-                previous = (
-                    (data.get("accounts") or {}).get(owner_slot) or {}
-                    if owner_slot
-                    else {}
-                )
-            # All of them, not only the proxy: a concurrent
-            # `cswap proxy --expect-country/--expect-ip` writes the rule
-            # fields beside it, and rebuilding the record from the earlier
-            # snapshot would silently drop an exit rule the user just set.
+
+            owner_slot = self._find_account_slot(
+                data, current_email, organization_uuid
+            )
+            migrate_from = (
+                owner_slot
+                if owner_slot is not None and owner_slot != account_num
+                else None
+            )
+            previous: dict = {}
+            if occupant and self._record_is(
+                occupant, current_email, organization_uuid
+            ):
+                previous = occupant
+            elif migrate_from is not None:
+                previous = data["accounts"][migrate_from]
+            migrate_email = (
+                previous.get("email", "") if migrate_from is not None else ""
+            )
+
+            # Refuse before the first write while either displaced account
+            # has a live session-mode Claude: deleting its profile afterwards
+            # would pull state out from under the running process.
+            if displaced is not None:
+                self._ensure_no_live_session(account_num, displaced[0], "add")
+            if migrate_from is not None:
+                self._ensure_no_live_session(migrate_from, migrate_email, "add")
+
+            # All three fields, present or absent: an absent one is removed
+            # from the pre-lock snapshot too, so a concurrent
+            # `cswap proxy --unset-expect` is not resurrected.
             for field in (account_proxy.FIELD, *egress.FIELDS):
                 if field in previous:
                     carried[field] = previous[field]
-            data["accounts"][account_num] = {
+                else:
+                    carried.pop(field, None)
+
+            self._write_account_credentials(
+                account_num, current_email, current_creds
+            )
+            self._write_account_config(
+                account_num, current_email, current_config
+            )
+            self._usage_store.clear_dead_token(
+                [account_num], {account_num: (current_email, organization_uuid)}
+            )
+
+            if displaced is not None:
+                data["accounts"].pop(account_num, None)
+                if int(account_num) in data.get("sequence", []):
+                    data["sequence"].remove(int(account_num))
+            if migrate_from is not None:
+                data["accounts"].pop(migrate_from, None)
+                if int(migrate_from) in data.get("sequence", []):
+                    data["sequence"].remove(int(migrate_from))
+
+            record = {
                 "email": current_email,
                 "uuid": account_uuid,
                 "organizationUuid": organization_uuid,
                 "organizationName": organization_name,
                 "added": get_timestamp(),
             }
+            record.update(carried)
             if alias is not None:
-                carried["alias"] = alias  # an explicit --alias wins over the carried one
+                record["alias"] = alias  # an explicit --alias wins over the carried one
             if explicit_route is not None:
-                carried[account_proxy.FIELD] = explicit_route.text()
+                record[account_proxy.FIELD] = explicit_route.text()
             if country is not None:
-                carried[egress.COUNTRY_FIELD] = country
+                record[egress.COUNTRY_FIELD] = country
             if ip is not None:
-                carried[egress.IP_FIELD] = ip
-            data["accounts"][account_num].update(carried)
+                record[egress.IP_FIELD] = ip
+            data["accounts"][account_num] = record
             if int(account_num) not in data["sequence"]:
                 data["sequence"].append(int(account_num))
                 data["sequence"].sort()
@@ -5296,6 +5328,32 @@ class ClaudeAccountSwitcher:
             data["lastUpdated"] = get_timestamp()
 
             self._write_json(self.sequence_file, data)
+
+        # Post-commit cleanup of the records the write replaced. The registry
+        # already names the new record, so a leftover file only wastes space;
+        # a raised error would report a completed add as failed. A same-email
+        # overwrite shares its keys with the record just written and keeps
+        # them: only its session profile goes.
+        if displaced is not None:
+            d_email, d_org = displaced
+            if d_email != current_email:
+                self._best_effort_cleanup(
+                    account_num, d_email, "displaced slot"
+                )
+            else:
+                try:
+                    self._delete_session_profile(account_num, d_email)
+                except Exception as e:
+                    self._logger.error(
+                        f"Stale session profile left at slot {account_num} "
+                        f"({d_email}): {e}"
+                    )
+            self._prune_mappings(d_email, d_org)
+        if migrate_from is not None:
+            self._best_effort_cleanup(
+                migrate_from, migrate_email, "migrated slot"
+            )
+
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
         if migrate_from:
@@ -5446,7 +5504,9 @@ class ClaudeAccountSwitcher:
             except ValueError as e:
                 raise ValidationError(str(e)) from e
         if email is not None and not self._validate_email(email):
-            raise ValidationError(f"Invalid email format: {email}")
+            # Never repeat the value: a pasted proxy URL can carry a password,
+            # and this message reaches stderr and the debug log.
+            raise ValidationError("Invalid email format")
 
         explicit_route: "account_proxy.ProxyRoute | None" = None
         if proxy is not None:
@@ -5493,21 +5553,32 @@ class ClaudeAccountSwitcher:
                 org_uuid=None,
             )
 
-        if explicit_route is not None:
+        # A re-login into a slot that already carries a proxy uses that route:
+        # without `--proxy`, the stored record is the effective setting, so a
+        # damaged value refuses before `claude` starts instead of logging in
+        # direct. An explicit `--proxy` is used alone, as before.
+        effective_route = explicit_route
+        effective_expectation = expectation
+        if explicit_route is None and slot is not None:
+            slot_record = (data.get("accounts") or {}).get(str(slot)) or {}
+            effective_route = account_proxy.route_for(slot_record)
+            effective_expectation = egress.read(slot_record)
+
+        if effective_route is not None:
             print(
                 f"{accent('Note:')} Claude Code's login exchange will use this "
                 f"proxy, but the OAuth link opens in your browser: open it "
                 f"from the network and country you expect for this account."
             )
             try:
-                account_proxy.probe(explicit_route)
+                account_proxy.probe(effective_route)
             except account_proxy.ProxyRouteError as e:
                 raise SessionError(
                     f"The proxy cannot be used: {e}. Claude Code was not started."
                 ) from None
-            if expectation is not None:
+            if effective_expectation is not None:
                 try:
-                    egress.check(explicit_route, expectation)
+                    egress.check(effective_route, effective_expectation)
                 except EgressCheckError as e:
                     raise EgressCheckError(
                         f"The proxy's exit does not match the expectation: {e}. "
@@ -5516,15 +5587,20 @@ class ClaudeAccountSwitcher:
 
         with login.isolated_profile() as config_dir:
             result = login.run_login(
-                claude_bin, config_dir, explicit_route, self.backup_dir, email
+                claude_bin, config_dir, effective_route, self.backup_dir, email
             )
             # The login succeeded; only now does the backup store change. A
             # refused or interrupted login left it, and sequence.json, as they
             # were. The migration runs before the slot is chosen so an old
             # record without organization fields is recognized as this account.
             self._setup_directories()
-            self._init_sequence_file()
-            self._migrate_org_fields()
+            # The registry is created and migrated under the account lock: a
+            # second `add --login` that started meanwhile must not have the
+            # file it just wrote replaced by an empty initial one, and the
+            # migration rewrites the same file.
+            with FileLock(self.lock_file):
+                self._init_sequence_file()
+                self._migrate_org_fields()
             self._reject_live_api_key_capture(result.credentials)
             self._reject_cross_kind_collision(result.email, False)
             # The ownership probe is cswap's own request, so an account that
@@ -5537,6 +5613,17 @@ class ClaudeAccountSwitcher:
             probe_route = explicit_route or account_proxy.route_for(
                 (registry.get("accounts") or {}).get(owner_num or "") or {}
             )
+            if (
+                slot is None
+                and explicit_route is None
+                and probe_route is not None
+            ):
+                warning(
+                    f"Account {result.email} already has a saved proxy "
+                    f"({probe_route.display()}); this login went direct. "
+                    f"Re-run it through that route with "
+                    f"`cswap add --login --slot {owner_num}`."
+                )
             credentials = self._reject_foreign_credential_capture(
                 result.credentials,
                 result.email,
@@ -5578,9 +5665,14 @@ class ClaudeAccountSwitcher:
         The pre-lock plan supplied ``account_num`` and the identity the
         overwrite question named. Everything is re-read here: a ``swap``,
         ``move``, ``remove`` or another ``add`` that landed meanwhile either
-        matches that plan or refuses the write. The slot write and
-        ``sequence.json`` commit happen in this one lock; the live login and
-        ``activeAccountNumber`` are never touched.
+        matches that plan or refuses the write.
+
+        The slot's files are written before ``sequence.json``, and that write
+        is the commit point: a failure beforehand restores the material the
+        slot held, and only a published record is followed by cleanup of the
+        files of the record it replaced. ``activeAccountNumber`` is left
+        alone unless the moved account is the live login itself, in which case
+        it follows the backup to its new slot (as ``move_account`` does).
         """
         org_uuid = result.organization_uuid
         prunable: list[tuple[str, str]] = []
@@ -5618,6 +5710,43 @@ class ClaudeAccountSwitcher:
                         f"Alias '{alias}' is already used by account {conflict}"
                     )
 
+            active_num = data.get("activeAccountNumber")
+            if (
+                occupied_by_other
+                and active_num is not None
+                and str(active_num) == account_num
+            ):
+                # The live login names this slot. `add --login` imports a
+                # different account, and replacing the active record would
+                # unname the account `~/.claude` is running.
+                raise ConfigError(
+                    f"Slot {account_num} is the active login; `add --login` "
+                    "does not replace it. Switch to another account or choose "
+                    "another slot."
+                )
+            if (
+                migrate_from is not None
+                and active_num is not None
+                and str(active_num) == migrate_from
+            ):
+                # The same account is moving its backup while its live login
+                # stays: point the registry at the slot that will hold it.
+                data["activeAccountNumber"] = int(account_num)
+
+            # Both slots a later write can disturb are checked before the
+            # first file changes. `_delete_account_files` checks again, but
+            # only after the new material was published.
+            if occupied_by_other:
+                self._ensure_no_live_session(
+                    account_num, occupant.get("email", ""), "add --login"
+                )
+            if migrate_from is not None:
+                self._ensure_no_live_session(
+                    migrate_from,
+                    data["accounts"][migrate_from].get("email", ""),
+                    "add --login",
+                )
+
             carried: dict = {}
             if self._record_is(occupant, result.email, org_uuid):
                 carried.update(self._carried_settings(occupant))
@@ -5626,31 +5755,24 @@ class ClaudeAccountSwitcher:
                     self._carried_settings(data["accounts"][migrate_from])
                 )
 
-            if occupied_by_other:
-                old_email = occupant.get("email", "")
-                old_org = occupant.get("organizationUuid", "") or ""
-                self._delete_account_files(account_num, old_email)
-                data["accounts"].pop(account_num, None)
-                if int(account_num) in data.get("sequence", []):
-                    data["sequence"].remove(int(account_num))
-                prunable.append((old_email, old_org))
-            if migrate_from is not None:
-                old_record = data["accounts"][migrate_from]
-                old_email = old_record.get("email", "")
-                self._delete_account_files(migrate_from, old_email)
-                data["accounts"].pop(migrate_from, None)
-                if int(migrate_from) in data.get("sequence", []):
-                    data["sequence"].remove(int(migrate_from))
-                # Mappings key on the account's identity, which a move keeps,
-                # so they are not pruned here (unlike a displaced occupant).
-
-            self._write_account_credentials(
-                account_num, result.email, credentials
+            old_email = occupant.get("email", "")
+            old_org = occupant.get("organizationUuid", "") or ""
+            migrate_email = (
+                data["accounts"][migrate_from].get("email", "")
+                if migrate_from is not None
+                else ""
             )
-            self._write_account_config(account_num, result.email, result.config)
-            self._usage_store.clear_dead_token(
-                [account_num], {account_num: (result.email, org_uuid)}
-            )
+            # Slot files are keyed by (number, email), so an existing record
+            # with this email (the same account refreshed, or another
+            # organization) shares the keys this write replaces and must be
+            # put back on failure. A different email has its own keys and is
+            # simply deleted on failure.
+            saved_old: tuple[str, str] | None = None
+            if occupant and old_email == result.email:
+                saved_old = (
+                    self._read_account_credentials(account_num, old_email),
+                    self._read_account_config(account_num, old_email),
+                )
 
             record = {
                 "email": result.email,
@@ -5668,16 +5790,97 @@ class ClaudeAccountSwitcher:
                 record[egress.COUNTRY_FIELD] = country
             if ip is not None:
                 record[egress.IP_FIELD] = ip
-            data["accounts"][account_num] = record
-            if int(account_num) not in data["sequence"]:
-                data["sequence"].append(int(account_num))
-                data["sequence"].sort()
-            data["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, data)
+
+            try:
+                self._write_account_credentials(
+                    account_num, result.email, credentials
+                )
+                self._write_account_config(
+                    account_num, result.email, result.config
+                )
+                self._usage_store.clear_dead_token(
+                    [account_num], {account_num: (result.email, org_uuid)}
+                )
+
+                if occupied_by_other:
+                    data["accounts"].pop(account_num, None)
+                    if int(account_num) in data.get("sequence", []):
+                        data["sequence"].remove(int(account_num))
+                if migrate_from is not None:
+                    data["accounts"].pop(migrate_from, None)
+                    if int(migrate_from) in data.get("sequence", []):
+                        data["sequence"].remove(int(migrate_from))
+
+                data["accounts"][account_num] = record
+                if int(account_num) not in data["sequence"]:
+                    data["sequence"].append(int(account_num))
+                    data["sequence"].sort()
+                data["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, data)
+            except BaseException:
+                # Nothing reached `sequence.json`: the slot still names its old
+                # account, so only the files this write touched are undone.
+                try:
+                    if saved_old is not None:
+                        old_creds, old_config = saved_old
+                        if old_creds:
+                            self._write_account_credentials(
+                                account_num, old_email, old_creds
+                            )
+                        else:
+                            self._delete_account_credentials(
+                                account_num, old_email
+                            )
+                        if old_config:
+                            self._write_account_config(
+                                account_num, old_email, old_config
+                            )
+                        else:
+                            self._delete_config_backup(
+                                account_num, old_email
+                            )
+                    else:
+                        self._delete_account_credentials(
+                            account_num, result.email
+                        )
+                        self._delete_config_backup(
+                            account_num, result.email
+                        )
+                except Exception as e:
+                    self._logger.error(
+                        f"Cleanup after a failed login import is incomplete: {e}"
+                    )
+                raise
+
+            if occupied_by_other:
+                prunable.append((old_email, old_org))
 
             refreshed = (
                 owner == account_num and migrate_from is None
                 and self._record_is(occupant, result.email, org_uuid)
+            )
+
+        # Post-commit cleanup. The registry now names the new record, so a
+        # leftover file only wastes space; a raised error would report a
+        # completed import as failed. A same-email overwrite shares its keys
+        # with the record just written and keeps them: only the old
+        # organization's session profile goes.
+        if occupied_by_other:
+            if old_email != result.email:
+                self._best_effort_cleanup(
+                    account_num, old_email, "displaced slot"
+                )
+            else:
+                try:
+                    self._delete_session_profile(account_num, old_email)
+                except Exception as e:
+                    self._logger.error(
+                        f"Stale session profile left at slot {account_num} "
+                        f"({old_email}): {e}"
+                    )
+        if migrate_from is not None:
+            self._best_effort_cleanup(
+                migrate_from, migrate_email, "migrated slot"
             )
 
         for old_email, old_org in prunable:

@@ -15,6 +15,8 @@
 
 The proxy's one `CONNECT` and, when a rule is given, the [egress check](#egress-expectation) run before `claude` starts and outside every file lock; a failure adds nothing. `--email` is forwarded to `claude auth login --email`. The OAuth link is opened by the browser, not by cswap, so it must be opened from the network and country the account expects — the command prints that reminder when a proxy is given. `--expect-country` and `--expect-ip` require `--proxy`.
 
+To log an account that already has a proxy in again, run `cswap add --login --slot N`; with no `--proxy`, the route and rule stored on slot N are used for the login and its checks.
+
 Without `--login`, `cswap add --proxy <url> --expect-country <CC> --expect-ip <IP>` stores the proxy and rule for the account that is already logged in. Both forms validate the URL, country and IP and store them under the account lock; an explicit `--expect-*` replaces a value carried over from the slot.
 
 ## What it routes

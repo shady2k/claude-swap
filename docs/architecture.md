@@ -114,7 +114,7 @@ Read next: the module docstring of `session.py`, and [proxy.md](proxy.md#launchi
 
 ### Adding an account by login
 
-`cswap add --login` validates its arguments and resolves `claude` first, then checks the given proxy and its egress rule outside every lock. It runs the official `claude auth login` in a throwaway profile (`login.py`, removed with its Keychain entry in `finally`) and reads the credential and `oauthAccount` metadata from that profile only. The slot is chosen and the overwrite question asked after the login, because only then is the account known; the write of the credential, the config and `sequence.json` is one step under the account lock, and `activeAccountNumber` is left alone.
+`cswap add --login` validates its arguments and resolves `claude` first, then checks the given proxy and its egress rule outside every lock. It runs the official `claude auth login` in a throwaway profile (`login.py`, removed with its Keychain entry in `finally`) and reads the credential and `oauthAccount` metadata from that profile only. The slot is chosen and the overwrite question asked after the login, because only then is the account known; the write of the credential, the config and `sequence.json` is one step under the account lock; `activeAccountNumber` is left alone unless the account is moving out of the active slot, in which case it follows the backup.
 
 ### A launch on the best account
 
