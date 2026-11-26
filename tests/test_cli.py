@@ -1300,7 +1300,12 @@ class TestRunCommand:
         self.backup_dir = tmp_path
 
     def _dispatch(self, argv: list[str], argv0: str = "claude-swap", **switcher_attrs):
-        """Run cli.main() with a fake SessionManager; returns recorded calls."""
+        """Run cli.main() with a fake SessionManager; returns recorded calls.
+
+        ``slot_for_directory`` — if passed — replaces ``slot_for_directory`` on
+        the fake switcher (the no-account fallback resolves the mapping from
+        it).
+        """
         calls = []
 
         class FakeSessionManager:
@@ -1821,6 +1826,10 @@ class TestRunCommand:
         is a real `cswap run --active` on a recorded slot whose only stand-in
         is the session manager: it prints its notices, then execs a fake
         claude that answers JSON.
+
+        `--active` carries the StopFailure hook like `--auto` does: the fake
+        claude's argv therefore starts with `--settings` carrying a
+        `rate_limit` matcher, and the user's words follow it.
         """
         fake_claude = tmp_path / "claude.py"
         fake_claude.write_text(
@@ -1861,12 +1870,14 @@ class TestRunCommand:
                     # Everything cswap says on the way must land on stderr.
                     print(f"Launching Account-{identifier} [session mode]")
                     print("a bootstrap warning", file=sys.stderr)
-                    # The launch's own handover: execvpe on POSIX, and on
-                    # Windows a resident child, where os.execv would have to
-                    # quote arguments carrying spaces itself.
+                    # The launch's own handover: exec the fake claude with the
+                    # hook settings cswap prepended, so its stdout carries the
+                    # full argv the launch hands over (the only visible trace
+                    # of the hook).
                     SessionManager._exec(
-                        self, sys.executable, claude_args, dict(os.environ)
+                        self, sys.executable, [fake, *claude_args], dict(os.environ)
                     )
+
 
             argv = [
                 "cswap", "run", "--active", "--",
@@ -1893,12 +1904,75 @@ class TestRunCommand:
         )
 
         assert result.returncode == 0, result.stderr
-        assert [json.loads(line) for line in result.stdout.splitlines()] == [
-            {"args": ["--output-format", "stream-json"]}
-        ]
+        claude_args = json.loads(result.stdout)["args"]
+        # The launch of `--active` carries the StopFailure hook like `--auto`.
+        settings = json.loads(claude_args[1])
+        hook = settings["hooks"]["StopFailure"][0]
+        assert hook["matcher"] == "rate_limit"
+        assert "rate-limited a@example.com" in (
+            hook["hooks"][0]["command"]
+        )
+        assert claude_args[0] == "--settings"
+        assert claude_args[2] == str(fake_claude)
+        assert claude_args[3:] == ["--output-format", "stream-json"]
         assert "Launching Account-1" in result.stderr
         assert "a bootstrap warning" in result.stderr
 
+
+    def _active_dispatch(self, argv, resolved=("2", ("2", "b@example.com", "org-1")), **switcher_attrs):
+        """Dispatch `cswap run --active` with the active-account resolver faked."""
+        with patch("claude_swap.cli._active_account", MagicMock(return_value=resolved)):
+            return self._dispatch(argv, **switcher_attrs)
+
+    def _hook_settings(self, claude_args):
+        """The decoded StopFailure hook settings cswap prepends to a launch."""
+        assert claude_args[0] == "--settings"
+        settings = json.loads(claude_args[1])
+        return settings["hooks"]["StopFailure"][0]
+
+    def test_active_launch_carries_the_stop_failure_hook(self):
+        """`cswap run --active` prepends the StopFailure hook with the account.
+
+        A refusal on the recorded active slot must mark that account, exactly
+        like a `--auto` launch does. The account triple the launch resolved
+        decides the hook's address, not the slot number alone.
+        """
+        calls = self._active_dispatch(["run", "--active", "--", "-p", "hi"])
+        claude_args = self._launch(calls)[2]
+        hook = self._hook_settings(claude_args)
+        assert hook["matcher"] == "rate_limit"
+        command = hook["hooks"][0]["command"]
+        assert "rate-limited b@example.com org-1" in command
+        assert claude_args[2:] == ["-p", "hi"]
+
+    def test_active_launch_with_no_mapping_also_carries_the_hook(self):
+        """The fallback launch (no directory mapping) carries the hook too."""
+        calls = self._active_dispatch(
+            ["run", "--", "-p", "hi"],
+            resolved=("2", ("2", "b@example.com", "org-1")),
+            slot_for_directory=MagicMock(return_value=(None, None)),
+        )
+
+        claude_args = self._launch(calls)[2]
+        hook = self._hook_settings(claude_args)
+        assert hook["matcher"] == "rate_limit"
+        assert "rate-limited b@example.com org-1" in hook["hooks"][0]["command"]
+        assert claude_args[2:] == ["-p", "hi"]
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            ["--settings", "user-settings.json", "-p", "hi"],
+            ["auth", "status"],
+            ["doctor"],
+            ["logs", "x"],
+        ],
+    )
+    def test_active_launch_skips_the_hook_like_auto(self, tail):
+        """The `--active` hook keeps `--auto`'s limits: a user `--settings`
+        owns that switch and a one-word subcommand would turn into a prompt,
+        so neither gets the hook."""
+        calls = self._active_dispatch(["run", "--active", "--", *tail])
+        assert self._launch(calls)[2] == tail
 
 class TestSubcommandAliases:
     """Memorable subcommands (`cswap switch`, `cswap list`, ...) → classic flags."""
@@ -3390,3 +3464,4 @@ class TestPersonAtTerminal:
         args = cli.argparse.Namespace(json=False, menubar=False)
         with patch.object(sys.stdin, "isatty", side_effect=ValueError("closed")):
             assert cli._person_at_terminal(args) is False
+

@@ -15730,3 +15730,129 @@ class TestTheLaunchRoute:
         )
 
         assert not switcher.default_login_still_holds(None, None)
+
+
+class TestStopFailureMarkGuardsTheBestPick:
+    """A `StopFailure` mark newer than the cached reading blocks the pick.
+
+    `_select_best_switchable` shares the evidence rule with the launch
+    ranking: a reading that predates Claude Code's refusal is stale proof,
+    so a `--strategy best` pass right after a refusal cannot roll the active
+    slot back onto the account that just refused.
+    """
+
+    def _setup_switch(self, temp_home: Path):
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def _seed_switch(self, s, num, email):
+        s._write_account_credentials(
+            str(num), email, json.dumps({"claudeAiOauth": {"accessToken": f"sk-{num}", "refreshToken": f"rt-{num}"}})
+        )
+        s._write_account_config(str(num), email, json.dumps({"oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"}}))
+        data = s._get_sequence_data()
+        data["accounts"][str(num)] = {"email": email, "uuid": f"uuid-{num}", "organizationUuid": "", "organizationName": "", "added": "2024-01-01T00:00:00Z"}
+        if num not in data["sequence"]:
+            data["sequence"].append(num)
+            data["sequence"].sort()
+        if data["activeAccountNumber"] is None:
+            data["activeAccountNumber"] = num
+        s._write_json(s.sequence_file, data)
+
+    @staticmethod
+    def _usage(pct):
+        return {"five_hour": {"pct": pct}, "seven_day": {"pct": 0.0}}
+
+    def _entry(self, pct, fetched_at=None):
+        """A switch-decision reading: headroom 100-pct, fresh enough to serve."""
+        if pct is None:
+            return UsageEntry()
+        return UsageEntry(
+            last_good={"five_hour": {"pct": pct}, "seven_day": {"pct": pct}},
+            fetched_at=fetched_at,
+            age_s=0.0,
+        )
+
+    def test_marked_candidate_with_stale_high_headroom_loses(self, temp_home: Path):
+        s = self._setup_switch(temp_home)
+        self._seed_switch(s, 1, "a@example.com")
+        self._seed_switch(s, 2, "b@example.com")
+        self._seed_switch(s, 3, "c@example.com")
+
+        usage = {"1": self._usage(50), "2": self._usage(10), "3": self._usage(40)}
+        entries = {
+            "2": self._entry(10, fetched_at=1000.0),
+            "3": self._entry(40),
+        }
+        marks = {("b@example.com", ""): 5000.0}
+        # 2's reading is older than its StopFailure mark: stale evidence,
+        # excluded — 3 (40% used) wins even though 2 promised more room.
+        target, note = s._select_best_switchable(
+            "1", (), usage, entries=entries, marks=marks
+        )
+
+        assert target == "3"
+
+    def test_reading_newer_than_the_mark_is_fresh_evidence(self, temp_home: Path):
+        s = self._setup_switch(temp_home)
+        self._seed_switch(s, 1, "a@example.com")
+        self._seed_switch(s, 2, "b@example.com")
+        self._seed_switch(s, 3, "c@example.com")
+
+        usage = {"1": self._usage(50), "2": self._usage(10), "3": self._usage(40)}
+        entries = {
+            "2": self._entry(10, fetched_at=6000.0),
+            "3": self._entry(40),
+        }
+        marks = {("b@example.com", ""): 5000.0}
+
+        target, note = s._select_best_switchable(
+            "1", (), usage, entries=entries, marks=marks
+        )
+
+        # 2's reading postdates its mark: the refusal happened before that
+        # reading, so 2 (90% headroom) legitimately wins.
+        assert target == "2"
+
+    def test_no_marks_keeps_the_plain_headroom_order(self, temp_home: Path):
+        s = self._setup_switch(temp_home)
+        self._seed_switch(s, 1, "a@example.com")
+        self._seed_switch(s, 2, "b@example.com")
+
+        usage = {"1": self._usage(50), "2": self._usage(10)}
+        entries = {"2": self._entry(10)}
+
+        target, note = s._select_best_switchable("1", (), usage, entries=entries)
+
+        assert target == "2"
+        assert note == ""
+
+    def test_marks_default_to_stored_when_not_passed(self, temp_home: Path):
+        s = self._setup_switch(temp_home)
+        self._seed_switch(s, 1, "a@example.com")
+        self._seed_switch(s, 2, "b@example.com")
+
+        usage = {"1": self._usage(50), "2": self._usage(10)}
+
+        target, note = s._select_best_switchable("1", (), usage)
+
+        assert target == "2"
+
+    def test_only_marked_candidates_leave_no_provable_target(self, temp_home: Path):
+        s = self._setup_switch(temp_home)
+        self._seed_switch(s, 1, "a@example.com")
+        self._seed_switch(s, 2, "b@example.com")
+
+        usage = {"1": self._usage(50), "2": self._usage(10)}
+        entries = {"2": self._entry(10, fetched_at=1000.0)}
+        marks = {("b@example.com", ""): 5000.0}
+
+        target, note = s._select_best_switchable(
+            "1", (), usage, entries=entries, marks=marks
+        )
+
+        assert target is None
+        assert note == "no-comparison"

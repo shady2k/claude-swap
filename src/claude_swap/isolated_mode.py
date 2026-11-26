@@ -426,3 +426,181 @@ def report_global_login(switcher: "ClaudeAccountSwitcher") -> None:
     notice = global_login_notice(switcher)
     if notice:
         warning(notice)
+
+def _suitable_slot_numbers(
+    switcher: "ClaudeAccountSwitcher", data: dict, active_key: str
+) -> list[str]:
+    """Slot numbers in rotation that could take over as active.
+
+    Everything the launch would refuse is out: a missing record, a disabled
+    slot, an API-key account (a launch refuses one), a slot without stored
+    credentials or without a stored config. Order is the rotation order of
+    ``sequence`` — the order a fallback pick walks.
+    """
+    accounts = data.get("accounts") or {}
+    suitable: list[str] = []
+    for num in data.get("sequence") or []:
+        key = str(num)
+        if key == active_key or key not in accounts:
+            continue
+        record = accounts[key]
+        if record.get("disabled") or record.get("kind") == "api_key":
+            continue
+        email = record.get("email", "")
+        if not switcher._account_is_switchable(key):
+            continue
+        if not switcher._read_account_config(key, email):
+            continue
+        suitable.append(key)
+    return suitable
+
+
+def _slot_is_marked(
+    switcher: "ClaudeAccountSwitcher",
+    marks: dict[tuple[str, str], float],
+    entry,
+    email: str,
+    org_uuid: str,
+) -> bool:
+    """Whether this slot carries a stop-failure mark newer than its reading."""
+    from claude_swap.usage_store import UsageEntry
+
+    if not isinstance(entry, UsageEntry):
+        return (email, org_uuid or "") in marks
+    return switcher._stop_failure_marked(marks, email, org_uuid or "", entry)
+
+
+def switch_active_after_rate_limit(
+    switcher: "ClaudeAccountSwitcher", email: str, org_uuid: str
+) -> bool:
+    """Move the recorded active slot off an account Claude Code refused.
+
+    Called by ``ClaudeAccountSwitcher.record_stop_failure`` after the stop
+    mark is written (the ``cswap rate-limited`` hook target). Decides under
+    ``FileLock(switcher.lock_file)`` and re-reads ``sequence.json`` inside
+    that lock, so a ``cswap switch``, ``cswap next`` or another session that
+    already moved the active slot wins: nothing changes unless the refused
+    account is still the recorded ``activeAccountNumber``.
+
+    The pick reads only the usage store's already-cached readings
+    (``_usage_store.entries`` with an empty fetch set — never a network
+    request) and the stop marks, so a refusal during a plain launch costs no
+    quota pass. Disabled slots, API-key accounts, slots without stored
+    credentials or config, slots already carrying a stop-failure mark newer
+    than their reading, and slots whose cached reading is at or below zero
+    headroom are never picked:
+
+    - prefer an unmarked slot with cached headroom above zero — the most
+      headroom wins, ties in rotation order;
+    - when no other slot has a usable cached reading (no ``cswap auto`` pass
+      has run, for instance), take the next unmarked suitable slot in
+      rotation order after the current active one, so the goal works without
+      a running ``cswap auto``;
+    - when no other suitable slot exists (one account, or everything else is
+      disabled / an API key / without credentials / marked / exhausted) the
+      recorded ``activeAccountNumber`` is left as is.
+
+    Writes only ``activeAccountNumber`` and ``lastUpdated`` into
+    ``sequence.json`` — never ``~/.claude``, never the Keychain — and prints
+    nothing: the hook's output is not the user's.
+
+    Returns ``True`` when the recorded active slot changed.
+    """
+    org_uuid = org_uuid or ""
+    try:
+        with FileLock(switcher.lock_file):
+            return _switch_active_after_rate_limit_locked(switcher, email, org_uuid)
+    except (LockError, OSError):
+        # A hook must never fail the report it carries; a missed move is
+        # repaired by the next launch's own ranking or a `cswap list` pass.
+        switcher._logger.warning(
+            f"Could not move the active slot off {email} after a rate-limit "
+            "stop: the account lock was unavailable"
+        )
+        return False
+
+
+def _switch_active_after_rate_limit_locked(
+    switcher: "ClaudeAccountSwitcher", email: str, org_uuid: str
+) -> bool:
+    data = switcher._get_sequence_data() or {}
+    accounts = data.get("accounts") or {}
+    sequence = [str(num) for num in data.get("sequence") or []]
+    active_num = data.get("activeAccountNumber")
+    active_key = str(active_num) if active_num is not None else None
+    record = accounts.get(active_key) if active_key is not None else None
+    if record is None:
+        return False
+    active_org = record.get("organizationUuid", "") or ""
+    if (record.get("email", ""), active_org) != (email, org_uuid):
+        # `cswap auto` / `cswap next` / another session already moved it.
+        return False
+
+    from claude_swap import oauth
+    from claude_swap.settings import load_settings, parse_model_names
+
+    settings = load_settings(switcher.backup_dir)
+    models = parse_model_names(settings.model)
+    marks = switcher._stop_failure_marks()
+    candidates = _suitable_slot_numbers(switcher, data, active_key)
+    if not candidates:
+        return False
+
+    identities = {
+        key: (accounts[key].get("email", ""), accounts[key].get("organizationUuid", "") or "")
+        for key in candidates
+    }
+    entries: dict = switcher._usage_store.entries(identities, models)
+    position = {key: index for index, key in enumerate(sequence) if key in candidates}
+
+    def classify(key: str) -> tuple[bool, float | None]:
+        entry = entries.get(key)
+        rec = accounts.get(key, {})
+        e_email, e_org = identities[key]
+        marked = _slot_is_marked(switcher, marks, entry, e_email, e_org)
+        if marked:
+            return True, None
+        if entry is None:
+            return False, None
+        room = oauth.account_headroom(entry.decision_value(), models)
+        return False, room
+
+    classified = {key: classify(key) for key in candidates}
+    preferred = [
+        key
+        for key in candidates
+        if not classified[key][0]
+        and classified[key][1] is not None
+        and classified[key][1] > 0
+    ]
+    target = None
+    if preferred:
+        target = max(
+            preferred,
+            key=lambda key: (classified[key][1], -position.get(key, 0)),
+        )
+    else:
+        suitable = {
+            key
+            for key in candidates
+            if not classified[key][0]
+            and (classified[key][1] is None or classified[key][1] > 0)
+        }
+        if suitable:
+            start = sequence.index(active_key) if active_key in sequence else -1
+            for key in sequence[start + 1:] + sequence[:start]:
+                if key in suitable:
+                    target = key
+                    break
+    if target is None or target == active_key:
+        return False
+    previous = data.get(ACTIVE_FIELD)
+    data[ACTIVE_FIELD] = int(target)
+    data["lastUpdated"] = get_timestamp()
+    switcher._write_json(switcher.sequence_file, data)
+    switcher._logger.info(
+        f"Active slot moved off {email} by the rate-limit hook to "
+        f"Account-{target}"
+        + (f" (was {previous})" if previous is not None else "")
+    )
+    return True

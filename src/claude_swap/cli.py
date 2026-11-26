@@ -380,7 +380,7 @@ def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
             slot, account = _active_account(switcher)
             manager.run(
                 slot,
-                tail,
+                _rate_limit_hook(tail, account),
                 share=not args.no_share,
                 share_history=args.share_history,
                 require_session=args.require_session,
@@ -428,7 +428,7 @@ def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
         slot, account = _active_account(switcher)
         manager.run(
             slot,
-            tail,
+            _rate_limit_hook(tail, account),
             share=not args.no_share,
             share_history=args.share_history,
             require_session=args.require_session,
