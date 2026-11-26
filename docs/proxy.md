@@ -1,6 +1,6 @@
 # Per-account proxy
 
-`cswap proxy <num|email> <url>`, `cswap proxy <num|email> --unset`, `cswap proxy` (list) and `cswap add --proxy <url>` set, clear, show and set-on-add one account's HTTP proxy. `cswap proxy` is in the [README](../README.md#per-account-proxy); how the route is built is in the module docstring of `account_proxy.py`.
+`cswap proxy <num|email> <url>`, `cswap proxy <num|email> --unset`, `cswap proxy` (list), `cswap add --proxy <url>` and `cswap add --login --proxy <url>` set, clear, show and set-on-add one account's HTTP proxy. `cswap proxy` is in the [README](../README.md#per-account-proxy); how the route is built is in the module docstring of `account_proxy.py`.
 
 ## The URL
 
@@ -8,6 +8,14 @@
 - HTTPS endpoints are tunneled through the proxy with `CONNECT`.
 - Only `http://` is accepted: cswap cannot speak TLS to the proxy itself, so an `https://` value would fail later instead of at the command.
 - Anything else is refused before `sequence.json` is touched, with a message that never repeats the value.
+
+## Adding a new account through a proxy
+
+`cswap add --login --proxy <url> [--expect-country <CC>] [--expect-ip <IP>] [--email <email>]` is the recommended way to add an account that belongs on a proxy. cswap runs Claude Code's own `claude auth login` with a temporary `CLAUDE_CONFIG_DIR`, so the login exchange uses that proxy and neither the live `~/.claude` profile nor `activeAccountNumber` is touched. The temporary profile is created 0700, its macOS Keychain entry is deleted, and both are removed afterwards on success, failure and Ctrl+C.
+
+The proxy's one `CONNECT` and, when a rule is given, the [egress check](#egress-expectation) run before `claude` starts and outside every file lock; a failure adds nothing. `--email` is forwarded to `claude auth login --email`. The OAuth link is opened by the browser, not by cswap, so it must be opened from the network and country the account expects — the command prints that reminder when a proxy is given. `--expect-country` and `--expect-ip` require `--proxy`.
+
+Without `--login`, `cswap add --proxy <url> --expect-country <CC> --expect-ip <IP>` stores the proxy and rule for the account that is already logged in. Both forms validate the URL, country and IP and store them under the account lock; an explicit `--expect-*` replaces a value carried over from the slot.
 
 ## What it routes
 
@@ -81,7 +89,7 @@ With a proxy set, none of these falls back to a direct connection:
 
 ## Storage and transfer
 
-The setting is a field on the account's record in `sequence.json` (written atomically, mode 0600), and the [egress expectation](#egress-expectation) is two more fields beside it: both move with the account on `cswap swap` and `cswap move`, survive a re-add into the same slot and an import over that slot, and are deleted with `cswap remove`. `cswap proxy` resolves, reads and writes under the same account lock as `switch` and `swap`, so neither can publish a snapshot over the other's change (one run at a time — see [Boundaries](#boundaries)).
+The setting is a field on the account's record in `sequence.json` (written atomically, mode 0600), and the [egress expectation](#egress-expectation) is two more fields beside it: both move with the account on `cswap swap` and `cswap move`, survive a re-add into the same slot and an import over that slot, and are deleted with `cswap remove`. A re-add copies all three fields from a fresh read under the account lock, so a `cswap proxy --expect-*` that landed while the add was running is kept. `cswap proxy` resolves, reads and writes under the same account lock as `switch` and `swap`, so neither can publish a snapshot over the other's change (one run at a time — see [Boundaries](#boundaries)).
 
 Only an absent key means "direct" — it is what `--unset` leaves and what every account had before this setting existed. A key with a value that is not a URL, an explicit `null` included, is damage and reads as `proxy-invalid`; `cswap list --json`/`status --json` then show `"invalid (…)"` instead of hiding it. The password is stored there because cswap must present it; every surface prints the masked form (`http://user:***@host:port`), and `cswap list --json`/`status --json` carry that masked form in an additive `proxy` field.
 

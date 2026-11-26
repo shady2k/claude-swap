@@ -23,6 +23,7 @@ It works on the same files and Keychain items Claude Code uses, and takes Claude
 - `switcher.py`: `ClaudeAccountSwitcher`. Slots, add, remove, switch, swap, move, usage collection and the token refresh gate. See the map below.
 - `autoswitch.py`: `AutoSwitchEngine`. Decides when to switch and reports through typed events; it never prints. `lines.py` holds the per-window switch lines.
 - `session.py`: `SessionManager`, behind `cswap run`. `mappings.py` maps a directory to an account.
+- `login.py`: the isolated `claude auth login` profile behind `cswap add --login`: a temporary `CLAUDE_CONFIG_DIR`, its cleanup, and reading the credential and identity Claude Code leaves there.
 - `usage_store.py`: `UsageStore`, the per-account usage table. `poll_policy.py` holds every polling number. `snapshot_source.py` is the read path for dashboards.
 - `oauth.py`: the token, usage and profile endpoints, the header probe, and the formatting of reset times. `subscription.py` reads the plan label; `pace.py` computes the weekly pace marker.
 - `account_proxy.py`: an account's proxy, and the pinned route its requests take. Every network call in `oauth.py` and `subscription.py` goes through it.
@@ -110,6 +111,10 @@ If the account is already the active default login, it starts plain `claude` ins
 A launch of an account with a proxy reads the route and the egress rule from ONE record, refuses before any Claude Code process (the `claude auth status` probe included) when one `CONNECT` through it fails, and hands Claude Code that proxy in its environment. The same applies to plain claude on a default login whose slot has one. An account with an egress expectation is refused the same way when the exit does not match it, measured through that route before Claude Code starts — and an unusable proxy for such an account is that same refusal, so `cswap run --auto` moves to the next ranked candidate either way. A `swap`/`move` that gives the slot to another account while the checks run ends the launch, on the fast path too.
 
 Read next: the module docstring of `session.py`, and [proxy.md](proxy.md#launching-claude-code).
+
+### Adding an account by login
+
+`cswap add --login` validates its arguments and resolves `claude` first, then checks the given proxy and its egress rule outside every lock. It runs the official `claude auth login` in a throwaway profile (`login.py`, removed with its Keychain entry in `finally`) and reads the credential and `oauthAccount` metadata from that profile only. The slot is chosen and the overwrite question asked after the login, because only then is the account known; the write of the credential, the config and `sequence.json` is one step under the account lock, and `activeAccountNumber` is left alone.
 
 ### A launch on the best account
 

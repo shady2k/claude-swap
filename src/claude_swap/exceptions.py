@@ -43,6 +43,12 @@ class SessionError(ClaudeSwitchError):
     pass
 
 
+class LoginError(SessionError):
+    """``cswap add --login`` could not finish; no slot was created."""
+
+    pass
+
+
 class LockError(ClaudeSwitchError):
     """Error acquiring lock."""
 

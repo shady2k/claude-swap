@@ -21,6 +21,7 @@ from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
     CredentialReadError,
+    EgressCheckError,
     LockError,
     SessionError,
     SwitchError,
@@ -4918,6 +4919,8 @@ class ClaudeAccountSwitcher:
         assume_yes: bool = False,
         alias: str | None = None,
         proxy: str | None = None,
+        expect_country: str | None = None,
+        expect_ip: str | None = None,
     ) -> None:
         """Add current account to managed accounts.
 
@@ -4938,12 +4941,18 @@ class ClaudeAccountSwitcher:
                   (``--proxy``). Validated before anything is read or sent.
                   When omitted, the proxy already stored on the slot holding
                   this account is kept.
+            expect_country: Optional ISO 3166-1 alpha-2 exit country
+                  (``--expect-country``) the account promises. Stored with the
+                  proxy; requires an explicit ``proxy``.
+            expect_ip: Optional exit IP (``--expect-ip``). Stored with the
+                  proxy; requires an explicit ``proxy``. An explicit value of
+                  either expectation replaces one carried over from the slot.
         """
         self._refuse_session_shell()
-        self._setup_directories()
-        self._init_sequence_file()
-        self._migrate_org_fields()
 
+        # Validate every value before the first write: a rejected alias,
+        # proxy or expectation leaves the backup directory and
+        # ``sequence.json`` untouched.
         if alias is not None:
             try:
                 alias = normalize_alias(alias)
@@ -4956,6 +4965,29 @@ class ClaudeAccountSwitcher:
                 explicit_route = account_proxy.parse(proxy)
             except account_proxy.ProxyUrlError as e:
                 raise ValidationError(str(e)) from e
+
+        country = None
+        if expect_country is not None:
+            try:
+                country = egress.normalize_country(expect_country)
+            except egress.ExpectationError as e:
+                raise ValidationError(str(e)) from e
+        ip = None
+        if expect_ip is not None:
+            try:
+                ip = egress.normalize_ip(expect_ip)
+            except egress.ExpectationError as e:
+                raise ValidationError(str(e)) from e
+        if (country is not None or ip is not None) and explicit_route is None:
+            raise ValidationError(
+                "--expect-country/--expect-ip require --proxy: an egress "
+                "expectation describes the proxy's exit and cannot be "
+                "checked without one"
+            )
+
+        self._setup_directories()
+        self._init_sequence_file()
+        self._migrate_org_fields()
 
         identity = self._get_current_identity_triple()
         if identity is None:
@@ -5035,6 +5067,10 @@ class ClaudeAccountSwitcher:
                     record["alias"] = alias
                 if explicit_route is not None:
                     record[account_proxy.FIELD] = explicit_route.text()
+                if country is not None:
+                    record[egress.COUNTRY_FIELD] = country
+                if ip is not None:
+                    record[egress.IP_FIELD] = ip
 
                 seq["activeAccountNumber"] = int(account_num)
                 seq["lastUpdated"] = get_timestamp()
@@ -5230,8 +5266,13 @@ class ClaudeAccountSwitcher:
                     if owner_slot
                     else {}
                 )
-            if account_proxy.FIELD in previous:
-                carried[account_proxy.FIELD] = previous[account_proxy.FIELD]
+            # All of them, not only the proxy: a concurrent
+            # `cswap proxy --expect-country/--expect-ip` writes the rule
+            # fields beside it, and rebuilding the record from the earlier
+            # snapshot would silently drop an exit rule the user just set.
+            for field in (account_proxy.FIELD, *egress.FIELDS):
+                if field in previous:
+                    carried[field] = previous[field]
             data["accounts"][account_num] = {
                 "email": current_email,
                 "uuid": account_uuid,
@@ -5243,6 +5284,10 @@ class ClaudeAccountSwitcher:
                 carried["alias"] = alias  # an explicit --alias wins over the carried one
             if explicit_route is not None:
                 carried[account_proxy.FIELD] = explicit_route.text()
+            if country is not None:
+                carried[egress.COUNTRY_FIELD] = country
+            if ip is not None:
+                carried[egress.IP_FIELD] = ip
             data["accounts"][account_num].update(carried)
             if int(account_num) not in data["sequence"]:
                 data["sequence"].append(int(account_num))
@@ -5256,6 +5301,403 @@ class ClaudeAccountSwitcher:
         if migrate_from:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
+
+    def _confirm_slot_overwrite(
+        self, slot: int, existing: dict, assume_yes: bool
+    ) -> bool:
+        """Ask before a login import replaces a slot's different account.
+
+        The question is asked OUTSIDE the account lock and before the new
+        credential is written: a user who declines leaves the slot untouched.
+        """
+        existing_email = existing.get("email", "unknown")
+        existing_tag = self._get_display_tag(
+            existing_email,
+            existing.get("organizationName", ""),
+            existing.get("organizationUuid", ""),
+        )
+        warning(f"Slot {slot} already occupied")
+        print(f"{existing_email} {muted(f'[{existing_tag}]')}")
+        if assume_yes:
+            return True
+        try:
+            answer = input(f"Overwrite slot {slot}? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n{dimmed('Cancelled')}")
+            return False
+        if answer not in ("y", "yes"):
+            print(dimmed("Cancelled"))
+            return False
+        return True
+
+    def _reject_login_alias_conflict(
+        self,
+        alias: str,
+        data: dict,
+        *,
+        target_num: str | None = None,
+        email: str | None = None,
+        org_uuid: str | None = None,
+    ) -> None:
+        """Refuse an alias another account holds.
+
+        An alias already on the row this login refreshes, or on the target row
+        being overwritten, is not a conflict. ``org_uuid=None`` is the
+        before-login check, where only ``--email`` can hint that the row may
+        be the same account; the exact identity check runs again after login,
+        before anything is written.
+        """
+        for num, record in (data.get("accounts") or {}).items():
+            if (record.get("alias") or "").lower() != alias.lower():
+                continue
+            if num == target_num:
+                return
+            if email is not None and self._login_record_matches(
+                record, email, org_uuid
+            ):
+                return
+            raise ValidationError(
+                f"Alias '{alias}' is already used by account {num}"
+            )
+
+    @staticmethod
+    def _login_record_matches(
+        record: dict, email: str, org_uuid: str | None
+    ) -> bool:
+        """Whether a record names ``email`` (and ``org_uuid`` when given)."""
+        if (record.get("email") or "").lower() != email.lower():
+            return False
+        return org_uuid is None or (
+            record.get("organizationUuid", "") or ""
+        ) == org_uuid
+
+    def _login_slot_plan(
+        self,
+        slot: int | None,
+        email: str,
+        org_uuid: str,
+        assume_yes: bool,
+    ) -> tuple[str, tuple[str, str] | None] | None:
+        """Choose the target slot and confirm a displacement, before the lock.
+
+        Returns ``(account_num, displacing_identity)`` or ``None`` when the
+        user declined the overwrite. The caller re-reads everything under the
+        account lock; this plan is what the confirmation was asked about, not
+        a licence to write.
+        """
+        data = self._get_sequence_data() or {}
+        owner = self._find_account_slot(data, email, org_uuid)
+        if slot is None:
+            account_num = owner or str(self._get_next_account_number())
+        else:
+            account_num = str(slot)
+        occupant = (data.get("accounts") or {}).get(account_num) or {}
+        displacing = None
+        if occupant and not self._record_is(occupant, email, org_uuid):
+            if not self._confirm_slot_overwrite(
+                int(account_num), occupant, assume_yes
+            ):
+                return None
+            displacing = (
+                occupant.get("email", ""),
+                occupant.get("organizationUuid", "") or "",
+            )
+        return account_num, displacing
+
+    def add_account_via_login(
+        self,
+        slot: int | None = None,
+        alias: str | None = None,
+        proxy: str | None = None,
+        expect_country: str | None = None,
+        expect_ip: str | None = None,
+        email: str | None = None,
+        assume_yes: bool = False,
+    ) -> None:
+        """Add an account by running ``claude auth login`` in a throwaway profile.
+
+        Unlike :meth:`add_account`, nothing of the live login is read or
+        written: Claude Code's official login runs with its own
+        ``CLAUDE_CONFIG_DIR`` (see ``login.py``), and only the credential and
+        ``oauthAccount`` metadata it leaves there are imported into a slot.
+        ``activeAccountNumber`` is not changed, because the live profile did
+        not change.
+
+        Every argument is validated and the ``claude`` binary resolved before
+        a profile is created. A proxy is checked with one ``CONNECT`` and an
+        egress expectation through that same proxy before Claude Code starts,
+        outside every file lock. The overwrite question is asked after the
+        login (only then is the account's identity known) and the final
+        write re-reads the slot under the account lock.
+
+        ``email`` is forwarded to ``claude auth login --email``; the account
+        metadata Claude Code writes remains the source of the imported
+        identity.
+        """
+        self._refuse_session_shell()
+        from claude_swap import login
+        from claude_swap.session import find_claude
+
+        if slot is not None and slot < 1:
+            raise ConfigError("Slot number must be >= 1")
+        if alias is not None:
+            try:
+                alias = normalize_alias(alias)
+            except ValueError as e:
+                raise ValidationError(str(e)) from e
+        if email is not None and not self._validate_email(email):
+            raise ValidationError(f"Invalid email format: {email}")
+
+        explicit_route: "account_proxy.ProxyRoute | None" = None
+        if proxy is not None:
+            try:
+                explicit_route = account_proxy.parse(proxy)
+            except account_proxy.ProxyUrlError as e:
+                raise ValidationError(str(e)) from e
+
+        country = None
+        if expect_country is not None:
+            try:
+                country = egress.normalize_country(expect_country)
+            except egress.ExpectationError as e:
+                raise ValidationError(str(e)) from e
+        ip = None
+        if expect_ip is not None:
+            try:
+                ip = egress.normalize_ip(expect_ip)
+            except egress.ExpectationError as e:
+                raise ValidationError(str(e)) from e
+        expectation = None
+        if country is not None or ip is not None:
+            if explicit_route is None:
+                raise ValidationError(
+                    "--expect-country/--expect-ip require --proxy: an egress "
+                    "expectation describes the proxy's exit and cannot be "
+                    "checked without one"
+                )
+            expectation = egress.Expectation(country=country, ip=ip)
+
+        claude_bin = find_claude()
+        if not claude_bin:
+            raise SessionError(
+                "'claude' was not found on PATH. Install Claude Code first."
+            )
+
+        data = self._get_sequence_data() or {}
+        if alias is not None:
+            self._reject_login_alias_conflict(
+                alias,
+                data,
+                target_num=str(slot) if slot is not None else None,
+                email=email,
+                org_uuid=None,
+            )
+
+        if explicit_route is not None:
+            print(
+                f"{accent('Note:')} Claude Code's login exchange will use this "
+                f"proxy, but the OAuth link opens in your browser: open it "
+                f"from the network and country you expect for this account."
+            )
+            try:
+                account_proxy.probe(explicit_route)
+            except account_proxy.ProxyRouteError as e:
+                raise SessionError(
+                    f"The proxy cannot be used: {e}. Claude Code was not started."
+                ) from None
+            if expectation is not None:
+                try:
+                    egress.check(explicit_route, expectation)
+                except EgressCheckError as e:
+                    raise EgressCheckError(
+                        f"The proxy's exit does not match the expectation: {e}. "
+                        "Claude Code was not started."
+                    ) from None
+
+        with login.isolated_profile() as config_dir:
+            result = login.run_login(
+                claude_bin, config_dir, explicit_route, self.backup_dir, email
+            )
+            # The login succeeded; only now does the backup store change. A
+            # refused or interrupted login left it, and sequence.json, as they
+            # were. The migration runs before the slot is chosen so an old
+            # record without organization fields is recognized as this account.
+            self._setup_directories()
+            self._init_sequence_file()
+            self._migrate_org_fields()
+            self._reject_live_api_key_capture(result.credentials)
+            self._reject_cross_kind_collision(result.email, False)
+            # The ownership probe is cswap's own request, so an account that
+            # already holds a proxy is never checked over a direct connection:
+            # an explicit --proxy wins, otherwise the slot's stored route.
+            registry = self._get_sequence_data() or {}
+            owner_num = self._find_account_slot(
+                registry, result.email, result.organization_uuid
+            )
+            probe_route = explicit_route or account_proxy.route_for(
+                (registry.get("accounts") or {}).get(owner_num or "") or {}
+            )
+            credentials = self._reject_foreign_credential_capture(
+                result.credentials,
+                result.email,
+                result.organization_uuid,
+                result.account_uuid,
+                route=probe_route,
+            )
+            plan = self._login_slot_plan(
+                slot, result.email, result.organization_uuid, assume_yes
+            )
+            if plan is None:
+                return
+            _, displacing = plan
+            self._commit_login_slot(
+                slot=slot,
+                displacing=displacing,
+                result=result,
+                credentials=credentials,
+                alias=alias,
+                route=explicit_route,
+                country=country,
+                ip=ip,
+            )
+
+    def _commit_login_slot(
+        self,
+        *,
+        slot: int | None,
+        displacing: tuple[str, str] | None,
+        result,
+        credentials: str,
+        alias: str | None,
+        route: "account_proxy.ProxyRoute | None",
+        country: str | None,
+        ip: str | None,
+    ) -> None:
+        """Write an imported login into its slot under the account lock.
+
+        The pre-lock plan supplied ``account_num`` and the identity the
+        overwrite question named. Everything is re-read here: a ``swap``,
+        ``move``, ``remove`` or another ``add`` that landed meanwhile either
+        matches that plan or refuses the write. The slot write and
+        ``sequence.json`` commit happen in this one lock; the live login and
+        ``activeAccountNumber`` are never touched.
+        """
+        org_uuid = result.organization_uuid
+        prunable: list[tuple[str, str]] = []
+        with FileLock(self.lock_file):
+            data = self._get_sequence_data() or {}
+            owner = self._find_account_slot(data, result.email, org_uuid)
+            if slot is None:
+                account_num = owner or str(self._get_next_account_number())
+            else:
+                account_num = str(slot)
+
+            occupant = (data.get("accounts") or {}).get(account_num) or {}
+            occupied_by_other = occupant and not self._record_is(
+                occupant, result.email, org_uuid
+            )
+            if occupied_by_other:
+                if displacing is None or not self._record_is(
+                    occupant, *displacing
+                ):
+                    raise ConfigError(
+                        f"Slot {account_num} was taken by another account while "
+                        "this login was running; the registry was not changed. "
+                        "Run the command again."
+                    )
+
+            migrate_from = (
+                owner if owner is not None and owner != account_num else None
+            )
+            if alias is not None:
+                conflict = self._find_account_by_alias(alias)
+                if conflict is not None and conflict not in {
+                    account_num, migrate_from
+                }:
+                    raise ValidationError(
+                        f"Alias '{alias}' is already used by account {conflict}"
+                    )
+
+            carried: dict = {}
+            if self._record_is(occupant, result.email, org_uuid):
+                carried.update(self._carried_settings(occupant))
+            if migrate_from is not None:
+                carried.update(
+                    self._carried_settings(data["accounts"][migrate_from])
+                )
+
+            if occupied_by_other:
+                old_email = occupant.get("email", "")
+                old_org = occupant.get("organizationUuid", "") or ""
+                self._delete_account_files(account_num, old_email)
+                data["accounts"].pop(account_num, None)
+                if int(account_num) in data.get("sequence", []):
+                    data["sequence"].remove(int(account_num))
+                prunable.append((old_email, old_org))
+            if migrate_from is not None:
+                old_record = data["accounts"][migrate_from]
+                old_email = old_record.get("email", "")
+                self._delete_account_files(migrate_from, old_email)
+                data["accounts"].pop(migrate_from, None)
+                if int(migrate_from) in data.get("sequence", []):
+                    data["sequence"].remove(int(migrate_from))
+                # Mappings key on the account's identity, which a move keeps,
+                # so they are not pruned here (unlike a displaced occupant).
+
+            self._write_account_credentials(
+                account_num, result.email, credentials
+            )
+            self._write_account_config(account_num, result.email, result.config)
+            self._usage_store.clear_dead_token(
+                [account_num], {account_num: (result.email, org_uuid)}
+            )
+
+            record = {
+                "email": result.email,
+                "uuid": result.account_uuid,
+                "organizationUuid": org_uuid,
+                "organizationName": result.organization_name,
+                "added": get_timestamp(),
+            }
+            record.update(carried)
+            if alias is not None:
+                record["alias"] = alias
+            if route is not None:
+                record[account_proxy.FIELD] = route.text()
+            if country is not None:
+                record[egress.COUNTRY_FIELD] = country
+            if ip is not None:
+                record[egress.IP_FIELD] = ip
+            data["accounts"][account_num] = record
+            if int(account_num) not in data["sequence"]:
+                data["sequence"].append(int(account_num))
+                data["sequence"].sort()
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+
+            refreshed = (
+                owner == account_num and migrate_from is None
+                and self._record_is(occupant, result.email, org_uuid)
+            )
+
+        for old_email, old_org in prunable:
+            self._prune_mappings(old_email, old_org)
+
+        tag = self._get_display_tag(
+            result.email, result.organization_name, org_uuid
+        )
+        if migrate_from is not None:
+            print(f"{dimmed(f'Moved from slot {migrate_from} → {account_num}')}")
+        verb = "Updated credentials for" if refreshed else "Added"
+        self._logger.info(
+            f"{'Updated' if refreshed else 'Added'} account {account_num} "
+            f"from an isolated login: {result.email} "
+            f"(org: {org_uuid or 'personal'})"
+        )
+        print(
+            f"{accent(verb)} Account {account_num}: {result.email} "
+            f"{muted(f'[{tag}]')}"
+        )
 
     def add_account_from_token(
         self,
