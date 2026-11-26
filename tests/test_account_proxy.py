@@ -1195,7 +1195,6 @@ class TestRouting:
         _endpoints(monkeypatch, origin.url)
         s = _switcher(sample_sequence_data)
         s.set_account_proxy("1", proxy.url)
-        s._write_credentials(CREDS_EXPIRED)
         s._write_account_credentials("1", "test@example.com", CREDS_EXPIRED)
 
         record = s._fetch_account_usage(
@@ -1207,7 +1206,8 @@ class TestRouting:
         assert proxy.paths("POST") == [origin.url + "/v1/oauth/token"]
         assert proxy.paths("GET") == [origin.url + "/api/oauth/usage"]
         assert origin.requests == [] and direct_calls == []
-        assert "rt-new" in s._read_credentials()
+        # The rotated token goes into the slot's backup — its only copy.
+        assert "rt-new" in s._read_account_credentials("1", "test@example.com")
 
     @pytest.mark.no_oauth_profile_fake
     def test_the_owner_lookup_follows_the_named_slot_not_the_tokens_owner(

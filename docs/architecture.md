@@ -6,9 +6,9 @@ Each topic has one home. What users see is in the [README](../README.md) and the
 
 ## What the tool does
 
-claude-swap keeps a backup of each Claude Code login in a numbered slot: the credential, and the `oauthAccount` section of `.claude.json`. Switching makes one slot the live login by writing it where Claude Code reads it. Usage display, auto-switch, session mode and the menu bar are all built on that.
+claude-swap keeps a backup of each Claude Code login in a numbered slot: the credential, and the `oauthAccount` section of `.claude.json`. This fork's active account is a field of its own state — `sequence.json`'s `activeAccountNumber` (`isolated_mode.py`) — and a switch writes that field and nothing else. A launch starts that slot in its own session profile; the global `~/.claude` login is read (by `cswap add`, and to report a leftover login) but never written and never active. Usage display, auto-switch, session mode and the menu bar are all built on that.
 
-It works on the same files and Keychain items Claude Code uses, and takes Claude Code's own locks while it does.
+It works on the same files and Keychain items Claude Code uses, and takes Claude Code's own locks only where it writes them — the switch path does not.
 
 ## Modules
 
@@ -21,6 +21,7 @@ It works on the same files and Keychain items Claude Code uses, and takes Claude
 **Core.**
 
 - `switcher.py`: `ClaudeAccountSwitcher`. Slots, add, remove, switch, swap, move, usage collection and the token refresh gate. See the map below.
+- `isolated_mode.py`: the active slot (`activeAccountNumber`), the switch that only records it, the read-only detector of a leftover global login, and the clearing of that login when `cswap add` commit its slot.
 - `autoswitch.py`: `AutoSwitchEngine`. Decides when to switch and reports through typed events; it never prints. `lines.py` holds the per-window switch lines.
 - `session.py`: `SessionManager`, behind `cswap run`. `mappings.py` maps a directory to an account.
 - `login.py`: the isolated `claude auth login` profile behind `cswap add --login`: a temporary `CLAUDE_CONFIG_DIR`, its cleanup, and reading the credential and identity Claude Code leaves there.
@@ -61,7 +62,7 @@ Everything lives under the backup root (its location per platform is in the [REA
 
 | Path | Owner | Holds |
 |---|---|---|
-| `sequence.json` | `switcher.py` | The slots, each slot's identity, alias and policy, and which slot is active |
+| `sequence.json` | `switcher.py` | The slots, each slot's identity, alias and policy, and which slot is active (`isolated_mode.py` writes that field) |
 | `configs/`, `credentials/` (Keychain on macOS) | `switcher.py` through `CredentialStore` | Each slot's backed-up config and credential |
 | `cache/usage.json` | `usage_store.py` | Last good usage reading and fetch state per account |
 | `settings.json` | `settings.py` | User preferences |
@@ -83,17 +84,19 @@ Read next: the module docstrings of `usage_store.py`, `poll_policy.py` and `snap
 
 ### A switch
 
-`switch` picks a target and `switch_to` is given one; both end in `_perform_switch`. It takes three locks in a fixed order: cswap's own lock, Claude Code's credential lock, Claude Code's config lock. Under them it:
+`switch` picks a target and `switch_to` is given one; both end in
+`isolated_mode.activate`. Under cswap's account lock it checks that the slot
+exists and still holds a stored credential and config (fresh reads, so a locked
+Keychain is "retry later", not "re-add"), then writes `activeAccountNumber` and
+`lastUpdated` into `sequence.json`. No credential, config or Keychain write and
+no Claude Code lock, so a running Claude Code cannot be disturbed or blocked and
+no slot's one-time refresh token is spent.
 
-1. backs up the outgoing login into its slot, after `_classify_outgoing_credential` decides whether the live credential really belongs to that slot;
-2. reads the target slot's backup;
-3. writes the target credential to the live store;
-4. replaces `oauthAccount` in the live `.claude.json`, leaving the rest of the file alone;
-5. records the new active slot in `sequence.json`.
+Upstream's live-login switch (`_perform_switch`, its transaction and the
+outgoing-credential classifier) is still in `switcher.py` and is unreachable from
+the fork's commands; it is kept verbatim to keep rebases against upstream cheap.
 
-A failure rolls the earlier steps back. Everything under the locks is local I/O; the identity lookup that step 1 needs is fetched before the locks are taken.
-
-Read next: the module docstring of `claude_locks.py`, and the docstring of `_classify_outgoing_credential`.
+Read next: the module docstring of `isolated_mode.py`.
 
 ### Token refresh
 
@@ -107,9 +110,12 @@ Read next: the docstrings of `consume_backup_grant` and `_fetch_active_usage`.
 
 `cswap run` calls `SessionManager.run`. `setup_session` creates or reuses the account's profile directory, seeds it with the slot's credential, and links the user's settings and history from `~/.claude` into it. Claude Code is then started with `CLAUDE_CONFIG_DIR` pointing at the profile, which leaves the default login untouched.
 
-If the account is already the active default login, it starts plain `claude` instead, because two copies of one credential drift apart.
+Every launch is a session profile: `cswap run --active` (what the `claude`
+wrapper runs) starts the recorded slot, `cswap run` with nothing mapped does the
+same, and an account that happens to be the global login is launched in its
+profile too. Nothing launches on `~/.claude`, and nothing falls back to it.
 
-A launch of an account with a proxy reads the route and the egress rule from ONE record, refuses before any Claude Code process (the `claude auth status` probe included) when one `CONNECT` through it fails, and hands Claude Code that proxy in its environment. When the route's scheme is `https://` or `socks5h://`/`socks5://` that environment names a local `proxy_bridge` (opened for the launch, closed in `finally`) instead of the account's URL, so the launch runs Claude Code as a child rather than `exec`-ing it; the `auth status` probe reads its own short-lived bridge the same way. The same applies to plain claude on a default login whose slot has one. An account with an egress expectation is refused the same way when the exit does not match it, measured through that route before Claude Code starts — and an unusable proxy for such an account is that same refusal, so `cswap run --auto` moves to the next ranked candidate either way. A `swap`/`move` that gives the slot to another account while the checks run ends the launch, on the fast path too.
+A launch of an account with a proxy reads the route and the egress rule from ONE record, refuses before any Claude Code process (the `claude auth status` probe included) when one `CONNECT` through it fails, and hands Claude Code that proxy in its environment. When the route's scheme is `https://` or `socks5h://`/`socks5://` that environment names a local `proxy_bridge` (opened for the launch, closed in `finally`) instead of the account's URL, so the launch runs Claude Code as a child rather than `exec`-ing it; the `auth status` probe reads its own short-lived bridge the same way. An account with an egress expectation is refused the same way when the exit does not match it, measured through that route before Claude Code starts — and an unusable proxy for such an account is that same refusal, so `cswap run --auto` moves to the next ranked candidate either way. A `swap`/`move` that gives the slot to another account while the checks run ends the launch.
 
 Read next: the module docstring of `session.py`, and [proxy.md](proxy.md#launching-claude-code).
 
@@ -119,11 +125,11 @@ Read next: the module docstring of `session.py`, and [proxy.md](proxy.md#launchi
 
 ### A launch on the best account
 
-`cswap run --auto` picks the account with `ClaudeAccountSwitcher.auto_run_plan` from one capture of the roster (`_build_accounts_info`): the launchable slots ranked by headroom above 0, then by "Claude Code has not reported a rate-limit stop on it", then by headroom, then the live login. The plan confirms a candidate's reading once when the walk reaches it (`_collect_usage_entries(fetch={candidate})`) and moves to the next one when that confirmation has no room left — `SERVE_TTL_S` is the oldest a ranking reading may be. The same plan answers the next candidate after a refused exit check, so a rejection costs one row of the order rather than a second capture. The launch is then the session-mode one above, without touching `sequence.json` or the default login; the slot travels into it as the (slot, email, organization) it was read with.
+`cswap run --auto` picks the account with `ClaudeAccountSwitcher.auto_run_plan` from one capture of the roster (`_build_accounts_info`): the launchable slots ranked by headroom above 0, then by "Claude Code has not reported a rate-limit stop on it", then by headroom. The plan confirms a candidate's reading once when the walk reaches it (`_collect_usage_entries(fetch={candidate})`) and moves to the next one when that confirmation has no room left — `SERVE_TTL_S` is the oldest a ranking reading may be. The same plan answers the next candidate after a refused exit check, so a rejection costs one row of the order rather than a second capture. The launch is then the session-mode one above, without touching `sequence.json`; the slot travels into it as the (slot, email, organization) it was read with.
 
 `StopFailure` with matcher `rate_limit` is what Claude Code reports a refused turn with; `cswap run --auto` passes that hook through `--settings`, and it runs `cswap rate-limited <email> <organization>` (`record_stop_failure`), which stamps `cache/stop-failure.json`. Marked means "the reading predates the refusal" — a reading newer than the stamp clears it, so no deadline is stored.
 
-The thin `claude` wrapper calls `cswap run --auto` for every launch. `session.find_claude` is the one place that resolves the binary a launch hands the terminal to, and it never returns the wrapper: a `claude` that is the wrapper (recognised by a marker line in its first bytes) is walked past on `PATH`.
+The thin `claude` wrapper calls `cswap run --active` for every launch — the recorded slot — and `cswap run --auto` keeps the quota-ranked launch for anyone who asks for it. `session.find_claude` is the one place that resolves the binary a launch hands the terminal to (`CSWAP_CLAUDE_BIN` first), and it never returns the wrapper: a `claude` that is the wrapper (recognised by a marker line in its first bytes) is walked past on `PATH`.
 
 Read next: `wrapper.py` and [auto-launch.md](auto-launch.md).
 
@@ -145,7 +151,8 @@ Read next: the module docstring of `autoswitch.py`. The rules as users see them 
 - **Surfaces hold no account logic.** Dashboards read through `SnapshotSource`; the engine does not print.
 - **Import direction.** `session.py` and `credentials.py` do not import `switcher.py`. `fsutil.py` imports nothing from the package. The TUI's heavy imports stay inside `tui.run`.
 - **Paths come from `paths.py`.** Do not hardcode `~/.claude`; Claude Code's own resolution has cases that differ.
-- **A launch hands the terminal to the real Claude Code, never to the wrapper.** `session.find_claude` is the only resolver; choosing an account happens once, in the wrapper's `cswap run --auto`.
+- **A launch hands the terminal to the real Claude Code, never to the wrapper.** `session.find_claude` is the only resolver, and the wrapper's `cswap run --active` is the only place an account is chosen for a plain `claude`.
+- **A switch writes `sequence.json` only.** `activeAccountNumber` is the active account; the global `~/.claude` login is reported and imported, never written and never active. No Claude Code lock is taken to switch.
 - **A proxy password stays in this process.** It is stored in `sequence.json` (0600) and masked everywhere it is shown; it reaches a child's environment (Claude Code, `claude auth login`) only for an `http://` route, and for the schemes `proxy_bridge` carries the child reads `http://127.0.0.1:<port>` instead.
 - **A request for an account travels that account's route.** Every network call in `oauth.py` and `subscription.py` takes an `account_proxy` route; a slot with no proxy goes direct, and one whose proxy is set never does. The route comes from the same read as the credential it is used for (`AccountInfo` in `switcher.py`), so a concurrent `swap`/`move` cannot pair one account's token with another slot's route. A launch of such an account takes the same route — checked before Claude Code starts and handed to it in the environment — and one whose route cannot be confirmed is refused rather than run direct. An egress expectation is measured on that same route, before Claude Code starts, and never through a direct connection.
 

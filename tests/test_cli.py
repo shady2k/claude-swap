@@ -212,7 +212,8 @@ class TestCLI:
             cli.main()
 
         switcher_cls.return_value.switch.assert_called_once_with(
-            strategy="best", json_output=False, models=(), model_source=None
+            strategy="best", json_output=False, models=(), model_source=None,
+            previous=False,
         )
 
     def test_switch_strategy_falls_back_to_configured_model(self):
@@ -231,6 +232,7 @@ class TestCLI:
         switcher_cls.return_value.switch.assert_called_once_with(
             strategy="best", json_output=False,
             models=("Fable",), model_source="autoswitch.model",
+            previous=False,
         )
 
     def test_switch_model_flag_overrides_setting(self):
@@ -251,6 +253,7 @@ class TestCLI:
         switcher_cls.return_value.switch.assert_called_once_with(
             strategy="next-available", json_output=False,
             models=("Opus", "Fable"), model_source="cli",
+            previous=False,
         )
 
     def test_switch_model_without_strategy_is_rejected(self, capsys):
@@ -270,7 +273,8 @@ class TestCLI:
             cli.main()
 
         switcher_cls.return_value.switch.assert_called_once_with(
-            strategy=None, json_output=False, models=(), model_source=None
+            strategy=None, json_output=False, models=(), model_source=None,
+            previous=False
         )
 
     def test_slot_flag_requires_add_account(self, capsys):
@@ -1322,6 +1326,9 @@ class TestRunCommand:
             def exec_default(self, claude_args, *, primary_profile=False):
                 calls.append(("exec_default", claude_args, primary_profile))
 
+            def exec_local(self, claude_args):
+                calls.append(("exec_local", claude_args))
+
         with patch("claude_swap.session.SessionManager", FakeSessionManager), \
              patch("claude_swap.cli.ClaudeAccountSwitcher",
                    return_value=MagicMock(backup_dir=self.backup_dir,
@@ -1690,16 +1697,12 @@ class TestRunCommand:
         [
             ["mcp", "add", "-s", "user", "x", "cmd"],
             ["mcp", "list"],
-            ["plugin", "install", "y"],
-            ["auth", "login"],
-            ["update"],
-            ["--version"],
-            ["-h"],
         ],
     )
-    def test_claude_housekeeping_goes_to_the_default_login(self, tail):
-        """`claude mcp add` must not write a session profile's copy (the next
-        _sync_mcp_servers deletes it), and `--version` must not need a quota."""
+    def test_mcp_goes_to_the_shared_profile(self, tail):
+        """`claude mcp add` must not write a session profile's copy: the next
+        _sync_mcp_servers deletes it, so the write belongs in the profile the
+        user manages their servers on."""
         target = MagicMock(side_effect=AssertionError("no account should be chosen"))
         calls = self._dispatch(
             ["run", "--auto", "--", *tail], auto_run_plan=target
@@ -1708,6 +1711,36 @@ class TestRunCommand:
         assert ("exec_default", tail, True) in calls
         assert not [call for call in calls if call[0] == "run"]
         target.assert_not_called()
+
+    @pytest.mark.parametrize("tail", [["--version"], ["-v"], ["-h"], ["--help"]])
+    def test_local_flags_answer_without_an_account(self, tail):
+        """An SDK asking for the version gets it with no slot and no quota."""
+        target = MagicMock(side_effect=AssertionError("no account should be chosen"))
+        calls = self._dispatch(
+            ["run", "--auto", "--", *tail], auto_run_plan=target
+        )
+
+        assert ("exec_local", tail) in calls
+        assert not [call for call in calls if call[0] in ("run", "exec_default")]
+        target.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            ["plugin", "install", "y"],
+            ["auth", "login"],
+            ["auth", "status", "--json"],
+            ["update"],
+            ["doctor"],
+        ],
+    )
+    def test_a_command_that_needs_a_login_goes_through_the_ranking(self, tail):
+        """`auth`/`update`/`doctor` are not the global profile's: they run on
+        the account the launch chose, inside that account's proxy."""
+        calls = self._auto_dispatch(["run", "--auto", "--", *tail], [self._row(2)])
+
+        assert self._launch(calls)[1] == "2"
+        assert not [call for call in calls if call[0] in ("exec_default", "exec_local")]
 
     def test_auto_forwards_the_run_flags(self):
         calls = self._auto_dispatch(
@@ -1781,39 +1814,67 @@ class TestRunCommand:
         "unbuffered", [False, True], ids=["buffered", "unbuffered"]
     )
     def test_real_handoff_leaves_stdout_to_claude(self, tmp_path, unbuffered):
-        """Through the real handoff, a piped stdout carries claude's output
-        and nothing else, and the launch notice still arrives, on stderr.
+        """Through a real subprocess, stdout carries claude's output alone.
 
-        Unbuffered is the case that puts a stdout notice in front of claude's
-        output; buffered is the one where a POSIX exec drops it.
+        Buffered is the case that would put a notice in front of claude's
+        output; unbuffered is the one where a POSIX exec drops it. The launch
+        is a real `cswap run --active` on a recorded slot whose only stand-in
+        is the session manager: it prints its notices, then execs a fake
+        claude that answers JSON.
         """
         fake_claude = tmp_path / "claude.py"
         fake_claude.write_text(
             'import json, sys\nprint(json.dumps({"args": sys.argv[1:]}))\n'
         )
-        # An unmapped directory launches the default login, which reads no
-        # credential on the way; its route is the one account-shaped answer
-        # this launch asks for (none: no slot, so nothing to apply).
         script = textwrap.dedent("""\
-            import sys
+            import os, sys
             from pathlib import Path
             from types import SimpleNamespace
             from unittest.mock import patch
 
             from claude_swap import cli
+            from claude_swap.session import SessionManager
 
+            fake = sys.argv[1]
+            recorded = {
+                "accounts": {"1": {"email": "a@example.com"}},
+                "sequence": [1],
+                "activeAccountNumber": 1,
+            }
             switcher = SimpleNamespace(
                 backup_dir=Path.cwd(),
                 _logger=None,
-                slot_for_directory=lambda cwd: (None, None),
-                default_login=lambda *, primary_profile=False: None,
-                default_login_still_holds=lambda identity, slot, *, primary_profile=False: True,
+                _get_sequence_data=lambda: recorded,
+                _account_is_switchable=lambda num: True,
+                is_account_disabled=lambda num: False,
+                account_email=lambda num: recorded["accounts"][num]["email"],
+                _get_current_identity_triple=lambda path=None: None,
+                resolve_account=lambda num: ("1", "a@example.com", ""),
                 _is_running_in_container=lambda: True,
             )
-            argv = ["cswap", "run", "--", sys.argv[1], "--output-format", "stream-json"]
-            # Python stands in for claude; the handoff itself is the real one.
+
+            class FakeSessionManager:
+                def __init__(self, switcher):
+                    pass
+
+                def run(self, identifier, claude_args, **kwargs):
+                    # Everything cswap says on the way must land on stderr.
+                    print(f"Launching Account-{identifier} [session mode]")
+                    print("a bootstrap warning", file=sys.stderr)
+                    # The launch's own handover: execvpe on POSIX, and on
+                    # Windows a resident child, where os.execv would have to
+                    # quote arguments carrying spaces itself.
+                    SessionManager._exec(
+                        self, sys.executable, claude_args, dict(os.environ)
+                    )
+
+            argv = [
+                "cswap", "run", "--active", "--",
+                fake, "--output-format", "stream-json",
+            ]
             with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=switcher), \\
-                 patch("claude_swap.session.shutil.which", return_value=sys.executable), \\
+                 patch("claude_swap.session.SessionManager", FakeSessionManager), \\
+                 patch("os.geteuid", return_value=1000, create=True), \\
                  patch.object(sys, "argv", argv):
                 cli.main()
         """)
@@ -1835,7 +1896,8 @@ class TestRunCommand:
         assert [json.loads(line) for line in result.stdout.splitlines()] == [
             {"args": ["--output-format", "stream-json"]}
         ]
-        assert "No account mapped" in result.stderr
+        assert "Launching Account-1" in result.stderr
+        assert "a bootstrap warning" in result.stderr
 
 
 class TestSubcommandAliases:
@@ -1858,6 +1920,21 @@ class TestSubcommandAliases:
         assert cli._translate_subcommand(["switch", "u@x.com", "--json"]) == [
             "--switch-to", "u@x.com", "--json",
         ]
+
+    @pytest.mark.parametrize(
+        "argv,expected",
+        [
+            (["next"], ["--switch"]),
+            (["next", "--json"], ["--switch", "--json"]),
+            (["prev"], ["--switch", "--previous"]),
+            (["prev", "--json"], ["--switch", "--previous", "--json"]),
+            (["current"], ["--status"]),
+            (["current", "--json"], ["--status", "--json"]),
+        ],
+    )
+    def test_translate_next_prev_current(self, argv, expected):
+        """The rotation aliases: `next`/`prev` move, `current` reports."""
+        assert cli._translate_subcommand(argv) == expected
 
     def test_translate_simple_verbs_and_aliases(self):
         assert cli._translate_subcommand(["list"]) == ["--list"]
@@ -1900,7 +1977,8 @@ class TestSubcommandAliases:
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
         switcher_cls.return_value.switch.assert_called_once_with(
-            strategy=None, json_output=False, models=(), model_source=None
+            strategy=None, json_output=False, models=(), model_source=None,
+            previous=False
         )
 
     def test_list_subcommand_with_json(self):
@@ -2000,6 +2078,7 @@ class TestJsonOutputCli:
 
         switcher_cls.return_value.switch.assert_called_once_with(
             strategy=None, json_output=True, models=(), model_source=None,
+            previous=False,
         )
         assert json.loads(capsys.readouterr().out) == payload
 
@@ -2979,7 +3058,11 @@ class TestRunAutoResolve:
             cli.main()
         assert ("run", "2", [], True, None) in calls
 
-    def test_unmapped_dir_falls_back_to_default(self, tmp_path, monkeypatch, capsys):
+    def test_unmapped_dir_without_an_active_slot_refuses(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """No mapping and no recorded slot is a refusal, never a plain claude:
+        this fork keeps no login in the global ``~/.claude`` to fall back to."""
         backup = tmp_path / "backup"
         backup.mkdir()
         scratch = tmp_path / "scratch"
@@ -2991,13 +3074,18 @@ class TestRunAutoResolve:
                    return_value=self._fake_switcher(backup, {"accounts": {}, "sequence": []})), \
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run"]):
-            cli.main()
-        assert ("exec_default", [], False) in calls
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 1
+        assert calls == []
         captured = capsys.readouterr()
         assert captured.out == ""
         assert "No account mapped" in captured.err
+        assert "No active account is recorded" in captured.err
 
-    def test_removed_account_falls_back_with_warning(self, tmp_path, monkeypatch, capsys):
+    def test_removed_account_is_a_warning_before_the_active_launch(
+        self, tmp_path, monkeypatch, capsys
+    ):
         from claude_swap.mappings import MappingStore
 
         repo = tmp_path / "repo"
@@ -3012,8 +3100,10 @@ class TestRunAutoResolve:
                    return_value=self._fake_switcher(backup, {"accounts": {}, "sequence": []})), \
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "run"]):
-            cli.main()
-        assert ("exec_default", [], False) in calls
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 1
+        assert calls == []
         captured = capsys.readouterr()
         assert captured.out == ""
         assert "no longer exists" in captured.err

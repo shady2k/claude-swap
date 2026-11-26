@@ -106,12 +106,18 @@ def test_manual_usage_strategies_skip_exhausted_weekly_candidate(temp_home, stra
     usage = {"1": _weekly(h, 95), "2": _weekly(h, 100), "3": _weekly(h, 30)}
     with (
         patch.object(h.switcher, "_usage_by_account", return_value=usage),
-        patch.object(h.switcher, "_perform_switch") as activate,
+        patch("claude_swap.switcher.isolated_mode.activate") as activate,
     ):
+        activate.return_value = {
+            "from": {"number": 1, "email": "a@example.com"},
+            "to": {"number": 3, "email": "c@example.com"},
+            "warnings": [],
+        }
         h.switcher.switch(strategy=strategy)
 
     assert activate.call_count == 1
-    assert activate.call_args.args[0] == "3"
+    # activate(switcher, target, ...) — the target is the second argument.
+    assert activate.call_args.args[1] == "3"
 
 
 def test_weekly_only_polling_responds_to_burn_and_imminent_reset(temp_home):

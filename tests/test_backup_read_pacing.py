@@ -37,6 +37,24 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import FetchRecord
 
 
+class _FrozenClock:
+    """A monotonic clock that only moves when a test says so.
+
+    Windows' ``time.monotonic`` steps by ~15.6 ms (``GetTickCount64``), so two
+    cooldowns armed a few milliseconds apart can carry the same deadline.
+    Freezing it reproduces that here on every platform.
+    """
+
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def __getattr__(self, name: str):
+        return getattr(time, name)
+
+
 def _cred(tag: str) -> str:
     return json.dumps({
         "claudeAiOauth": {
@@ -167,18 +185,31 @@ class TestBackupReadCooldown:
         assert keychain.backup_calls(2) == 1
 
     def test_a_cooldown_is_announced_once_and_its_skips_are_silent(
-        self, temp_home: Path, block_real_keychain, keychain: _Keychain, caplog
+        self, temp_home: Path, block_real_keychain, keychain: _Keychain, caplog,
+        monkeypatch,
     ):
         """Skipped reads are expected, not failures: no per-lookup warning
         (31 per snapshot at 11 accounts, ~600/min on the 3 s tick), one info
         line per cooldown, and the verdict stays unreadable."""
         s = _switcher(temp_home, block_real_keychain, 5)
+        store = s._store
+        clock = _FrozenClock()
+        monkeypatch.setattr("claude_swap.credentials.time", clock)
         keychain.fail = lambda *_: True
         with caplog.at_level(logging.INFO, logger="claude-swap"):
             for _ in range(2):
                 snap = s.accounts_snapshot(fetch=set())
             idle = [a for a in snap.accounts if not a.is_active]
             assert [a.usage.sentinel for a in idle] == [USAGE_KEYCHAIN_UNAVAILABLE] * 4
+            announced = [
+                r for r in caplog.records if "Keychain backed off" in r.getMessage()
+            ]
+            assert len(announced) == 1, "one announcement per cooldown"
+
+            # The pass that ARMS the cooldown reports the failure it met; every
+            # pass inside the cooldown is a skip and must stay silent.
+            caplog.clear()
+            s.accounts_snapshot(fetch=set())
             skipped_as_failures = [
                 r for r in caplog.records
                 if r.levelno >= logging.WARNING
@@ -187,20 +218,17 @@ class TestBackupReadCooldown:
             assert skipped_as_failures == [], (
                 f"{len(skipped_as_failures)} cooldown skips were logged as failures"
             )
+
+            # The cooldown lapses, the re-probe fails again: a new cooldown,
+            # announced again — once, even though this clock gives it the very
+            # deadline the first line recorded (the Windows tick).
+            store._keychain_disabled_until = clock.now - 1
+            s.accounts_snapshot(fetch=set())
+            s.accounts_snapshot(fetch=set())
             announced = [
                 r for r in caplog.records if "Keychain backed off" in r.getMessage()
             ]
             assert len(announced) == 1, "one announcement per cooldown"
-
-            # The cooldown lapses, the re-probe fails again: a new cooldown,
-            # announced again — once.
-            s._store._keychain_disabled_until = time.monotonic() - 1
-            s.accounts_snapshot(fetch=set())
-            s.accounts_snapshot(fetch=set())
-            announced = [
-                r for r in caplog.records if "Keychain backed off" in r.getMessage()
-            ]
-            assert len(announced) == 2
 
 
 class TestBackupReadCache:
@@ -370,27 +398,32 @@ class TestDisplaySitesUseTheCache:
     def test_a_snapshot_pass_spawns_once_per_slot_then_only_the_live_read(
         self, temp_home: Path, block_real_keychain, keychain: _Keychain
     ):
-        """The probe from #496 as a test: 2N+1 spawns per pass became N+1 on
-        the first pass and 1 (the live item) on every pass within the TTL."""
+        """The probe from #496 as a test: 2N+1 spawns per pass became N.
+
+        The active slot is read from its own backup like every other slot —
+        there is no live Keychain item to read for it any more — so one pass
+        spawns once per slot and a repaint inside the TTL spawns nothing.
+        """
         n = 5
         s = _switcher(temp_home, block_real_keychain, n)
         snap = s.accounts_snapshot(fetch=set())
         assert [a.switchable for a in snap.accounts] == [True] * n
         assert [a.usage.sentinel for a in snap.accounts] == [None] * n
-        assert keychain.live_calls() == 1
+        assert keychain.live_calls() == 0, (
+            "no live credential is read: the active slot's backup is its only "
+            "stored copy"
+        )
         # N-1 idle backups (_build_accounts_info) + the active slot's backup
-        # (_account_is_switchable). Not N+2: with no strike on the row the
-        # strike scan reads nothing (it used to read the active backup every
-        # pass).
+        # (_account_is_switchable).
         assert sum(keychain.backup_calls(i) for i in range(1, n + 1)) == n
         assert keychain.backup_calls(1) == 1
 
         keychain.calls.clear()
         snap = s.accounts_snapshot(fetch=set())
         assert [a.switchable for a in snap.accounts] == [True] * n
-        assert keychain.calls == [
-            (CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name())
-        ], "a repaint within the TTL must spawn for the live item only"
+        assert keychain.calls == [], (
+            "a repaint within the TTL must spawn for nothing"
+        )
 
     def test_a_locked_keychain_is_probed_once_per_cooldown(
         self, temp_home: Path, block_real_keychain, keychain: _Keychain

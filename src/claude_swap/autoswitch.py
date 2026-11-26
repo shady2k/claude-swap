@@ -1104,22 +1104,15 @@ class AutoSwitchEngine:
                     weekly_threshold=settings.weekly_threshold,
                 )
             )
-            if self.switcher.has_live_login():
-                # Live login exists but cswap doesn't manage it: never act —
-                # a switch would overwrite it without a backup.
-                self._emit(
-                    NoSwitchEvent(
-                        reason="unmanaged-active-account",
-                        detail="run 'cswap --add-account' to include it in rotation",
-                    )
+            # No slot recorded means nothing to switch FROM, whatever the
+            # global ~/.claude holds: that login is not an account of ours,
+            # and a switch would neither back it up nor act on it.
+            self._emit(
+                NoSwitchEvent(
+                    reason="no-active-account",
+                    detail="log in and run 'cswap --add-account' first",
                 )
-            else:
-                self._emit(
-                    NoSwitchEvent(
-                        reason="no-active-account",
-                        detail="log in and run 'cswap --add-account' first",
-                    )
-                )
+            )
             return TickOutcome.NO_ACTION
 
         current_email = self.switcher.account_email(current)

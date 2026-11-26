@@ -225,49 +225,33 @@ def export_accounts(
     else:
         target_nums = sorted(accounts_map.keys(), key=int)
 
-    # Identify the live active account (live vault has fresher tokens than backup)
-    current_identity = switcher._get_current_account()
-
     accounts_payload: list[dict[str, Any]] = []
     for num in target_nums:
         record = accounts_map[num]
         email = record.get("email", "")
         org_uuid = record.get("organizationUuid", "") or ""
 
-        is_active = (
-            current_identity is not None
-            and current_identity[0] == email
-            and current_identity[1] == org_uuid
-        )
-
-        if is_active:
-            creds_text = switcher._read_credentials()
-            if not creds_text:
-                raise CredentialReadError(
-                    f"failed to read live credentials for active account {email}"
-                )
-            config_path = switcher._get_claude_config_path()
-            if not config_path.exists():
-                raise ConfigError("Claude config file not found")
-            config_text = config_path.read_text(encoding="utf-8")
-        else:
-            creds_text = switcher._read_account_credentials(num, email)
-            config_text = switcher._read_account_config(num, email)
-            if not creds_text or not config_text:
-                if explicit_account:
-                    if not creds_text:
-                        raise CredentialReadError(
-                            f"no backup credentials found for account {num} ({email})"
-                        )
-                    raise ConfigError(
-                        f"no backup config found for account {num} ({email})"
+        # The slot's own backup is the account. The fork keeps no live login
+        # in the global ~/.claude (``isolated_mode``), so there is no fresher
+        # live copy to prefer — and reading one would either export a login
+        # cswap does not manage or fail when the global credential is gone.
+        creds_text = switcher._read_account_credentials(num, email)
+        config_text = switcher._read_account_config(num, email)
+        if not creds_text or not config_text:
+            if explicit_account:
+                if not creds_text:
+                    raise CredentialReadError(
+                        f"no backup credentials found for account {num} ({email})"
                     )
-                _eprint(
-                    f"Skipping Account-{num} ({email}): no stored "
-                    f"credentials/config — re-add with: "
-                    f"cswap --add-account --slot {num}"
+                raise ConfigError(
+                    f"no backup config found for account {num} ({email})"
                 )
-                continue
+            _eprint(
+                f"Skipping Account-{num} ({email}): no stored "
+                f"credentials/config — re-add with: "
+                f"cswap --add-account --slot {num}"
+            )
+            continue
 
         config_obj = _parse_payload(config_text, f"config for {email}")
         if not full:
@@ -719,17 +703,19 @@ def import_accounts(
         summary += f", {replaced} replaced (dead token)"
     _eprint(summary)
 
-    # If we just rewrote the stored backup for the account that is the current
-    # live login, a plain switch would back the (possibly stale) live
-    # credentials up over it (issue #79) — point at the explicit activation
-    # path instead.
-    identity = switcher._get_current_account()
-    if identity is not None and final is not None:
-        live_slot = switcher._find_account_slot(final, identity[0], identity[1])
+    # If we just rewrote the stored backup for the recorded active slot, name
+    # it: a switch has no live login to back up any more, so activating the
+    # imported credentials is `cswap switch <num>`.
+    if final is not None:
+        active_slot = final.get("activeAccountNumber")
+        live_slot = str(active_slot) if active_slot else None
         if live_slot is not None and live_slot in written_slots:
+            email = (final.get("accounts", {}).get(live_slot) or {}).get(
+                "email", ""
+            )
             _eprint(
-                f"Note: {identity[0]} is your current live login — activate the "
-                f"imported credentials with: cswap --switch-to {live_slot} --force"
+                f"Note: Account-{live_slot} ({email}) is the active account — "
+                "the imported credentials are what the next launch uses."
             )
 
 

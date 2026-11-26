@@ -285,8 +285,7 @@ def mark_session_stale(session_dir: Path) -> bool:
 # claude 2.1.175). Dropped from the auth-status probe (they'd fake "logged in"
 # for the wrong reason) AND scrubbed from the session launch env with a
 # warning: `cswap run N` is an explicit request for account N, so letting an
-# exported API key silently hijack the session would defeat the command. The
-# same-account fast path (plain claude, untouched env) does not scrub.
+# exported API key silently hijack the session would defeat the command.
 AUTH_OVERRIDE_ENV_VARS = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
@@ -755,12 +754,29 @@ def find_claude() -> str | None:
     """The real Claude Code binary, never claude-swap's own wrapper.
 
     A launch hands the terminal to Claude Code, and this is the only place
-    that says which file that is. The first ``claude`` on ``PATH`` is passed
-    over when it is the wrapper (:func:`wrapper.is_wrapper`) and the walk goes
-    on: exec'ing the wrapper from here would replace the account cswap already
+    that says which file that is. ``CSWAP_CLAUDE_BIN`` answers first when it
+    names an executable that is not the wrapper: a symlink farm, a NixOS
+    wrapper or a hand-installed binary can then be named outright, and a bare
+    ``claude`` need not be on ``PATH`` at all (``docs/auto-launch.md``).
+
+    Otherwise the first ``claude`` on ``PATH`` is taken, passed over when it
+    is the wrapper (:func:`wrapper.is_wrapper`) with the walk going on:
+    exec'ing the wrapper from here would replace the account cswap already
     chose with a second automatic choice (``cswap run 3`` included), and would
     turn the ``claude auth status`` probe into another cswap.
     """
+    override = os.environ.get("CSWAP_CLAUDE_BIN", "")
+    if override:
+        # An explicit answer is honoured exactly, including its failures: a
+        # value that names no usable binary refuses the launch rather than
+        # silently running a different `claude` from PATH. The wrapper's
+        # shell check reads the same value untrimmed, so a whitespace-only
+        # setting refuses in both places.
+        if os.path.isfile(override) and os.access(override, os.X_OK) and not (
+            wrapper.is_wrapper(override)
+        ):
+            return override
+        return None
     found = shutil.which("claude")
     if found is None or not wrapper.is_wrapper(found):
         return found
@@ -773,6 +789,30 @@ def find_claude() -> str | None:
         ):
             return candidate
     return None
+
+
+def require_claude_bin() -> str:
+    """The real Claude Code binary, or the refusal that names why there is none.
+
+    ``find_claude`` answers ``None`` for two different situations, and the
+    remedy differs: nothing installed (put `claude` on PATH) and an explicit
+    ``CSWAP_CLAUDE_BIN`` that names no usable binary (fix or unset the
+    variable). Naming the variable is what keeps the second one from reading
+    as a missing install and sending the user to reinstall Claude Code.
+    """
+    claude_bin = find_claude()
+    if claude_bin:
+        return claude_bin
+    override = os.environ.get("CSWAP_CLAUDE_BIN", "")
+    if override:
+        raise SessionError(
+            f"CSWAP_CLAUDE_BIN is set to {override!r}, which is not an "
+            "executable Claude Code binary (and is not claude-swap's own "
+            "wrapper). Nothing was launched; fix or unset CSWAP_CLAUDE_BIN."
+        )
+    raise SessionError(
+        "'claude' was not found on PATH. Install Claude Code first."
+    )
 
 
 def _claude_env(
@@ -899,36 +939,29 @@ class SessionManager:
         are dropped — the filter the session branch applies — because this
         account's credential is what was asked for.
 
-        ``require_session`` turns the same-account fast path (a plain claude
-        launch on the default login) into a refusal: a wrapper that hands a
-        terminal to one account per session needs the isolation guaranteed,
-        and a session on the default login is the one thing an account
-        switch can later pull out from under it.
+        Every launch is a session profile: the fork keeps no live login in
+        ``~/.claude`` (``isolated_mode``), so there is no same-account fast
+        path left to take and nothing for ``require_session`` to refuse. The
+        flag stays in the signature because the CLI carries it; isolation is
+        unconditional.
 
         The account's proxy and its egress rule, if it has either, are resolved
         here — in one read, with the identity that names the slot — and the
         proxy is checked with one ``CONNECT`` before any profile is created,
         seeded or probed: an unusable proxy or an exit the account did not
-        promise ends the command here, with Claude Code never started. That
-        identity and the default login it names are checked again just before
-        the fast path hands the terminal to claude, and the identity goes on to
-        ``setup_session``, which makes the same slot check on the session
-        branch: a ``switch``, ``swap`` or ``move`` during the checks ends the
-        launch instead of running it.
+        promise ends the command here, with Claude Code never started. The
+        identity goes on to ``setup_session``, which makes the same slot check:
+        a ``switch``, ``swap`` or ``move`` during the checks ends the launch
+        instead of running another account.
 
         Notices on the way are printed plainly. `cswap run` sends them to
         stderr, because stdout is claude's (``cli._run_launch``).
         """
-        claude_bin = find_claude()
-        if not claude_bin:
-            raise SessionError(
-                "'claude' was not found on PATH. Install Claude Code first."
-            )
-        # Resolved here for the fast path below, which never reaches
-        # setup_session. setup_session is then handed the request, not the
-        # answer: it resolves it the same way, and only the request says
-        # whether sharing was asked for or defaulted (``_share_history_asked``
-        # — an answer of True would read as asked for).
+        claude_bin = require_claude_bin()
+        # setup_session is handed the request, not the answer: it resolves it
+        # the same way, and only the request says whether sharing was asked
+        # for or defaulted (``_share_history_asked`` — an answer of True would
+        # read as asked for).
         requested_history = share_history
         share_history = self._resolve_share_history(requested_history)
 
@@ -945,8 +978,7 @@ class SessionManager:
                 identifier
             )
 
-        # Guard before the same-account direct-launch fast path below (which
-        # _exec's claude and never returns) — and before setup_session.
+        # Guard before anything is created, seeded or probed.
         self._ensure_not_api_key(account_num, email)
         # ONE read for this launch's route and rule, pinned to the account it
         # belongs to: the environment the launch hands Claude Code and the
@@ -971,78 +1003,6 @@ class SessionManager:
         self._check_egress(route, expectation, who)
 
         config_dir_preset = os.environ.get("CLAUDE_CONFIG_DIR")
-        # Same-account fast path: never create a second credential copy
-        # for the account that is already the active default login —
-        # two copies of one account can drift if the server rotates the
-        # refresh token. With CLAUDE_CONFIG_DIR preset (we may be inside
-        # another session's terminal) the *default* login is still what a
-        # session for this account would copy, so it is read from the
-        # default profile rather than from the preset directory.
-        if config_dir_preset:
-            current = self._default_login_identity()
-        else:
-            current = self.switcher._get_current_account()
-        # A default login with no usable token cannot run claude, and holds no
-        # refresh token a session could spend twice, so the account's session
-        # profile is the launch that works.
-        signed_out = (
-            current is not None
-            and current == (email, org_uuid)
-            and self._default_login_signed_out()
-        )
-        if signed_out:
-            print(
-                dimmed(
-                    f"Account-{account_num} ({email}) is the default login, "
-                    "but that login holds no usable token; launching from "
-                    "the stored login in a session profile."
-                )
-            )
-        if current is not None and current == (email, org_uuid) and not signed_out:
-            if require_session:
-                raise SessionError(
-                    f"Account-{account_num} ({email}) is the active default "
-                    "login, so this launch would run plain claude on the "
-                    "default login rather than in a session profile (a "
-                    "second copy of the active credential would drift). "
-                    "Switch the default login to another account first, "
-                    "or run `claude` directly."
-                )
-            print(
-                dimmed(
-                    f"Account-{account_num} ({email}) is already the active "
-                    "default login — launching claude directly."
-                )
-            )
-            self._history_on_the_fast_path(
-                session_dir_for(self.switcher.backup_dir, account_num, email),
-                share_history,
-            )
-            if account is not None:
-                # Chosen for the user, so the shell's auth overrides go.
-                _warn_auth_overrides()
-            # The check above may have taken seconds (a `CONNECT`, then the
-            # GeoIP chain): the login this launch would run or the slot it
-            # belongs to must still be the ones it read. A `switch` replaces
-            # the login, a `swap`/`move` gives the slot away, and a lock that
-            # could not be taken leaves either unconfirmed. ``setup_session``
-            # makes the same slot check on the session branch.
-            if not self.switcher.default_login_still_holds(
-                (email, org_uuid),
-                str(account_num),
-                primary_profile=bool(config_dir_preset),
-            ):
-                raise SessionError(
-                    f"Account-{account_num} ({email}) is no longer the login "
-                    "this launch would run, or its slot changed or could not "
-                    "be confirmed: a switch, swap or move landed while its "
-                    "exit was being checked. Nothing was launched; run the "
-                    "command again."
-                )
-            env = self._launch_base_env(account is not None)
-            # Run on the default login, not on the preset profile.
-            env.pop("CLAUDE_CONFIG_DIR", None)
-            self._launch(claude_bin, claude_args, route, env)
         if config_dir_preset:
             warning(
                 f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
@@ -1071,9 +1031,8 @@ class SessionManager:
         """This process's environment, less the auth overrides a chosen
         account must not be given.
 
-        The session branch always scrubs; the same-account fast path only does
-        so for an automatic choice (``run(account=…)``), where the account was
-        picked for the user and a stray ``ANTHROPIC_API_KEY`` would make the
+        An automatic choice (``run(account=…)``) scrubs: the account was
+        picked for the user, and a stray ``ANTHROPIC_API_KEY`` would make the
         process bill with a credential other than the account whose proxy it
         was launched with. An explicit ``cswap run 3`` keeps its environment.
         """
@@ -1082,38 +1041,6 @@ class SessionManager:
         return {
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
         }
-
-    def _history_on_the_fast_path(
-        self, session_dir: Path, share_history: bool
-    ) -> None:
-        """Deal with history the profile holds, on the launch that skips it.
-
-        The fast path is plain claude on ``~/.claude``, so what the account's
-        sessions wrote into its profile is not in front of the user (#239).
-        With sharing on it is merged now, by the steps a session launch
-        takes: an account that stays the default login would otherwise never
-        be migrated, however often it is run. With sharing off it stays
-        apart, and the launch says which history it is about to use.
-
-        History only. Nothing here seeds, validates or refreshes the
-        profile's credentials — a second live copy of the default login's
-        credential is what the fast path exists to avoid. A profile with no
-        history of its own (never used, or already linked) is left alone.
-        """
-        if not any(
-            (session_dir / name).exists() and not is_link(session_dir / name)
-            for name in HISTORY_ITEMS
-        ):
-            return
-        if share_history:
-            self._sync_items(session_dir, HISTORY_ITEMS, scope=HISTORY_ITEMS)
-        else:
-            print(
-                dimmed(
-                    "   This launch uses the default login's chat history "
-                    "(~/.claude), not the account's own."
-                )
-            )
 
     def _resolve_share_history(self, requested: bool | None) -> bool:
         """Whether this launch shares chat history across accounts.
@@ -1146,63 +1073,6 @@ class SessionManager:
             return None
         return oauth["emailAddress"], oauth.get("organizationUuid", "") or ""
 
-    def _default_login_signed_out(self) -> bool:
-        """True only when the default login certainly holds no usable token.
-
-        The same-account fast path runs plain claude on the default login.
-        When a refresh is rejected with invalid_grant, Claude Code (2.1.322)
-        empties both tokens in the credential store and leaves
-        ``oauthAccount`` in ``.claude.json``. The login then still names the
-        account, and every launch on it stops at "Not logged in" or "Login
-        expired", while the slot's stored login may still be good.
-        ``/logout`` does not lead here: it removes ``oauthAccount``, so the
-        account is no longer the default login.
-
-        Read as the fast path's claude would read it: the default profile,
-        whatever ``CLAUDE_CONFIG_DIR`` says. An unreadable Keychain, a file
-        read error, a managed API key or a blob of unknown shape cannot be
-        told apart from a working login, so they answer False and keep the
-        fast path.
-
-        A non-empty ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` answers False too.
-        Claude Code (2.1.322) then resolves its credential store from that
-        value, and the plaintext half of this read does not follow it, so
-        an empty result would say nothing about the login claude uses. A
-        session launched instead would inherit the override and read that
-        same store, not its own profile.
-        """
-        from claude_swap import oauth as _oauth
-        from claude_swap.credentials import looks_like_api_key
-
-        if os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"):
-            return False
-        preset = os.environ.pop("CLAUDE_CONFIG_DIR", None)
-        try:
-            active = self.switcher._read_active_credentials()
-        finally:
-            if preset is not None:
-                os.environ["CLAUDE_CONFIG_DIR"] = preset
-        if active.value is None or active.keychain_unavailable or active.degraded:
-            return False
-        if not active.value.strip():
-            return True
-        if looks_like_api_key(active.value):
-            return False
-        data = _oauth.extract_oauth_data(active.value)
-        if data is None:
-            return False
-        if data.get("refreshToken"):
-            return False
-        if not data.get("accessToken"):
-            return True
-        # An access token without a refresh token works until it expires.
-        expires_at = data.get("expiresAt")
-        return (
-            isinstance(expires_at, (int, float))
-            and not isinstance(expires_at, bool)
-            and expires_at <= time.time() * 1000
-        )
-
     def exec_default(
         self, claude_args: list[str], *, primary_profile: bool = False
     ) -> NoReturn:
@@ -1222,8 +1092,8 @@ class SessionManager:
 
         ``primary_profile`` launches on the profile the user manages, even
         when ``CLAUDE_CONFIG_DIR`` or ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` name
-        another one — a session's terminal. `cswap run --auto` passes it for
-        Claude Code's own housekeeping commands: their writes belong in the
+        another one — a session's terminal. It is passed for Claude Code's own
+        housekeeping commands (`claude mcp …`), whose writes belong in the
         profile the next session launch syncs FROM, not in a session copy that
         launch overwrites (``_sync_sharing``), and the proxy must be that
         profile's login's.
@@ -1235,11 +1105,7 @@ class SessionManager:
         running claude through a route and a rule that no longer belong to
         what runs.
         """
-        claude_bin = find_claude()
-        if not claude_bin:
-            raise SessionError(
-                "'claude' was not found on PATH. Install Claude Code first."
-            )
+        claude_bin = require_claude_bin()
         env = dict(os.environ)
         if primary_profile:
             env.pop("CLAUDE_CONFIG_DIR", None)
@@ -1270,6 +1136,18 @@ class SessionManager:
                 "Nothing was launched; run the command again."
             )
         self._launch(claude_bin, claude_args, route, env)
+
+    def exec_local(self, claude_args: list[str]) -> NoReturn:
+        """Run one of claude's own local commands on the real binary.
+
+        ``--version`` and ``--help`` answer a property of the installed
+        program: no account, no profile and no proxy is involved, and asking
+        a quota or a login for them would refuse a question that has an
+        answer anyway. `cswap run --auto` sends them here — an SDK asking for
+        the version must work while no slot is recorded.
+        """
+        claude_bin = require_claude_bin()
+        self._exec(claude_bin, claude_args, dict(os.environ))
 
     def _check_proxy(
         self,
@@ -1448,7 +1326,7 @@ class SessionManager:
                 "Nothing was prepared and Claude Code was not started; run "
                 "the command again."
             )
-        # Defense-in-depth: also guard here (run() guards before its fast path).
+        # Defense-in-depth: also guard here (run() guards before it).
         self._ensure_not_api_key(account_num, email)
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
 
@@ -1724,10 +1602,11 @@ class SessionManager:
         """The refusal to copy the live login into a session profile: two
         Claude Codes on one refresh token invalidate each other."""
         return SessionError(
-            f"Account-{account_num}'s stored login is the live login right "
-            f"now, so a session would be a second copy of the same login. "
-            f"Run 'cswap --switch-to {account_num}' so cswap treats it as the "
-            f"active account, then start claude normally."
+            f"Account-{account_num}'s stored login is also the login in the "
+            f"global ~/.claude right now, so a session would be a second copy "
+            f"of the same one-time login. Run 'cswap add' once: it saves the "
+            f"login into the account and removes the global copy, then start "
+            f"claude again."
         )
 
     @staticmethod
@@ -1917,8 +1796,7 @@ class SessionManager:
 
         ``scope`` is what this call decides about. An entry in it that is not
         active is removed, and a managed entry outside it stays exactly as it
-        is, on disk and in the manifest. Everything by default; the fast
-        path passes the history items alone (``_history_on_the_fast_path``).
+        is, on disk and in the manifest. Everything by default.
         """
         # Reset per call: _prepare_history_share accumulates into this as it
         # runs (once per HISTORY_ITEMS entry), so a launch with nothing to

@@ -223,9 +223,8 @@ class TestListJson:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        with patch.object(switcher, "_read_active_credentials",
-                          return_value=ActiveCredentials(active_creds, False)), \
-             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+        switcher._write_account_credentials("1", "test@example.com", active_creds)
+        with patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
              patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(usage)):
             payload = switcher.list_accounts(json_output=True)
 
@@ -250,9 +249,8 @@ class TestListJson:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        with patch.object(switcher, "_read_active_credentials",
-                          return_value=ActiveCredentials(active_creds, False)), \
-             patch.object(switcher, "_read_account_credentials", return_value=""), \
+        switcher._write_account_credentials("1", "test@example.com", active_creds)
+        with patch.object(switcher, "_read_account_credentials", return_value=""), \
              patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
             payload = switcher.list_accounts(json_output=True)
 
@@ -279,9 +277,8 @@ class TestListJson:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        with patch.object(switcher, "_read_active_credentials",
-                          return_value=ActiveCredentials(active_creds, False)), \
-             patch.object(switcher, "_read_account_credentials", return_value=""), \
+        switcher._write_account_credentials("1", "test@example.com", active_creds)
+        with patch.object(switcher, "_read_account_credentials", return_value=""), \
              patch("claude_swap.oauth.try_fetch_usage_for_account",
                    return_value=oauth.UsageOutcome(None)):
             payload = switcher.list_accounts(json_output=True)
@@ -307,9 +304,13 @@ class TestListJson:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        with patch.object(switcher, "_read_active_credentials",
-                          return_value=ActiveCredentials(active_creds, False)), \
-             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+        switcher._write_account_credentials("1", "test@example.com", active_creds)
+        with patch.object(
+                 switcher, "_read_account_credentials",
+                 side_effect=lambda num, email, **_kw: (
+                     active_creds if str(num) == "1" else backup_creds
+                 ),
+             ), \
              patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
             payload = switcher.list_accounts(json_output=True)
 
@@ -330,9 +331,13 @@ class TestListJson:
 
         # Account 1 active with creds but the fetch fails (None → unavailable);
         # account 2 has no backup creds (→ no_credentials).
-        with patch.object(switcher, "_read_active_credentials",
-                          return_value=ActiveCredentials(active_creds, False)), \
-             patch.object(switcher, "_read_account_credentials", return_value=""), \
+        switcher._write_account_credentials("1", "test@example.com", active_creds)
+        with patch.object(
+                 switcher, "_read_account_credentials",
+                 side_effect=lambda num, email, **_kw: (
+                     active_creds if str(num) == "1" else ""
+                 ),
+             ), \
              patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
             payload = switcher.list_accounts(json_output=True)
 
@@ -377,9 +382,13 @@ class TestListJson:
 
         # The stale entry is due for a refetch, but the fetch fails — the
         # store keeps serving the old measurement.
-        with patch.object(switcher, "_read_active_credentials",
-                          return_value=ActiveCredentials(active_creds, False)), \
-             patch.object(switcher, "_read_account_credentials", return_value=""), \
+        switcher._write_account_credentials("1", "test@example.com", active_creds)
+        with patch.object(
+                 switcher, "_read_account_credentials",
+                 side_effect=lambda num, email, **_kw: (
+                     active_creds if str(num) == "1" else ""
+                 ),
+             ), \
              patch("claude_swap.oauth.try_fetch_usage_for_account",
                    return_value=oauth.UsageOutcome(None, error="timeout")):
             payload = switcher.list_accounts(json_output=True)
@@ -412,10 +421,15 @@ class TestStatusJson:
             "active": None,
         }
 
-    def test_status_unmanaged(self, temp_home: Path, mock_claude_config: Path):
+    def test_status_reports_a_leftover_global_login(
+        self, temp_home: Path, mock_claude_config: Path
+    ):
+        """A login in the global ``~/.claude`` is reported additively and is
+        never the active account — the slot record is."""
         switcher = ClaudeAccountSwitcher()
         payload = switcher.status(json_output=True)
-        assert payload["active"] == {"email": "test@example.com", "managed": False}
+        assert payload["active"] is None
+        assert payload["globalLogin"] == {"email": "test@example.com"}
 
     def test_status_managed(
         self, temp_home: Path, mock_claude_config: Path,
@@ -430,9 +444,8 @@ class TestStatusJson:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        with patch.object(switcher, "_read_active_credentials",
-                          return_value=ActiveCredentials(active_creds, False)), \
-             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(usage)):
+        switcher._write_account_credentials("1", "test@example.com", active_creds)
+        with patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(usage)):
             payload = switcher.status(json_output=True)
 
         assert capsys.readouterr().out == ""
@@ -465,9 +478,8 @@ class TestStatusJson:
             backoff_until=time_mod.time() + 3600,
         )
 
-        with patch.object(switcher, "_read_active_credentials",
-                          return_value=ActiveCredentials(active_creds, False)), \
-             patch.object(switcher, "_active_account_usage", return_value=(entry, None)):
+        switcher._write_account_credentials("1", "test@example.com", active_creds)
+        with patch.object(switcher, "_active_account_usage", return_value=(entry, None)):
             payload = switcher.status(json_output=True)
 
         active = payload["active"]
@@ -490,9 +502,8 @@ class TestStatusJson:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        with patch.object(switcher, "_read_active_credentials",
-                          return_value=ActiveCredentials(active_creds, False)), \
-             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
+        switcher._write_account_credentials("1", "test@example.com", active_creds)
+        with patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
             payload = switcher.status(json_output=True)
 
         assert payload["active"]["alias"] == "dev"
@@ -596,12 +607,12 @@ class TestSwitchJson:
         assert result["reason"] == "already-active"
         assert result["from"] == result["to"] == {"number": 1, "email": "test@example.com"}
 
-    def test_switch_to_force_self_activation_reports_activated(
+    def test_switch_to_force_on_the_active_slot_is_a_noop(
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict, capsys,
     ):
-        """--switch-to <current> --force rewrites creds from the stored backup:
-        switched stays identity-based (false) but reason says 'activated'."""
+        """``--force`` has no live login to rewrite: on the recorded slot it is
+        the same already-active no-op as any other self-switch."""
         switcher, creds, configs, live = _two_account_stores(temp_home, sample_sequence_data)
         creds[("1", "test@example.com")] = json.dumps(
             {"claudeAiOauth": {"accessToken": "sk-imported-1", "refreshToken": "rt-imported-1"}}
@@ -615,11 +626,14 @@ class TestSwitchJson:
 
         assert capsys.readouterr().out == ""
         assert result["switched"] is False
-        assert result["reason"] == "activated"
+        assert result["reason"] == "already-active"
         assert result["from"] == result["to"] == {"number": 1, "email": "test@example.com"}
-        assert result["message"].startswith("Activated Account-1")
-        # The live login was really rewritten from the stored backup.
-        assert json.loads(live["creds"])["claudeAiOauth"]["accessToken"] == "sk-imported-1"
+        # The stored backup and the global login are both left alone.
+        assert creds[("1", "test@example.com")] == json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-imported-1",
+                               "refreshToken": "rt-imported-1"}}
+        )
+        assert json.loads(live["creds"])["claudeAiOauth"]["accessToken"] == "sk-1"
 
     def test_switch_to_force_cross_slot_reports_switched(
         self, temp_home: Path, mock_claude_config: Path,
@@ -666,7 +680,7 @@ class TestSwitchJson:
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict,
     ):
-        """Current live account unmanaged → --switch-to proceeds, from.number is null."""
+        """No recorded slot → --switch-to proceeds, from.number is null."""
         # Managed accounts use other emails; the live account (test@example.com)
         # is not among them.
         switcher = ClaudeAccountSwitcher()
@@ -686,7 +700,7 @@ class TestSwitchJson:
             for p in patches:
                 p.stop()
         assert result["switched"] is True
-        assert result["from"] == {"number": None, "email": "test@example.com"}
+        assert result["from"] == {"number": 1, "email": "account1@example.com"}
         assert result["to"]["number"] == 2
 
     def test_switch_to_ambiguous_email_raises(
@@ -719,21 +733,43 @@ class TestSwitchJson:
         assert result["switched"] is False
         assert result["reason"] == "only-one-account"
 
-    def test_switch_unmanaged_account_is_noop_without_add(
+    def test_switch_without_a_recorded_slot_starts_the_rotation(
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict,
     ):
-        """Plain --switch from an unmanaged account: structured no-op, no auto-add."""
-        # Live account (test@example.com) not in the managed set.
+        """No slot recorded yet: plain --switch activates the first launchable
+        one. The global login is unrelated to the choice and is never added."""
+        sample_sequence_data["activeAccountNumber"] = None
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
+        switcher.platform = Platform.LINUX
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
-        with patch.object(switcher, "add_account") as add:
-            result = switcher.switch(json_output=True)
+        creds = {
+            ("1", "account1@example.com"): json.dumps(
+                {"claudeAiOauth": {"accessToken": "sk-1", "refreshToken": "rt-1"}}),
+            ("2", "account2@example.com"): json.dumps(
+                {"claudeAiOauth": {"accessToken": "sk-2", "refreshToken": "rt-2"}}),
+        }
+        configs = {
+            ("1", "account1@example.com"): json.dumps(
+                {"oauthAccount": {"emailAddress": "account1@example.com",
+                                  "accountUuid": "uuid-1"}}),
+            ("2", "account2@example.com"): json.dumps(
+                {"oauthAccount": {"emailAddress": "account2@example.com",
+                                  "accountUuid": "uuid-2"}}),
+        }
+        patches = _install_patches(switcher, creds, configs, {"creds": ""})
+        try:
+            with patch.object(switcher, "add_account") as add:
+                result = switcher.switch(json_output=True)
+        finally:
+            for p in patches:
+                p.stop()
         add.assert_not_called()
-        assert result["switched"] is False
-        assert result["reason"] == "unmanaged-account"
-        assert result["from"] == {"number": None, "email": "test@example.com"}
+        assert result["switched"] is True
+        assert result["from"] is None
+        assert result["to"]["number"] == 1
+        assert switcher._get_sequence_data()["activeAccountNumber"] == 1
 
 
 class TestAccountRowFailure:

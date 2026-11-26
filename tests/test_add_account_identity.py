@@ -284,6 +284,15 @@ def test_CONTROL_refresh_in_place_still_accepts_the_owning_token(
         "accessToken": "sk-ant-oat01-MINE-ROTATED", "refreshToken": "rt-mine-2",
         "expiresAt": 99999999999000}})
 
+    # `cswap add` took the global login over and cleared it; a refresh after a
+    # re-login starts with the new login in place again.
+    (temp_home / ".claude.json").write_text(json.dumps({
+        "oauthAccount": {
+            "emailAddress": "ax@example.com",
+            "accountUuid": "u-ax",
+            "organizationUuid": "",
+        },
+    }))
     with patch.object(s, "_read_capture_credentials", return_value=OWN_ROTATED), \
          patch("claude_swap.oauth.fetch_oauth_profile",
                return_value={"uuid": "u-ax", "email": "ax@example.com",

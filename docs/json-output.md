@@ -7,6 +7,8 @@
 - Every payload carries a `schemaVersion` (currently `1`).
 - On a handled error stdout is `{"schemaVersion":1,"error":{...}}` with a non-zero exit code.
 - `--switch`/`--switch-to` report `{"switched": true|false, "from": …, "to": …, "reason": …}`.
+- `activeAccountNumber` is the slot recorded as active in cswap's own state. `active` in the `status` payload is that slot, never a login read from `~/.claude`.
+- `globalLogin` (`{"email": …}`) appears in `list` and `status` payloads only when a login is left in the global `~/.claude`. It is reported, never adopted and never written; the fork has no other field for it. An empty `email` means the credential file is there with no `oauthAccount` beside it — the residue of a cleanup that did not finish. `cswap add` imports only an account it can see in `~/.claude.json`, so there it refuses; delete `~/.claude/.credentials.json` by hand, or log in again and run `cswap add`.
 
 ## Usage windows
 

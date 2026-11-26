@@ -151,12 +151,22 @@ class EngineHarness:
         self.switcher._write_json(self.switcher.sequence_file, data)
 
     def make_live(self, email: str, num: int) -> None:
+        """Make account ``num`` the one the user is on.
+
+        The recorded slot IS that answer in this fork (``isolated_mode``); the
+        global ``~/.claude`` login is written too, because that is what a user
+        who logged in with a bare ``claude`` leaves behind, and the engine must
+        ignore it.
+        """
         (self.temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
             "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
         }))
         (self.temp_home / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},
         }))
+        data = self.switcher._get_sequence_data()
+        data["activeAccountNumber"] = num
+        self.switcher._write_json(self.switcher.sequence_file, data)
 
     def tick_with_usage(self, usage: dict) -> TickOutcome:
         entries = {
@@ -673,7 +683,9 @@ class TestDecisionTable:
         outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
         assert outcome is TickOutcome.NO_ACTION
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
-        assert reasons == ["unmanaged-active-account"]
+        # A global login is not an account of ours, so it changes no answer:
+        # with no recorded slot there is nothing to switch FROM.
+        assert reasons == ["no-active-account"]
         assert (temp_home / ".claude" / ".credentials.json").read_text() == live_before
 
     def test_all_exhausted_carries_earliest_reset(self, harness):
@@ -1718,13 +1730,9 @@ class TestAdaptiveScheduler:
         from claude_swap.usage_store import FetchRecord
 
         h = self._harness(temp_home, monkeypatch)
-        # Active token locally expired while an owner is present.
-        (h.temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
-            "claudeAiOauth": {
-                "accessToken": "sk-live", "refreshToken": "rt-live",
-                "expiresAt": 1000,
-            },
-        }))
+        # The active slot's stored token is locally expired.
+        h.seed(1, "a@example.com", expires_at=1000)
+        h.make_live("a@example.com", 1)
         # Active row sits in a long failure backoff → the fetch path (and its
         # own expired short-circuit) is unreachable this tick.
         h.switcher._usage_store.record(
@@ -1970,11 +1978,14 @@ class TestFreshening:
 
         assert outcome is TickOutcome.SWITCHED
         mock_refresh.assert_called_once()
-        # Freshening itself never touched the active store (the switch did,
-        # afterwards, via _perform_switch): the rotated token must have gone
-        # through the backup, and now be live.
-        assert "sk-2-new" in live_creds_path.read_text()
-        assert live_creds_path.read_text() != live_before
+        # Freshening never touches a live store: the rotated token goes through
+        # the consume gate into the slot's backup, and the switch that follows
+        # only records the slot.
+        assert "sk-2-new" in h.switcher._read_account_credentials(
+            "2", "b@example.com"
+        )
+        assert live_creds_path.read_text() == live_before
+        assert h.active_number() == 2
 
     def test_fresh_target_is_not_refreshed(self, temp_home):
         h = EngineHarness(temp_home)
