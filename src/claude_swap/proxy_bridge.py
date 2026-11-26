@@ -41,9 +41,11 @@ from __future__ import annotations
 
 import base64
 import ipaddress
+import select
 import socket
 import ssl
 import threading
+import time
 import urllib.error
 import urllib.parse
 
@@ -59,9 +61,6 @@ MAX_HEAD_BYTES = 64 * 1024
 
 #: Default port of each scheme this module can drive.
 DEFAULT_PORTS = {"https": 443, "socks5h": 1080, "socks5": 1080}
-
-#: How long ``accept`` waits before the serving loop looks at its stop flag.
-_ACCEPT_POLL_S = 0.2
 
 #: Bytes one copy step carries.
 _BUFFER_BYTES = 64 * 1024
@@ -226,16 +225,23 @@ class Bridge:
         self._closed = False
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            self._listener.bind(("127.0.0.1", 0))
-            self._listener.listen(64)
-            self._listener.settimeout(_ACCEPT_POLL_S)
+            self._wake_r, self._wake_w = socket.socketpair()
+            try:
+                self._wake_w.setblocking(False)
+                self._listener.bind(("127.0.0.1", 0))
+                self._listener.listen(64)
+                self._listener.setblocking(False)
+                self._thread = threading.Thread(
+                    target=self._serve, name="proxy-bridge", daemon=True
+                )
+                self._thread.start()
+            except BaseException:
+                self._wake_r.close()
+                self._wake_w.close()
+                raise
         except BaseException:
             self._listener.close()
             raise
-        self._thread = threading.Thread(
-            target=self._serve, name="proxy-bridge", daemon=True
-        )
-        self._thread.start()
 
     # -- public surface ---------------------------------------------------
 
@@ -267,15 +273,28 @@ class Bridge:
                 return
             self._closed = True
             self._stop.set()
-        _close_socket(self._listener)
+            # Leave the byte unread so every waiter sees the same wakeup.
+            try:
+                self._wake_w.send(b"\x00")
+            except OSError:
+                pass
         self._thread.join(5.0)
+        _close_socket(self._listener)
         with self._lock:
             connections = list(self._connections)
             workers = list(self._workers)
+        # Release blocking pumps without invalidating descriptors in select.
         for connection in connections:
-            _close_socket(connection)
+            _shutdown_socket(connection)
         for worker in workers:
             worker.join(5.0)
+        with self._lock:
+            remaining = list(self._connections)
+            self._connections.clear()
+        for connection in remaining:
+            _close_socket(connection)
+        self._wake_r.close()
+        self._wake_w.close()
 
     def __enter__(self) -> "Bridge":
         return self
@@ -288,8 +307,9 @@ class Bridge:
     def _serve(self) -> None:
         while not self._stop.is_set():
             try:
+                _wait_io(self._listener, self, None)
                 client, _address = self._listener.accept()
-            except TimeoutError:
+            except BlockingIOError:
                 continue
             except OSError:
                 return
@@ -315,12 +335,8 @@ class Bridge:
         upstream: socket.socket | None = None
         upload: threading.Thread | None = None
         try:
-            # The listener polls, so an accepted socket can carry that timeout
-            # in some interpreter/OS combinations; a connection here must
-            # block for as long as its peer does, or an idle moment reads as
-            # end-of-stream and truncates the reply being copied. It runs
-            # inside the ``try`` because :meth:`close` closes this socket from
-            # the thread that owns the bridge, which fails the call.
+            # An accepted socket can inherit the listener's nonblocking mode.
+            # The client side and the pumps must wait as long as their peers do.
             client.settimeout(None)
             head, rest = _read_head(client)
             request = _parse_head(head)
@@ -441,7 +457,20 @@ class Bridge:
             self._connections.discard(raw)
             self._connections.add(tls)
         try:
-            tls.do_handshake()
+            deadline = time.monotonic() + tls.gettimeout()
+            tls.setblocking(False)
+            while True:
+                try:
+                    tls.do_handshake()
+                    break
+                except ssl.SSLWantReadError:
+                    _wait_io(tls, self, deadline)
+                except ssl.SSLWantWriteError:
+                    _wait_io(tls, self, deadline, want_write=True)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out")
+            tls.settimeout(remaining)
         except BaseException:
             self._untrack(tls)
             _close_socket(tls)
@@ -465,8 +494,61 @@ class _Request:
         self.headers = headers
 
 
+def _wait_io(
+    sock: socket.socket,
+    bridge: Bridge | None,
+    deadline: float | None,
+    want_write: bool = False,
+) -> None:
+    """Wait for socket readiness or the bridge's shared close signal."""
+    if bridge is not None and bridge._stop.is_set():
+        raise OSError("bridge is closed")
+    if not want_write and isinstance(sock, ssl.SSLSocket) and sock.pending():
+        return
+    readers = [] if want_write else [sock]
+    if bridge is not None:
+        readers.append(bridge._wake_r)
+    writers = [sock] if want_write else []
+    remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+    try:
+        ready, writable, _ = select.select(readers, writers, [], remaining)
+    except ValueError as error:
+        raise OSError("socket cannot be selected") from error
+    if bridge is not None and (bridge._wake_r in ready or bridge._stop.is_set()):
+        raise OSError("bridge is closed")
+    if not ready and not writable:
+        raise TimeoutError("timed out")
+
+
+def _recv(
+    connection: socket.socket, size: int, bridge: Bridge | None, deadline: float | None
+) -> bytes:
+    if bridge is None or deadline is None:
+        return connection.recv(size)
+    # Readiness need not mean a full TLS record is available. Let only select
+    # wait, so even a partial record cannot stall close().
+    timeout = connection.gettimeout()
+    connection.setblocking(False)
+    try:
+        want_write = False
+        while True:
+            _wait_io(connection, bridge, deadline, want_write)
+            try:
+                return connection.recv(size)
+            except (BlockingIOError, ssl.SSLWantReadError):
+                want_write = False
+            except ssl.SSLWantWriteError:
+                want_write = True
+    finally:
+        if not bridge._stop.is_set():
+            connection.settimeout(timeout)
+
+
 def _read_head(
-    connection: socket.socket, data: bytes = b""
+    connection: socket.socket,
+    data: bytes = b"",
+    bridge: Bridge | None = None,
+    deadline: float | None = None,
 ) -> tuple[bytes, bytes]:
     """Read through the blank line, keeping any bytes beyond it."""
     while True:
@@ -475,7 +557,7 @@ def _read_head(
             return data[:end + 4], data[end + 4:]
         if len(data) >= MAX_HEAD_BYTES:
             raise _BadRequest("head too large")
-        chunk = connection.recv(4096)
+        chunk = _recv(connection, 4096, bridge, deadline)
         if not chunk:
             raise _BadRequest("incomplete head")
         data += chunk
@@ -634,12 +716,17 @@ def _drop(connection: socket.socket | None, bridge: Bridge | None) -> None:
 def _close_socket(connection: socket.socket | None) -> None:
     if connection is None:
         return
-    try:
-        socket.socket.shutdown(connection, socket.SHUT_RDWR)
-    except OSError:
-        pass
+    _shutdown_socket(connection)
     try:
         connection.close()
+    except OSError:
+        pass
+
+
+def _shutdown_socket(connection: socket.socket) -> None:
+    # The base method leaves TLS state intact for any concurrent I/O.
+    try:
+        socket.socket.shutdown(connection, socket.SHUT_RDWR)
     except OSError:
         pass
 
@@ -729,7 +816,8 @@ def _https_tunnel(
         if authorization is not None:
             lines.append(f"Proxy-Authorization: {authorization}")
         tls.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
-        _head, rest, status = _response_head(tls)
+        deadline = time.monotonic() + timeout
+        _head, rest, status = _response_head(tls, bridge=bridge, deadline=deadline)
         if status == 200:
             tls.settimeout(None)
             return tls, rest
@@ -740,10 +828,13 @@ def _https_tunnel(
 
 
 def _response_head(
-    connection: socket.socket, rest: bytes = b""
+    connection: socket.socket,
+    rest: bytes = b"",
+    bridge: Bridge | None = None,
+    deadline: float | None = None,
 ) -> tuple[bytes, bytes, int]:
     try:
-        head, rest = _read_head(connection, rest)
+        head, rest = _read_head(connection, rest, bridge, deadline)
     except _BadRequest:
         raise BridgeError(
             "unreachable", "the account's proxy did not send a complete HTTP reply"
@@ -785,11 +876,12 @@ def _socks5_tunnel(
 ) -> socket.socket:
     """A SOCKS5 ``CONNECT`` with remote DNS and optional RFC 1929 auth."""
     socks = _dial(route, timeout, bridge)
+    deadline = time.monotonic() + timeout
     try:
         credentials = _credentials(route)
         methods = [0x00] if credentials is None else [0x00, 0x02]
         socks.sendall(bytes([5, len(methods), *methods]))
-        version, method = _recv_exact(socks, 2)
+        version, method = _recv_exact(socks, 2, bridge, deadline)
         if version != 5:
             raise BridgeError(
                 "unreachable", "the proxy did not answer a SOCKS5 greeting"
@@ -799,7 +891,7 @@ def _socks5_tunnel(
                 "auth", "the SOCKS5 proxy refused every authentication method"
             )
         if method == 0x02:
-            _socks5_authenticate(socks, *credentials)
+            _socks5_authenticate(socks, *credentials, bridge, deadline)
         elif method != 0x00:
             raise BridgeError(
                 "unreachable",
@@ -811,12 +903,14 @@ def _socks5_tunnel(
             + _socks5_address(host)
             + (port & 0xFFFF).to_bytes(2, "big")
         )
-        version, reply, _reserved, address_type = _recv_exact(socks, 4)
+        version, reply, _reserved, address_type = _recv_exact(
+            socks, 4, bridge, deadline
+        )
         if version != 5:
             raise BridgeError(
                 "unreachable", "the proxy did not answer a SOCKS5 reply"
             )
-        _discard_socks5_address(socks, address_type)
+        _discard_socks5_address(socks, address_type, bridge, deadline)
         if reply != 0:
             raise BridgeError(
                 "refused",
@@ -830,12 +924,18 @@ def _socks5_tunnel(
         raise
 
 
-def _socks5_authenticate(socks: socket.socket, username: str, password: str) -> None:
+def _socks5_authenticate(
+    socks: socket.socket,
+    username: str,
+    password: str,
+    bridge: Bridge | None,
+    deadline: float,
+) -> None:
     """RFC 1929 user name/password sub-negotiation."""
     user = _socks5_text(username)
     secret = _socks5_text(password)
     socks.sendall(bytes([1, len(user)]) + user + bytes([len(secret)]) + secret)
-    version, status = _recv_exact(socks, 2)
+    version, status = _recv_exact(socks, 2, bridge, deadline)
     if version != 1 or status != 0:
         raise BridgeError(
             "auth", "the SOCKS5 proxy rejected the user name or password"
@@ -878,27 +978,34 @@ def _socks5_address(host: str) -> bytes:
     return b"\x03" + bytes([len(name)]) + name
 
 
-def _discard_socks5_address(socks: socket.socket, address_type: int) -> None:
+def _discard_socks5_address(
+    socks: socket.socket, address_type: int, bridge: Bridge | None, deadline: float
+) -> None:
     """Read the bound address a SOCKS5 reply carries; nothing uses it."""
     if address_type == 0x01:
-        _recv_exact(socks, 4)
+        _recv_exact(socks, 4, bridge, deadline)
     elif address_type == 0x04:
-        _recv_exact(socks, 16)
+        _recv_exact(socks, 16, bridge, deadline)
     elif address_type == 0x03:
-        (length,) = _recv_exact(socks, 1)
-        _recv_exact(socks, length)
+        (length,) = _recv_exact(socks, 1, bridge, deadline)
+        _recv_exact(socks, length, bridge, deadline)
     else:
         raise BridgeError(
             "unreachable", "the SOCKS5 proxy answered an unknown address type"
         )
-    _recv_exact(socks, 2)  # bound port
+    _recv_exact(socks, 2, bridge, deadline)  # bound port
 
 
-def _recv_exact(connection: socket.socket, size: int) -> bytes:
+def _recv_exact(
+    connection: socket.socket,
+    size: int,
+    bridge: Bridge | None = None,
+    deadline: float | None = None,
+) -> bytes:
     """Exactly ``size`` bytes, or a refusal instead of a short read."""
     data = b""
     while len(data) < size:
-        chunk = connection.recv(size - len(data))
+        chunk = _recv(connection, size - len(data), bridge, deadline)
         if not chunk:
             raise BridgeError(
                 "unreachable", "the account's proxy closed the connection"

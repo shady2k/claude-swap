@@ -890,11 +890,13 @@ class TestFailureDiagnostics:
     @pytest.mark.parametrize("expected", ["network error", "timeout"])
     def test_bridged_proxy_transport_failure(self, scheme, expected, monkeypatch):
         with socket.socket() as proxy:
-            proxy.bind(("127.0.0.1", 0))
             if expected == "timeout":
+                proxy.bind(("127.0.0.1", 0))
                 # TCP connects, but nothing answers the TLS or SOCKS greeting.
                 proxy.listen()
-            port = proxy.getsockname()[1]
+                port = proxy.getsockname()[1]
+            else:
+                port = proxy_servers.DeadProxy().port
             route = account_proxy.parse(f"{scheme}://user:secret@127.0.0.1:{port}")
             timeout = 0.3 if expected == "timeout" else 5.0
             message = self._expect(

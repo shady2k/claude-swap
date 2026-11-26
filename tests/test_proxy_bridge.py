@@ -126,6 +126,42 @@ class TestTheLocalListener:
                         assert not any(worker.is_alive() for worker in local._workers)
                         assert local.failure is None
 
+    def test_close_cancels_a_blocked_https_connect_reply(self, monkeypatch):
+        proxy_servers.trust_fixture_ca(monkeypatch)
+        waiting = threading.Event()
+        wait_io = proxy_bridge._wait_io
+
+        def observe_wait(sock, bridge, deadline, want_write=False):
+            if isinstance(sock, ssl.SSLSocket):
+                # getpeercert() raises until the TLS handshake is complete.
+                with suppress(ValueError):
+                    sock.getpeercert()
+                    waiting.set()
+            return wait_io(sock, bridge, deadline, want_write)
+
+        monkeypatch.setattr(proxy_bridge, "_wait_io", observe_wait)
+        with socket.create_server(("127.0.0.1", 0)) as listener:
+            listener.settimeout(5)
+            route = account_proxy.parse(f"https://127.0.0.1:{listener.getsockname()[1]}")
+            with proxy_bridge.Bridge(route) as local:
+                with socket.create_connection((local.host, local.port), timeout=5) as client:
+                    client.sendall(b"CONNECT example.test:443 HTTP/1.1\r\n\r\n")
+                    raw, _ = listener.accept()
+                    with raw:
+                        raw.settimeout(5)
+                        with proxy_servers.server_context().wrap_socket(
+                            raw, server_side=True
+                        ) as peer:
+                            assert peer.recv(4096).startswith(b"CONNECT ")
+                            assert waiting.wait(5)
+                            started = time.monotonic()
+                            local.close()
+                            assert time.monotonic() - started < 1
+                            assert not any(worker.is_alive() for worker in local._workers)
+                            assert not local._connections
+                            assert local.failure is None
+                            assert local._wake_r.fileno() == local._wake_w.fileno() == -1
+
     def test_a_disallowed_scheme_is_refused_by_the_transport(self):
         class _Ftp:
             scheme = "ftp"
