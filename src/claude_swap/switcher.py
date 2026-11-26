@@ -5639,8 +5639,11 @@ class ClaudeAccountSwitcher:
             return explicit_route, explicit_expectation
         accounts = data.get("accounts") or {}
         if email is not None:
+            needle = email.strip().lower()
             matches = [
-                rec for rec in accounts.values() if rec.get("email") == email
+                rec
+                for rec in accounts.values()
+                if (rec.get("email") or "").strip().lower() == needle
             ]
             if not matches:
                 return None, None
@@ -5652,7 +5655,7 @@ class ClaudeAccountSwitcher:
                 return next(iter(choices))
             if slot is not None:
                 slot_record = accounts.get(str(slot)) or {}
-                if slot_record.get("email") == email:
+                if (slot_record.get("email") or "").strip().lower() == needle:
                     return (
                         account_proxy.route_for(slot_record),
                         egress.read(slot_record),
@@ -5689,19 +5692,24 @@ class ClaudeAccountSwitcher:
         """Write slot credentials, config and ``sequence.json`` with rollback.
 
         Called with ``self.lock_file`` held after pre-write checks passed.
-        Snapshots an existing occupant sharing ``email`` before writing so a
-        failed write restores it; otherwise deletes only newly written files.
-        Post-commit cleanup of replaced or migrated slots runs under the same
-        lock right after ``sequence.json`` is published, so a concurrent
-        ``move``/``swap`` cannot claim the freed slot before old backups go.
+        For a same-email overwrite, stages durable pre-write copies before the
+        first overwrite so a persistent write outage cannot strand a credential
+        in memory: a clean rollback deletes the staging files, while a failed
+        rollback leaves them on disk and points the user to them. Otherwise
+        deletes only newly written files on failure. Post-commit cleanup of
+        replaced or migrated slots runs under the same lock right after
+        ``sequence.json`` is published, so a concurrent ``move``/``swap``
+        cannot claim the freed slot before old backups go.
         """
         old_email = occupant.get("email", "")
         saved_old: tuple[str, str] | None = None
+        staging: dict[str, Path] = {}
         if occupant and old_email == email:
             saved_old = (
                 self._read_backup_or_abort(account_num, old_email),
                 self._read_account_config(account_num, old_email),
             )
+            staging = self._stage_overlap_material({account_num: saved_old})
 
         try:
             self._write_account_credentials(account_num, email, credentials)
@@ -5729,28 +5737,59 @@ class ClaudeAccountSwitcher:
             data["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, data)
         except BaseException:
-            try:
-                if saved_old is not None:
-                    old_creds, old_config = saved_old
+            failures = 0
+            if saved_old is not None:
+                old_creds, old_config = saved_old
+                try:
                     if old_creds:
                         self._write_account_credentials(
                             account_num, old_email, old_creds
                         )
                     else:
-                        self._delete_account_credentials(account_num, old_email)
+                        self._delete_account_credentials_strict(
+                            account_num, old_email
+                        )
+                except Exception as e:
+                    failures += 1
+                    self._logger.error(
+                        f"Rollback creds restore failed for slot {account_num}: {e}"
+                    )
+                try:
                     if old_config:
                         self._write_account_config(
                             account_num, old_email, old_config
                         )
                     else:
                         self._delete_config_backup(account_num, old_email)
-                else:
+                except Exception as e:
+                    failures += 1
+                    self._logger.error(
+                        f"Rollback config restore failed for slot {account_num}: {e}"
+                    )
+                if not failures and old_creds:
+                    self._store.delete_previous_backup(account_num, old_email)
+            else:
+                try:
                     self._delete_account_credentials(account_num, email)
                     self._delete_config_backup(account_num, email)
-            except Exception as e:
-                self._logger.error(
-                    f"Cleanup after failed {operation} is incomplete: {e}"
-                )
+                except Exception as e:
+                    failures += 1
+                    self._logger.error(
+                        f"Cleanup after failed {operation} is incomplete: {e}"
+                    )
+            if staging:
+                if failures:
+                    kept = ", ".join(str(p) for p in staging.values())
+                    self._logger.error(
+                        f"Rollback incomplete — staged pre-write copies kept for "
+                        f"manual recovery: {kept}"
+                    )
+                    warning(
+                        f"Rollback after failed {operation} was incomplete; "
+                        f"previous credentials are preserved in: {kept}"
+                    )
+                else:
+                    self._discard_staging(staging)
             raise
 
         # Post-commit cleanup under the same lock: the registry now names the
@@ -5773,6 +5812,8 @@ class ClaudeAccountSwitcher:
             self._best_effort_cleanup(
                 migrate_from, migrate_email, "migrated slot"
             )
+        if staging:
+            self._discard_staging(staging)
 
     def _commit_login_slot(
         self,

@@ -541,6 +541,44 @@ class TestAddLogin:
         switcher.add_account_via_login(slot=3, email="b@example.com")
         assert record["env"]["HTTPS_PROXY"] == "http://127.0.0.1:3129"
 
+    def test_email_lookup_for_proxy_is_case_insensitive(
+        self, temp_home, claude_bin, checks_pass, monkeypatch,
+    ):
+        switcher = _switcher()
+        _seed(switcher, {
+            "1": _account("live@example.com"),
+            "2": _account(
+                "b@example.com",
+                org="org-b",
+                proxy="http://127.0.0.1:3128",
+                proxy_expected_country="US",
+            ),
+        })
+        record = {}
+        b_config = json.dumps({
+            "oauthAccount": {
+                "emailAddress": "b@example.com",
+                "accountUuid": "uuid-b@example.com",
+                "organizationUuid": "org-b",
+                "organizationName": "Org B",
+            }
+        })
+        monkeypatch.setattr(
+            "claude_swap.login.spawn.run",
+            _login_mock(record, config=b_config),
+        )
+
+        switcher.add_account_via_login(email="b@EXAMPLE.COM")
+
+        route = account_proxy.parse("http://127.0.0.1:3128")
+        assert [r.text() for r in checks_pass["probe"]] == [route.text()]
+        assert len(checks_pass["egress"]) == 1
+        assert checks_pass["egress"][0][0].text() == route.text()
+        assert checks_pass["egress"][0][1] == egress.Expectation(country="US")
+        assert record["env"]["HTTPS_PROXY"] == route.text()
+        assert "--email" in record["argv"]
+        assert record["argv"][record["argv"].index("--email") + 1] == "b@EXAMPLE.COM"
+
     def test_a_stored_expectation_without_a_proxy_refuses_before_claude(
         self, temp_home, claude_bin, monkeypatch,
     ):
@@ -926,6 +964,7 @@ class TestLoginCommitSafety:
         assert switcher._read_account_config(
             "2", "new@example.com"
         ) == self.OLD_CONFIG
+        assert not list(switcher.credentials_dir.glob(".swap-staging-*"))
 
     def test_a_refresh_failure_keeps_the_slots_old_files(
         self, temp_home, claude_bin, checks_pass, monkeypatch,
@@ -1255,6 +1294,116 @@ class TestLoginCommitSafety:
         assert switcher._read_account_config(
             "2", "new@example.com"
         ) == self.OLD_CONFIG
+
+    @pytest.mark.parametrize("use_login", [True, False], ids=["login", "plain"])
+    def test_same_email_write_and_rollback_failure_keeps_staging_files(
+        self, temp_home, claude_bin, checks_pass, monkeypatch, capsys, caplog, use_login,
+    ):
+        switcher = _switcher()
+        _seed(switcher, {
+            "1": _account("live@example.com"),
+            "2": _account(
+                "new@example.com", org="org-old", org_name="Old Org"
+            ),
+        })
+        self._seed_files(switcher, "2", "new@example.com")
+        before = switcher.sequence_file.read_bytes()
+
+        real_write_creds = switcher._write_account_credentials
+        cred_calls = {"n": 0}
+
+        def fail_on_rollback_creds(num, email, creds):
+            cred_calls["n"] += 1
+            if cred_calls["n"] >= 2:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real_write_creds(num, email, creds)
+
+        def fail_config(num, email, config):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(
+            switcher, "_write_account_credentials", fail_on_rollback_creds
+        )
+        monkeypatch.setattr(switcher, "_write_account_config", fail_config)
+
+        if use_login:
+            monkeypatch.setattr("claude_swap.login.spawn.run", _login_mock({}))
+            with pytest.raises(OSError) as exc:
+                switcher.add_account_via_login(slot=2, assume_yes=True)
+        else:
+            monkeypatch.setattr(
+                "claude_swap.switcher.ClaudeAccountSwitcher._read_capture_credentials",
+                lambda self: NEW_CREDS,
+            )
+            config_path = switcher._get_claude_config_path()
+            config_path.write_text(NEW_CONFIG, encoding="utf-8")
+            with pytest.raises(OSError) as exc:
+                switcher.add_account(slot=2, assume_yes=True)
+
+        assert exc.value.errno == errno.ENOSPC
+        assert switcher.sequence_file.read_bytes() == before
+        assert switcher._get_sequence_data()["accounts"]["2"]["organizationUuid"] == "org-old"
+        # The new credential was written before config failed and the rollback
+        # write also failed, so the durable staging files must survive on disk
+        # and their paths must be reported to the user and logged.
+        staged_creds = switcher.credentials_dir / ".swap-staging-creds-2.json"
+        staged_config = switcher.credentials_dir / ".swap-staging-config-2.json"
+        assert staged_creds.read_text(encoding="utf-8") == self.OLD_CREDS
+        assert staged_config.read_text(encoding="utf-8") == self.OLD_CONFIG
+        if sys.platform != "win32":
+            assert stat.S_IMODE(staged_creds.stat().st_mode) == 0o600
+            assert stat.S_IMODE(staged_config.stat().st_mode) == 0o600
+        out = capsys.readouterr().out
+        assert str(staged_creds) in out
+        assert str(staged_config) in out
+        assert str(staged_creds) in caplog.text
+
+    def test_same_email_staging_failure_aborts_before_any_write(
+        self, temp_home, claude_bin, checks_pass, monkeypatch,
+    ):
+        switcher = _switcher()
+        _seed(switcher, {
+            "1": _account("live@example.com"),
+            "2": _account(
+                "new@example.com", org="org-old", org_name="Old Org"
+            ),
+        })
+        self._seed_files(switcher, "2", "new@example.com")
+        leftover = switcher.credentials_dir / ".swap-staging-creds-2.json"
+        leftover.write_text(self.OLD_CREDS, encoding="utf-8")
+        before = switcher.sequence_file.read_bytes()
+
+        monkeypatch.setattr("claude_swap.login.spawn.run", _login_mock({}))
+        monkeypatch.setattr(
+            switcher,
+            "_write_account_credentials",
+            lambda *a, **k: pytest.fail("credential write ran despite leftover staging"),
+        )
+
+        with pytest.raises(ConfigError, match="Found leftover staging"):
+            switcher.add_account_via_login(slot=2, assume_yes=True)
+
+        assert switcher.sequence_file.read_bytes() == before
+        assert leftover.read_text(encoding="utf-8") == self.OLD_CREDS
+        assert switcher._read_account_credentials("2", "new@example.com") == self.OLD_CREDS
+
+    def test_same_email_success_discards_staging_files(
+        self, temp_home, claude_bin, checks_pass, monkeypatch,
+    ):
+        switcher = _switcher()
+        _seed(switcher, {
+            "1": _account("live@example.com"),
+            "2": _account(
+                "new@example.com", org="org-old", org_name="Old Org"
+            ),
+        })
+        self._seed_files(switcher, "2", "new@example.com")
+        monkeypatch.setattr("claude_swap.login.spawn.run", _login_mock({}))
+
+        switcher.add_account_via_login(slot=2, assume_yes=True)
+
+        assert not list(switcher.credentials_dir.glob(".swap-staging-*"))
+        assert switcher._get_sequence_data()["accounts"]["2"]["organizationUuid"] == "org-new"
 
 class TestIsolatedProfileCleanup:
     def test_the_directory_is_removed_on_success_and_on_error(self):
