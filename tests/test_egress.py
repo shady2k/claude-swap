@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import socket
 import socketserver
+import ssl
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
@@ -29,6 +30,7 @@ import pytest
 from claude_swap import account_proxy, cli, egress
 from claude_swap.exceptions import EgressCheckError
 from claude_swap.switcher import ClaudeAccountSwitcher
+from tests import proxy_servers
 
 
 # --- local servers -----------------------------------------------------------
@@ -827,3 +829,155 @@ class TestJsonFields:
         payload = switcher.list_accounts(json_output=True)
         row = next(a for a in payload["accounts"] if a["number"] == 1)
         assert row["proxyExpected"].startswith("invalid (")
+
+
+# --- what a failed request is called -----------------------------------------
+
+
+class TestFailureDiagnostics:
+    """Each refusal names its cause, and no more than its cause.
+
+    A proxy's status phrase and a certificate error's text are the peer's
+    words — a phrase can name a credential — so only the code travels.
+    """
+
+    def _expect(self, route, endpoint, monkeypatch, timeout=5.0):
+        monkeypatch.setattr(
+            egress, "ENDPOINTS", (egress.Endpoint(endpoint),)
+        )
+        with pytest.raises(EgressCheckError) as err:
+            egress.check(
+                route,
+                egress.read({egress.IP_FIELD: "1.2.3.4"}),
+                timeout=timeout,
+            )
+        return str(err.value)
+
+    def test_a_refused_connect_keeps_only_its_code(self, monkeypatch):
+        with proxy_servers.HttpProxy(refuse=403) as proxy:
+            route = account_proxy.parse(proxy.url)
+            dead = proxy_servers.DeadProxy()
+            message = self._expect(
+                route, f"https://127.0.0.1:{dead.port}/json", monkeypatch
+            )
+            assert proxy.url not in message
+
+        assert "CONNECT HTTP 403" in message
+        assert "Refused" not in message  # the proxy's own phrase
+
+    def test_a_tls_failure_is_a_tls_error(self, monkeypatch):
+        with proxy_servers.HttpProxy() as proxy:
+            with proxy_servers.Origin(tls=False) as origin:
+                route = account_proxy.parse(proxy.url)
+                message = self._expect(
+                    route, f"https://127.0.0.1:{origin.port}/json", monkeypatch
+                )
+
+        assert "TLS error" in message
+
+    def test_an_unreachable_proxy_is_a_network_error(self, monkeypatch):
+        dead = proxy_servers.DeadProxy()
+        route = account_proxy.parse(f"http://127.0.0.1:{dead.port}")
+        with proxy_servers.Origin() as origin:
+            message = self._expect(
+                route, f"{origin.url}/json", monkeypatch
+            )
+
+        assert "network error" in message
+        assert origin.hits == 0
+
+    @pytest.mark.parametrize("scheme", ["https", "socks5h"])
+    @pytest.mark.parametrize("expected", ["network error", "timeout"])
+    def test_bridged_proxy_transport_failure(self, scheme, expected, monkeypatch):
+        with socket.socket() as proxy:
+            if expected == "timeout":
+                proxy.bind(("127.0.0.1", 0))
+                # TCP connects, but nothing answers the TLS or SOCKS greeting.
+                proxy.listen()
+                port = proxy.getsockname()[1]
+            else:
+                port = proxy_servers.DeadProxy().port
+            route = account_proxy.parse(f"{scheme}://user:secret@127.0.0.1:{port}")
+            timeout = 0.3 if expected == "timeout" else 5.0
+            message = self._expect(
+                route, "https://127.0.0.1:443/json", monkeypatch, timeout=timeout
+            )
+
+        assert expected in message
+        assert "ConnectionRefusedError" not in message
+        assert "secret" not in message
+
+    def test_a_silent_https_proxy_is_a_timeout_under_a_verifying_wrap_context(
+        self, monkeypatch
+    ):
+        """A context that verifies the peer inside ``wrap_socket`` —
+        ``truststore`` on macOS and Windows — must still report a proxy that
+        never answers as a timeout, not as a TLS failure."""
+        proxy_servers.trust_fixture_ca(
+            monkeypatch, proxy_servers.verifying_context()
+        )
+        with socket.socket() as proxy:
+            proxy.bind(("127.0.0.1", 0))
+            proxy.listen()
+            route = account_proxy.parse(
+                f"https://user:secret@127.0.0.1:{proxy.getsockname()[1]}"
+            )
+            message = self._expect(
+                route, "https://127.0.0.1:443/json", monkeypatch, timeout=0.3
+            )
+
+        assert "timeout" in message
+        assert "TLS error" not in message
+        assert "secret" not in message
+
+    def test_an_untrusted_https_proxy_certificate_is_a_tls_error(self, monkeypatch):
+        proxy_servers.trust_fixture_ca(monkeypatch)
+        with proxy_servers.HttpProxy(
+            tls=True, context=proxy_servers.untrusted_context(),
+        ) as proxy:
+            route = account_proxy.parse(f"https://user:secret@127.0.0.1:{proxy.port}")
+            with proxy_servers.Origin(tls=True) as origin:
+                message = self._expect(route, f"{origin.url}/json", monkeypatch)
+                assert origin.hits == 0
+
+        assert "TLS error" in message
+        assert "secret" not in message
+
+    def test_a_service_redirect_inside_a_tls_proxy_tunnel(self, monkeypatch):
+        proxy_servers.trust_fixture_ca(monkeypatch)
+        with proxy_servers.HttpProxy(tls=True) as proxy:
+            route = account_proxy.parse(f"https://127.0.0.1:{proxy.port}")
+            with proxy_servers.Origin(tls=True, status=302) as origin:
+                message = self._expect(route, f"{origin.url}/json", monkeypatch)
+
+        assert message.endswith(": redirect")
+
+    def test_a_service_that_never_answers_is_a_timeout(self, monkeypatch):
+        """The proxy opens the tunnel and then says nothing at all."""
+        with proxy_servers.SilentProxy() as proxy:
+            route = account_proxy.parse(proxy.url)
+            message = self._expect(
+                route, "https://127.0.0.1:443/json", monkeypatch, timeout=0.3
+            )
+
+        assert "timeout" in message
+
+    @pytest.mark.parametrize(
+        ("reason", "expected"),
+        [
+            (TimeoutError(), "timeout"),
+            (ConnectionRefusedError(), "network error"),
+            (OSError("Tunnel connection failed: 407 Nope"), "CONNECT HTTP 407"),
+            (ssl.SSLError("handshake"), "TLS error"),
+            (
+                ssl.SSLCertVerificationError("untrusted: proxy-password"),
+                "TLS error",
+            ),
+        ],
+    )
+    def test_the_reason_mapping(self, reason, expected):
+        assert egress._transport_failure(reason) == expected
+
+    def test_a_tls_reason_never_repeats_its_text(self):
+        reason = ssl.SSLCertVerificationError("hostname 'secret.example'")
+        assert "secret.example" not in egress._transport_failure(reason)

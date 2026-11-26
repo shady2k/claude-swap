@@ -18,12 +18,16 @@ A route is pinned rather than negotiated:
 - an unreachable proxy, a 407, or a stored value that does not parse is an
   error the caller reports — never a fallback to a direct connection.
 
-Only ``http://`` proxies are accepted. urllib can tunnel an HTTPS request
-through an HTTP proxy (``CONNECT``), but cannot speak TLS to the proxy
-itself, so an ``https://`` value would only fail later, once per request.
-Credentials are optional (``http://user:pass@host:port``) and travel as
-``Proxy-Authorization`` on the tunnel; the account's own OAuth token and the
-API keys are never sent to the proxy.
+Four schemes are accepted. ``http://`` is the direct one: urllib tunnels an
+HTTPS request through it (``CONNECT``) by itself. ``https://`` and
+``socks5h://``/``socks5://`` are schemes urllib cannot speak, so a request on
+one of them runs through ``proxy_bridge`` — a local HTTP proxy on
+``127.0.0.1:0`` that talks to the account's real proxy and copies the bytes
+(see :func:`bridge` and the module docstring of ``proxy_bridge.py``). The
+schemes with no such transport are refused when the value is stored.
+Credentials are optional (``user:pass@`` in any of them) and travel as
+``Proxy-Authorization`` on an HTTP tunnel, or by RFC 1929 to a SOCKS5 proxy;
+the account's own OAuth token and the API keys are never sent to the proxy.
 
 How the request is placed on the route, measured with CPython 3.14's
 ``urllib.request`` (3.12–3.14 share this code): :meth:`Request.set_proxy`
@@ -44,31 +48,44 @@ wherever it leaves the process, and it never enters an export; see
 :func:`describe` and ``docs/json-output.md``.
 
 The same route serves a launch, in two more shapes. :func:`probe` is the
-pre-start check: one ``CONNECT`` to :data:`PROBE_TARGET`, so an unreachable or
+pre-start check: one tunnel to :data:`PROBE_TARGET`, so an unreachable or
 misconfigured proxy refuses the launch before Claude Code starts.
 :func:`launch_env` is the other half — the variables Claude Code reads a proxy
-from, written in both spellings over whatever the shell carried. Nothing here
-forbids a direct connection at the OS level, so a program that ignores these
-variables still goes out directly (``docs/proxy.md``).
+from, written in both spellings over whatever the shell carried. For a scheme
+that needs the bridge those variables carry the bridge's loopback address, not
+the account's URL: the proxy password never enters the child's environment,
+and the bridge lives exactly as long as the child (:func:`bridge`). Nothing
+here forbids a direct connection at the OS level, so a program that ignores
+these variables still goes out directly (``docs/proxy.md``).
 """
 
 from __future__ import annotations
 
 import base64
 import http.client
+import io
 import re
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
+
+from claude_swap import proxy_bridge
 
 #: The ``sequence.json`` account field. Absent means "direct", which is how
 #: every account behaved before this setting existed.
 FIELD = "proxy"
 
-#: Default port of an ``http://`` proxy URL without one.
-DEFAULT_PORT = 80
+#: Default port of each accepted scheme, for a URL without one.
+DEFAULT_PORTS = {"http": 80, "https": 443, "socks5h": 1080, "socks5": 1080}
+
+#: The schemes urllib cannot speak and ``proxy_bridge`` therefore carries.
+#: ``socks5://`` is an alias of ``socks5h://``: this module only ever sends the
+#: target as a domain, so both mean "remote DNS".
+BRIDGED_SCHEMES = frozenset({"https", "socks5h", "socks5"})
 
 #: ``ProxyRouteError.kind`` values. They reach the usage store as
 #: ``last_error``, so they are stable tokens (see ``ERROR_NOTES`` in
@@ -108,18 +125,22 @@ class ProxyRouteError(Exception):
     network outcome — none of these may be retried directly.
     """
 
-    def __init__(self, kind: str, message: str):
+    def __init__(self, kind: str, message: str, status: int | None = None):
         super().__init__(message)
         self.kind = kind
+        #: The HTTP status the proxy refused a ``CONNECT`` with, when that is
+        #: what happened: the code, never the proxy's phrase. ``egress.py``
+        #: reports it as ``CONNECT HTTP <code>`` and nothing here repeats it.
+        self.status = status
 
 
 class _NoRedirects(urllib.request.HTTPRedirectHandler):
     """Refuse every redirect instead of following it.
 
     ``redirect_request`` returning None is urllib's documented way to stop a
-    redirect: the reply continues down the handler chain and surfaces as the
-    original ``HTTPError``, which :meth:`ProxyRoute.open` turns into a
-    :data:`PROXY_REDIRECT` failure.
+    redirect: the reply continues down the handler chain and surfaces as an
+    ``HTTPError``. A proxy's redirect is reported by :meth:`ProxyRoute.open`
+    as :data:`PROXY_REDIRECT`.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -138,10 +159,20 @@ class ProxyRoute:
     """
 
     host: str = ""
-    port: int = DEFAULT_PORT
+    port: int = DEFAULT_PORTS["http"]
     username: str | None = None
     password: str | None = None
     invalid: str | None = None
+    scheme: str = "http"
+
+    @property
+    def needs_bridge(self) -> bool:
+        """Whether this route's requests travel a local ``proxy_bridge``.
+
+        An ``http://`` route (and an unusable one, which raises before it gets
+        this far) keeps the direct ``urllib`` path it always had.
+        """
+        return self.scheme in BRIDGED_SCHEMES
 
     @property
     def authorization(self) -> str | None:
@@ -165,7 +196,7 @@ class ProxyRoute:
                 userinfo += ":" + urllib.parse.quote(self.password, safe="")
             userinfo += "@"
         host = f"[{self.host}]" if ":" in self.host else self.host
-        return f"http://{userinfo}{host}:{self.port}"
+        return f"{self.scheme}://{userinfo}{host}:{self.port}"
 
     def display(self) -> str:
         """The form shown to people: same URL with the password masked.
@@ -180,7 +211,7 @@ class ProxyRoute:
         if self.username is not None:
             userinfo = urllib.parse.quote(self.username, safe="") + ":***@"
         host = f"[{self.host}]" if ":" in self.host else self.host
-        return f"http://{userinfo}{host}:{self.port}"
+        return f"{self.scheme}://{userinfo}{host}:{self.port}"
 
     def open(self, request: urllib.request.Request, timeout: float = 5.0):
         """Send ``request`` through this proxy, refusing to go direct.
@@ -190,18 +221,26 @@ class ProxyRoute:
         built for this one attempt — every caller in ``oauth.py`` and
         ``subscription.py`` does.
 
+        An ``http://`` route is handed to urllib as it always was. The other
+        schemes run through a :func:`bridge` opened for this one request: the
+        request goes to the loopback address, and the bridge speaks to the
+        account's real proxy.
+
         Raises:
-            ProxyRouteError: the stored value is unusable, the proxy asked for
-                credentials it rejected (407), or it redirected. Transport
-                failures of the connection itself stay ``URLError``/
-                ``HTTPError``, so the existing classification (timeout,
-                certificate, network) keeps working.
+            ProxyRouteError: the stored value is unusable, the proxy rejected
+                its credentials (407), redirected, or could not be used.
+            urllib.error.URLError: the connection failed, including refusal
+                of an ``https://`` proxy's certificate before any request to
+                the target.
+            urllib.error.HTTPError: the target returned an HTTP error.
         """
         if self.invalid is not None:
             raise ProxyRouteError(
                 PROXY_INVALID,
                 f"the account's proxy setting is unusable: {self.invalid}",
             )
+        if self.needs_bridge:
+            return self._open_through_bridge(request, timeout)
         request.set_proxy(f"{self.host}:{self.port}", "http")
         authorization = self.authorization
         if authorization is not None:
@@ -219,6 +258,7 @@ class ProxyRoute:
                     PROXY_REDIRECT,
                     f"the proxy answered HTTP {e.code} instead of forwarding "
                     "the request",
+                    status=e.code,
                 ) from None
             raise
         except urllib.error.URLError as e:
@@ -229,7 +269,7 @@ class ProxyRoute:
             # (measured on CPython 3.12-3.14). The phrase is the proxy's own
             # text and can name a credential, so only the code survives this
             # boundary; the rest of the message is ours.
-            status = _tunnel_status(e.reason)
+            status = tunnel_status(e.reason)
             if status is None:
                 raise
             if status == "407":
@@ -237,12 +277,14 @@ class ProxyRoute:
                     PROXY_AUTH,
                     "the proxy rejected the credentials in its URL "
                     "(HTTP 407 to CONNECT)",
+                    status=407,
                 ) from None
             if status.isdigit() and 300 <= int(status) < 400:
                 raise ProxyRouteError(
                     PROXY_REDIRECT,
                     f"the proxy answered HTTP {status} to CONNECT instead of "
                     "opening the tunnel",
+                    status=int(status),
                 ) from None
             raise urllib.error.URLError(
                 f"the proxy refused the CONNECT tunnel (HTTP {status})"
@@ -250,29 +292,183 @@ class ProxyRoute:
                 else "the proxy refused the CONNECT tunnel"
             ) from None
 
+    def _open_through_bridge(
+        self, request: urllib.request.Request, timeout: float
+    ):
+        """``open`` for a scheme urllib cannot speak: one bridge, one request.
+
+        The local client only ever sees a status code for an upstream failure,
+        so the bridge keeps the typed error for this process. A refused tunnel
+        maps to a proxy error kind, and TLS failures use ``URLError`` for the
+        OAuth classifications.
+
+        A successful response carries the bridge (see :class:`_BridgedResponse`)
+        while its body is read. A target HTTP error is buffered here so its
+        headers and body stay readable after the bridge closes.
+        """
+        local = proxy_bridge.Bridge(self, timeout=timeout)
+        request.set_proxy(f"{local.host}:{local.port}", "http")
+        try:
+            response = _opener().open(request, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            body = b""
+            try:
+                # The bridge records upstream refusals before replying. Only
+                # read a target's error body, while the tunnel is still open.
+                if local.failure is None:
+                    body = e.read()
+            except Exception:
+                # An unreadable body is not a verdict on the credential.
+                pass
+            finally:
+                try:
+                    e.close()
+                finally:
+                    local.close()
+            raise_failure(local.failure)
+            raise urllib.error.HTTPError(
+                e.url, e.code, e.msg, e.hdrs, io.BytesIO(body)
+            ) from None
+        except urllib.error.URLError:
+            local.close()
+            raise_failure(local.failure)
+            raise
+        except BaseException:
+            local.close()
+            raise
+        return _BridgedResponse(response, local)
+
 
 _TUNNEL_REFUSED = "Tunnel connection failed: "
 
+#: :meth:`ProxyRoute.open`'s own sentence for a tunnel the proxy answered with
+#: another status. Re-read by :func:`tunnel_status`, so the code survives even
+#: though the proxy's phrase does not.
+_OUR_TUNNEL_REFUSAL = re.compile(
+    r"^the proxy refused the CONNECT tunnel \(HTTP (\d{3})\)$"
+)
 
-def _tunnel_status(reason: object) -> str | None:
-    """The status of a refused CONNECT tunnel, from http.client's message.
+
+def tunnel_status(reason: object) -> str | None:
+    """The status of a refused CONNECT tunnel, from a failure's own text.
 
     ``HTTPConnection._tunnel`` raises ``OSError`` whose message is "Tunnel
     connection failed: <code> <phrase>" for every reply other than 200, and
     only the leading code is kept: the phrase is the proxy's text, which this
-    module never repeats. Anything else — a refused connection, a timeout —
-    is not a tunnel reply and returns None.
+    module never repeats. Reading a reply through urllib ends with that
+    ``OSError`` as a ``URLError``'s reason, while :meth:`ProxyRoute.open`
+    re-raises a 4xx/5xx refusal as a ``URLError`` whose reason is this
+    module's own static sentence — both shapes are read here, and neither can
+    carry the proxy's phrase.
+
+    ``egress.check`` reads the code the same way, so a refused tunnel is
+    reported as ``CONNECT HTTP <code>`` rather than a bare network failure.
+    Anything else — a refused connection, a timeout — is not a tunnel reply
+    and returns None.
     """
-    if not isinstance(reason, OSError):
+    if isinstance(reason, OSError):
+        text = str(reason)
+        if text.startswith(_TUNNEL_REFUSED):
+            return text[len(_TUNNEL_REFUSED):].split(" ", 1)[0]
         return None
-    text = str(reason)
-    if not text.startswith(_TUNNEL_REFUSED):
-        return None
-    return text[len(_TUNNEL_REFUSED):].split(" ", 1)[0]
+    if isinstance(reason, str):
+        match = _OUR_TUNNEL_REFUSAL.match(reason)
+        if match is not None:
+            return match.group(1)
+    return None
+
+
+#: A bridge failure's kind, in this module's stable ``ProxyRouteError`` tokens.
+_BRIDGE_ERROR_KINDS = {"auth": PROXY_AUTH, "redirect": PROXY_REDIRECT}
+
+
+def raise_failure(failure: BaseException | None) -> None:
+    """Re-raise a bridge's recorded upstream error in this module's terms.
+
+    ``proxy_bridge`` keeps the typed failure because a local HTTP client only
+    ever receives a status code. TLS failures use ``URLError``, as in urllib.
+    ``TLSSetupError`` also tells refresh that the request could not be sent.
+    A refused tunnel becomes the same :class:`ProxyRouteError` kind the
+    direct path raises, with the proxy's own phrase dropped.
+
+    Returns normally when the bridge recorded no failure: the request failed
+    after the tunnel was opened, and that answer belongs to the caller.
+    """
+    if failure is None:
+        return
+    if isinstance(failure, proxy_bridge.TLSSetupError):
+        raise failure from None
+    if isinstance(failure, ssl.SSLError):
+        raise urllib.error.URLError(failure) from None
+    if isinstance(failure, proxy_bridge.BridgeError):
+        raise ProxyRouteError(
+            _BRIDGE_ERROR_KINDS.get(failure.kind, PROXY_UNREACHABLE),
+            str(failure),
+            status=failure.status,
+        ) from None
+    raise ProxyRouteError(
+        PROXY_UNREACHABLE,
+        "the account's proxy could not be used for this request",
+    ) from None
+
+
+class _BridgedResponse:
+    """A bridged request's response, with its bridge in tow.
+
+    ``urllib`` returns from ``open`` as soon as the head of the reply has
+    arrived; the rest of the body is still behind it and travels the bridge.
+    The bridge therefore lives exactly as long as the response does — the same
+    lifetime ``with route.open(...)`` gives it — and closing the response
+    closes it, so neither the loopback listener nor its threads outlive a
+    request. Nothing else about the response changes; every attribute is the
+    wrapped one's.
+    """
+
+    def __init__(self, response, local: proxy_bridge.Bridge):
+        self._response = response
+        self._bridge = local
+
+    def __getattr__(self, name: str):
+        return getattr(self._response, name)
+
+    def __enter__(self) -> "_BridgedResponse":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Close the response and the bridge that carried it."""
+        try:
+            self._response.close()
+        finally:
+            self._bridge.close()
+
+
+@contextmanager
+def bridge(
+    route: "ProxyRoute | None", timeout: float = proxy_bridge.TIMEOUT_S
+) -> Iterator["proxy_bridge.Bridge | None"]:
+    """A local HTTP proxy for a route that needs one, and nothing otherwise.
+
+    Yields ``None`` for a direct or ``http://`` account, so a caller can wrap a
+    request or a launch unconditionally and only the schemes that need the
+    bridge pay for it. The bridge is closed — its listener, every live
+    connection and its threads — when the block ends, whether it returned or
+    raised.
+    """
+    if route is None or not route.needs_bridge:
+        yield None
+        return
+    with proxy_bridge.Bridge(route, timeout=timeout) as instance:
+        yield instance
 
 
 def parse(text: str) -> ProxyRoute:
-    """Parse ``http://[user[:pass]@]host[:port]`` into a :class:`ProxyRoute`.
+    """Parse ``scheme://[user[:pass]@]host[:port]`` into a :class:`ProxyRoute`.
+
+    ``http`` (port 80), ``https`` (443), ``socks5h`` and its alias ``socks5``
+    (1080) are the accepted schemes.
 
     Raises:
         ProxyUrlError: anything else. The message names what is wrong and
@@ -285,11 +481,13 @@ def parse(text: str) -> ProxyRoute:
         raise ProxyUrlError(
             "a proxy URL must include a scheme, e.g. http://host:3128"
         )
-    if raw.split("://", 1)[0].lower() != "http":
+    scheme = raw.split("://", 1)[0].lower()
+    if scheme not in DEFAULT_PORTS:
         # Static: whatever precedes ``://`` may be a mistyped scheme with a
         # credential in it, and this text reaches the log and the JSON.
         raise ProxyUrlError(
-            "only http:// proxies are supported (the URL's scheme must be http)"
+            "the proxy URL's scheme must be one of http, https, socks5h or "
+            "socks5 (e.g. http://host:3128)"
         )
     try:
         parts = urllib.parse.urlsplit(raw)
@@ -307,7 +505,7 @@ def parse(text: str) -> ProxyRoute:
             "(no path, query or fragment)"
         )
     if port is None:
-        port = DEFAULT_PORT
+        port = DEFAULT_PORTS[scheme]
     if not 1 <= port <= 65535:
         raise ProxyUrlError("the proxy port must be between 1 and 65535")
     username = (
@@ -320,7 +518,13 @@ def parse(text: str) -> ProxyRoute:
     )
     if password is not None and username is None:
         raise ProxyUrlError("a proxy password needs a user name before it")
-    return ProxyRoute(host=host, port=port, username=username, password=password)
+    return ProxyRoute(
+        host=host,
+        port=port,
+        username=username,
+        password=password,
+        scheme=scheme,
+    )
 
 
 def unusable(reason: str) -> ProxyRoute:
@@ -401,13 +605,19 @@ def probe(route: ProxyRoute, timeout: float = PROBE_TIMEOUT_S) -> None:
     ``http.client`` reports a refused tunnel as an ``OSError`` whose message is
     "Tunnel connection failed: <code> <phrase>" — the shape
     :meth:`ProxyRoute.open` already classifies through urllib — so
-    :func:`_tunnel_status` reads both and the proxy's own phrase never travels
+    :func:`tunnel_status` reads both and the proxy's own phrase never travels
     on: it may name a credential. Everything else ``http.client`` raises on the
     way to that reply is turned into one static message here: ``BadStatusLine``
     when the port speaks another protocol carries that reply's first line, and
     ``InvalidURL``/``UnicodeError`` when the stored address cannot be turned
     into a connection would otherwise surface as a traceback (measured on
     CPython 3.14).
+
+    For a scheme urllib cannot speak, the one tunnel is opened by
+    ``proxy_bridge`` instead — the same step the bridge takes for every
+    request it carries — and its typed failure comes back as the same kinds.
+    A refused ``https://`` proxy certificate is reported as a TLS error
+    without the certificate's own message.
 
     Raises:
         ProxyRouteError: the stored value is unusable, the proxy rejected the
@@ -419,6 +629,9 @@ def probe(route: ProxyRoute, timeout: float = PROBE_TIMEOUT_S) -> None:
             PROXY_INVALID,
             f"the account's proxy setting is unusable: {route.invalid}",
         )
+    if route.needs_bridge:
+        _probe_through_bridge(route, timeout)
+        return
     headers = (
         {"Proxy-Authorization": route.authorization}
         if route.authorization is not None
@@ -432,11 +645,12 @@ def probe(route: ProxyRoute, timeout: float = PROBE_TIMEOUT_S) -> None:
         connection.set_tunnel(*PROBE_TARGET, headers=headers)
         connection.connect()
     except OSError as e:
-        status = _tunnel_status(e)
+        status = tunnel_status(e)
         if status == "407":
             raise ProxyRouteError(
                 PROXY_AUTH,
                 "the proxy rejected the credentials in its URL (HTTP 407)",
+                status=407,
             ) from None
         if status is not None and status.isdigit():
             if 300 <= int(status) < 400:
@@ -444,11 +658,13 @@ def probe(route: ProxyRoute, timeout: float = PROBE_TIMEOUT_S) -> None:
                     PROXY_REDIRECT,
                     f"the proxy answered HTTP {status} to CONNECT instead of "
                     "opening the tunnel",
+                    status=int(status),
                 ) from None
             raise ProxyRouteError(
                 PROXY_UNREACHABLE,
                 f"the proxy answered HTTP {status} to CONNECT instead of "
                 "opening the tunnel",
+                status=int(status),
             ) from None
         # Not a tunnel reply: refused, unresolvable, timed out. The socket's
         # own text names the address at most, never the URL's credentials.
@@ -469,8 +685,42 @@ def probe(route: ProxyRoute, timeout: float = PROBE_TIMEOUT_S) -> None:
             connection.close()
 
 
+def _probe_through_bridge(route: ProxyRoute, timeout: float) -> None:
+    """``probe`` for a scheme the account's proxy has to be reached for.
+
+    One tunnel and nothing else: no local server, no request, no TLS to the
+    target. A ``https://`` proxy's refused certificate and every transport
+    failure are refusals of the launch, so they arrive as
+    :data:`PROXY_UNREACHABLE` with static text — the certificate's own message
+    names the proxy's host at most, never its URL or password.
+    """
+    tunnel: object = None
+    try:
+        tunnel = proxy_bridge.connect(route, *PROBE_TARGET, timeout=timeout)
+    except proxy_bridge.BridgeError as e:
+        raise ProxyRouteError(
+            _BRIDGE_ERROR_KINDS.get(e.kind, PROXY_UNREACHABLE),
+            str(e),
+            status=e.status,
+        ) from None
+    except ssl.SSLError:
+        raise ProxyRouteError(
+            PROXY_UNREACHABLE, "the proxy could not be reached (TLS error)"
+        ) from None
+    except OSError:
+        raise ProxyRouteError(
+            PROXY_UNREACHABLE, "the proxy could not be reached"
+        ) from None
+    finally:
+        if tunnel is not None:
+            tunnel.close()
+
+
 def launch_env(
-    route: ProxyRoute, no_proxy: str, env: Mapping[str, str]
+    route: ProxyRoute,
+    no_proxy: str,
+    env: Mapping[str, str],
+    bridge: "proxy_bridge.Bridge | None" = None,
 ) -> dict[str, str]:
     """``env`` with the account's proxy in place of whatever it inherited.
 
@@ -482,15 +732,26 @@ def launch_env(
     (``run.noProxy``) is the whole list.
 
     The URL is :meth:`ProxyRoute.text` — credentials included, because that is
-    how a client presents them to a proxy. It is as secret as the stored
-    value and must not be printed or logged.
+    how a client presents them to a proxy — and it is as secret as the stored
+    value. For a scheme that needs the bridge, ``bridge`` is that bridge and
+    the URL is its loopback address: the proxy's password never enters the
+    child's environment, and the child reads the account's proxy through this
+    process. A bridged route without a bridge is refused rather than written
+    with the real URL, which would leak it.
     """
     written = {
         name: value
         for name, value in env.items()
         if name.upper() not in LAUNCH_ENV_NAMES
     }
-    url = route.text()
+    if route.needs_bridge:
+        if bridge is None:
+            raise ValueError(
+                "a bridged proxy needs a running bridge for launch_env"
+            )
+        url = bridge.url
+    else:
+        url = route.text()
     for name in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"):
         written[name] = url
         written[name.lower()] = url

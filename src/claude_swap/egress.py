@@ -22,7 +22,17 @@ per-service reason. A redirect is not the proxy's fault once the request
 travels an HTTPS tunnel: it is that service refusing to answer in place, so
 the chain continues instead of stopping on a route that may still be fine.
 Only a refused route (no connection, 407 on the ``CONNECT``, an unparsable
-stored value) stops the chain, because every service would meet it.
+stored value) stops the chain, because every service would meet it. A refusal
+the route itself carries a status for — an ``https://`` proxy answering this
+target's ``CONNECT`` with 403, say — is that target's answer and moves on to
+the next service.
+
+Each service's reason names the cause, and never the peer's words: ``TLS
+error`` for a refused certificate or another TLS failure, ``CONNECT HTTP
+<code>`` for a tunnel the proxy refused with a status of its own, ``timeout``,
+and ``network error`` for everything else. A proxy's status phrase can name a
+credential and a certificate error's message quotes the host, so neither
+travels.
 
 No rule means no request and no delay: :func:`check` returns before it reads
 an endpoint when :func:`read` gives it nothing, and ``check`` is the only
@@ -45,13 +55,20 @@ from __future__ import annotations
 import http.client
 import ipaddress
 import json
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from claude_swap.account_proxy import PROXY_REDIRECT, ProxyRoute, ProxyRouteError
+from claude_swap.account_proxy import (
+    PROXY_AUTH,
+    PROXY_REDIRECT,
+    ProxyRoute,
+    ProxyRouteError,
+    tunnel_status,
+)
 from claude_swap.exceptions import EgressCheckError
 
 #: The ``sequence.json`` account fields. Either one alone is a rule; both
@@ -318,7 +335,9 @@ def _observe(endpoint: Endpoint, route: ProxyRoute, timeout: float) -> Observati
 
     Raises:
         ProxyRouteError: the route cannot be used. It is the same failure for
-            every endpoint, so the caller stops instead of retrying it.
+            every endpoint, so the caller stops instead of retrying it — except
+            a refused ``CONNECT`` carrying a status, which is this target's
+            answer and lets the next service be asked.
         _EndpointFailed: this endpoint's answer cannot be used; the next one
             may.
     """
@@ -338,14 +357,25 @@ def _observe(endpoint: Endpoint, route: ProxyRoute, timeout: float) -> Observati
             # proxy's: it refuses to answer in place, and the next service may
             # still answer. The redirect is still not followed.
             raise _EndpointFailed("redirect") from None
+        if e.status is not None and e.kind != PROXY_AUTH:
+            # The proxy answered this target's CONNECT with a status of its
+            # own. Only the code travels: the reply's phrase is the proxy's
+            # text. Whether the refusal is this host's or the whole route's is
+            # not knowable here, so the next service is asked. A rejected
+            # credential is the exception: every service would meet it.
+            raise _EndpointFailed(f"CONNECT HTTP {e.status}") from None
         raise
     except urllib.error.HTTPError as e:
         e.close()
+        if 300 <= e.code < 400:
+            raise _EndpointFailed("redirect") from None
         raise _EndpointFailed(f"HTTP {e.code}") from None
     except urllib.error.URLError as e:
-        raise _EndpointFailed(
-            "timeout" if isinstance(e.reason, TimeoutError) else "network error"
-        ) from None
+        raise _EndpointFailed(_transport_failure(e.reason)) from None
+    except ssl.SSLError:
+        # A refused certificate, a TLS alert or a plaintext port on the other
+        # side: the repair is trust or the address, not another round.
+        raise _EndpointFailed("TLS error") from None
     except TimeoutError:
         raise _EndpointFailed("timeout") from None
     except OSError:
@@ -380,6 +410,24 @@ def _observe(endpoint: Endpoint, route: ProxyRoute, timeout: float) -> Observati
     if ip is None and country is None:
         raise _EndpointFailed("no usable IP or country")
     return Observation(ip=ip, country=country)
+
+
+def _transport_failure(reason: object) -> str:
+    """One short reason for a request that did not get an answer.
+
+    The peer's text never travels: a proxy's status phrase may name a
+    credential, and a certificate error's message quotes the host. What is
+    left is the code of a refused ``CONNECT`` tunnel, the word for a TLS
+    failure, ``timeout``, and ``network error`` for everything else.
+    """
+    if isinstance(reason, ssl.SSLError):
+        return "TLS error"
+    status = tunnel_status(reason)
+    if status is not None:
+        return f"CONNECT HTTP {status}"
+    if isinstance(reason, TimeoutError):
+        return "timeout"
+    return "network error"
 
 
 def check(

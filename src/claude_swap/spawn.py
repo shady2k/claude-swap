@@ -41,14 +41,17 @@ holds only until it exits, whether that child is ``ps``, ``security`` or a
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 from collections.abc import Sequence
 from typing import Any
 
 _logger = logging.getLogger("claude-swap")
 
 _FD_DIR = "/dev/fd"
+_SIGNAL_POLL_S = 0.25
 
 # Keyword arguments on which CPython forks regardless, or that change what
 # ``cmd[0]`` means. Such calls are passed through untouched.
@@ -74,11 +77,66 @@ _fallback_logged = False
 
 def run(cmd: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
     """``subprocess.run`` for an argv list; see the module docstring."""
+    cmd, kwargs = _spawn_args(cmd, kwargs)
+    return subprocess.run(cmd, **kwargs)
+
+
+def foreground(
+    cmd: Sequence[str], *, env: dict[str, str], cancel_on_interrupt: bool = False
+) -> int:
+    """Keep the terminal and wait for the child before the caller cleans up.
+
+    Ctrl+C reaches both processes through their foreground group. SIGTERM
+    addressed only to this process is forwarded, including during startup.
+    Only the main thread can install a signal handler. An interrupted login
+    cancels even if the child exits successfully; a session mirrors the
+    child's status.
+    """
+    cmd, kwargs = _spawn_args(cmd, {"env": env})
+    terminated = False
+
+    def request_termination(_signum, _frame):
+        nonlocal terminated
+        terminated = True
+
+    main_thread = threading.current_thread() is threading.main_thread()
+    previous = signal.signal(signal.SIGTERM, request_termination) if main_thread else None
+    # SIGTERM can land on a bridge thread while the main thread is in waitpid.
+    # Wake it within 250 ms to run the Python handler; the child has no deadline.
+    timeout = _SIGNAL_POLL_S if main_thread and os.name == "posix" else None
+    try:
+        process = subprocess.Popen(cmd, **kwargs)
+        forwarded = interrupted = False
+        while True:
+            if terminated and not forwarded:
+                process.send_signal(signal.SIGTERM)
+                forwarded = True
+            try:
+                returncode = process.wait(timeout=timeout)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+            except KeyboardInterrupt:
+                interrupted = True
+        if cancel_on_interrupt:
+            if interrupted:
+                raise KeyboardInterrupt
+            if terminated and returncode == 0:
+                return -signal.SIGTERM
+        return returncode
+    finally:
+        if main_thread:
+            signal.signal(signal.SIGTERM, previous)
+
+
+def _spawn_args(
+    cmd: Sequence[str], kwargs: dict[str, Any]
+) -> tuple[Sequence[str], dict[str, Any]]:
     if _spawn_path_applies(cmd, kwargs):
         executable = _resolve(cmd[0], kwargs.get("env"))
         if executable is not None and not _inheritable_fds_above_stdio():
-            return subprocess.run([executable, *cmd[1:]], close_fds=False, **kwargs)
-    return subprocess.run(cmd, **kwargs)
+            return [executable, *cmd[1:]], {"close_fds": False, **kwargs}
+    return cmd, kwargs
 
 
 def _spawn_path_applies(cmd: Any, kwargs: dict[str, Any]) -> bool:

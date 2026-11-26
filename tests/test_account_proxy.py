@@ -36,7 +36,9 @@ import pytest
 from claude_swap import account_proxy, oauth, subscription
 from claude_swap.exceptions import ValidationError
 from claude_swap.locking import FileLock
-from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.switcher import ClaudeAccountSwitcher, _usage_entry_lines
+from claude_swap.usage_store import UsageEntry
+from tests import proxy_servers
 
 USAGE = {
     "five_hour": {"utilization": 10.0, "resets_at": None},
@@ -97,6 +99,8 @@ class _Recorder(BaseHTTPRequestHandler):
             self.send_header(name, value)
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
+        if server.body_gate is not None and not server.body_gate.wait(5):
+            return
         self.wfile.write(payload)
 
     do_GET = _reply
@@ -112,11 +116,13 @@ class LocalServer:
 
     ``connect``, when given, is the ``(status, phrase)`` a CONNECT gets
     instead of the default 200; the phrase is what the client would put in its
-    error message, so a test can prove it does not travel further.
+    error message, so a test can prove it does not travel further. ``body_gate``
+    can hold back the body until the client begins reading it.
     """
 
     def __init__(
-        self, responder=None, address: str = "127.0.0.1", connect=None
+        self, responder=None, address: str = "127.0.0.1", connect=None,
+        *, body_gate: threading.Event | None = None,
     ):
         self.responder = responder or (lambda method, path: (200, {}, b"{}"))
         self.connect = connect
@@ -125,6 +131,7 @@ class LocalServer:
         self.httpd = ThreadingHTTPServer((address, 0), _Recorder)
         self.httpd.responder = self.responder
         self.httpd.connect = self.connect
+        self.httpd.body_gate = body_gate
         self.httpd.requests = self.requests
         self.httpd.lock = self.lock
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -328,8 +335,8 @@ class TestParse:
             "",
             "   ",
             "127.0.0.1:3128",          # no scheme
-            "https://127.0.0.1:3128",  # urllib cannot speak TLS to the proxy
-            "socks5://127.0.0.1:1080",
+            "ftp://127.0.0.1:3128",  # no transport speaks it
+            "socks4://127.0.0.1:1080",
             "http://",                 # no host
             "http://:3128",
             "http://127.0.0.1:0",
@@ -346,7 +353,7 @@ class TestParse:
 
     def test_the_error_never_repeats_the_password(self):
         with pytest.raises(account_proxy.ProxyUrlError) as err:
-            account_proxy.parse("https://user:secret@127.0.0.1:3128")
+            account_proxy.parse("ftp://user:secret@127.0.0.1:3128")
         assert "secret" not in str(err.value)
 
     def test_absent_field_is_direct(self):
@@ -369,13 +376,110 @@ class TestParse:
 
     def test_a_stored_value_that_does_not_parse_blocks_instead_of_going_direct(self):
         route = account_proxy.route_for(
-            {"proxy": "https://user:secret@127.0.0.1:3128"}
+            {"proxy": "ftp://user:secret@127.0.0.1:3128"}
         )
         assert route is not None and route.invalid
         assert "secret" not in route.display()  # the stored value is not echoed
         with pytest.raises(account_proxy.ProxyRouteError) as err:
             route.open(urllib.request.Request("http://127.0.0.1:1/"))
         assert err.value.kind == account_proxy.PROXY_INVALID
+
+
+class TestScheme:
+    """Which schemes a route accepts, and what each one stores."""
+
+    @pytest.mark.parametrize(
+        ("url", "scheme", "port"),
+        [
+            ("http://proxy.example", "http", 80),
+            ("https://proxy.example", "https", 443),
+            ("socks5h://proxy.example", "socks5h", 1080),
+            ("socks5://proxy.example", "socks5", 1080),
+        ],
+    )
+    def test_each_scheme_has_its_default_port(self, url, scheme, port):
+        route = account_proxy.parse(url)
+        assert route.scheme == scheme
+        assert route.port == port
+
+    @pytest.mark.parametrize(
+        ("typed", "stored"),
+        [
+            ("HTTPS://User:p%40ss@Proxy.Example:8443/",
+             "https://User:p%40ss@proxy.example:8443"),
+            ("socks5h://user:pw@proxy.example:1080",
+             "socks5h://user:pw@proxy.example:1080"),
+            ("socks5://user:pw@proxy.example:1080",
+             "socks5://user:pw@proxy.example:1080"),
+        ],
+    )
+    def test_the_stored_form_round_trips(self, typed, stored):
+        route = account_proxy.parse(typed)
+        assert route.text() == stored
+        assert account_proxy.parse(stored).text() == stored
+
+    @pytest.mark.parametrize(
+        ("url", "shown"),
+        [
+            ("https://user:secret@127.0.0.1:8443",
+             "https://user:***@127.0.0.1:8443"),
+            ("socks5h://user:secret@127.0.0.1:1080",
+             "socks5h://user:***@127.0.0.1:1080"),
+        ],
+    )
+    def test_display_keeps_the_scheme_and_masks_the_password(
+        self, url, shown
+    ):
+        route = account_proxy.parse(url)
+        assert route.display() == shown
+        assert "secret" in route.text()
+
+    @pytest.mark.parametrize(
+        "value",
+        ["ftp://127.0.0.1:21", "socks4://127.0.0.1:1080", "httpss://h:1",
+         "h:3128"],
+    )
+    def test_another_scheme_is_refused_without_echoing_the_url(self, value):
+        with pytest.raises(account_proxy.ProxyUrlError) as err:
+            account_proxy.parse(value)
+        assert value.split("://")[-1] not in str(err.value)
+
+    def test_only_the_bridged_schemes_need_the_bridge(self):
+        assert not account_proxy.parse("http://h:80").needs_bridge
+        for url in ("https://h:443", "socks5h://h:1080", "socks5://h:1080"):
+            assert account_proxy.parse(url).needs_bridge
+
+    def test_a_route_without_a_scheme_field_is_http(self):
+        """Constructors that predate the field stay direct."""
+        route = account_proxy.ProxyRoute(host="127.0.0.1", port=3128)
+        assert route.scheme == "http"
+        assert route.text() == "http://127.0.0.1:3128"
+        assert not route.needs_bridge
+
+
+class TestSchemeStorage:
+    """What a bridged scheme leaves in ``sequence.json``."""
+
+    @pytest.mark.parametrize(
+        ("url", "stored"),
+        [
+            ("https://user:pw@127.0.0.1:8443",
+             "https://user:pw@127.0.0.1:8443"),
+            ("socks5h://user:pw@127.0.0.1:1080",
+             "socks5h://user:pw@127.0.0.1:1080"),
+            ("socks5://127.0.0.1:1080", "socks5://127.0.0.1:1080"),
+        ],
+    )
+    def test_it_is_stored_canonically_and_read_back(
+        self, temp_home: Path, sample_sequence_data: dict, url, stored
+    ):
+        s = _switcher(sample_sequence_data)
+        _num, masked = s.set_account_proxy("1", url)
+        assert s._get_sequence_data()["accounts"]["1"]["proxy"] == stored
+        assert account_proxy.route_for(
+            s._get_sequence_data()["accounts"]["1"]
+        ).text() == stored
+        assert "pw" not in masked
 
 
 class TestRouteTransport:
@@ -499,6 +603,130 @@ class TestRouteTransport:
         assert origin.requests == []
 
 
+class TestBridgedOAuth:
+    @pytest.mark.parametrize("error", ["invalid_grant", "invalid_client"])
+    def test_refresh_reads_the_origins_error(self, monkeypatch, error):
+        def refuses(method, path):
+            return 400, {}, json.dumps({"error": error}).encode()
+
+        with LocalServer(refuses) as origin, proxy_servers.Socks5Proxy() as proxy:
+            _endpoints(monkeypatch, origin.url)
+            route = account_proxy.parse(proxy.url)
+            outcome = oauth.try_refresh_oauth_credentials(CREDS_EXPIRED, route=route)
+
+        assert outcome.error == error
+        assert origin.paths("POST") == ["/v1/oauth/token"]
+        assert proxy.only("CONNECT")["port"] == origin.port
+
+    @pytest.mark.parametrize("body_read_fails", [False, True])
+    def test_usage_retains_a_delayed_error_body_and_retry_after(
+        self, monkeypatch, body_read_fails,
+    ):
+        error = "oauth_not_allowed_for_organization"
+        released = threading.Event()
+        opener = account_proxy._opener()
+        real_open = opener.open
+
+        def open_with_body_gate(*args, **kwargs):
+            try:
+                return real_open(*args, **kwargs)
+            except urllib.error.HTTPError as e:
+                # At this point urllib has parsed the headers but the origin
+                # is still waiting to send the body.
+                read = e.read
+
+                def release_then_read(*args):
+                    released.set()
+                    body = read(*args)
+                    if body_read_fails:
+                        raise http.client.IncompleteRead(body, 1)
+                    return body
+
+                e.read = release_then_read
+                raise
+
+        def refuses(method, path):
+            body = json.dumps({"error": {"details": {"error_code": error}}}).encode()
+            return 403, {"Retry-After": "60"}, body
+
+        monkeypatch.setattr(opener, "open", open_with_body_gate)
+        with (
+            LocalServer(refuses, body_gate=released) as origin,
+            proxy_servers.Socks5Proxy() as proxy,
+        ):
+            _endpoints(monkeypatch, origin.url)
+            route = account_proxy.parse(proxy.url)
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "test@example.com", CREDS_OK, is_active=True, route=route,
+            )
+
+        assert released.is_set()
+        assert outcome.error == ("http-403" if body_read_fails else error)
+        assert outcome.retry_after_s == 60
+        assert origin.paths("GET") == ["/api/oauth/usage"]
+        assert proxy.only("CONNECT")["port"] == origin.port
+
+    def test_proxy_certificate_failure_is_tls_cert_and_never_spends_the_grant(
+        self, monkeypatch, caplog,
+    ):
+        proxy_servers.trust_fixture_ca(monkeypatch)
+        caplog.set_level(logging.DEBUG, logger="claude-swap")
+        with proxy_servers.Origin(tls=True) as origin, proxy_servers.HttpProxy(
+            tls=True, context=proxy_servers.untrusted_context(),
+        ) as proxy:
+            _endpoints(monkeypatch, origin.url)
+            route = account_proxy.parse(f"https://127.0.0.1:{proxy.port}")
+            usage = oauth.try_fetch_usage_for_account(
+                "1", "test@example.com", CREDS_OK, is_active=True, route=route,
+            )
+            refresh = oauth.try_refresh_oauth_credentials(CREDS_EXPIRED, route=route)
+            plan = subscription.fetch_plan("sk-live", route=route)
+
+        assert usage.error == "tls-cert"
+        (line,) = _usage_entry_lines(UsageEntry(last_error=usage.error))
+        assert "SSL_CERT_FILE" in line
+        assert refresh.error == "transient"
+        assert "OAuth refresh not sent: SSLCertVerificationError" in caplog.text
+        assert "may now be spent" not in caplog.text
+        assert "whether the request reached the server is unknown" not in caplog.text
+        assert plan.plan is None
+        assert proxy.recorded() == []  # no CONNECT, let alone an OAuth request
+        assert origin.hits == 0
+
+    @pytest.mark.parametrize("wrap_verifies_peer", [False, True])
+    def test_a_plaintext_port_on_an_https_proxy_is_network_and_never_sends_refresh(
+        self, monkeypatch, caplog, wrap_verifies_peer,
+    ):
+        class _PlaintextProxy(proxy_servers.HttpProxy):
+            def _handle(self, connection):
+                # Read the TLS record before answering so closing the socket
+                # does not reset the connection with the response unread.
+                connection.settimeout(5)
+                header = proxy_servers._recv(connection, 5)
+                proxy_servers._recv(connection, int.from_bytes(header[3:], "big"))
+                connection.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+
+        caplog.set_level(logging.DEBUG, logger="claude-swap")
+        context = (
+            proxy_servers.verifying_context() if wrap_verifies_peer else None
+        )
+        proxy_servers.trust_fixture_ca(monkeypatch, context)
+        with proxy_servers.Origin(tls=True) as origin, _PlaintextProxy() as proxy:
+            _endpoints(monkeypatch, origin.url)
+            route = account_proxy.parse(f"https://127.0.0.1:{proxy.port}")
+            usage = oauth.try_fetch_usage_for_account(
+                "1", "test@example.com", CREDS_OK, is_active=True, route=route,
+            )
+            refresh = oauth.try_refresh_oauth_credentials(CREDS_EXPIRED, route=route)
+
+        assert usage.error == "network"
+        assert refresh.error == "transient"
+        assert "OAuth refresh not sent: SSLError" in caplog.text
+        assert "may now be spent" not in caplog.text
+        assert "whether the request reached the server is unknown" not in caplog.text
+        assert origin.hits == 0
+
+
 # --- the switcher: setting lifecycle ----------------------------------------
 
 
@@ -536,7 +764,7 @@ class TestSettingLifecycle:
         s = _switcher(sample_sequence_data)
         before = s.sequence_file.read_bytes()
         with pytest.raises(ValidationError):
-            s.set_account_proxy("1", "socks5://127.0.0.1:1080")
+            s.set_account_proxy("1", "socks4://127.0.0.1:1080")
         assert s.sequence_file.read_bytes() == before
 
     def test_the_proxy_moves_with_the_account_on_swap_and_move(
@@ -701,7 +929,7 @@ class TestSettingLifecycle:
     ):
         s = _switcher(sample_sequence_data)
         with pytest.raises(ValidationError):
-            s.add_account(slot=3, proxy="https://127.0.0.1:3128")
+            s.add_account(slot=3, proxy="ftp://127.0.0.1:3128")
         assert "3" not in s._get_sequence_data()["accounts"]
 
 
@@ -862,7 +1090,7 @@ class TestRouting:
         _endpoints(monkeypatch, origin.url)
         s = _switcher(sample_sequence_data)
         data = s._get_sequence_data()
-        data["accounts"]["1"]["proxy"] = "socks5://127.0.0.1:1080"
+        data["accounts"]["1"]["proxy"] = "socks4://127.0.0.1:1080"
         s._write_json(s.sequence_file, data)
         record = s._fetch_account_usage(_info(s, 1, CREDS_OK))
         assert record.error == account_proxy.PROXY_INVALID
