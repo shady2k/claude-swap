@@ -603,6 +603,98 @@ class TestRouteTransport:
         assert origin.requests == []
 
 
+class TestTheTargetsHost:
+    """The target sees its own ``Host``, never the proxy's or the bridge's.
+
+    ``Request.set_proxy`` replaces ``request.host`` with the address it was
+    given — the account's proxy on the direct path, the bridge's loopback
+    address on the bridged ones — and urllib builds ``Host`` from that same
+    attribute as it sends (``AbstractHTTPHandler.do_open``: ``sel_host =
+    host``, measured on CPython 3.14). A tunnelled request therefore reached
+    the origin as ``Host: 127.0.0.1:<port>``, and Cloudflare in front of the
+    GeoIP endpoints answered 404/403. Only the origin can see this, so each
+    test reads the headers the origin received.
+    """
+
+    @pytest.mark.parametrize("scheme", ["http", "https", "socks5h"])
+    def test_a_tls_target_reaches_the_origin_with_its_own_host(
+        self, monkeypatch, scheme
+    ):
+        proxy_servers.trust_fixture_ca(monkeypatch)
+        with (
+            proxy_servers.Origin(tls=True) as origin,
+            proxy_servers.proxy_for(scheme) as proxy,
+        ):
+            route = account_proxy.parse(
+                f"{scheme}://user:pw@127.0.0.1:{proxy.port}"
+            )
+            with route.open(
+                urllib.request.Request(f"https://localhost:{origin.port}/json"),
+                timeout=10,
+            ) as response:
+                assert response.status == 200
+            entry = origin.only("GET")
+
+        # One Host, the target's own: the URL names a non-default port, so
+        # the port belongs in the header.
+        assert entry["hosts"] == [f"localhost:{origin.port}"]
+        # The proxy's credentials travel the route, not to the target.
+        assert "proxy-authorization" not in entry["headers"]
+
+    @pytest.mark.parametrize("scheme", ["http", "https", "socks5h"])
+    def test_a_plain_http_target_reaches_the_origin_with_its_own_host(
+        self, monkeypatch, scheme
+    ):
+        proxy_servers.trust_fixture_ca(monkeypatch)
+        with (
+            proxy_servers.Origin() as origin,
+            proxy_servers.proxy_for(scheme) as proxy,
+        ):
+            route = account_proxy.parse(
+                f"{scheme}://user:pw@127.0.0.1:{proxy.port}"
+            )
+            with route.open(
+                urllib.request.Request(f"http://localhost:{origin.port}/json"),
+                timeout=10,
+            ) as response:
+                assert response.status == 200
+            entry = origin.only("GET")
+
+        assert entry["hosts"] == [f"localhost:{origin.port}"]
+        assert "proxy-authorization" not in entry["headers"]
+
+    @pytest.mark.parametrize("scheme", ["http", "https", "socks5h"])
+    def test_a_default_port_stays_out_of_the_host(self, scheme):
+        """``Host`` is the target's authority, port only when the URL has one."""
+        dead = proxy_servers.DeadProxy()
+        route = account_proxy.parse(f"{scheme}://127.0.0.1:{dead.port}")
+        request = urllib.request.Request("https://api.anthropic.com/v1/x")
+        with pytest.raises(
+            (urllib.error.URLError, account_proxy.ProxyRouteError)
+        ):
+            route.open(request, timeout=5)
+        assert request.get_header("Host") == "api.anthropic.com"
+
+    @pytest.mark.parametrize("scheme", ["http", "https", "socks5h"])
+    def test_an_explicit_host_header_is_left_alone(self, monkeypatch, scheme):
+        """A caller's own ``Host`` is why the header is pinned only when absent."""
+        proxy_servers.trust_fixture_ca(monkeypatch)
+        with (
+            proxy_servers.Origin(tls=True) as origin,
+            proxy_servers.proxy_for(scheme) as proxy,
+        ):
+            route = account_proxy.parse(f"{scheme}://127.0.0.1:{proxy.port}")
+            request = urllib.request.Request(
+                f"https://localhost:{origin.port}/json",
+                headers={"Host": "example.test"},
+            )
+            with route.open(request, timeout=10) as response:
+                assert response.status == 200
+            entry = origin.only("GET")
+
+        assert entry["hosts"] == ["example.test"]
+
+
 class TestBridgedOAuth:
     @pytest.mark.parametrize("error", ["invalid_grant", "invalid_client"])
     def test_refresh_reads_the_origins_error(self, monkeypatch, error):

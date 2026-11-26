@@ -2570,6 +2570,20 @@ class TestAliasCommand:
 class TestProxyCommand:
     """`cswap proxy` — set/unset/list an account's HTTP proxy."""
 
+    def test_help_names_every_accepted_scheme(self, capsys):
+        """The URL argument's own line names every scheme the setting takes."""
+        with patch.object(sys, "argv", ["claude-swap", "proxy", "--help"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 0
+        # argparse wraps the help to the terminal's width, so the phrase is
+        # what matters, not where it broke.
+        out = " ".join(capsys.readouterr().out.split())
+        assert (
+            "Proxy URL: http://, https://, or socks5h://[user:pass@]host[:port]"
+            in out
+        )
+
     def _seeded_switcher_env(self, temp_home):
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()

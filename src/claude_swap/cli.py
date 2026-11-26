@@ -921,7 +921,7 @@ An expectation needs a proxy on the same account; set one first.
         "url",
         nargs="?",
         metavar="URL",
-        help="Proxy URL: http://[user:pass@]host[:port]",
+        help="Proxy URL: http://, https://, or socks5h://[user:pass@]host[:port]",
     )
     parser.add_argument(
         "--unset", action="store_true",

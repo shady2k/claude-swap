@@ -517,6 +517,12 @@ class Origin:
     reply whose body is still in flight when a client's ``open`` returns: the
     head is written, then the origin waits for the event, and only then sends
     the body.
+
+    Each request is recorded as ``method``, ``path``, ``headers`` (lower-case
+    names, the last value of a repeated one) and ``hosts``: every ``Host``
+    value the wire carried, in order, so a duplicated header is visible and
+    not collapsed into one. This is what the origin *received*, which is the
+    only place a wrong ``Host`` on a tunneled request shows up.
     """
 
     def __init__(
@@ -531,9 +537,24 @@ class Origin:
         class _Handler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.0"
 
+            def _record(self) -> None:
+                with self.server.lock:
+                    self.server.requests.append(
+                        {
+                            "method": self.command,
+                            "path": self.path,
+                            "headers": {
+                                name.lower(): value
+                                for name, value in self.headers.items()
+                            },
+                            "hosts": self.headers.get_all("Host") or [],
+                        }
+                    )
+
             def do_GET(self) -> None:
                 with self.server.lock:
                     self.server.hits += 1
+                self._record()
                 self.send_response(self.server.status)
                 self.send_header("Content-Type", "application/json")
                 if self.server.location is not None:
@@ -545,6 +566,7 @@ class Origin:
                 self.wfile.write(self.server.body)
 
             def do_POST(self) -> None:
+                self._record()
                 body = self.rfile.read(int(self.headers["Content-Length"]))
                 with self.server.lock:
                     self.server.received.append(body)
@@ -558,6 +580,7 @@ class Origin:
         )
         self._server.hits = 0
         self._server.lock = threading.Lock()
+        self._server.requests = []
         self._server.body = body
         self._server.received = []
         self._server.status = status
@@ -586,6 +609,17 @@ class Origin:
     def received(self) -> list[bytes]:
         with self._server.lock:
             return list(self._server.received)
+
+    def only(self, method: str) -> dict:
+        """The one recorded request of ``method``, failed on zero or several."""
+        with self._server.lock:
+            requests = [
+                record
+                for record in self._server.requests
+                if record["method"] == method
+            ]
+        assert len(requests) == 1, requests
+        return requests[0]
 
     @property
     def url(self) -> str:
@@ -635,3 +669,20 @@ class DeadProxy:
         probe.bind(("127.0.0.1", 0))
         self.port = probe.getsockname()[1]
         probe.close()
+
+
+def proxy_for(scheme: str):
+    """A loopback proxy speaking ``scheme``: the shape one route needs.
+
+    ``http`` is the direct path (urllib's own ``CONNECT``/absolute form),
+    ``https`` a TLS proxy and ``socks5h`` a SOCKS5 one — the two schemes that
+    only ``proxy_bridge`` can reach. A test parametrized over the three then
+    spells each route the same way, ``f"{scheme}://127.0.0.1:{proxy.port}"``.
+    """
+    if scheme == "http":
+        return HttpProxy()
+    if scheme == "https":
+        return HttpProxy(tls=True)
+    if scheme in ("socks5h", "socks5"):
+        return Socks5Proxy()
+    raise ValueError(f"no test proxy for {scheme!r}")
