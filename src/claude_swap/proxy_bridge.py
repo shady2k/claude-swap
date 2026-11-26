@@ -137,6 +137,21 @@ def default_context() -> ssl.SSLContext:
     return ssl.create_default_context()
 
 
+#: The plain ``ssl.SSLContext`` class, whatever replaced it in ``ssl``.
+#: ``truststore.inject_into_ssl()`` — which ``cli.main`` calls — sets
+#: ``ssl.SSLContext`` to a subclass whose ``wrap_socket`` verifies the peer
+#: itself, so the plain class is found through the replacement's MRO rather
+#: than captured at import time (the injection may already have happened).
+_PLAIN_SSL_CONTEXT = next(
+    (
+        base
+        for base in ssl.SSLContext.__mro__
+        if base.__module__ == "ssl" and base.__name__ == "SSLContext"
+    ),
+    ssl.SSLContext,
+)
+
+
 def connect(
     route,
     host: str,
@@ -381,15 +396,57 @@ class Bridge:
     def _wrap_tls(
         self, raw: socket.socket, context: ssl.SSLContext, host: str
     ) -> ssl.SSLSocket:
+        """TLS to the proxy, handshaken, tracked so :meth:`close` can end it.
+
+        A plain ``ssl.SSLContext`` hands back the TLS socket before the
+        handshake: the descriptor is tracked under this lock and the handshake
+        then runs outside it, so ``close()`` ends a handshake a silent proxy
+        never answers.
+
+        A subclass verifies the peer inside ``wrap_socket()`` and ignores
+        ``do_handshake_on_connect=False`` — ``truststore 0.10.4``, which
+        ``cli.main`` injects into ``ssl``, verifies the chain of the socket it
+        just built and refuses one with no certificate yet ("Peer sent no
+        certificates to verify"). Such a context therefore has to run the
+        handshake itself; its socket replaces ``raw`` here as soon as it
+        exists, and a ``close()`` that already happened ends it at once.
+
+        Raises with neither a tracked socket nor an open descriptor left
+        behind.
+        """
+        if type(context) is not _PLAIN_SSL_CONTEXT:
+            with self._lock:
+                if self._stop.is_set():
+                    raise OSError("bridge is closed")
+            try:
+                tls = context.wrap_socket(raw, server_hostname=host)
+            except BaseException:
+                self._untrack(raw)
+                raise
+            with self._lock:
+                self._connections.discard(raw)
+                self._connections.add(tls)
+                stopped = self._stop.is_set()
+            if stopped:
+                self._untrack(tls)
+                _close_socket(tls)
+                raise OSError("bridge is closed")
+            return tls
         with self._lock:
             if self._stop.is_set():
                 raise OSError("bridge is closed")
             tls = context.wrap_socket(
                 raw, server_hostname=host, do_handshake_on_connect=False
             )
-            self._connections.remove(raw)
+            self._connections.discard(raw)
             self._connections.add(tls)
-            return tls
+        try:
+            tls.do_handshake()
+        except BaseException:
+            self._untrack(tls)
+            _close_socket(tls)
+            raise
+        return tls
 
     def _untrack(self, connection: socket.socket) -> None:
         with self._lock:
@@ -643,16 +700,13 @@ def _dial_https(
             _close_socket(raw)
             raise
 
-    # Transfer the descriptor under the bridge lock, but handshake outside
-    # it so close() can shut down the tracked TLS socket while it waits.
-    tls = None
+    # The handshake happens inside _wrap_tls, which leaves nothing tracked or
+    # open when it raises; closing ``raw`` here covers a socket it detached.
     try:
-        tls = bridge._wrap_tls(raw, context, route.host)
-        tls.do_handshake()
+        return bridge._wrap_tls(raw, context, route.host)
     except BaseException:
-        _drop(tls if tls is not None else raw, bridge)
+        _drop(raw, bridge)
         raise
-    return tls
 
 
 def _https_tunnel(

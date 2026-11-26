@@ -693,9 +693,9 @@ class TestBridgedOAuth:
         assert proxy.recorded() == []  # no CONNECT, let alone an OAuth request
         assert origin.hits == 0
 
-
+    @pytest.mark.parametrize("wrap_verifies_peer", [False, True])
     def test_a_plaintext_port_on_an_https_proxy_is_network_and_never_sends_refresh(
-        self, monkeypatch, caplog,
+        self, monkeypatch, caplog, wrap_verifies_peer,
     ):
         class _PlaintextProxy(proxy_servers.HttpProxy):
             def _handle(self, connection):
@@ -707,6 +707,10 @@ class TestBridgedOAuth:
                 connection.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
 
         caplog.set_level(logging.DEBUG, logger="claude-swap")
+        context = (
+            proxy_servers.verifying_context() if wrap_verifies_peer else None
+        )
+        proxy_servers.trust_fixture_ca(monkeypatch, context)
         with proxy_servers.Origin(tls=True) as origin, _PlaintextProxy() as proxy:
             _endpoints(monkeypatch, origin.url)
             route = account_proxy.parse(f"https://127.0.0.1:{proxy.port}")

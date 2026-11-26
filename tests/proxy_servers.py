@@ -91,18 +91,58 @@ def client_context() -> ssl.SSLContext:
     return context
 
 
-def trust_fixture_ca(monkeypatch) -> None:
+class VerifyingContext(_PLAIN_CONTEXT):
+    """A client context that verifies the peer inside ``wrap_socket``.
+
+    ``truststore 0.10.4`` — which ``cli.main`` injects into ``ssl`` — builds
+    the socket and then verifies the peer off it whatever
+    ``do_handshake_on_connect`` says, refusing one whose handshake has not
+    happened with "Peer sent no certificates to verify". Reproducing that here
+    makes the macOS and Windows path measurable on any platform: a handshake
+    that has not run is visible as a missing peer certificate.
+    """
+
+    def wrap_socket(self, sock, *args, **kwargs):
+        tls = super().wrap_socket(sock, *args, **kwargs)
+        try:
+            try:
+                certificate = tls.getpeercert()
+            except ValueError:
+                # 3.14 refuses ``getpeercert`` until the handshake is done;
+                # truststore reads the same fact off an empty chain.
+                certificate = None
+            if certificate is None:
+                raise ssl.SSLCertVerificationError(
+                    "Peer sent no certificates to verify"
+                )
+        except Exception:
+            tls.close()
+            raise
+        return tls
+
+
+def verifying_context() -> ssl.SSLContext:
+    """A context trusting the fixture CA that verifies in ``wrap_socket``."""
+    context = VerifyingContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.load_verify_locations(cafile=str(_CA_FILE))
+    return context
+
+
+def trust_fixture_ca(monkeypatch, context: ssl.SSLContext | None = None) -> None:
     """Pin this test's TLS trust to the fixture CA, on both ends.
 
     Two contexts matter: the one ``proxy_bridge`` builds for an ``https://``
     proxy, and the one ``http.client`` builds for the target of a tunneled
-    request. Both are pinned here to a context loaded from ``ca.pem``, so a
-    test neither depends on — nor changes — the process-wide default, which
-    another test in the same worker may already have replaced with the OS
-    verifier. A certificate that context refuses is a real refusal, which is
-    what the fail-closed tests measure.
+    request. Both are pinned here to ``context`` — a context loaded from
+    ``ca.pem`` — so a test neither depends on — nor changes — the
+    process-wide default, which another test in the same worker may already
+    have replaced with the OS verifier. A certificate that context refuses is
+    a real refusal, which is what the fail-closed tests measure.
+
+    ``context`` is :func:`client_context` unless a test passes
+    :func:`verifying_context` to stand in for ``truststore``'s own context.
     """
-    context = client_context()
+    context = context if context is not None else client_context()
     monkeypatch.setattr(proxy_bridge, "default_context", lambda: context)
     monkeypatch.setattr(
         account_proxy,

@@ -182,6 +182,34 @@ class TestThroughAnHttpsProxy:
         assert connect["headers"]["proxy-authorization"] == f"Basic {expected}"
         assert origin.hits == 1
 
+    def test_a_context_that_verifies_in_wrap_socket_still_tunnels(
+        self, monkeypatch
+    ):
+        """A context that verifies inside ``wrap_socket`` has to run the
+        handshake itself: handed a socket before its handshake, it refuses a
+        certificate it has not read yet, so every ``https://`` proxy failed
+        with "Peer sent no certificates to verify" under ``truststore``."""
+        proxy_servers.trust_fixture_ca(
+            monkeypatch, proxy_servers.verifying_context()
+        )
+        with proxy_servers.Origin(tls=True) as origin:
+            with proxy_servers.HttpProxy(tls=True) as upstream:
+                route = account_proxy.parse(
+                    f"https://user:pw@127.0.0.1:{upstream.port}"
+                )
+                request = urllib.request.Request(
+                    f"https://localhost:{origin.port}/json"
+                )
+
+                with route.open(request, timeout=10) as response:
+                    assert response.status == 200
+                    assert response.read() == (
+                        b'{"ip": "1.2.3.4", "country": "US"}'
+                    )
+
+        assert upstream.only("CONNECT")["target"] == f"localhost:{origin.port}"
+        assert origin.hits == 1
+
     @pytest.mark.parametrize("scheme", ["https", "socks5h"])
     def test_plain_http_post_forwards_the_full_body(self, monkeypatch, scheme):
         proxy_servers.trust_fixture_ca(monkeypatch)

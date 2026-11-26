@@ -905,6 +905,29 @@ class TestFailureDiagnostics:
         assert "ConnectionRefusedError" not in message
         assert "secret" not in message
 
+    def test_a_silent_https_proxy_is_a_timeout_under_a_verifying_wrap_context(
+        self, monkeypatch
+    ):
+        """A context that verifies the peer inside ``wrap_socket`` —
+        ``truststore`` on macOS and Windows — must still report a proxy that
+        never answers as a timeout, not as a TLS failure."""
+        proxy_servers.trust_fixture_ca(
+            monkeypatch, proxy_servers.verifying_context()
+        )
+        with socket.socket() as proxy:
+            proxy.bind(("127.0.0.1", 0))
+            proxy.listen()
+            route = account_proxy.parse(
+                f"https://user:secret@127.0.0.1:{proxy.getsockname()[1]}"
+            )
+            message = self._expect(
+                route, "https://127.0.0.1:443/json", monkeypatch, timeout=0.3
+            )
+
+        assert "timeout" in message
+        assert "TLS error" not in message
+        assert "secret" not in message
+
     def test_an_untrusted_https_proxy_certificate_is_a_tls_error(self, monkeypatch):
         proxy_servers.trust_fixture_ca(monkeypatch)
         with proxy_servers.HttpProxy(
