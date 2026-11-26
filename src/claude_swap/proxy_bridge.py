@@ -276,13 +276,15 @@ class Bridge:
             worker.start()
 
     def _handle(self, client: socket.socket) -> None:
-        # The listener polls, so an accepted socket can carry that timeout in
-        # some interpreter/OS combinations; a connection here must block for
-        # as long as its peer does, or an idle moment reads as end-of-stream
-        # and truncates the reply being copied.
-        client.settimeout(None)
         upstream: socket.socket | None = None
         try:
+            # The listener polls, so an accepted socket can carry that timeout
+            # in some interpreter/OS combinations; a connection here must
+            # block for as long as its peer does, or an idle moment reads as
+            # end-of-stream and truncates the reply being copied. It runs
+            # inside the ``try`` because :meth:`close` closes this socket from
+            # the thread that owns the bridge, which fails the call.
+            client.settimeout(None)
             request = _parse_head(_read_head(client))
             if request.method == "CONNECT":
                 host, port = _authority(request.target)
@@ -305,6 +307,11 @@ class Bridge:
             self._record(e)
             _respond(client, 502, "Bad Gateway")
         except OSError as e:
+            # Every socket of this bridge is closed the moment it stops, so an
+            # ``OSError`` while stopping is that shutdown, not an upstream
+            # failure: nothing is recorded and no answer is written.
+            if self._stop.is_set():
+                return
             self._record(
                 BridgeError(
                     "unreachable",

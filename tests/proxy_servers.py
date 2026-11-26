@@ -294,10 +294,19 @@ class HttpProxy(_Server):
 
     def _handle(self, connection: socket.socket) -> None:
         connection.settimeout(_TIMEOUT_S)
-        if self._tls:
-            connection = self._context.wrap_socket(
-                connection, server_side=True
-            )
+        if not self._tls:
+            self._converse(connection)
+            return
+        # ``wrap_socket`` detaches the raw socket and carries its descriptor
+        # into the TLS one, so the TLS socket is what has to be closed here:
+        # ``_run`` only still holds the detached original.
+        tls = self._context.wrap_socket(connection, server_side=True)
+        try:
+            self._converse(tls)
+        finally:
+            _close(tls)
+
+    def _converse(self, connection: socket.socket) -> None:
         head = _read_head(connection)
         if not head:
             return
@@ -433,7 +442,10 @@ class Origin:
     """A loopback HTTP or HTTPS origin answering one JSON body.
 
     ``hits`` counts the requests that reached it, so a test can prove a
-    refused route never fell back to a direct connection.
+    refused route never fell back to a direct connection. ``body_gate`` is a
+    reply whose body is still in flight when a client's ``open`` returns: the
+    head is written, then the origin waits for the event, and only then sends
+    the body.
     """
 
     def __init__(
@@ -442,6 +454,7 @@ class Origin:
         *,
         tls: bool = False,
         status: int = 200,
+        body_gate: threading.Event | None = None,
     ) -> None:
         self._lock = threading.Lock()
 
@@ -455,6 +468,8 @@ class Origin:
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(self.server.body)))
                 self.end_headers()
+                if self.server.body_gate is not None:
+                    self.server.body_gate.wait(_TIMEOUT_S)
                 self.wfile.write(self.server.body)
 
             def log_message(self, *args) -> None:
@@ -467,6 +482,7 @@ class Origin:
         self._server.lock = threading.Lock()
         self._server.body = body
         self._server.status = status
+        self._server.body_gate = body_gate
         if tls:
             context = server_context()
             self._server.socket = context.wrap_socket(

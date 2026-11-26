@@ -302,31 +302,48 @@ class ProxyRoute:
         tunnel is replaced by the proxy's own error kind (and an
         ``https://`` proxy's refused certificate by the TLS error itself),
         which is what the token and usage classifications read.
+
+        A returned response carries the bridge (see :class:`_BridgedResponse`):
+        ``open`` comes back once the reply's head has arrived, and its body
+        still travels that bridge. A request that produces no response closes
+        the bridge here instead, so nothing outlives it.
         """
-        with bridge(self, timeout=timeout) as local:
-            request.set_proxy(f"{local.host}:{local.port}", "http")
-            try:
-                return _opener().open(request, timeout=timeout)
-            except urllib.error.HTTPError as e:
-                raise_failure(local.failure)
-                if e.code == 407:
-                    raise ProxyRouteError(
-                        PROXY_AUTH,
-                        "the proxy rejected the credentials in its URL "
-                        "(HTTP 407)",
-                        status=407,
-                    ) from None
-                if 300 <= e.code < 400:
-                    raise ProxyRouteError(
-                        PROXY_REDIRECT,
-                        f"the proxy answered HTTP {e.code} instead of "
-                        "forwarding the request",
-                        status=e.code,
-                    ) from None
-                raise
-            except urllib.error.URLError:
-                raise_failure(local.failure)
-                raise
+        local = proxy_bridge.Bridge(self, timeout=timeout)
+        request.set_proxy(f"{local.host}:{local.port}", "http")
+        try:
+            response = _opener().open(request, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            # The error is not handed on with a readable body — its bridge is
+            # closing — so it is closed here instead of being left to the
+            # garbage collector; only its code and headers travel.
+            e.close()
+            # Closed before the failure is read: ``close`` joins the workers,
+            # so whatever the bridge recorded has been recorded by now.
+            local.close()
+            raise_failure(local.failure)
+            if e.code == 407:
+                raise ProxyRouteError(
+                    PROXY_AUTH,
+                    "the proxy rejected the credentials in its URL "
+                    "(HTTP 407)",
+                    status=407,
+                ) from None
+            if 300 <= e.code < 400:
+                raise ProxyRouteError(
+                    PROXY_REDIRECT,
+                    f"the proxy answered HTTP {e.code} instead of "
+                    "forwarding the request",
+                    status=e.code,
+                ) from None
+            raise
+        except urllib.error.URLError:
+            local.close()
+            raise_failure(local.failure)
+            raise
+        except BaseException:
+            local.close()
+            raise
+        return _BridgedResponse(response, local)
 
 
 _TUNNEL_REFUSED = "Tunnel connection failed: "
@@ -399,6 +416,39 @@ def raise_failure(failure: BaseException | None) -> None:
         PROXY_UNREACHABLE,
         "the account's proxy could not be used for this request",
     ) from None
+
+
+class _BridgedResponse:
+    """A bridged request's response, with its bridge in tow.
+
+    ``urllib`` returns from ``open`` as soon as the head of the reply has
+    arrived; the rest of the body is still behind it and travels the bridge.
+    The bridge therefore lives exactly as long as the response does — the same
+    lifetime ``with route.open(...)`` gives it — and closing the response
+    closes it, so neither the loopback listener nor its threads outlive a
+    request. Nothing else about the response changes; every attribute is the
+    wrapped one's.
+    """
+
+    def __init__(self, response, local: proxy_bridge.Bridge):
+        self._response = response
+        self._bridge = local
+
+    def __getattr__(self, name: str):
+        return getattr(self._response, name)
+
+    def __enter__(self) -> "_BridgedResponse":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Close the response and the bridge that carried it."""
+        try:
+            self._response.close()
+        finally:
+            self._bridge.close()
 
 
 @contextmanager

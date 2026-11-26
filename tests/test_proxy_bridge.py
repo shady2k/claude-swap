@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import socket
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -45,6 +46,24 @@ def _wait_until_closed(port: int, timeout: float = 5.0) -> None:
     raise AssertionError(f"port {port} still accepts connections")
 
 
+def _capture_bridges(monkeypatch) -> list[tuple[proxy_bridge.Bridge, int]]:
+    """Every bridge this test's code opens, with the port it listened on.
+
+    The port is read here, while the bridge is still open: a closed bridge's
+    listener can no longer name it.
+    """
+    created: list[tuple[proxy_bridge.Bridge, int]] = []
+    real_bridge = proxy_bridge.Bridge
+
+    class _Captured(real_bridge):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            created.append((self, self.port))
+
+    monkeypatch.setattr(proxy_bridge, "Bridge", _Captured)
+    return created
+
+
 class TestTheLocalListener:
     def test_it_listens_on_loopback_only_and_reports_its_address(
         self, monkeypatch
@@ -55,9 +74,10 @@ class TestTheLocalListener:
             with proxy_bridge.Bridge(route) as local:
                 assert local.host == "127.0.0.1"
                 assert local.url == f"http://127.0.0.1:{local.port}"
-                assert socket.create_connection(
+                probe = socket.create_connection(
                     ("127.0.0.1", local.port), timeout=5
                 )
+                probe.close()
                 port = local.port
         _wait_until_closed(port)
 
@@ -466,6 +486,60 @@ class TestARequestThatNeverLeaves:
                     response.read()
 
         assert request.full_url == original
+
+
+class TestTheReplyBodyThatFollowsTheHead:
+    """``open`` returns on the reply's head; the body still travels the bridge.
+
+    Every caller reads the body after ``open`` has returned, which is where a
+    bridge that closed with the call would truncate the reply — the shape of a
+    real usage or OAuth answer.
+    """
+
+    def test_the_body_is_read_after_open_returns(self, monkeypatch):
+        proxy_servers.trust_fixture_ca(monkeypatch)
+        body = b'{"ip": "1.2.3.4", "country": "US"}'
+        released = threading.Event()
+        created = _capture_bridges(monkeypatch)
+        with proxy_servers.Origin(body=body, body_gate=released) as origin:
+            with proxy_servers.HttpProxy(tls=True) as upstream:
+                route = account_proxy.parse(
+                    f"https://127.0.0.1:{upstream.port}"
+                )
+                request = urllib.request.Request(f"{origin.url}/json")
+                with route.open(request, timeout=10) as response:
+                    # The origin is still holding the body back: only a bridge
+                    # that outlived ``open`` can deliver it.
+                    assert origin.hits == 1
+                    assert len(created) == 1
+                    released.set()
+                    assert response.read() == body
+        bridge, port = created[0]
+        assert bridge.failure is None
+        # Closed with the response: nothing of the bridge is left listening
+        # or running.
+        assert not [
+            thread
+            for thread in threading.enumerate()
+            if thread.name.startswith("proxy-bridge")
+        ]
+        _wait_until_closed(port)
+
+    def test_a_failed_open_leaves_no_bridge_behind(self, monkeypatch):
+        """No response to carry it, so the bridge is closed in the failure."""
+        proxy_servers.trust_fixture_ca(monkeypatch)
+        created = _capture_bridges(monkeypatch)
+        with proxy_servers.HttpProxy(tls=True, refuse=407) as upstream:
+            route = account_proxy.parse(
+                f"https://user:pw@127.0.0.1:{upstream.port}"
+            )
+            with pytest.raises(account_proxy.ProxyRouteError):
+                route.open(
+                    urllib.request.Request("https://api.anthropic.com/v1/x"),
+                    timeout=10,
+                )
+        assert isinstance(created[0][0].failure, proxy_bridge.BridgeError)
+        _wait_until_closed(created[0][1])
 
 
 def test_the_bridge_module_imports_nothing_from_the_package():
