@@ -6615,6 +6615,23 @@ class TestUsageAwareSwitch:
     def _usage(pct: float) -> dict:
         return {"five_hour": {"pct": pct}, "seven_day": {"pct": 0.0}}
 
+    @staticmethod
+    def _usage_entries(usage_map: dict) -> dict:
+        """Decision-value dicts → per-account ``UsageEntry`` fake readings.
+
+        Lets the ``best`` block's single store pass (``_usage_entries_by_account``)
+        hand ``_select_best_switchable`` the same values the tests used to inject
+        through the patched ``_usage_by_account`` dict.
+        """
+        out = {}
+        for num, value in usage_map.items():
+            if isinstance(value, dict):
+                entry = UsageEntry(last_good=value, age_s=0.0, fetched_at=time.time())
+            else:
+                entry = UsageEntry()
+            out[str(num)] = entry
+        return out
+
     def test_best_switches_to_more_headroom(self, temp_home: Path):
         s = self._setup(temp_home)
         self._seed(s, 1, "a@example.com")
@@ -6625,6 +6642,7 @@ class TestUsageAwareSwitch:
         # Current (1) has 50% headroom; 3 has 80% (best), 2 has 10%.
         usage = {"1": self._usage(50), "2": self._usage(90), "3": self._usage(20)}
         with patch.object(s, "_usage_by_account", return_value=usage), \
+            patch.object(s, "_usage_entries_by_account", return_value=self._usage_entries(usage)), \
              patch.object(s, "list_accounts"):
             s.switch(strategy="best")
 
@@ -6641,6 +6659,7 @@ class TestUsageAwareSwitch:
         # Current (1) has 11% headroom; the only other (2) is maxed out.
         usage = {"1": self._usage(89), "2": self._usage(100)}
         with patch.object(s, "_usage_by_account", return_value=usage), \
+            patch.object(s, "_usage_entries_by_account", return_value=self._usage_entries(usage)), \
              patch.object(s, "list_accounts") as mock_list:
             s.switch(strategy="best")
 
@@ -6657,6 +6676,7 @@ class TestUsageAwareSwitch:
 
         usage = {"1": self._usage(100), "2": self._usage(100), "3": self._usage(100)}
         with patch.object(s, "_usage_by_account", return_value=usage), \
+            patch.object(s, "_usage_entries_by_account", return_value=self._usage_entries(usage)), \
              patch.object(s, "list_accounts"):
             s.switch(strategy="best")
 
@@ -6676,6 +6696,7 @@ class TestUsageAwareSwitch:
         # Current (1) usage unknown; candidate 2 looks good (90% headroom).
         usage = {"1": None, "2": self._usage(10)}
         with patch.object(s, "_usage_by_account", return_value=usage), \
+            patch.object(s, "_usage_entries_by_account", return_value=self._usage_entries(usage)), \
              patch.object(s, "list_accounts") as mock_list:
             s.switch(strategy="best")
 
@@ -6693,6 +6714,7 @@ class TestUsageAwareSwitch:
 
         usage = {"1": self._usage(50), "2": None}
         with patch.object(s, "_usage_by_account", return_value=usage), \
+            patch.object(s, "_usage_entries_by_account", return_value=self._usage_entries(usage)), \
              patch.object(s, "list_accounts") as mock_list:
             s.switch(strategy="best")
 
@@ -6715,6 +6737,7 @@ class TestUsageAwareSwitch:
         # Current (1) 50% headroom; 2 worse (10%); 3 unknown.
         usage = {"1": self._usage(50), "2": self._usage(90), "3": None}
         with patch.object(s, "_usage_by_account", return_value=usage), \
+            patch.object(s, "_usage_entries_by_account", return_value=self._usage_entries(usage)), \
              patch.object(s, "list_accounts") as mock_list:
             s.switch(strategy="best")
 
@@ -6740,6 +6763,7 @@ class TestUsageAwareSwitch:
         # Current (1) exhausted; 2 also exhausted (known, not better); 3 unknown.
         usage = {"1": self._usage(100), "2": self._usage(100), "3": None}
         with patch.object(s, "_usage_by_account", return_value=usage), \
+            patch.object(s, "_usage_entries_by_account", return_value=self._usage_entries(usage)), \
              patch.object(s, "list_accounts") as mock_list:
             s.switch(strategy="best")
 
@@ -6758,6 +6782,7 @@ class TestUsageAwareSwitch:
 
         usage = {"1": self._usage(0), "2": self._usage(100), "3": self._usage(20)}
         with patch.object(s, "_usage_by_account", return_value=usage), \
+            patch.object(s, "_usage_entries_by_account", return_value=self._usage_entries(usage)), \
              patch.object(s, "list_accounts"):
             s.switch(strategy="next-available")
 
@@ -6790,6 +6815,7 @@ class TestUsageAwareSwitch:
             "3": self._model_usage(20, 20),
         }
         with patch.object(s, "_usage_by_account", return_value=usage), \
+            patch.object(s, "_usage_entries_by_account", return_value=self._usage_entries(usage)), \
              patch.object(s, "list_accounts"):
             s.switch(
                 strategy="next-available",
@@ -6818,6 +6844,7 @@ class TestUsageAwareSwitch:
             "3": self._model_usage(20, 20),
         }
         with patch.object(s, "_usage_by_account", return_value=usage), \
+            patch.object(s, "_usage_entries_by_account", return_value=self._usage_entries(usage)), \
              patch.object(s, "list_accounts"):
             s.switch(strategy="next-available")
 
@@ -6836,7 +6863,8 @@ class TestUsageAwareSwitch:
 
         # Current already best → already-best no-op.
         usage = {"1": self._model_usage(0, 10), "2": self._model_usage(50, 10)}
-        with patch.object(s, "_usage_by_account", return_value=usage):
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+            patch.object(s, "_usage_entries_by_account", return_value=self._usage_entries(usage)):
             payload = s.switch(
                 strategy="best", json_output=True,
                 models=("Fabel",), model_source="cli",
@@ -6847,7 +6875,8 @@ class TestUsageAwareSwitch:
 
         # Everything exhausted → candidates-exhausted no-op.
         usage = {"1": self._model_usage(100, 10), "2": self._model_usage(100, 10)}
-        with patch.object(s, "_usage_by_account", return_value=usage):
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+            patch.object(s, "_usage_entries_by_account", return_value=self._usage_entries(usage)):
             payload = s.switch(
                 strategy="best", json_output=True,
                 models=("Fabel",), model_source="cli",
@@ -6866,12 +6895,14 @@ class TestUsageAwareSwitch:
 
         usage = {"1": self._model_usage(0, 10), "2": self._model_usage(5, 10)}
         with patch.object(s, "_usage_by_account", return_value=usage), \
+            patch.object(s, "_usage_entries_by_account", return_value=self._usage_entries(usage)), \
              patch.object(s, "list_accounts"):
             s.switch(strategy="next-available", models=("Fabel",),
                      model_source="cli")
         assert "Fabel" in capsys.readouterr().out
         # ...but a matching name stays quiet.
         with patch.object(s, "_usage_by_account", return_value=usage), \
+            patch.object(s, "_usage_entries_by_account", return_value=self._usage_entries(usage)), \
              patch.object(s, "list_accounts"):
             s.switch(strategy="best", models=("Fable",), model_source="cli")
         assert "typo" not in capsys.readouterr().out
@@ -6893,6 +6924,7 @@ class TestUsageAwareSwitch:
             "3": self._model_usage(50, 80),
         }
         with patch.object(s, "_usage_by_account", return_value=usage), \
+            patch.object(s, "_usage_entries_by_account", return_value=self._usage_entries(usage)), \
              patch.object(s, "list_accounts"):
             s.switch(strategy="best", models=("Fable",), model_source="cli")
 
@@ -6909,6 +6941,7 @@ class TestUsageAwareSwitch:
 
         usage = {"1": self._usage(0), "2": self._usage(100), "3": self._usage(100)}
         with patch.object(s, "_usage_by_account", return_value=usage), \
+            patch.object(s, "_usage_entries_by_account", return_value=self._usage_entries(usage)), \
              patch.object(s, "list_accounts") as mock_list:
             s.switch(strategy="next-available")
 
@@ -6926,6 +6959,7 @@ class TestUsageAwareSwitch:
 
         # Usage unknown for account 2 → must NOT be skipped (give it a chance).
         with patch.object(s, "_usage_by_account", return_value={"1": None, "2": None}), \
+            patch.object(s, "_usage_entries_by_account", return_value=self._usage_entries({"1": None, "2": None})), \
              patch.object(s, "list_accounts"):
             s.switch(strategy="next-available")
 
@@ -6946,6 +6980,7 @@ class TestUsageAwareSwitch:
         # All healthy, so nothing is skipped for being at its limit.
         usage = {"1": self._usage(0), "2": self._usage(0), "3": self._usage(0)}
         with patch.object(s, "_usage_by_account", return_value=usage), \
+            patch.object(s, "_usage_entries_by_account", return_value=self._usage_entries(usage)), \
              patch.object(s, "list_accounts"):
             s.switch(strategy="next-available")
 

@@ -1478,14 +1478,116 @@ class TestStopFailureMovesTheActiveSlot:
         _set_active(s, 1)
         s._usage_store = _FakeUsageStore({})
         marks_before = s._stop_failure_marks()
+        claude_tree_before = _tree(temp_home / ".claude")
 
         s.record_stop_failure("a@example.com", "")
 
         data = s._get_sequence_data()
         assert data["activeAccountNumber"] == 2
         assert s._stop_failure_marks() == {("a@example.com", ""): s._usage_store.clock()}
-        assert capsys.readouterr().out == "" and capsys.readouterr().err == ""
-        # The mark file is inside the backup dir — never in ~/.claude.
-        assert list((temp_home / ".claude").rglob("*")) == [] or not any(
-            p.name == "cache" for p in (temp_home / ".claude").rglob("*")
+        captured = capsys.readouterr()
+        assert captured.out == "" and captured.err == ""
+        # The mark file is inside the backup dir — ~/.claude is byte-for-byte untouched.
+        assert _tree(temp_home / ".claude") == claude_tree_before
+
+
+class TestStopFailurePickRules:
+    def test_marked_slot_with_oldest_mark_wins_when_all_marked(self, temp_home: Path):
+        from claude_swap import isolated_mode
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _seed(s, 2, "b@example.com", CREDS_2)
+        _seed(s, 3, "c@example.com")
+        _set_active(s, 2)
+        # No usage cache: the rotation fallback would apply, but both other
+        # slots are marked — slot 1's report is older than slot 3's, so the
+        # active slot moves back to slot 1 (its reading, if any, predates the
+        # report and is stale evidence either way).
+        s._usage_store = _FakeUsageStore({})
+        s._stop_failure_marks = lambda: {
+            ("a@example.com", ""): 1000.0,
+            ("c@example.com", ""): 5000.0,
+        }
+
+        changed = isolated_mode.switch_active_after_rate_limit(s, "b@example.com", "")
+
+        assert changed is True
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_unmarked_headroom_tie_breaks_in_rotation_order(self, temp_home: Path):
+        from claude_swap import isolated_mode
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _seed(s, 2, "b@example.com", CREDS_2)
+        _seed(s, 3, "c@example.com")
+        _set_active(s, 3)
+        # Slots 1 and 2 have the same cached headroom; 1 comes first in the
+        # rotation, so it wins — not 2.
+        s._usage_store = _FakeUsageStore(
+            {"1": _headroom_entry(30), "2": _headroom_entry(30)}
         )
+        s._stop_failure_marks = lambda: {}
+
+        changed = isolated_mode.switch_active_after_rate_limit(s, "c@example.com", "")
+
+        assert changed is True
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_rotation_walk_starts_after_the_active_slot(self, temp_home: Path):
+        from claude_swap import isolated_mode
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _seed(s, 2, "b@example.com", CREDS_2)
+        _seed(s, 3, "c@example.com")
+        _set_active(s, 2)
+        # No cached readings anywhere: the fallback walks rotation order
+        # starting after the active slot — 3, then 1 — and takes 3.
+        s._usage_store = _FakeUsageStore({})
+        s._stop_failure_marks = lambda: {}
+
+        changed = isolated_mode.switch_active_after_rate_limit(s, "b@example.com", "")
+
+        assert changed is True
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+
+    def test_credential_less_slot_is_skipped_not_only_config_less(self, temp_home: Path):
+        from claude_swap import isolated_mode
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _seed(s, 2, "b@example.com", CREDS_2)
+        _seed(s, 3, "c@example.com")
+        _seed(s, 4, "d@example.com", CREDS_2)
+        _set_active(s, 1)
+        # Slot 4 has its config backup but no stored credential → not suitable.
+        s._store._backup_enc_path("4", "d@example.com").unlink()
+        s._usage_store = _FakeUsageStore({})
+        s._stop_failure_marks = lambda: {}
+
+        changed = isolated_mode.switch_active_after_rate_limit(s, "a@example.com", "")
+
+        assert changed is True
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_exhausted_unmarked_slots_fall_back_to_oldest_marked(self, temp_home: Path):
+        from claude_swap import isolated_mode
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _seed(s, 2, "b@example.com", CREDS_2)
+        _seed(s, 3, "c@example.com")
+        _set_active(s, 1)
+        # Slot 2 is unmarked but spent (headroom 0); slot 3 is marked. The
+        # marked slot with the oldest report takes over — never the spent one.
+        s._usage_store = _FakeUsageStore(
+            {"2": _headroom_entry(100), "3": _headroom_entry(5)}
+        )
+        s._stop_failure_marks = lambda: {("c@example.com", ""): 1000.0}
+
+        changed = isolated_mode.switch_active_after_rate_limit(s, "a@example.com", "")
+
+        assert changed is True
+        assert s._get_sequence_data()["activeAccountNumber"] == 3

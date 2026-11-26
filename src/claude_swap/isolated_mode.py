@@ -449,25 +449,27 @@ def _suitable_slot_numbers(
         email = record.get("email", "")
         if not switcher._account_is_switchable(key):
             continue
-        if not switcher._read_account_config(key, email):
-            continue
         suitable.append(key)
     return suitable
 
 
 def _slot_is_marked(
-    switcher: "ClaudeAccountSwitcher",
     marks: dict[tuple[str, str], float],
     entry,
     email: str,
     org_uuid: str,
 ) -> bool:
-    """Whether this slot carries a stop-failure mark newer than its reading."""
-    from claude_swap.usage_store import UsageEntry
+    """Whether this slot carries a stop-failure mark newer than its reading.
 
-    if not isinstance(entry, UsageEntry):
-        return (email, org_uuid or "") in marks
-    return switcher._stop_failure_marked(marks, email, org_uuid or "", entry)
+    A ``UsageEntry`` is always what comes back from the store, so no type
+    dispatch is needed: the mark is the only evidence for a slot without a
+    reading (``fetched_at`` None), and a reading at or after the stamp clears
+    it.
+    """
+    at = marks.get((email, org_uuid or ""))
+    if at is None:
+        return False
+    return entry is None or entry.fetched_at is None or entry.fetched_at < at
 
 
 def switch_active_after_rate_limit(
@@ -486,9 +488,8 @@ def switch_active_after_rate_limit(
     (``_usage_store.entries`` with an empty fetch set — never a network
     request) and the stop marks, so a refusal during a plain launch costs no
     quota pass. Disabled slots, API-key accounts, slots without stored
-    credentials or config, slots already carrying a stop-failure mark newer
-    than their reading, and slots whose cached reading is at or below zero
-    headroom are never picked:
+    credentials or config, and slots whose cached reading is trusted at or
+    below zero headroom are never picked:
 
     - prefer an unmarked slot with cached headroom above zero — the most
       headroom wins, ties in rotation order;
@@ -496,9 +497,20 @@ def switch_active_after_rate_limit(
       has run, for instance), take the next unmarked suitable slot in
       rotation order after the current active one, so the goal works without
       a running ``cswap auto``;
-    - when no other suitable slot exists (one account, or everything else is
-      disabled / an API key / without credentials / marked / exhausted) the
+    - when every other suitable slot is marked (its reading predates a
+      ``StopFailure`` report, so its headroom is stale evidence), the marked
+      slot with the oldest report takes over — ties in rotation order — so a
+      refusal never pins the active slot on the refused account;
+    - when no other suitable slot exists at all (one account, or everything
+      else is disabled / an API key / without credentials / exhausted) the
       recorded ``activeAccountNumber`` is left as is.
+
+    A marked slot's reading is never trusted (it predates the refusal), so a
+    marked slot is decided by its report's age, not its stale headroom.
+
+    After the lock is released, ``_replan_new_active`` pulls the new active
+    slot's poll plan to the active floor — so ``cswap auto`` does not wait up
+    to ``CANDIDATE_MAX_INTERVAL_S`` to poll the account that just took over.
 
     Writes only ``activeAccountNumber`` and ``lastUpdated`` into
     ``sequence.json`` — never ``~/.claude``, never the Keychain — and prints
@@ -507,9 +519,14 @@ def switch_active_after_rate_limit(
     Returns ``True`` when the recorded active slot changed.
     """
     org_uuid = org_uuid or ""
+    target = None
+    target_email = None
+    target_org = None
     try:
         with FileLock(switcher.lock_file):
-            return _switch_active_after_rate_limit_locked(switcher, email, org_uuid)
+            target, target_email, target_org = _switch_active_after_rate_limit_locked(
+                switcher, email, org_uuid
+            )
     except (LockError, OSError):
         # A hook must never fail the report it carries; a missed move is
         # repaired by the next launch's own ranking or a `cswap list` pass.
@@ -518,11 +535,14 @@ def switch_active_after_rate_limit(
             "stop: the account lock was unavailable"
         )
         return False
+    if target is not None:
+        switcher._replan_new_active(target, target_email, target_org)
+    return target is not None
 
 
 def _switch_active_after_rate_limit_locked(
     switcher: "ClaudeAccountSwitcher", email: str, org_uuid: str
-) -> bool:
+) -> tuple[str | None, str | None, str | None]:
     data = switcher._get_sequence_data() or {}
     accounts = data.get("accounts") or {}
     sequence = [str(num) for num in data.get("sequence") or []]
@@ -530,11 +550,11 @@ def _switch_active_after_rate_limit_locked(
     active_key = str(active_num) if active_num is not None else None
     record = accounts.get(active_key) if active_key is not None else None
     if record is None:
-        return False
+        return None, None, None
     active_org = record.get("organizationUuid", "") or ""
     if (record.get("email", ""), active_org) != (email, org_uuid):
         # `cswap auto` / `cswap next` / another session already moved it.
-        return False
+        return None, None, None
 
     from claude_swap import oauth
     from claude_swap.settings import load_settings, parse_model_names
@@ -544,7 +564,7 @@ def _switch_active_after_rate_limit_locked(
     marks = switcher._stop_failure_marks()
     candidates = _suitable_slot_numbers(switcher, data, active_key)
     if not candidates:
-        return False
+        return None, None, None
 
     identities = {
         key: (accounts[key].get("email", ""), accounts[key].get("organizationUuid", "") or "")
@@ -553,15 +573,15 @@ def _switch_active_after_rate_limit_locked(
     entries: dict = switcher._usage_store.entries(identities, models)
     position = {key: index for index, key in enumerate(sequence) if key in candidates}
 
+    def mark_at(key: str) -> float:
+        e_email, e_org = identities[key]
+        return marks.get((e_email, e_org or ""), 0.0)
+
     def classify(key: str) -> tuple[bool, float | None]:
         entry = entries.get(key)
-        rec = accounts.get(key, {})
         e_email, e_org = identities[key]
-        marked = _slot_is_marked(switcher, marks, entry, e_email, e_org)
-        if marked:
+        if _slot_is_marked(marks, entry, e_email, e_org):
             return True, None
-        if entry is None:
-            return False, None
         room = oauth.account_headroom(entry.decision_value(), models)
         return False, room
 
@@ -592,8 +612,20 @@ def _switch_active_after_rate_limit_locked(
                 if key in suitable:
                     target = key
                     break
+        else:
+            # Every other suitable slot is marked (its reading predates the
+            # refusal, so its headroom is stale evidence): the slot whose
+            # StopFailure report is the oldest is the least stale — ties in
+            # rotation order. Headroom<=0 slots are skipped above on trusted
+            # readings; a marked slot's reading is never trusted.
+            marked = [key for key in candidates if classified[key][0]]
+            if marked:
+                target = min(
+                    marked,
+                    key=lambda key: (mark_at(key), position.get(key, 0)),
+                )
     if target is None or target == active_key:
-        return False
+        return None, None, None
     previous = data.get(ACTIVE_FIELD)
     data[ACTIVE_FIELD] = int(target)
     data["lastUpdated"] = get_timestamp()
@@ -603,4 +635,5 @@ def _switch_active_after_rate_limit_locked(
         f"Account-{target}"
         + (f" (was {previous})" if previous is not None else "")
     )
-    return True
+    target_record = accounts[target]
+    return target, target_record.get("email", ""), target_record.get("organizationUuid", "") or ""

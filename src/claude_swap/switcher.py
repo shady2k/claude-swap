@@ -7832,12 +7832,15 @@ class ClaudeAccountSwitcher:
         per-model weekly windows into every headroom comparison (see
         ``oauth.account_headroom``).
 
-        A slot carrying a ``StopFailure`` mark newer than its cached reading
-        (``_stop_failure_marked``) is never recommended: the reading predates
-        Claude Code's refusal, so its headroom is provably stale and a
-        ``cswap auto`` pass right after a refusal would otherwise roll the
-        active slot back onto the account that just refused. Returns
-        ``(target, note)``:
+        The protection belongs to this ``cswap switch --strategy best`` decision
+        (``cswap auto`` ranks candidates in
+        ``AutoSwitchEngine._rank_candidates`` — a separate backlog task;
+        ``autoswitch.py`` is untouched here). A slot carrying a ``StopFailure``
+        mark newer than its cached reading (``_rate_limit_marked``) is never
+        recommended: the reading predates Claude Code's refusal, so its
+        headroom is provably stale and a ``--strategy best`` pass right after a
+        refusal would otherwise roll the active slot back onto the account that
+        just refused. Returns ``(target, note)``:
 
         - ``(num, "")`` — switch to ``num`` (strictly more headroom than current)
         - ``(None, "current-unavailable")`` — current account's usage is unknown,
@@ -7884,9 +7887,10 @@ class ClaudeAccountSwitcher:
 
         scored = []
         for num in others:
-            if self._stop_failure_marked(
-                marks, *identity_of[num], entries.get(num)
-            ):
+            entry = entries.get(num)
+            email, org = identity_of[num]
+            at = marks.get((email, org or ""))
+            if at is not None and (entry is None or entry.fetched_at is None or entry.fetched_at < at):
                 # The reading predates a StopFailure report: its headroom is
                 # stale evidence, so this slot cannot win the pick.
                 scored.append((None, num))
@@ -8041,11 +8045,10 @@ class ClaudeAccountSwitcher:
             f"in {oauth.format_countdown(soonest - now_utc.timestamp())}"
         )
 
-    def _stop_failure_marked(
+    def _rate_limit_marked(
         self,
         marks: dict[tuple[str, str], float],
-        email: str,
-        org_uuid: str,
+        row: AccountInfo,
         entry: UsageEntry,
     ) -> bool:
         """Whether Claude Code's last word on this account is a rate-limit stop.
@@ -8056,30 +8059,24 @@ class ClaudeAccountSwitcher:
         after the stamp is newer evidence and clears the mark — there is no
         deadline to keep, which is why the mark needs no expiry.
         """
-        at = marks.get((email, org_uuid or ""))
-        if entry is None:
-            return at is not None
-        return at is not None and (entry.fetched_at is None or entry.fetched_at < at)
-
-    def _rate_limit_marked(
-        self,
-        marks: dict[tuple[str, str], float],
-        row: AccountInfo,
-        entry: UsageEntry,
-    ) -> bool:
-        """Whether Claude Code's last word on this account is a rate-limit stop.
-
-        Row-shaped convenience wrapper of :meth:`_stop_failure_marked`.
-        """
-        return self._stop_failure_marked(marks, row[1], row[3], entry)
-
+        at = marks.get((row[1], row[3]))
+        return at is not None and (
+            entry.fetched_at is None or entry.fetched_at < at
+        )
     def record_stop_failure(self, email: str, org_uuid: str) -> None:
         """Note that Claude Code reported a rate-limit stop on this account.
 
-        Called by the ``StopFailure`` hook ``cswap run --auto`` passes
-        (``cli._rate_limit_hook``); see ``docs/auto-launch.md``. Stored by
-        ``(email, organization)`` rather than slot, because a ``swap`` moves
-        slots and the mark belongs to the account.
+        Called by the ``StopFailure`` hook every launch that runs the recorded
+        active account passes — ``cswap run --active`` (what the thin ``claude``
+        wrapper runs), the fallback launch when the directory has no ``cswap
+        map``, and ``--auto`` (``cli._rate_limit_hook``); see
+        ``docs/auto-launch.md``. Stored by ``(email, organization)`` rather than
+        slot, because a ``swap`` moves slots and the mark belongs to the
+        account. After stamping the mark it delegates to
+        ``isolated_mode.switch_active_after_rate_limit`` to move the recorded
+        active slot off the refused account in ``sequence.json`` — only while
+        that account is still the recorded slot, writing
+        ``activeAccountNumber``/``lastUpdated`` only.
         """
         path = self.backup_dir / "cache" / STOP_FAILURE_FILE
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -8762,14 +8759,17 @@ class ClaudeAccountSwitcher:
         # Usage-aware "jump to most headroom". Only switches when another
         # account is provably better; otherwise stays put (never moves onto a
         # worse or unverifiable account). Bare `cswap --switch` rotates anyway.
+        # One store pass: `entries` feeds both the headroom values (via
+        # `decision_value()`) and the stop-mark staleness check.
         if strategy == "best":
-            best_usage = self._usage_by_account()
+            entries = self._usage_entries_by_account(fetch=set())
+            best_usage = {num: entry.decision_value() for num, entry in entries.items()}
             self._warn_inert_models(best_usage, models, json_output, warnings)
             target, note = self._select_best_switchable(
                 current_num,
                 models,
                 best_usage,
-                entries=self._usage_entries_by_account(fetch=set()),
+                entries=entries,
                 marks=self._stop_failure_marks(),
             )
             if target is not None:

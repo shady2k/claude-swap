@@ -94,9 +94,9 @@ in this order:
   so a bucket Anthropic resets or tops up early is seen — but that is slower than
   a launch.
 - **Claude Code's own report.** Every launch that runs the recorded active
-  account — `--active` (what the thin `claude` wrapper runs), the fallback
-  launch when the directory has no `cswap map`, and `--auto` — passes a
-  `StopFailure` hook (`--settings`, matcher `rate_limit`). A user `--settings`
+  account — `--active` (what the thin `claude` wrapper runs) and the fallback
+  launch when the directory has no `cswap map` — passes a `StopFailure` hook
+  (`--settings`, matcher `rate_limit`); `--auto` carries the same hook for the launch it picks itself. A user `--settings`
   on the command line and one-word subcommands (`auth`, `doctor`, …) keep the
   hook off, exactly as with `--auto`: in front of a subcommand `--settings`
   turns the line into a prompt (measured on 2.1.329), and a user's own
@@ -109,14 +109,17 @@ in this order:
   cached headroom above zero wins (ties in rotation order); when no other
   slot has a cached reading, the next unmarked suitable slot in rotation
   order takes over — so the next `claude` picks a different account even with
-  no `cswap auto` running. The move writes only `activeAccountNumber` and
-  `lastUpdated` into `sequence.json` (never `~/.claude`, never the Keychain),
-  prints nothing, and costs no network request: it reads the usage store's
-  already-cached readings and the stop marks. A `cswap switch`, `cswap next`
-  or another session that already moved the active slot wins — nothing
-  changes. If no other suitable slot exists (one account, or everything else
-  disabled / an API key / without credentials / marked / exhausted) the
-  recorded slot stays.
+  no `cswap auto` running. When every other suitable slot is marked (its
+  reading predates a `StopFailure` report, so its headroom is stale evidence),
+  the marked slot with the oldest report takes over — ties in rotation order —
+  so a refusal never pins the active slot on the refused account. The move
+  writes only `activeAccountNumber` and `lastUpdated` into `sequence.json`
+  (never `~/.claude`, never the Keychain), prints nothing, and costs no
+  network request: it reads the usage store's already-cached readings and
+  the stop marks. A `cswap switch`, `cswap next` or another session that
+  already moved the active slot wins — nothing changes. If no other suitable
+  slot exists (one account, or everything else disabled / an API key /
+  without credentials / exhausted) the recorded slot stays.
 
   The same evidence rule guards `--strategy best`: a slot whose stop mark is
   newer than its cached reading is provably stale and can never win the pick,

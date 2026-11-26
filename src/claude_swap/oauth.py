@@ -1334,9 +1334,6 @@ def account_headroom(
 ) -> float | None:
     """Remaining percentage before this account hits a rate-limit window.
 
-    A ``None`` (or non-dict, e.g. a store sentinel) reading is unknown
-    headroom: never auto-skipped, never a proof of room.
-
     Considers the 5-hour and 7-day windows the account reports (Ultra has
     no 5-hour one; a window without a figure does not count). When
     ``models`` is non-empty, each named per-model weekly
@@ -1348,8 +1345,6 @@ def account_headroom(
     or carries no window data, which callers treat as "unknown" (never
     auto-skipped).
     """
-    if not isinstance(usage, dict):
-        return None
     pcts = [pct for _, pct, _ in relevant_windows(usage, models)]
     if not pcts:
         return None

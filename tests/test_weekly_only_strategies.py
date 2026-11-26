@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap import poll_policy
+from claude_swap.usage_store import UsageEntry
 from claude_swap.autoswitch import NoSwitchEvent, SwitchEvent, TickOutcome
 from tests.test_autoswitch import EngineHarness, _iso_at
 
@@ -28,6 +29,17 @@ def _weekly(h, pct, *, reset_in=3600):
     if reset_in is not None:
         window["resets_at"] = _iso_at(h.clock.now + reset_in)
     return {"seven_day": window}
+
+
+def _weekly_entries(h, usage_map):
+    """Decision-value dicts → per-account ``UsageEntry`` fake readings."""
+    out = {}
+    for num, value in usage_map.items():
+        if isinstance(value, dict):
+            out[str(num)] = UsageEntry(last_good=value, age_s=0.0, fetched_at=h.clock.now)
+        else:
+            out[str(num)] = UsageEntry()
+    return out
 
 
 def _targets(h):
@@ -104,8 +116,10 @@ def test_scoped_limit_still_binds_without_a_five_hour_window(temp_home):
 def test_manual_usage_strategies_skip_exhausted_weekly_candidate(temp_home, strategy):
     h = _harness(temp_home)
     usage = {"1": _weekly(h, 95), "2": _weekly(h, 100), "3": _weekly(h, 30)}
+    usage_entries = _weekly_entries(h, usage)
     with (
         patch.object(h.switcher, "_usage_by_account", return_value=usage),
+        patch.object(h.switcher, "_usage_entries_by_account", return_value=usage_entries),
         patch("claude_swap.switcher.isolated_mode.activate") as activate,
     ):
         activate.return_value = {
