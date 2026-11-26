@@ -1409,11 +1409,18 @@ class TestLoginCommitSafety:
     def _simulate_case_insensitive_fs(monkeypatch, switcher: ClaudeAccountSwitcher) -> None:
         from claude_swap import fsutil
 
-        targets = (switcher.configs_dir.resolve(), switcher.credentials_dir.resolve())
+        targets = {
+            os.path.normcase(os.path.realpath(os.fspath(switcher.configs_dir))),
+            os.path.normcase(os.path.realpath(os.fspath(switcher.credentials_dir))),
+        }
 
         def _fold(path):
-            p = Path(path)
-            if p.parent.resolve() in targets and not p.name.startswith(".swap-staging-"):
+            p = path if isinstance(path, Path) else Path(path)
+            if (
+                p.name
+                and os.path.normcase(os.path.realpath(os.fspath(p.parent))) in targets
+                and not p.name.startswith(".swap-staging-")
+            ):
                 return p.with_name(p.name.casefold())
             return p
 
