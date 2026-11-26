@@ -53,7 +53,7 @@ find_real_claude() {
     fi
     old_ifs=$IFS
     IFS=:
-    for dir in $PATH; do
+    for dir in ${PATH:-}; do
         [ -n "$dir" ] || continue
         candidate="$dir/claude"
         if [ -f "$candidate" ] && [ -x "$candidate" ] \

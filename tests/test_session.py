@@ -509,8 +509,9 @@ class TestBootstrap:
             or oauth.RefreshOutcome(None, "transient"),
         )
 
-        with pytest.raises(SessionError, match="live login"):
+        with pytest.raises(SessionError, match="global ~/.claude") as excinfo:
             manager.setup_session("2", share=False)
+        assert "cswap add" in str(excinfo.value)
 
         assert posted == []
         session_dir = session_dir_for(
@@ -558,8 +559,9 @@ class TestBootstrap:
             session_mod, "delete_macos_keychain_entry", deleted.append
         )
 
-        with pytest.raises(SessionError, match="live login"):
+        with pytest.raises(SessionError, match="global ~/.claude") as excinfo:
             manager.setup_session("2", share=False)
+        assert "cswap add" in str(excinfo.value)
 
         assert posted == []
         assert deleted == []

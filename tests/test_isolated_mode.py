@@ -18,7 +18,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from claude_swap import isolated_mode, oauth
-from claude_swap.exceptions import ConfigError, SwitchError
+from claude_swap.credentials import CredentialStore
+from claude_swap.exceptions import ConfigError, SessionError, SwitchError
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -362,7 +363,7 @@ class TestAddTakesTheGlobalLoginOver:
         self._login(temp_home)
         (temp_home / ".claude.json").write_text('{"oauthAccount": ')
 
-        assert isolated_mode.clear_global_login(s) is False
+        assert isolated_mode.clear_global_login(s, CREDS_1) is False
         # The credential still went; the file is left for the user to repair.
         assert not (temp_home / ".claude" / ".credentials.json").exists()
         assert (temp_home / ".claude.json").read_text() == '{"oauthAccount": '
@@ -509,6 +510,10 @@ class TestFindClaude:
         assert find_claude() is None
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="the wrapper is a POSIX shell script; Windows is not a target",
+)
 class TestTheShippedWrapper:
     def _layout(self, tmp_path: Path) -> dict[str, Path]:
         from claude_swap import wrapper
@@ -620,3 +625,556 @@ class TestTheShippedWrapper:
 
         assert result.returncode == 0, result.stderr
         assert json.loads(result.stdout) == {"real": ["--version"]}
+
+
+# ---------------------------------------------------------------------------
+# A disabled slot is refused by every launch and switch, not skipped silently
+# ---------------------------------------------------------------------------
+
+
+def _active_args(**overrides) -> MagicMock:
+    args = MagicMock()
+    args.account = None
+    args.auto = False
+    args.active = True
+    args.no_share = False
+    args.share_history = None
+    args.require_session = False
+    args.debug = False
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def _disable(s: ClaudeAccountSwitcher, num: int) -> None:
+    s.set_account_disabled(str(num), True)
+
+
+class TestADisabledSlotIsRefused:
+    def test_require_active_slot_refuses_a_disabled_slot(self, temp_home: Path):
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _disable(s, 1)
+
+        with pytest.raises(ConfigError, match="cswap enable 1"):
+            isolated_mode.require_active_slot(s)
+
+    def test_switch_to_a_disabled_slot_refuses(self, temp_home: Path):
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _seed(s, 2, "b@example.com", CREDS_2)
+        _disable(s, 2)
+
+        with pytest.raises(SwitchError, match="cswap enable 2"):
+            s.switch_to("2", json_output=True)
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_activate_refuses_a_disabled_slot(self, temp_home: Path):
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _seed(s, 2, "b@example.com", CREDS_2)
+        _disable(s, 2)
+
+        with pytest.raises(SwitchError, match="disabled"):
+            isolated_mode.activate(s, "2", emit_output=False)
+
+    def test_run_active_on_a_disabled_slot_launches_nothing(
+        self, temp_home: Path, capsys
+    ):
+        from claude_swap import cli
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _disable(s, 1)
+        manager = MagicMock()
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=s), \
+             patch("claude_swap.session.SessionManager", return_value=manager), \
+             patch("claude_swap.cli._guard_root"):
+            with pytest.raises(SystemExit) as excinfo:
+                cli._run_launch(_active_args(), [])
+
+        assert excinfo.value.code == 1
+        manager.run.assert_not_called()
+        manager.exec_default.assert_not_called()
+        assert "cswap enable 1" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Upgrading from the release that kept the login in ~/.claude
+# ---------------------------------------------------------------------------
+
+
+class TestTheUpgradeFromTheGlobalLogin:
+    def _managed_with_its_global_login(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = _switcher()
+        _seed(s, 1, "a@example.com", CREDS_1)
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com",
+                             "accountUuid": "uuid-1",
+                             "organizationUuid": ""},
+        }))
+        (temp_home / ".claude" / ".credentials.json").write_text(CREDS_1)
+        return s
+
+    def test_a_launch_refuses_until_cswap_add_takes_the_login_over(
+        self, temp_home: Path, capsys
+    ):
+        from claude_swap import cli
+
+        s = self._managed_with_its_global_login(temp_home)
+
+        manager = MagicMock()
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=s), \
+             patch("claude_swap.session.SessionManager", return_value=manager), \
+             patch("claude_swap.cli._guard_root"):
+            with pytest.raises(SystemExit) as excinfo:
+                cli._run_launch(_active_args(), ["--resume"])
+
+        assert excinfo.value.code == 1
+        manager.run.assert_not_called()
+        err = capsys.readouterr().err
+        assert "Account-1 (a@example.com)" in err
+        assert "cswap add" in err
+
+        # The remedy the refusal names: `cswap add` on the managed account
+        # takes the update branch and clears the global copy.
+        with patch.object(s, "_read_capture_credentials", return_value=CREDS_1), \
+             patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value={"uuid": "uuid-1", "email": "a@example.com",
+                                 "organizationUuid": ""}):
+            s.add_account()
+
+        assert not (temp_home / ".claude" / ".credentials.json").exists()
+        config = json.loads((temp_home / ".claude.json").read_text())
+        assert "oauthAccount" not in config
+        assert isolated_mode.require_active_slot(s) == "1"
+
+    def test_the_update_branch_keeps_the_slot_settings(self, temp_home: Path):
+        """`cswap add` refreshes in place: alias, threshold, proxy survive."""
+        s = self._managed_with_its_global_login(temp_home)
+        s.set_alias("1", "work")
+        s.set_account_threshold("1", 70)
+
+        with patch.object(s, "_read_capture_credentials", return_value=CREDS_1), \
+             patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value={"uuid": "uuid-1", "email": "a@example.com",
+                                 "organizationUuid": ""}):
+            s.add_account()
+
+        record = s._get_sequence_data()["accounts"]["1"]
+        assert record["alias"] == "work"
+        assert record["threshold"] == 70
+
+    def test_another_accounts_global_login_does_not_block_the_launch(
+        self, temp_home: Path
+    ):
+        """Only the active slot's own login is the upgrade case."""
+        s = _switcher()
+        _seed(s, 1, "a@example.com", CREDS_1)
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "stray@example.com",
+                             "accountUuid": "uuid-x",
+                             "organizationUuid": ""},
+        }))
+
+        assert isolated_mode.require_active_slot(s) == "1"
+
+
+# ---------------------------------------------------------------------------
+# The global cleanup: default profile, matching fingerprint, verified
+# ---------------------------------------------------------------------------
+
+
+class TestTheGlobalCleanupKeepsTheLiveToken:
+    def _login(self, temp_home: Path, creds: str = CREDS_1) -> None:
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com",
+                             "accountUuid": "uuid-1",
+                             "organizationUuid": ""},
+            "mcpServers": {"keep": {"command": "x"}},
+        }))
+        (temp_home / ".claude" / ".credentials.json").write_text(creds)
+
+    def test_a_refreshed_global_token_is_left_in_place(self, temp_home: Path, capsys):
+        """Claude Code may have spent the generation the add read."""
+        s = _switcher()
+        self._login(temp_home, CREDS_2)  # a different refresh token
+
+        assert isolated_mode.clear_global_login(s, CREDS_1) is False
+        assert (temp_home / ".claude" / ".credentials.json").read_text() == CREDS_2
+        config = json.loads((temp_home / ".claude.json").read_text())
+        assert config["oauthAccount"]["emailAddress"] == "a@example.com"
+        assert "only live copy" in capsys.readouterr().out
+
+    def test_the_matching_token_goes_and_the_shared_files_stay(
+        self, temp_home: Path
+    ):
+        s = _switcher()
+        self._login(temp_home, CREDS_1)
+
+        assert isolated_mode.clear_global_login(s, CREDS_1) is True
+        assert not (temp_home / ".claude" / ".credentials.json").exists()
+        config = json.loads((temp_home / ".claude.json").read_text())
+        assert "oauthAccount" not in config
+        assert config["mcpServers"] == {"keep": {"command": "x"}}
+
+    def test_a_macos_keychain_item_is_removed(self, temp_home: Path):
+        """The default Keychain item is the credential on macOS."""
+        s = _switcher()
+        s.platform = Platform.MACOS
+        self._login(temp_home, CREDS_1)
+        reads = [(CREDS_1, False), (None, False)]
+        removed: list[bool] = []
+
+        with patch.object(s._store, "_read_one_oauth_keychain",
+                          side_effect=lambda service: reads.pop(0)), \
+             patch.object(s._store, "_delete_active_keychain_entry",
+                          side_effect=lambda: removed.append(True) or True):
+            assert isolated_mode.clear_global_login(s, CREDS_1) is True
+
+        assert removed == [True], "the default Keychain item was never deleted"
+        assert not (temp_home / ".claude" / ".credentials.json").exists()
+
+    def test_a_still_present_file_is_reported(self, temp_home: Path, capsys):
+        """Removal is verified, not assumed: a survivor is a warning."""
+        s = _switcher()
+        self._login(temp_home, CREDS_1)
+
+        with patch.object(s._store, "_clear_oauth_credential"):  # unlinks nothing
+            assert isolated_mode.clear_global_login(s, CREDS_1) is False
+
+        assert (temp_home / ".claude" / ".credentials.json").exists()
+        assert "could not be removed" in capsys.readouterr().out
+
+    def test_another_profile_skips_the_default_cleanup(
+        self, temp_home: Path, monkeypatch, capsys
+    ):
+        """`CLAUDE_CONFIG_DIR` means the add imported from that profile."""
+        s = _switcher()
+        self._login(temp_home, CREDS_1)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(temp_home / "other"))
+
+        assert isolated_mode.clear_global_login(s, CREDS_1) is False
+        assert (temp_home / ".claude" / ".credentials.json").exists()
+        assert "another profile" in capsys.readouterr().out
+
+    def test_an_orphaned_credentials_file_is_a_login(self, temp_home: Path):
+        """A failed cleanup leaves the file without the key beside it."""
+        s = _switcher()
+        (temp_home / ".claude" / ".credentials.json").write_text(CREDS_1)
+
+        assert isolated_mode.global_login(s) == {"email": ""}
+        notice = isolated_mode.global_login_notice(s)
+        assert notice is not None and "no recorded email" in notice
+
+    def test_one_cswap_add_clears_the_orphan_too(self, temp_home: Path):
+        s = _switcher()
+        (temp_home / ".claude" / ".credentials.json").write_text(CREDS_1)
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com",
+                             "accountUuid": "uuid-1",
+                             "organizationUuid": ""},
+        }))
+
+        assert isolated_mode.clear_global_login(s, CREDS_1) is True
+        assert isolated_mode.global_login(s) is None
+
+
+# ---------------------------------------------------------------------------
+# CSWAP_CLAUDE_BIN: one answer, whitespace included
+# ---------------------------------------------------------------------------
+
+
+class TestTheClaudeBinaryOverride:
+    def test_a_whitespace_only_value_refuses_instead_of_searching_path(
+        self, temp_home: Path, monkeypatch
+    ):
+        from claude_swap.session import find_claude
+
+        real = temp_home / "bin" / "claude"
+        real.parent.mkdir(parents=True)
+        real.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        real.chmod(0o755)
+        monkeypatch.setenv("CSWAP_CLAUDE_BIN", "   ")
+        monkeypatch.setenv("PATH", str(real.parent))
+
+        assert find_claude() is None
+
+    def test_the_refusal_names_the_variable(self, temp_home: Path, monkeypatch):
+        from claude_swap.session import SessionManager
+
+        monkeypatch.setenv("CSWAP_CLAUDE_BIN", str(temp_home / "nope" / "claude"))
+        manager = SessionManager(_switcher())
+
+        with pytest.raises(SessionError, match="CSWAP_CLAUDE_BIN"):
+            manager.run("1", [])
+
+
+# ---------------------------------------------------------------------------
+# The key invariant: nothing outside the record is ever written
+# ---------------------------------------------------------------------------
+
+
+class TestTheInvariantAcrossEverySurface:
+    """No launch or switch writes a login — only the record changes.
+
+    Every path that could reach Claude Code's active store is driven at once,
+    with those store writes replaced by a raise: a re-base onto upstream that
+    restores ``_perform_switch`` or a same-account fast path fails here instead
+    of spending a user's refresh token.
+    """
+
+    @staticmethod
+    def _readonly(name: str):
+        def boom(*args, **kwargs):
+            raise AssertionError(
+                f"{name} was called: a switch or launch wrote a login"
+            )
+
+        return patch.object(CredentialStore, name, boom)
+
+    def test_switch_list_status_auto_and_run_write_no_login(self, temp_home: Path):
+        from claude_swap import cli
+        from claude_swap.autoswitch import AutoSwitchEngine
+        from claude_swap.settings import AutoSwitchSettings
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _seed(s, 2, "b@example.com", CREDS_2)
+        # A global login is present, so a path that still looked for one would
+        # find something to rewrite.
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com",
+                             "accountUuid": "uuid-1",
+                             "organizationUuid": ""},
+        }))
+        (temp_home / ".claude" / ".credentials.json").write_text(CREDS_1)
+        config_path = temp_home / ".claude.json"
+        cred_path = temp_home / ".claude" / ".credentials.json"
+        before = (config_path.read_bytes(), cred_path.read_bytes())
+
+        manager = MagicMock()
+        with patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(None)), \
+             self._readonly("_write_credentials"), \
+             self._readonly("_write_oauth_credentials"), \
+             self._readonly("_write_active_credentials_file"), \
+             self._readonly("_update_global_config"), \
+             patch("claude_swap.cli._guard_root"), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=s), \
+             patch("claude_swap.session.SessionManager", return_value=manager):
+            s.switch(json_output=True)                    # `cswap next`
+            s.switch(previous=True, json_output=True)     # `cswap prev`
+            s.switch_to("2", json_output=True)
+            s.list_accounts(json_output=True)
+            s.status(json_output=True)
+            AutoSwitchEngine(
+                s, AutoSwitchSettings(), lambda event: None
+            ).tick()                                      # `cswap auto`
+            cli._run_launch(_active_args(), [])           # `cswap run --active`
+
+        manager.run.assert_called_once()
+        manager.exec_default.assert_not_called()
+        assert (config_path.read_bytes(), cred_path.read_bytes()) == before
+
+
+# ---------------------------------------------------------------------------
+# `--active` is wired to the slot's own route, fail-closed
+# ---------------------------------------------------------------------------
+
+
+class _HandedOver(Exception):
+    def __init__(self, binary, argv, env):
+        self.binary, self.argv, self.env = binary, argv, env
+
+
+def _manager_with_a_fake_handover(
+    monkeypatch, seen: dict, profile: Path
+) -> None:
+    from claude_swap import session as session_mod
+
+    monkeypatch.setattr(
+        session_mod.SessionManager,
+        "_check_proxy",
+        lambda self, route, who, expectation=None: seen.update(route=route),
+    )
+    monkeypatch.setattr(session_mod.SessionManager, "_check_egress",
+                        lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        session_mod.SessionManager,
+        "setup_session",
+        lambda self, *args, **kwargs: (profile, "1", "a@example.com"),
+    )
+
+    def fake_exec(self, binary, args, env):
+        raise _HandedOver(binary, [binary, *args], env)
+
+    monkeypatch.setattr(session_mod.SessionManager, "_exec", fake_exec)
+    monkeypatch.setattr(
+        session_mod.shutil, "which", lambda name: "/fake/bin/claude"
+    )
+
+
+class TestTheActiveLaunchUsesItsOwnRoute:
+    def test_the_slots_proxy_is_checked_and_handed_to_claude(
+        self, temp_home: Path, monkeypatch
+    ):
+        from claude_swap import cli
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        s.set_account_proxy("1", "http://127.0.0.1:3128")
+        seen: dict = {}
+        _manager_with_a_fake_handover(monkeypatch, seen, temp_home / "profile")
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=s), \
+             patch("claude_swap.cli._guard_root"):
+            with pytest.raises(_HandedOver) as excinfo:
+                cli._run_launch(_active_args(), ["-p", "hi"])
+
+        assert seen["route"] is not None
+        assert excinfo.value.env["HTTPS_PROXY"] == seen["route"].text()
+        assert excinfo.value.env["HTTPS_PROXY"].startswith("http://127.0.0.1:")
+        assert excinfo.value.argv[1:] == ["-p", "hi"]
+
+    def test_an_account_without_a_proxy_keeps_what_it_inherited(
+        self, temp_home: Path, monkeypatch
+    ):
+        from claude_swap import cli
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        monkeypatch.setenv("HTTPS_PROXY", "http://inherited:8443")
+        seen: dict = {}
+        _manager_with_a_fake_handover(monkeypatch, seen, temp_home / "profile")
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=s), \
+             patch("claude_swap.cli._guard_root"):
+            with pytest.raises(_HandedOver) as excinfo:
+                cli._run_launch(_active_args(), [])
+
+        assert seen["route"] is None
+        assert excinfo.value.env["HTTPS_PROXY"] == "http://inherited:8443"
+
+    def test_a_dead_proxy_stops_the_launch_before_claude_starts(
+        self, temp_home: Path, monkeypatch, capsys
+    ):
+        import socket
+
+        from claude_swap import cli
+        from claude_swap import session as session_mod
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        s.set_account_proxy("1", f"http://127.0.0.1:{port}")
+
+        launched: list = []
+        monkeypatch.setattr(
+            session_mod.SessionManager, "_exec",
+            lambda self, *a, **k: launched.append(a),
+        )
+        monkeypatch.setattr(
+            session_mod.shutil, "which", lambda name: "/fake/bin/claude"
+        )
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=s), \
+             patch("claude_swap.cli._guard_root"):
+            with pytest.raises(SystemExit) as excinfo:
+                cli._run_launch(_active_args(), [])
+
+        assert excinfo.value.code == 1
+        assert launched == []
+        assert "proxy" in capsys.readouterr().err.lower()
+
+    def test_a_failed_egress_check_stops_the_launch_before_claude_starts(
+        self, temp_home: Path, monkeypatch, capsys
+    ):
+        from claude_swap import cli
+        from claude_swap import session as session_mod
+        from claude_swap.exceptions import EgressCheckError
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        s.set_account_proxy("1", "http://127.0.0.1:3128")
+
+        launched: list = []
+        monkeypatch.setattr(
+            session_mod.SessionManager,
+            "_check_proxy",
+            lambda self, route, who, expectation=None: None,
+        )
+        monkeypatch.setattr(
+            session_mod.SessionManager,
+            "_check_egress",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                EgressCheckError("the exit country is DE, but US was expected")
+            ),
+        )
+        monkeypatch.setattr(
+            session_mod.SessionManager, "_exec",
+            lambda self, *a, **k: launched.append(a),
+        )
+        monkeypatch.setattr(
+            session_mod.shutil, "which", lambda name: "/fake/bin/claude"
+        )
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=s), \
+             patch("claude_swap.cli._guard_root"):
+            with pytest.raises(SystemExit) as excinfo:
+                cli._run_launch(_active_args(), [])
+
+        assert excinfo.value.code == 1
+        assert launched == []
+        assert "exit country" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Claude Code's own commands through the active launch
+# ---------------------------------------------------------------------------
+
+
+class TestClaudeCommandsOnTheActiveLaunch:
+    def test_mcp_goes_to_the_shared_profile(self, temp_home: Path):
+        from claude_swap import cli
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        manager = MagicMock()
+        tail = ["mcp", "add", "-s", "user", "x", "cmd"]
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=s), \
+             patch("claude_swap.session.SessionManager", return_value=manager), \
+             patch("claude_swap.cli._guard_root"):
+            cli._run_launch(_active_args(), tail)
+
+        manager.exec_default.assert_called_once_with(tail, primary_profile=True)
+        manager.run.assert_not_called()
+
+    def test_a_command_that_needs_a_login_runs_on_the_active_slot(
+        self, temp_home: Path
+    ):
+        """`claude auth status` must answer about the active account."""
+        from claude_swap import cli
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        manager = MagicMock()
+        manager.run.side_effect = AssertionError("launch recorded")
+        tail = ["auth", "status", "--json"]
+
+        with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=s), \
+             patch("claude_swap.session.SessionManager", return_value=manager), \
+             patch("claude_swap.cli._guard_root"):
+            with pytest.raises(AssertionError, match="launch recorded"):
+                cli._run_launch(_active_args(), tail)
+
+        args, kwargs = manager.run.call_args
+        assert args[0] == "1"
+        assert args[1] == tail
+        assert kwargs["account"] == ("1", "a@example.com", "")
+        manager.exec_default.assert_not_called()

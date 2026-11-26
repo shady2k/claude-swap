@@ -24,8 +24,12 @@ ln -s "$(cswap wrapper)" ~/.local/claude-swap/bin/claude
 export PATH="$HOME/.local/claude-swap/bin:$PATH"
 ```
 
-Every `claude`, `claude --resume` and `claude -p "…"` then picks an account, with
-its arguments passed through unchanged and its exit code kept.
+Every `claude`, `claude --resume` and `claude -p "…"` then runs the account
+recorded as active, in its own profile, with its arguments passed through
+unchanged and its exit code kept. It refuses — never falling back to a bare
+`claude` on `~/.claude` — when no slot is recorded, when the recorded slot is
+disabled, when its login is still in the global `~/.claude`, or when its proxy
+or exit check fails.
 
 ## Which account
 
@@ -126,33 +130,39 @@ Claude Code's mark, and a one-word prompt gets none.
 - **It ignores `cswap map`.** A directory mapping is a choice of account; it
   applies to `cswap run` with no account named, not to `--auto`.
 - **It does not isolate nested launches.** A `claude` started inside a session
-  goes through the wrapper and chooses an account again. On an account with no
-  proxy it inherits the proxy variables of the session that started it — the
-  accepted rule of [proxy.md](proxy.md#launching-claude-code), which only
-  replaces the variables of an account that has a proxy of its own.
+  goes through the wrapper and launches the recorded active account in its own
+  profile again. On an account with no proxy it inherits the proxy variables of
+  the session that started it — the accepted rule of
+  [proxy.md](proxy.md#launching-claude-code), which only replaces the variables
+  of an account that has a proxy of its own.
 - **It does not change background sessions.** Claude Code's `--bg` sessions and
   `attach` belong to the profile they were started from; a later launch choosing
   another account neither detaches them nor moves them.
 
 ## Claude Code's own commands
 
-`claude mcp add …`, `claude plugin …`, `claude auth …`, `claude update`,
-`claude --version`, `claude doctor` and the rest of Claude Code's housekeeping
-are not sessions, so `--auto` hands them to the default login
-(`manager.exec_default`) instead of choosing an account:
+Claude Code's housekeeping commands are not sessions, so each launch form
+answers them where they belong rather than starting one:
 
-- `claude mcp add -s user` would otherwise write the server into the chosen
-  account's profile, which the next launch's MCP sync deletes, and the login the
-  user manages their MCP servers on would never see it;
-- `claude --version` and `claude update` would be refused when no account has
-  quota left.
-
-The default login's own proxy is still checked and handed over, fail-closed, the
-same as any launch of that login. These commands run on the user's own profile
-even from inside a session, whose terminal exports its profile in
-`CLAUDE_CONFIG_DIR`: that variable is dropped for the child, so `claude mcp add`
-writes the profile the next session launch syncs FROM rather than a copy it
-overwrites.
+- **`claude mcp …`** manages the user's shared server list. A session profile's
+  copy is deleted by the next launch's MCP sync, so a write there would be lost
+  and the profile the user manages their servers on would never see it. Every
+  launch form — `--active` (what the wrapper runs), `--auto`, a named account
+  and the directory-mapping launch — sends it to the primary profile
+  (`manager.exec_default(..., primary_profile=True)`), whose login's proxy is
+  still checked and handed over, fail-closed. The command runs on the user's
+  own profile even from inside a session, whose terminal exports its profile in
+  `CLAUDE_CONFIG_DIR`: that variable is dropped for the child, so the server
+  lands in the profile the next session launch syncs FROM.
+- **`claude --version`, `-v`, `--help`, `-h`** answer a property of the
+  installed binary: `--auto` runs them on the real binary directly
+  (`manager.exec_local`), with no login, profile, proxy or quota involved. The
+  thin wrapper hands them over the same way before it calls cswap at all.
+- **`claude auth …`, `plugin …`, `update`, `doctor` and the rest** need a
+  login, so they are a launch: `--active` runs them on the recorded account's
+  session profile (so `claude auth status --json` answers about that account)
+  and `--auto` runs them through its ranking like any other launch. Neither
+  hands them to the global `~/.claude` outside the account's proxy.
 
 ## The wrapper
 
@@ -198,7 +208,7 @@ run.disableNonessentialTraffic false` stops cswap from setting the variable (it
 never unsets an inherited one), giving those features back; the proxy settings an
 account carries are unaffected either way.
 
-A launch on an account the wrapper (or `--auto`) chose drops the shell's auth
+A launch on the recorded account (or the one `--auto` chose) drops the shell's auth
 overrides (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and the rest of
 `AUTH_OVERRIDE_ENV_VARS`): the account, and the proxy it was checked with, were
 chosen for the user, and an exported key would bill someone else's credential

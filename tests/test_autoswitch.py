@@ -683,7 +683,9 @@ class TestDecisionTable:
         outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
         assert outcome is TickOutcome.NO_ACTION
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
-        assert reasons == ["unmanaged-active-account"]
+        # A global login is not an account of ours, so it changes no answer:
+        # with no recorded slot there is nothing to switch FROM.
+        assert reasons == ["no-active-account"]
         assert (temp_home / ".claude" / ".credentials.json").read_text() == live_before
 
     def test_all_exhausted_carries_earliest_reset(self, harness):

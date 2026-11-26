@@ -5118,6 +5118,14 @@ class ClaudeAccountSwitcher:
 
             tag = self._get_display_tag(current_email, matched_org_name, current_org_uuid)
             self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
+            # The slot now holds this login, so the global copy goes — the
+            # same rule as the create path below, and the one an upgrade from
+            # upstream's paradigm needs here: the global login is this
+            # account's live generation, and leaving it keeps the wrapper's
+            # "run cswap add" refusal coming forever. Only after the save:
+            # a failed add leaves the global login as it was. The cleanup
+            # reports any copy it had to leave on screen itself.
+            isolated_mode.clear_global_login(self, current_creds)
             print(
                 f"{accent('Updated credentials')} for Account {account_num} "
                 f"({current_email} {muted(f'[{tag}]')})."
@@ -5344,8 +5352,10 @@ class ClaudeAccountSwitcher:
 
         # The slot now holds this login, so the global copy goes: one one-time
         # refresh token must not exist twice (``isolated_mode``). Only after
-        # the save — a failed add leaves the global login as it was.
-        isolated_mode.clear_global_login(self)
+        # the save — a failed add leaves the global login as it was. The
+        # cleanup reports any copy it had to leave (another profile, a token
+        # Claude Code refreshed meanwhile) on screen itself.
+        isolated_mode.clear_global_login(self, current_creds)
 
         if displaced is not None:
             self._prune_mappings(displaced[0], displaced[1])
@@ -7885,20 +7895,18 @@ class ClaudeAccountSwitcher:
 
         A slot is launchable when it is in rotation, not disabled, is not an
         API-key account (``cswap run`` refuses those), and has stored
-        credentials and config — except the live login itself, whose launch is
-        plain claude on its own credential. Ranking, highest first: quota left
+        credentials and config. Ranking, highest first: quota left
         (``oauth.account_headroom`` > 0 over the 5h and 7d windows, plus the
         ``autoswitch.model`` ones) before none, an account Claude Code has not
         just reported a rate-limit stop on before one it has
-        (:meth:`record_stop_failure`), more headroom before less, the live
-        login before another slot at equal headroom, and the earlier slot in
-        the rotation before a later one. A reading whose access token has
+        (:meth:`record_stop_failure`), more headroom before less, an account
+        that is not merely the recorded active slot before one that is at
+        equal headroom, and the earlier slot in the rotation before a later
+        one. A reading whose access token has
         expired ranks on its stored measurement like any other
         (``_launch_value``): the token says nothing about the quota.
 
-        A launch never writes ``sequence.json``, and may land on the login the
-        terminal already has (``cswap run`` then satisfies that on the default
-        login, the same-account fast path).
+        A launch never writes ``sequence.json``.
         """
         if models is None:
             models = parse_model_names(load_settings(self.backup_dir).model)
@@ -7915,7 +7923,7 @@ class ClaudeAccountSwitcher:
             if (record := records.get(str(row[0])))
             and not record.get("disabled")
             and record.get("kind") != "api_key"
-            and (row[4] or row[5])
+            and row[5]
             and str(row[0]) not in exclude
             and self._read_account_config(str(row[0]), row[1])
         ]
@@ -8453,7 +8461,6 @@ class ClaudeAccountSwitcher:
                 f"{bolded('Status:')} "
                 f"{dimmed('No active account recorded — cswap switch <num|email>')}"
             )
-            print()
             isolated_mode.report_global_login(self)
             return None
 
@@ -8802,12 +8809,10 @@ class ClaudeAccountSwitcher:
 
         next_account: str | None = None
         skipped_exhausted: list[str] = []
-        skipped_disabled: list[str] = []
         step = -1 if previous else 1
         for offset in range(1, len(sequence)):
             candidate = str(sequence[(current_index + step * offset) % len(sequence)])
             if self._disabled_from_data(data, candidate):
-                skipped_disabled.append(candidate)
                 if json_output:
                     warnings.append(f"Skipped Account-{candidate} (disabled)")
                 else:
@@ -8872,20 +8877,6 @@ class ClaudeAccountSwitcher:
                 f"Account-{current_num}."
             )
             return None
-
-        if next_account is None and skipped_disabled:
-            # Every slot either disabled or unlaunchable: naming the disabled
-            # ones is the actionable half, and the roster has nothing to give
-            # a plain rotation here.
-            if any(self._account_is_switchable(num) for num in sequence):
-                raise ConfigError(
-                    "No accounts remain in rotation. Re-enable one with: "
-                    "cswap enable <num|email>"
-                )
-            raise ConfigError(
-                "No managed accounts have valid stored credentials/config. "
-                "Re-add a slot with: cswap --add-account --slot <number>"
-            )
 
         if next_account is None:
             if json_output:

@@ -376,12 +376,11 @@ class TestConflictPolicy:
         assert seq["accounts"]["1"]["email"] == "bob@example.com"
         assert seq["accounts"]["3"]["email"] == "alice@example.com"
 
-    def test_import_over_live_login_hints_force_activation(
+    def test_import_over_the_active_slot_names_it(
         self, temp_home: Path, capsys
     ):
-        """Overwriting the stored backup of the current live login prints the
-        --switch-to --force activation hint (issue #79 follow-up): a plain
-        switch would back the stale live creds up over the fresh import."""
+        """Re-importing over the recorded active slot says the next launch
+        uses the imported credentials: there is no live login to re-sync."""
         s = _linux_switcher(temp_home)
         _seed_account(s, 1, "alice@example.com", "org-a", "Org A")
         (temp_home / ".claude.json").write_text(json.dumps({
@@ -401,8 +400,9 @@ class TestConflictPolicy:
         import_accounts(s, str(out), force=True)
 
         err = capsys.readouterr().err
-        assert "alice@example.com is your current live login" in err
-        assert "cswap --switch-to 1 --force" in err
+        assert "Account-1 (alice@example.com) is the active account" in err
+        assert "--force" not in err
+        assert "--switch-to" not in err
 
     def test_import_without_matching_live_login_prints_no_hint(
         self, temp_home: Path, capsys

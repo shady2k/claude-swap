@@ -122,11 +122,16 @@ def _translate_subcommand(argv: list[str]) -> list[str]:
     return argv
 
 
-_SERVICE_COMMANDS = frozenset({
-    "mcp", "plugin", "plugins", "auth", "setup-token", "install", "update",
-    "upgrade", "doctor", "import", "purge",
-    "--version", "-v", "--help", "-h",
-})
+#: Claude Code's own local commands: they answer a property of the installed
+#: binary, so `cswap run --auto` runs them without an account, a profile or a
+#: proxy.
+_LOCAL_COMMANDS = frozenset({"--version", "-v", "--help", "-h"})
+
+#: Claude Code's commands that write the user's SHARED profile rather than a
+#: session copy. Every session profile mirrors that profile
+#: (``_sync_mcp_servers``), so a write into a session copy is deleted by the
+#: next launch.
+_PROFILE_COMMANDS = frozenset({"mcp"})
 
 
 def _run_command(argv: list[str]) -> None:
@@ -291,16 +296,25 @@ def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
 
         manager = SessionManager(switcher)
 
+        # `claude mcp …` manages the user's shared server list, which every
+        # session profile mirrors: a write into a session copy would be
+        # deleted by the next launch. It goes to the primary profile whichever
+        # launch form named an account.
+        if tail and tail[0] in _PROFILE_COMMANDS:
+            manager.exec_default(tail, primary_profile=True)
+            return  # only reachable in tests where exec/exit is mocked
+
         # share_history goes through as given: None (neither flag) leaves it
         # to run.shareHistory, which SessionManager.run resolves.
         if args.auto:
-            # `claude`'s own housekeeping is not a session: `claude mcp add`
-            # must write the login the user manages their MCP servers on (a
-            # session profile's copy is deleted by the next _sync_mcp_servers),
-            # and `--version`/`update` must answer without a quota. The default
-            # login's own proxy is still checked, fail-closed.
-            if tail and tail[0] in _SERVICE_COMMANDS:
-                manager.exec_default(tail, primary_profile=True)
+            # `--version`/`--help` answer without an account: an SDK or a
+            # package manager asking must get an answer while no slot is
+            # recorded. Nothing else is answered here: `auth`, `update` and
+            # `doctor` need the login the launch chose, and must not run in
+            # the global profile outside that account's proxy — so `--auto`
+            # walks its plan for them like any other command.
+            if tail and tail[0] in _LOCAL_COMMANDS:
+                manager.exec_local(tail)
                 return  # only reachable in tests where exec/exit is mocked
 
             # Walk the ranked candidates of ONE capture (``auto_run_plan``):
@@ -443,8 +457,8 @@ def _wrapper_command(argv: list[str]) -> None:
         description=(
             "Print the path of claude-swap's thin `claude` wrapper: a symlink "
             "to it, ahead of the real Claude Code in PATH, makes every "
-            "`claude` launch the managed account with the most quota left "
-            "(`cswap run --auto`) without switching the default login."
+            "`claude` launch the account recorded in cswap's state "
+            "(`cswap run --active`) in that account's own profile."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

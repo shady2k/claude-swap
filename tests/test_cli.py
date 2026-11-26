@@ -1326,6 +1326,9 @@ class TestRunCommand:
             def exec_default(self, claude_args, *, primary_profile=False):
                 calls.append(("exec_default", claude_args, primary_profile))
 
+            def exec_local(self, claude_args):
+                calls.append(("exec_local", claude_args))
+
         with patch("claude_swap.session.SessionManager", FakeSessionManager), \
              patch("claude_swap.cli.ClaudeAccountSwitcher",
                    return_value=MagicMock(backup_dir=self.backup_dir,
@@ -1694,16 +1697,12 @@ class TestRunCommand:
         [
             ["mcp", "add", "-s", "user", "x", "cmd"],
             ["mcp", "list"],
-            ["plugin", "install", "y"],
-            ["auth", "login"],
-            ["update"],
-            ["--version"],
-            ["-h"],
         ],
     )
-    def test_claude_housekeeping_goes_to_the_default_login(self, tail):
-        """`claude mcp add` must not write a session profile's copy (the next
-        _sync_mcp_servers deletes it), and `--version` must not need a quota."""
+    def test_mcp_goes_to_the_shared_profile(self, tail):
+        """`claude mcp add` must not write a session profile's copy: the next
+        _sync_mcp_servers deletes it, so the write belongs in the profile the
+        user manages their servers on."""
         target = MagicMock(side_effect=AssertionError("no account should be chosen"))
         calls = self._dispatch(
             ["run", "--auto", "--", *tail], auto_run_plan=target
@@ -1712,6 +1711,36 @@ class TestRunCommand:
         assert ("exec_default", tail, True) in calls
         assert not [call for call in calls if call[0] == "run"]
         target.assert_not_called()
+
+    @pytest.mark.parametrize("tail", [["--version"], ["-v"], ["-h"], ["--help"]])
+    def test_local_flags_answer_without_an_account(self, tail):
+        """An SDK asking for the version gets it with no slot and no quota."""
+        target = MagicMock(side_effect=AssertionError("no account should be chosen"))
+        calls = self._dispatch(
+            ["run", "--auto", "--", *tail], auto_run_plan=target
+        )
+
+        assert ("exec_local", tail) in calls
+        assert not [call for call in calls if call[0] in ("run", "exec_default")]
+        target.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            ["plugin", "install", "y"],
+            ["auth", "login"],
+            ["auth", "status", "--json"],
+            ["update"],
+            ["doctor"],
+        ],
+    )
+    def test_a_command_that_needs_a_login_goes_through_the_ranking(self, tail):
+        """`auth`/`update`/`doctor` are not the global profile's: they run on
+        the account the launch chose, inside that account's proxy."""
+        calls = self._auto_dispatch(["run", "--auto", "--", *tail], [self._row(2)])
+
+        assert self._launch(calls)[1] == "2"
+        assert not [call for call in calls if call[0] in ("exec_default", "exec_local")]
 
     def test_auto_forwards_the_run_flags(self):
         calls = self._auto_dispatch(
@@ -1785,40 +1814,61 @@ class TestRunCommand:
         "unbuffered", [False, True], ids=["buffered", "unbuffered"]
     )
     def test_real_handoff_leaves_stdout_to_claude(self, tmp_path, unbuffered):
-        """Through a real subprocess, everything cswap says is on stderr and
-        stdout stays empty.
+        """Through a real subprocess, stdout carries claude's output alone.
 
         Buffered is the case that would put a notice in front of claude's
         output; unbuffered is the one where a POSIX exec drops it. The launch
-        here ends in the fork's fail-closed refusal — there is no account to
-        run — which is the path a user without a recorded slot meets.
+        is a real `cswap run --active` on a recorded slot whose only stand-in
+        is the session manager: it prints its notices, then execs a fake
+        claude that answers JSON.
         """
         fake_claude = tmp_path / "claude.py"
         fake_claude.write_text(
             'import json, sys\nprint(json.dumps({"args": sys.argv[1:]}))\n'
         )
-        # An unmapped directory launches the default login, which reads no
-        # credential on the way; its route is the one account-shaped answer
-        # this launch asks for (none: no slot, so nothing to apply).
         script = textwrap.dedent("""\
-            import sys
+            import os, sys
             from pathlib import Path
             from types import SimpleNamespace
             from unittest.mock import patch
 
             from claude_swap import cli
 
+            fake = sys.argv[1]
+            recorded = {
+                "accounts": {"1": {"email": "a@example.com"}},
+                "sequence": [1],
+                "activeAccountNumber": 1,
+            }
             switcher = SimpleNamespace(
                 backup_dir=Path.cwd(),
                 _logger=None,
-                slot_for_directory=lambda cwd: (None, None),
-                _get_sequence_data=lambda: {"accounts": {}, "sequence": []},
+                _get_sequence_data=lambda: recorded,
+                _account_is_switchable=lambda num: True,
+                is_account_disabled=lambda num: False,
+                account_email=lambda num: recorded["accounts"][num]["email"],
+                _get_current_identity_triple=lambda path=None: None,
+                resolve_account=lambda num: ("1", "a@example.com", ""),
                 _is_running_in_container=lambda: True,
             )
-            argv = ["cswap", "run", "--", sys.argv[1], "--output-format", "stream-json"]
-            # Python stands in for claude; the handoff itself is the real one.
+
+            class FakeSessionManager:
+                def __init__(self, switcher):
+                    pass
+
+                def run(self, identifier, claude_args, **kwargs):
+                    # Everything cswap says on the way must land on stderr.
+                    print(f"Launching Account-{identifier} [session mode]")
+                    print("a bootstrap warning", file=sys.stderr)
+                    os.execv(sys.executable, [sys.executable, *claude_args])
+
+            argv = [
+                "cswap", "run", "--active", "--",
+                fake, "--output-format", "stream-json",
+            ]
             with patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=switcher), \\
-                 patch("claude_swap.session.shutil.which", return_value=sys.executable), \\
+                 patch("claude_swap.session.SessionManager", FakeSessionManager), \\
+                 patch("os.geteuid", return_value=1000, create=True), \\
                  patch.object(sys, "argv", argv):
                 cli.main()
         """)
@@ -1836,10 +1886,12 @@ class TestRunCommand:
             timeout=60,
         )
 
-        assert result.returncode == 1, result.stderr
-        assert result.stdout == ""
-        assert "No account mapped" in result.stderr
-        assert "No active account is recorded" in result.stderr
+        assert result.returncode == 0, result.stderr
+        assert [json.loads(line) for line in result.stdout.splitlines()] == [
+            {"args": ["--output-format", "stream-json"]}
+        ]
+        assert "Launching Account-1" in result.stderr
+        assert "a bootstrap warning" in result.stderr
 
 
 class TestSubcommandAliases:
@@ -1862,6 +1914,21 @@ class TestSubcommandAliases:
         assert cli._translate_subcommand(["switch", "u@x.com", "--json"]) == [
             "--switch-to", "u@x.com", "--json",
         ]
+
+    @pytest.mark.parametrize(
+        "argv,expected",
+        [
+            (["next"], ["--switch"]),
+            (["next", "--json"], ["--switch", "--json"]),
+            (["prev"], ["--switch", "--previous"]),
+            (["prev", "--json"], ["--switch", "--previous", "--json"]),
+            (["current"], ["--status"]),
+            (["current", "--json"], ["--status", "--json"]),
+        ],
+    )
+    def test_translate_next_prev_current(self, argv, expected):
+        """The rotation aliases: `next`/`prev` move, `current` reports."""
+        assert cli._translate_subcommand(argv) == expected
 
     def test_translate_simple_verbs_and_aliases(self):
         assert cli._translate_subcommand(["list"]) == ["--list"]

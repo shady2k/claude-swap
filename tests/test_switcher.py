@@ -6537,15 +6537,23 @@ class TestSwitchSkipsBrokenSlots:
         )
         assert s._get_sequence_data()["activeAccountNumber"] == 1
 
-    def test_fresh_machine_all_disabled_raises(self, temp_home: Path):
+    def test_a_rotation_with_every_slot_disabled_is_a_noop(self, temp_home: Path):
+        """The recorded slot stays: a bare rotation has no target and says so.
+
+        Upstream reached the "no accounts remain" error here because its
+        active account was the (absent) live login, so this read as a fresh
+        machine. The fork records the slot, and a disabled slot is still where
+        the user is until they switch away from it.
+        """
         s = self._setup(temp_home)
         self._seed(s, 1, "a@example.com")
         self._seed(s, 2, "b@example.com")
         s.set_account_disabled("1", True)
         s.set_account_disabled("2", True)
 
-        with pytest.raises(ConfigError, match="No accounts remain in rotation"):
-            s.switch()
+        s.switch()
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
 
 
 class TestUsageAwareSwitch:
@@ -11513,19 +11521,24 @@ class TestDisableEnableAccount:
         assert target is None
         assert note == "none"
 
-    def test_explicit_switch_to_disabled_still_works(self, temp_home):
-        """Disabling only holds an account out of *automatic* selection;
-        an explicit `switch <num>` must still activate it."""
+    def test_explicit_switch_to_a_disabled_slot_is_refused(self, temp_home):
+        """A disabled slot is not a launch target even when named outright.
+
+        It keeps its login; the remedy is `cswap enable`, not a silent
+        activation of an account the user held out.
+        """
+        from claude_swap.exceptions import SwitchError
+
         s = self._setup(temp_home)
         self._seed(s, 1, "a@example.com")
         self._seed(s, 2, "b@example.com")
         s.set_account_disabled("2", True)
         self._make_live(temp_home, "a@example.com", 1)
 
-        with patch.object(s, "list_accounts"):
+        with pytest.raises(SwitchError, match="cswap enable 2"):
             s.switch_to("2")
 
-        assert s._get_sequence_data()["activeAccountNumber"] == 2
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
 
     def test_remove_then_readd_clears_disabled(self, temp_home):
         """A disabled slot re-added later must not inherit the stale flag."""

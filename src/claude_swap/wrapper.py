@@ -1,26 +1,28 @@
-"""The thin ``claude`` wrapper: launch on the best account without switching.
+"""The thin ``claude`` wrapper: launch the recorded active account.
 
 ``cswap wrapper`` prints the path of the shipped script (``scripts/claude``).
 A symlink to it in a directory ahead of the real Claude Code in ``PATH`` makes
 every ``claude``, ``claude --resume`` included, run
 
-    cswap run --auto -- "$@"
+    cswap run --active -- "$@"
 
-so one account is chosen by the headroom ranking
-(``ClaudeAccountSwitcher.auto_run_target``) and started as its own session
-profile with its own proxy — the default login is read, never switched. What
-a user sees is in ``docs/auto-launch.md``.
+so the slot recorded in ``sequence.json`` (``cswap switch``) is started in its
+own session profile with its own proxy, and the global ``~/.claude`` login is
+never read, written or switched. What a user sees is in
+``docs/auto-launch.md``.
 
 The script resolves nothing and searches nothing: it checks that ``cswap`` is
-on ``PATH`` and replaces itself with ``cswap run --auto -- "$@"``. Finding the
-real Claude Code is ``session.find_claude``'s single job, so there is one
+on ``PATH`` and replaces itself with ``cswap run --active -- "$@"``. Finding
+the real Claude Code is ``session.find_claude``'s single job, so there is one
 answer to "which binary is Claude Code" and it cannot disagree with itself.
+Its ``--version``/``-v``/``--help``/``-h`` passthrough uses the same rule, so
+a caller asking which version is installed gets an answer without an account.
 
 One rule keeps the two from handing the terminal to each other in a loop:
 ``find_claude`` never returns this file. Started as ``cswap run 3`` with the
 wrapper on ``PATH``, it walks ``PATH`` past the wrapper to the real binary, so
-an explicit account is not replaced by an automatic choice, and the ``claude
-auth status`` probe does not become a second cswap. :func:`is_wrapper`
+an explicit account is not replaced by the wrapper's own launch, and the
+``claude auth status`` probe does not become a second cswap. :func:`is_wrapper`
 recognises the script by a marker line in its first kilobytes — cheap on a
 377 MB binary, and still true of an edited copy or another version.
 """

@@ -762,3 +762,69 @@ class TestADeniedKeychainSurvivesAnUnreadableFallbackFile:
         assert ac.keychain_unavailable is True, (
             "the keychain WAS denied; an unreadable fallback cannot clear that"
         )
+
+
+class TestATornRosterDoesNotDestroyBackups:
+    """`_get_sequence_data` answers None for ABSENT and for TORN alike.
+
+    27 sites write the result back through `or {}`, so a torn `sequence.json`
+    read as "no accounts" and the next write rebuilt the roster from nothing.
+    """
+
+    def test_add_account_refuses_instead_of_overwriting_a_live_backup(
+        self, temp_home: Path
+    ):
+        """Measured: the backup was destroyed BEFORE the crash, not by it.
+
+        `_get_next_account_number` collapsed to 1, `_write_account_credentials`
+        landed at switcher.py:2934, and only THEN did `data["accounts"][num]`
+        raise `TypeError` at :2941 — which `cli.py`'s `except
+        ClaudeSwitchError` does not catch, so `--json` emitted no envelope.
+
+            before  sha256:296e3
+            raised  TypeError    is_ClaudeSwitchError=False
+            after   sha256:6aabc
+
+        Asserts the BACKUP survives, not the exception type: a refusal that
+        still overwrote it would satisfy `pytest.raises` and lose the token.
+        """
+        s = _linux_switcher()
+        s._write_account_credentials("1", "shared@example.com", OAUTH_JSON)
+        data = s._get_sequence_data() or {
+            "activeAccountNumber": None, "lastUpdated": "",
+            "sequence": [], "accounts": {},
+        }
+        data["accounts"]["1"] = {
+            "email": "shared@example.com", "uuid": "u1",
+            "organizationUuid": "org-A", "organizationName": "A",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [1]
+        data["activeAccountNumber"] = 1
+        s._write_json(s.sequence_file, data)
+        before = s._read_account_credentials("1", "shared@example.com")
+        assert before, "premise: slot 1 has a credential backup"
+
+        s.sequence_file.write_text(
+            s.sequence_file.read_text(encoding="utf-8")[:-12], encoding="utf-8"
+        )
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(s.sequence_file.read_text(encoding="utf-8"))
+
+        # A live login for the SAME email under a different org — what makes
+        # the collapsed slot number land on top of the resident one.
+        get_credentials_path().parent.mkdir(parents=True, exist_ok=True)
+        get_credentials_path().write_text(OAUTH_JSON, encoding="utf-8")
+        get_global_config_path().write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "shared@example.com",
+                             "accountUuid": "u2",
+                             "organizationUuid": "org-B"},
+        }), encoding="utf-8")
+
+        with pytest.raises(ClaudeSwitchError):
+            s.add_account()
+
+        assert s._read_account_credentials("1", "shared@example.com") == before, (
+            "slot 1's credential backup was overwritten before the failure; "
+            "the torn roster read as an empty one"
+        )

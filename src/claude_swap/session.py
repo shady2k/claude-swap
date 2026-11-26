@@ -765,8 +765,13 @@ def find_claude() -> str | None:
     chose with a second automatic choice (``cswap run 3`` included), and would
     turn the ``claude auth status`` probe into another cswap.
     """
-    override = os.environ.get("CSWAP_CLAUDE_BIN", "").strip()
+    override = os.environ.get("CSWAP_CLAUDE_BIN", "")
     if override:
+        # An explicit answer is honoured exactly, including its failures: a
+        # value that names no usable binary refuses the launch rather than
+        # silently running a different `claude` from PATH. The wrapper's
+        # shell check reads the same value untrimmed, so a whitespace-only
+        # setting refuses in both places.
         if os.path.isfile(override) and os.access(override, os.X_OK) and not (
             wrapper.is_wrapper(override)
         ):
@@ -784,6 +789,30 @@ def find_claude() -> str | None:
         ):
             return candidate
     return None
+
+
+def require_claude_bin() -> str:
+    """The real Claude Code binary, or the refusal that names why there is none.
+
+    ``find_claude`` answers ``None`` for two different situations, and the
+    remedy differs: nothing installed (put `claude` on PATH) and an explicit
+    ``CSWAP_CLAUDE_BIN`` that names no usable binary (fix or unset the
+    variable). Naming the variable is what keeps the second one from reading
+    as a missing install and sending the user to reinstall Claude Code.
+    """
+    claude_bin = find_claude()
+    if claude_bin:
+        return claude_bin
+    override = os.environ.get("CSWAP_CLAUDE_BIN", "")
+    if override:
+        raise SessionError(
+            f"CSWAP_CLAUDE_BIN is set to {override!r}, which is not an "
+            "executable Claude Code binary (and is not claude-swap's own "
+            "wrapper). Nothing was launched; fix or unset CSWAP_CLAUDE_BIN."
+        )
+    raise SessionError(
+        "'claude' was not found on PATH. Install Claude Code first."
+    )
 
 
 def _claude_env(
@@ -928,11 +957,7 @@ class SessionManager:
         Notices on the way are printed plainly. `cswap run` sends them to
         stderr, because stdout is claude's (``cli._run_launch``).
         """
-        claude_bin = find_claude()
-        if not claude_bin:
-            raise SessionError(
-                "'claude' was not found on PATH. Install Claude Code first."
-            )
+        claude_bin = require_claude_bin()
         # setup_session is handed the request, not the answer: it resolves it
         # the same way, and only the request says whether sharing was asked
         # for or defaulted (``_share_history_asked`` — an answer of True would
@@ -1067,8 +1092,8 @@ class SessionManager:
 
         ``primary_profile`` launches on the profile the user manages, even
         when ``CLAUDE_CONFIG_DIR`` or ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` name
-        another one — a session's terminal. `cswap run --auto` passes it for
-        Claude Code's own housekeeping commands: their writes belong in the
+        another one — a session's terminal. It is passed for Claude Code's own
+        housekeeping commands (`claude mcp …`), whose writes belong in the
         profile the next session launch syncs FROM, not in a session copy that
         launch overwrites (``_sync_sharing``), and the proxy must be that
         profile's login's.
@@ -1080,11 +1105,7 @@ class SessionManager:
         running claude through a route and a rule that no longer belong to
         what runs.
         """
-        claude_bin = find_claude()
-        if not claude_bin:
-            raise SessionError(
-                "'claude' was not found on PATH. Install Claude Code first."
-            )
+        claude_bin = require_claude_bin()
         env = dict(os.environ)
         if primary_profile:
             env.pop("CLAUDE_CONFIG_DIR", None)
@@ -1115,6 +1136,18 @@ class SessionManager:
                 "Nothing was launched; run the command again."
             )
         self._launch(claude_bin, claude_args, route, env)
+
+    def exec_local(self, claude_args: list[str]) -> NoReturn:
+        """Run one of claude's own local commands on the real binary.
+
+        ``--version`` and ``--help`` answer a property of the installed
+        program: no account, no profile and no proxy is involved, and asking
+        a quota or a login for them would refuse a question that has an
+        answer anyway. `cswap run --auto` sends them here — an SDK asking for
+        the version must work while no slot is recorded.
+        """
+        claude_bin = require_claude_bin()
+        self._exec(claude_bin, claude_args, dict(os.environ))
 
     def _check_proxy(
         self,
@@ -1569,10 +1602,11 @@ class SessionManager:
         """The refusal to copy the live login into a session profile: two
         Claude Codes on one refresh token invalidate each other."""
         return SessionError(
-            f"Account-{account_num}'s stored login is the live login right "
-            f"now, so a session would be a second copy of the same login. "
-            f"Run 'cswap --switch-to {account_num}' so cswap treats it as the "
-            f"active account, then start claude normally."
+            f"Account-{account_num}'s stored login is also the login in the "
+            f"global ~/.claude right now, so a session would be a second copy "
+            f"of the same one-time login. Run 'cswap add' once: it saves the "
+            f"login into the account and removes the global copy, then start "
+            f"claude again."
         )
 
     @staticmethod

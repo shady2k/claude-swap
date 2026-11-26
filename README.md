@@ -53,6 +53,8 @@ pipx upgrade claude-swap
 
 For a fork install above, re-run the same `uv tool install --force` command with the new tag: `cswap upgrade` and `uv tool upgrade` follow PyPI, not the fork.
 
+Coming from `v1.2.0-shady2k.4` (which kept the active login in `~/.claude`), run `cswap add` once after updating: the active account's login is already saved, and `cswap add` now also removes that global copy, which nothing reads any more. The first `claude` before it refuses with that instruction.
+
 ## Usage
 
 ### Add your first account
@@ -141,7 +143,7 @@ The weekly ones exist because weekly quota left unused at its reset is lost.
 
 **Per-account controls**
 
-- `cswap disable <num|email>` holds an account out of rotation: auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies skip it until `cswap enable` puts it back. It keeps its login and is still a valid explicit `cswap switch <num|email>` target.
+- `cswap disable <num|email>` holds an account out of rotation: auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies skip it until `cswap enable` puts it back. It keeps its login, but an explicit `cswap switch <num|email>` to it and `cswap run` on it are refused (`cswap enable` / `cswap next` names the way out).
 - `cswap threshold <num|email> <pct>` gives one account its own switch-away line (50–99.9) in place of the global one.
 - `cswap priority <num|email> <tier>` ranks accounts for `priority-consume-first`: higher tiers (0–1000, default 0) are used first. The other strategies ignore tiers.
 
@@ -358,7 +360,7 @@ cswap config set autoswitch.weeklyThreshold 97  # own switch line for the 7-day/
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
 cswap config set run.shareHistory false   # each account keeps its own chat history (see "run")
 cswap config set run.noProxy 'localhost,10.0.0.0/8'  # hosts a proxied launch reaches directly
-cswap config set run.disableNonessentialTraffic false  # let Claude Code auto-update, keep Remote Control
+cswap config set run.disableNonessentialTraffic false  # keep Remote Control (a wrapped `claude` still sets DISABLE_AUTOUPDATER=1)
 cswap config set updates.check false      # no daily PyPI lookup for the "newer version" hint
 cswap config set usage.headerProbe true   # opt in: setup-token usage via a 1-token request (see "add-token")
 cswap config set usage.fableProbe true    # opt in: also their Fable weekly limit, via a 1-token Fable request
@@ -477,7 +479,7 @@ cswap add-token --email user@example.com     # optional label override
 - [docs/auto-switch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-switch.md) — the exact auto-switch rules: hysteresis margins, landing rules, per-account thresholds and tiers, polling cadence. Read it to find out why it did or didn't switch.
 - [docs/json-output.md](https://github.com/realiti4/claude-swap/blob/main/docs/json-output.md) — every field in `--json` output, including the optional ones. Read it before writing a script against `cswap list --json` or `cswap auto --json`.
 - [docs/menubar.md](https://github.com/realiti4/claude-swap/blob/main/docs/menubar.md) — how the macOS menu bar runs under launchd: start at login, the wrapper app in `/Applications`, file locations, upgrades, the Login Items switch. Read it when the icon is missing or the service misbehaves.
-- [docs/auto-launch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-launch.md) — launching on the account with the most quota: which account `cswap run --auto` picks and why, what the `claude` wrapper does, how the next launch follows an exhausted account, and the non-essential-traffic switch.
+- [docs/auto-launch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-launch.md) — launching the recorded active account: what the `claude` wrapper runs, how `cswap run --auto` ranks accounts when asked, how the next launch follows an exhausted account, and the non-essential-traffic switch.
 - [docs/proxy.md](https://github.com/realiti4/claude-swap/blob/main/docs/proxy.md) — the per-account proxy: the URL forms, what it routes, the fail-closed cases and how they are reported, storage, export and rollback.
 
 `cswap --help` and `cswap <command> --help` document every flag.
