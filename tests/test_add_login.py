@@ -2,7 +2,7 @@
 
 The isolated login is Claude Code's own ``claude auth login`` in a throwaway
 ``CLAUDE_CONFIG_DIR``. These tests drive that child through a fake
-``spawn.run``: no browser, no network, no real profile. The proxy and GeoIP
+spawn helper: no browser, no network, no real profile. The proxy and GeoIP
 checks are seams too, so a refused check is observed before the child starts.
 """
 
@@ -11,7 +11,9 @@ from __future__ import annotations
 import errno
 import json
 import os
+import shlex
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -115,6 +117,15 @@ def _login_mock(
             (config_dir / ".claude.json").write_text(config, encoding="utf-8")
         return subprocess.CompletedProcess(argv, returncode)
     return fake
+
+
+@pytest.fixture(autouse=True)
+def _foreground_uses_login_mock(monkeypatch):
+    # Share the spawn.run test seam between the Windows and POSIX login paths.
+    monkeypatch.setattr(
+        login.spawn, "foreground",
+        lambda argv, *, env, cancel_on_interrupt: login.spawn.run(argv, env=env).returncode,
+    )
 
 
 @pytest.fixture
@@ -2138,6 +2149,111 @@ class TestALoginThroughTheLocalBridge:
     follows the account's proxy without its password ever entering the login
     child's environment.
     """
+
+    @pytest.mark.skipif(os.name != "posix", reason="requires POSIX signal delivery")
+    def test_sigterm_to_cswap_stops_login_and_cleans_up(self, temp_home, tmp_path):
+        fake_claude = tmp_path / "claude"
+        child_script = tmp_path / "child.py"
+        terminated = tmp_path / "child-terminated"
+        deleted = tmp_path / "keychain-deleted"
+        fake_claude.write_text(
+            f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(child_script))} \"$@\"\n"
+        )
+        fake_claude.chmod(0o700)
+        before = _seed(_switcher(), {"1": _account("live@example.com")})
+        # The CLI runs in its own process, so apply the test guards there too.
+        cli_script = """
+import os
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+# Freeze the real-store guard before redirecting this CLI to its test home.
+from tests.conftest import _KeychainStore
+from claude_swap import cli, login, macos_keychain
+
+home = sys.argv.pop(1)
+os.environ.update(HOME=home, USERPROFILE=home)
+marker = Path(sys.argv.pop(1))
+keychain = _KeychainStore()
+for method in ("get_password", "item_exists", "set_password"):
+    setattr(macos_keychain, method, getattr(keychain, method))
+
+def delete(service, account):
+    keychain.delete_password(service, account)
+    marker.write_text(service)
+
+macos_keychain.delete_password = delete
+login.Platform = SimpleNamespace(detect=lambda: "macos", MACOS="macos")
+cli.main()
+"""
+        with socket.socket() as ready, proxy_servers.Socks5Proxy(forward=False) as proxy:
+            ready.bind(("127.0.0.1", 0))
+            ready.listen()
+            # Bound a failed subprocess handshake, with room for loaded CI.
+            ready.settimeout(10)
+            child_script.write_text(f"""
+import json
+import os
+import signal
+import socket
+from pathlib import Path
+
+profile = Path(os.environ["CLAUDE_CONFIG_DIR"])
+(profile / ".credentials.json").write_text({NEW_CREDS!r})
+(profile / ".claude.json").write_text({NEW_CONFIG!r})
+
+def handle_term(signum, frame):
+    Path({str(terminated)!r}).write_text(str(signum))
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, handle_term)
+with socket.create_connection({ready.getsockname()!r}, timeout=10) as conn:
+    conn.sendall(json.dumps([str(profile), os.environ["HTTPS_PROXY"]]).encode())
+    conn.sendall(b"\\n")
+signal.pause()
+""")
+            env = dict(os.environ, TMPDIR=str(tmp_path))
+            env.pop("HOME", None)
+            env.pop("USERPROFILE", None)
+            env["PATH"] = os.pathsep.join([str(tmp_path), env["PATH"]])
+            with subprocess.Popen(
+                [sys.executable, "-c", cli_script, str(temp_home), str(deleted),
+                 "add", "--login", "--slot", "2", "--proxy", proxy.url],
+                env=env, cwd=Path(__file__).resolve().parents[1],
+                start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            ) as cswap:
+                try:
+                    conn, _ = ready.accept()
+                    with conn, conn.makefile("rb") as response:
+                        conn.settimeout(10)
+                        profile_name, bridge_url = json.loads(response.readline())
+                    profile = Path(profile_name)
+                    assert profile.is_dir()
+                    endpoint = ("127.0.0.1", urlsplit(bridge_url).port)
+                    with socket.create_connection(endpoint, timeout=10):
+                        pass
+                    cswap.send_signal(signal.SIGTERM)
+                    out, err = cswap.communicate(timeout=10)
+                except TimeoutError:
+                    if cswap.poll() is not None:
+                        pytest.fail(f"cswap exited before login completed: {cswap.communicate(timeout=1)}")
+                    raise
+                finally:
+                    # Also stop a leaked child if the regression makes cswap
+                    # die without forwarding the signal.
+                    try:
+                        os.killpg(cswap.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+        assert cswap.returncode == 1, (out, err)
+        assert terminated.read_text() == str(signal.SIGTERM)
+        assert deleted.read_text() == login.keychain_service_name(profile)
+        assert not profile.exists()
+        with pytest.raises(ConnectionRefusedError):
+            socket.create_connection(endpoint, timeout=10).close()
+        assert _switcher()._get_sequence_data() == before
 
     def test_the_login_child_reads_the_bridge(
         self, temp_home, claude_bin, checks_pass, monkeypatch,

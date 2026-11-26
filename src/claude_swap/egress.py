@@ -367,6 +367,8 @@ def _observe(endpoint: Endpoint, route: ProxyRoute, timeout: float) -> Observati
         raise
     except urllib.error.HTTPError as e:
         e.close()
+        if 300 <= e.code < 400:
+            raise _EndpointFailed("redirect") from None
         raise _EndpointFailed(f"HTTP {e.code}") from None
     except urllib.error.URLError as e:
         raise _EndpointFailed(_transport_failure(e.reason)) from None

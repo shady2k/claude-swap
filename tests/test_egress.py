@@ -886,6 +886,46 @@ class TestFailureDiagnostics:
         assert "network error" in message
         assert origin.hits == 0
 
+    @pytest.mark.parametrize("scheme", ["https", "socks5h"])
+    @pytest.mark.parametrize("expected", ["network error", "timeout"])
+    def test_bridged_proxy_transport_failure(self, scheme, expected, monkeypatch):
+        with socket.socket() as proxy:
+            proxy.bind(("127.0.0.1", 0))
+            if expected == "timeout":
+                # TCP connects, but nothing answers the TLS or SOCKS greeting.
+                proxy.listen()
+            port = proxy.getsockname()[1]
+            route = account_proxy.parse(f"{scheme}://user:secret@127.0.0.1:{port}")
+            message = self._expect(
+                route, "https://127.0.0.1:443/json", monkeypatch, timeout=0.3
+            )
+
+        assert expected in message
+        assert "ConnectionRefusedError" not in message
+        assert "secret" not in message
+
+    def test_an_untrusted_https_proxy_certificate_is_a_tls_error(self, monkeypatch):
+        proxy_servers.trust_fixture_ca(monkeypatch)
+        with proxy_servers.HttpProxy(
+            tls=True, context=proxy_servers.untrusted_context(),
+        ) as proxy:
+            route = account_proxy.parse(f"https://user:secret@127.0.0.1:{proxy.port}")
+            with proxy_servers.Origin(tls=True) as origin:
+                message = self._expect(route, f"{origin.url}/json", monkeypatch)
+                assert origin.hits == 0
+
+        assert "TLS error" in message
+        assert "secret" not in message
+
+    def test_a_service_redirect_inside_a_tls_proxy_tunnel(self, monkeypatch):
+        proxy_servers.trust_fixture_ca(monkeypatch)
+        with proxy_servers.HttpProxy(tls=True) as proxy:
+            route = account_proxy.parse(f"https://127.0.0.1:{proxy.port}")
+            with proxy_servers.Origin(tls=True, status=302) as origin:
+                message = self._expect(route, f"{origin.url}/json", monkeypatch)
+
+        assert message.endswith(": redirect")
+
     def test_a_service_that_never_answers_is_a_timeout(self, monkeypatch):
         """The proxy opens the tunnel and then says nothing at all."""
         with proxy_servers.SilentProxy() as proxy:

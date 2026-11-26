@@ -36,7 +36,9 @@ import pytest
 from claude_swap import account_proxy, oauth, subscription
 from claude_swap.exceptions import ValidationError
 from claude_swap.locking import FileLock
-from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.switcher import ClaudeAccountSwitcher, _usage_entry_lines
+from claude_swap.usage_store import UsageEntry
+from tests import proxy_servers
 
 USAGE = {
     "five_hour": {"utilization": 10.0, "resets_at": None},
@@ -97,6 +99,8 @@ class _Recorder(BaseHTTPRequestHandler):
             self.send_header(name, value)
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
+        if server.body_gate is not None and not server.body_gate.wait(5):
+            return
         self.wfile.write(payload)
 
     do_GET = _reply
@@ -112,11 +116,13 @@ class LocalServer:
 
     ``connect``, when given, is the ``(status, phrase)`` a CONNECT gets
     instead of the default 200; the phrase is what the client would put in its
-    error message, so a test can prove it does not travel further.
+    error message, so a test can prove it does not travel further. ``body_gate``
+    can hold back the body until the client begins reading it.
     """
 
     def __init__(
-        self, responder=None, address: str = "127.0.0.1", connect=None
+        self, responder=None, address: str = "127.0.0.1", connect=None,
+        *, body_gate: threading.Event | None = None,
     ):
         self.responder = responder or (lambda method, path: (200, {}, b"{}"))
         self.connect = connect
@@ -125,6 +131,7 @@ class LocalServer:
         self.httpd = ThreadingHTTPServer((address, 0), _Recorder)
         self.httpd.responder = self.responder
         self.httpd.connect = self.connect
+        self.httpd.body_gate = body_gate
         self.httpd.requests = self.requests
         self.httpd.lock = self.lock
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -594,6 +601,97 @@ class TestRouteTransport:
         route.open(urllib.request.Request(f"{origin.url}/api/oauth/usage"))
         assert proxy.paths() == [f"{origin.url}/api/oauth/usage"]
         assert origin.requests == []
+
+
+class TestBridgedOAuth:
+    @pytest.mark.parametrize("error", ["invalid_grant", "invalid_client"])
+    def test_refresh_reads_the_origins_error(self, monkeypatch, error):
+        def refuses(method, path):
+            return 400, {}, json.dumps({"error": error}).encode()
+
+        with LocalServer(refuses) as origin, proxy_servers.Socks5Proxy() as proxy:
+            _endpoints(monkeypatch, origin.url)
+            route = account_proxy.parse(proxy.url)
+            outcome = oauth.try_refresh_oauth_credentials(CREDS_EXPIRED, route=route)
+
+        assert outcome.error == error
+        assert origin.paths("POST") == ["/v1/oauth/token"]
+        assert proxy.only("CONNECT")["port"] == origin.port
+
+    @pytest.mark.parametrize("body_read_fails", [False, True])
+    def test_usage_retains_a_delayed_error_body_and_retry_after(
+        self, monkeypatch, body_read_fails,
+    ):
+        error = "oauth_not_allowed_for_organization"
+        released = threading.Event()
+        opener = account_proxy._opener()
+        real_open = opener.open
+
+        def open_with_body_gate(*args, **kwargs):
+            try:
+                return real_open(*args, **kwargs)
+            except urllib.error.HTTPError as e:
+                # At this point urllib has parsed the headers but the origin
+                # is still waiting to send the body.
+                read = e.read
+
+                def release_then_read(*args):
+                    released.set()
+                    body = read(*args)
+                    if body_read_fails:
+                        raise http.client.IncompleteRead(body, 1)
+                    return body
+
+                e.read = release_then_read
+                raise
+
+        def refuses(method, path):
+            body = json.dumps({"error": {"details": {"error_code": error}}}).encode()
+            return 403, {"Retry-After": "60"}, body
+
+        monkeypatch.setattr(opener, "open", open_with_body_gate)
+        with (
+            LocalServer(refuses, body_gate=released) as origin,
+            proxy_servers.Socks5Proxy() as proxy,
+        ):
+            _endpoints(monkeypatch, origin.url)
+            route = account_proxy.parse(proxy.url)
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "test@example.com", CREDS_OK, is_active=True, route=route,
+            )
+
+        assert released.is_set()
+        assert outcome.error == ("http-403" if body_read_fails else error)
+        assert outcome.retry_after_s == 60
+        assert origin.paths("GET") == ["/api/oauth/usage"]
+        assert proxy.only("CONNECT")["port"] == origin.port
+
+    def test_proxy_certificate_failure_is_tls_cert_and_never_spends_the_grant(
+        self, monkeypatch, caplog,
+    ):
+        proxy_servers.trust_fixture_ca(monkeypatch)
+        caplog.set_level(logging.DEBUG, logger="claude-swap")
+        with proxy_servers.Origin(tls=True) as origin, proxy_servers.HttpProxy(
+            tls=True, context=proxy_servers.untrusted_context(),
+        ) as proxy:
+            _endpoints(monkeypatch, origin.url)
+            route = account_proxy.parse(f"https://127.0.0.1:{proxy.port}")
+            usage = oauth.try_fetch_usage_for_account(
+                "1", "test@example.com", CREDS_OK, is_active=True, route=route,
+            )
+            refresh = oauth.try_refresh_oauth_credentials(CREDS_EXPIRED, route=route)
+            plan = subscription.fetch_plan("sk-live", route=route)
+
+        assert usage.error == "tls-cert"
+        (line,) = _usage_entry_lines(UsageEntry(last_error=usage.error))
+        assert "SSL_CERT_FILE" in line
+        assert refresh.error == "transient"
+        assert "OAuth refresh not sent: SSLCertVerificationError" in caplog.text
+        assert "may now be spent" not in caplog.text
+        assert "whether the request reached the server is unknown" not in caplog.text
+        assert plan.plan is None
+        assert proxy.recorded() == []  # no CONNECT, let alone an OAuth request
+        assert origin.hits == 0
 
 
 # --- the switcher: setting lifecycle ----------------------------------------

@@ -77,7 +77,6 @@ import hashlib
 import json
 import os
 import shutil
-import signal
 import subprocess
 import sys
 import time
@@ -1380,34 +1379,9 @@ class SessionManager:
     def _run_foreground(
         self, claude_bin: str, claude_args: list[str], env: dict[str, str]
     ) -> NoReturn:
-        """Run claude as a child, mirror its exit status, never leak the bridge.
-
-        The child keeps the terminal: ``SIGINT`` reaches it through the process
-        group, and this process waits for it instead of dying first and taking
-        the bridge down under a running claude. ``SIGTERM`` is forwarded as
-        well — unlike the terminal's interrupt it is addressed to this process
-        alone, and a bridge left behind leaves Claude Code dialling a closed
-        port. Every path out of here unwinds the launch's ``with`` block, which
-        closes the bridge and joins its threads.
-        """
-        argv = [claude_bin, *claude_args]
-        process = subprocess.Popen(argv, env=env)
-
-        def forward(signum, _frame) -> None:
-            if process.poll() is None:
-                process.send_signal(signum)
-
-        previous = signal.signal(signal.SIGTERM, forward)
-        try:
-            while True:
-                try:
-                    returncode = process.wait()
-                    break
-                except KeyboardInterrupt:
-                    continue
-        finally:
-            signal.signal(signal.SIGTERM, previous)
-        sys.exit(returncode)
+        """Mirror the child's shell exit status, then close the launch's bridge."""
+        returncode = spawn.foreground([claude_bin, *claude_args], env=env)
+        sys.exit(128 - returncode if returncode < 0 else returncode)
 
     def _exec(self, claude_bin: str, claude_args: list[str], env: dict[str, str]) -> NoReturn:
         """Hand the terminal over to claude. Never returns.

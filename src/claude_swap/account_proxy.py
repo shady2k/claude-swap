@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import base64
 import http.client
+import io
 import re
 import ssl
 import urllib.error
@@ -137,9 +138,9 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
     """Refuse every redirect instead of following it.
 
     ``redirect_request`` returning None is urllib's documented way to stop a
-    redirect: the reply continues down the handler chain and surfaces as the
-    original ``HTTPError``, which :meth:`ProxyRoute.open` turns into a
-    :data:`PROXY_REDIRECT` failure.
+    redirect: the reply continues down the handler chain and surfaces as an
+    ``HTTPError``. A proxy's redirect is reported by :meth:`ProxyRoute.open`
+    as :data:`PROXY_REDIRECT`.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -226,13 +227,12 @@ class ProxyRoute:
         account's real proxy.
 
         Raises:
-            ProxyRouteError: the stored value is unusable, the proxy asked for
-                credentials it rejected (407), or it redirected. Transport
-                failures of the connection itself stay ``URLError``/
-                ``HTTPError``, so the existing classification (timeout,
-                certificate, network) keeps working.
-            ssl.SSLCertVerificationError: the ``https://`` proxy's own
-                certificate was refused; nothing touches the target.
+            ProxyRouteError: the stored value is unusable, the proxy rejected
+                its credentials (407), redirected, or could not be used.
+            urllib.error.URLError: the connection failed, including refusal
+                of an ``https://`` proxy's certificate before any request to
+                the target.
+            urllib.error.HTTPError: the target returned an HTTP error.
         """
         if self.invalid is not None:
             raise ProxyRouteError(
@@ -297,45 +297,38 @@ class ProxyRoute:
     ):
         """``open`` for a scheme urllib cannot speak: one bridge, one request.
 
-        The local client only ever sees a status code, so the bridge keeps the
-        typed upstream failure for this process: ``URLError`` after a refused
-        tunnel is replaced by the proxy's own error kind (and an
-        ``https://`` proxy's refused certificate by the TLS error itself),
-        which is what the token and usage classifications read.
+        The local client only ever sees a status code for an upstream failure,
+        so the bridge keeps the typed error for this process. A refused tunnel
+        maps to a proxy error kind, and a refused proxy certificate is wrapped
+        in ``URLError`` for the OAuth classifications.
 
-        A returned response carries the bridge (see :class:`_BridgedResponse`):
-        ``open`` comes back once the reply's head has arrived, and its body
-        still travels that bridge. A request that produces no response closes
-        the bridge here instead, so nothing outlives it.
+        A successful response carries the bridge (see :class:`_BridgedResponse`)
+        while its body is read. A target HTTP error is buffered here so its
+        headers and body stay readable after the bridge closes.
         """
         local = proxy_bridge.Bridge(self, timeout=timeout)
         request.set_proxy(f"{local.host}:{local.port}", "http")
         try:
             response = _opener().open(request, timeout=timeout)
         except urllib.error.HTTPError as e:
-            # The error is not handed on with a readable body — its bridge is
-            # closing — so it is closed here instead of being left to the
-            # garbage collector; only its code and headers travel.
-            e.close()
-            # Closed before the failure is read: ``close`` joins the workers,
-            # so whatever the bridge recorded has been recorded by now.
-            local.close()
+            body = b""
+            try:
+                # The bridge records upstream refusals before replying. Only
+                # read a target's error body, while the tunnel is still open.
+                if local.failure is None:
+                    body = e.read()
+            except Exception:
+                # An unreadable body is not a verdict on the credential.
+                pass
+            finally:
+                try:
+                    e.close()
+                finally:
+                    local.close()
             raise_failure(local.failure)
-            if e.code == 407:
-                raise ProxyRouteError(
-                    PROXY_AUTH,
-                    "the proxy rejected the credentials in its URL "
-                    "(HTTP 407)",
-                    status=407,
-                ) from None
-            if 300 <= e.code < 400:
-                raise ProxyRouteError(
-                    PROXY_REDIRECT,
-                    f"the proxy answered HTTP {e.code} instead of "
-                    "forwarding the request",
-                    status=e.code,
-                ) from None
-            raise
+            raise urllib.error.HTTPError(
+                e.url, e.code, e.msg, e.hdrs, io.BytesIO(body)
+            ) from None
         except urllib.error.URLError:
             local.close()
             raise_failure(local.failure)
@@ -393,17 +386,19 @@ def raise_failure(failure: BaseException | None) -> None:
     """Re-raise a bridge's recorded upstream error in this module's terms.
 
     ``proxy_bridge`` keeps the typed failure because a local HTTP client only
-    ever receives a status code. Nothing is lost across that hop: an
-    ``https://`` proxy's refused certificate is re-raised as itself (the
-    ``tls-cert`` classification and ``_NEVER_SENT`` read it), and a refused
-    tunnel becomes the same :class:`ProxyRouteError` kind the direct path
-    raises, with the proxy's own phrase dropped.
+    ever receives a status code. An ``https://`` proxy's refused certificate
+    is wrapped in ``URLError``, just as urllib wraps a target certificate
+    failure (the ``tls-cert`` classification and ``_NEVER_SENT`` read it).
+    A refused tunnel becomes the same :class:`ProxyRouteError` kind the
+    direct path raises, with the proxy's own phrase dropped.
 
     Returns normally when the bridge recorded no failure: the request failed
     after the tunnel was opened, and that answer belongs to the caller.
     """
     if failure is None:
         return
+    if isinstance(failure, ssl.SSLCertVerificationError):
+        raise urllib.error.URLError(failure) from None
     if isinstance(failure, ssl.SSLError):
         raise failure
     if isinstance(failure, proxy_bridge.BridgeError):
@@ -622,8 +617,8 @@ def probe(route: ProxyRoute, timeout: float = PROBE_TIMEOUT_S) -> None:
     For a scheme urllib cannot speak, the one tunnel is opened by
     ``proxy_bridge`` instead — the same step the bridge takes for every
     request it carries — and its typed failure comes back as the same kinds.
-    A refused ``https://`` proxy certificate is a refusal here, not a
-    ``ProxyRouteError`` detail: the launch has nowhere else to go.
+    A refused ``https://`` proxy certificate is reported as a TLS error
+    without the certificate's own message.
 
     Raises:
         ProxyRouteError: the stored value is unusable, the proxy rejected the
@@ -709,11 +704,13 @@ def _probe_through_bridge(route: ProxyRoute, timeout: float) -> None:
             str(e),
             status=e.status,
         ) from None
-    except (ssl.SSLError, OSError):
+    except ssl.SSLError:
         raise ProxyRouteError(
-            PROXY_UNREACHABLE,
-            "the proxy could not be reached, or its TLS certificate was "
-            "refused",
+            PROXY_UNREACHABLE, "the proxy could not be reached (TLS error)"
+        ) from None
+    except OSError:
+        raise ProxyRouteError(
+            PROXY_UNREACHABLE, "the proxy could not be reached"
         ) from None
     finally:
         if tunnel is not None:

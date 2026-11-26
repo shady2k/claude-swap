@@ -160,17 +160,21 @@ def run_login(
         # login: the child reads the loopback address, and the account's own
         # URL stays in this process.
         with account_bridge(route) as bridge:
-            completed = spawn.run(
-                argv, env=login_environment(config_dir, route, backup_dir, bridge)
-            )
+            env = login_environment(config_dir, route, backup_dir, bridge)
+            # POSIX SIGTERM sent to cswap alone must stop the child before
+            # the bridge and isolated profile are removed.
+            if os.name == "posix":
+                returncode = spawn.foreground(argv, env=env, cancel_on_interrupt=True)
+            else:
+                returncode = spawn.run(argv, env=env).returncode
     except OSError as e:
         raise LoginError(
             f"Could not run Claude Code's login: {e.strerror or e}"
         ) from None
-    if completed.returncode != 0:
+    if returncode != 0:
         raise LoginError(
             "`claude auth login` exited with status "
-            f"{completed.returncode}; no account was added."
+            f"{returncode}; no account was added."
         )
     return read_login_result(config_dir)
 

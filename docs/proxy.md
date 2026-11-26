@@ -5,16 +5,16 @@
 ## The URL
 
 - `http://[user:pass@]host[:port]`, port 80 when omitted. Credentials are optional and travel as `Proxy-Authorization` (`Basic`) on the proxy request and on the `CONNECT` tunnel; the account's OAuth token is never sent to the proxy.
-- `https://[user:pass@]host[:port]`, port 443: TLS to the proxy itself, verified against the system trust store with SNI = the proxy's host, then the tunnel inside it.
+- `https://[user:pass@]host[:port]`, port 443: TLS to the proxy itself, verified against the system trust store with SNI = the proxy's host. Plain HTTP requests are sent in absolute form inside that TLS connection.
 - `socks5h://[user:pass@]host[:port]` and the alias `socks5://`, port 1080. The target is always sent as a domain (`ATYP=0x03`, RFC 1928), so the proxy resolves it and nothing leaks a DNS lookup from here; user name and password travel by RFC 1929.
 - HTTPS endpoints are tunneled through the proxy with `CONNECT` whichever scheme carried the tunnel.
 - Anything else is refused before `sequence.json` is touched, with a message that never repeats the value.
 
-The three schemes urllib cannot speak — `https://`, `socks5h://`, `socks5://` — are carried by `proxy_bridge.py`, a local HTTP proxy on `127.0.0.1:0` that speaks the plain proxy protocol to whatever is local and the account's protocol upstream. cswap's own requests go through it, and so does a launch (see [Launching Claude Code](#launching-claude-code)). `http://` keeps the direct urllib path it always had. The mechanics are in the module docstring of `proxy_bridge.py`.
+The three schemes urllib cannot speak — `https://`, `socks5h://`, `socks5://` — are carried by `proxy_bridge.py`, a local HTTP proxy on `127.0.0.1:0` that speaks the plain proxy protocol to whatever is local and the account's protocol upstream. cswap's own requests go through it, and so does a launch (see [Launching Claude Code](#launching-claude-code)). `http://` keeps the direct urllib path it always had. The loopback bridge has no authentication of its own; access is limited to the local host. The mechanics are in the module docstring of `proxy_bridge.py`.
 
 ## Adding a new account through a proxy
 
-`cswap add --login --proxy <url> [--expect-country <CC>] [--expect-ip <IP>] [--email <email>]` is the recommended way to add an account that belongs on a proxy. cswap runs Claude Code's own `claude auth login` with a temporary `CLAUDE_CONFIG_DIR`, so the login exchange uses that proxy and neither the live `~/.claude` profile nor `activeAccountNumber` is touched. The temporary profile is created 0700, its macOS Keychain entry is deleted, and both are removed afterwards on success, failure and Ctrl+C.
+`cswap add --login --proxy <url> [--expect-country <CC>] [--expect-ip <IP>] [--email <email>]` is the recommended way to add an account that belongs on a proxy. cswap runs Claude Code's own `claude auth login` with a temporary `CLAUDE_CONFIG_DIR`, so the login exchange uses that proxy and neither the live `~/.claude` profile nor `activeAccountNumber` is touched. The temporary profile is created 0700, its macOS Keychain entry is deleted, and both are removed afterwards on success, failure, Ctrl+C and POSIX `SIGTERM` during login.
 
 The proxy's one `CONNECT` and, when a rule is given, the [egress check](#egress-expectation) run before `claude` starts and outside every file lock; a failure adds nothing. `--email` is forwarded to `claude auth login --email`. The OAuth link is opened by the browser, not by cswap, so it must be opened from the network and country the account expects — the command prints that reminder when a proxy is given. `--expect-country` and `--expect-ip` require `--proxy`.
 

@@ -14,7 +14,8 @@ proxy:
   ``CONNECT target:port`` carrying ``Proxy-Authorization`` when the URL has
   credentials, then the bytes are copied in both directions. TLS to the
   target therefore runs through that tunnel untouched: TLS-over-TLS with this
-  process never terminating the inner connection.
+  process never terminating the inner connection. Plain HTTP requests instead
+  go to the TLS proxy in absolute form, without a tunnel.
 - ``socks5h://[user:pass@]host[:port]`` and its alias ``socks5://`` (RFC
   1928): a domain target travels as ``ATYP=0x03`` and is never resolved here,
   so the proxy does the DNS (an IP literal uses ``ATYP=0x01``/``0x04``); user
@@ -101,11 +102,10 @@ class BridgeError(Exception):
 
     ``kind`` is one of ``"auth"`` (the proxy rejected the URL's credentials),
     ``"redirect"`` (it answered a 3xx instead of a tunnel), ``"refused"`` (it
-    answered another status or SOCKS5 reply) and ``"unreachable"`` (the proxy
-    closed the connection, answered something that is not the protocol, or
-    named an address this bridge cannot send). ``status`` is the HTTP status of
-    a refused ``CONNECT`` when there was one, so a caller can report the code
-    without the proxy's phrase.
+    answered another status or SOCKS5 reply), ``"timeout"`` (it stopped
+    answering), ``"network"`` (another socket error), and ``"unreachable"``
+    (an incomplete or invalid proxy reply). ``status`` holds the HTTP code of
+    a refusal, if any, without the proxy's phrase.
 
     The message never carries the URL, its credentials or the proxy's own
     reply text.
@@ -153,12 +153,24 @@ def connect(
             failures, which are the caller's business (a refused proxy
             certificate is not an unreachable host).
     """
+    tunnel, _rest = _connect(route, host, port, timeout, context)
+    return tunnel
+
+
+def _connect(
+    route,
+    host: str,
+    port: int,
+    timeout: float,
+    context: ssl.SSLContext | None,
+    bridge: Bridge | None = None,
+) -> tuple[socket.socket, bytes]:
     scheme = _scheme_of(route)
     timeout = TIMEOUT_S if not timeout or timeout <= 0 else timeout
     if scheme == "https":
-        return _https_tunnel(route, host, port, timeout, context)
+        return _https_tunnel(route, host, port, timeout, context, bridge)
     if scheme in ("socks5h", "socks5"):
-        return _socks5_tunnel(route, host, port, timeout)
+        return _socks5_tunnel(route, host, port, timeout, bridge), b""
     raise ValueError(f"no tunnel exists for a {scheme}:// proxy")
 
 
@@ -234,7 +246,7 @@ class Bridge:
             if self._closed:
                 return
             self._closed = True
-        self._stop.set()
+            self._stop.set()
         _close_socket(self._listener)
         self._thread.join(5.0)
         with self._lock:
@@ -261,7 +273,11 @@ class Bridge:
                 continue
             except OSError:
                 return
-            self._track(client)
+            try:
+                self._track(client)
+            except OSError:
+                _close_socket(client)
+                return
             worker = threading.Thread(
                 target=self._handle,
                 args=(client,),
@@ -285,65 +301,52 @@ class Bridge:
             # inside the ``try`` because :meth:`close` closes this socket from
             # the thread that owns the bridge, which fails the call.
             client.settimeout(None)
-            request = _parse_head(_read_head(client))
+            head, rest = _read_head(client)
+            request = _parse_head(head)
+            forward_absolute = False
             if request.method == "CONNECT":
                 host, port = _authority(request.target)
-                upstream = self._open(host, port)
-                client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                upstream, received = _connect(
+                    self._route, host, port, self._timeout, self._context, self
+                )
+                client.sendall(
+                    b"HTTP/1.1 200 Connection Established\r\n\r\n" + received
+                )
+                if rest:
+                    upstream.sendall(rest)
             else:
-                host, port, head = _absolute_form(request)
-                upstream = self._open(host, port)
-                upstream.sendall(head)
-            _relay(client, upstream)
+                forward_absolute = _scheme_of(self._route) == "https"
+                host, port, head = _absolute_form(
+                    request, self._route if forward_absolute else None
+                )
+                if forward_absolute:
+                    upstream = _dial_https(
+                        self._route, self._timeout, self._context, self
+                    )
+                    upstream.settimeout(None)
+                else:
+                    upstream, _ = _connect(
+                        self._route, host, port, self._timeout, self._context, self
+                    )
+                upstream.sendall(head + rest)
+            _relay(client, upstream, forward_absolute)
         except _BadRequest:
             _respond(client, 400, "Bad Request")
-        except BridgeError as e:
-            self._record(e)
-            _respond(client, _status_of(e), _reason_of(e))
-        except ssl.SSLError as e:
-            # A proxy certificate this process refused, or a TLS failure while
-            # speaking to it. The client can only be told "bad gateway"; the
-            # typed error stays available through ``failure``.
-            self._record(e)
-            _respond(client, 502, "Bad Gateway")
-        except OSError as e:
-            # Every socket of this bridge is closed the moment it stops, so an
-            # ``OSError`` while stopping is that shutdown, not an upstream
-            # failure: nothing is recorded and no answer is written.
+        except (BridgeError, OSError) as e:
             if self._stop.is_set():
                 return
-            self._record(
-                BridgeError(
-                    "unreachable",
-                    "the account's proxy did not answer on its address "
-                    f"({type(e).__name__})",
+            if isinstance(e, ssl.SSLError):
+                self._record(e)
+                _respond(client, 502, "Bad Gateway")
+            else:
+                error = (
+                    e if isinstance(e, BridgeError) else _connection_failure(e)
                 )
-            )
-            _respond(client, 504, "Gateway Timeout")
+                self._record(error)
+                _respond(client, _status_of(error), _reason_of(error))
         finally:
-            if upstream is not None:
-                self._untrack(upstream)
-                _close_socket(upstream)
-            self._untrack(client)
-            _close_socket(client)
-
-    def _open(self, host: str, port: int) -> socket.socket:
-        try:
-            upstream = connect(
-                self._route, host, port, timeout=self._timeout, context=self._context
-            )
-        except BridgeError:
-            raise
-        except ssl.SSLError:
-            raise
-        except OSError as e:
-            raise BridgeError(
-                "unreachable",
-                "the account's proxy did not answer on its address "
-                f"({type(e).__name__})",
-            ) from None
-        self._track(upstream)
-        return upstream
+            _drop(upstream, self)
+            _drop(client, self)
 
     def _record(self, error: BaseException) -> None:
         with self._lock:
@@ -352,7 +355,16 @@ class Bridge:
 
     def _track(self, connection: socket.socket) -> None:
         with self._lock:
+            if self._stop.is_set():
+                raise OSError("bridge is closed")
             self._connections.add(connection)
+
+    def _replace(self, raw: socket.socket, tls: ssl.SSLSocket) -> None:
+        with self._lock:
+            if self._stop.is_set():
+                raise OSError("bridge is closed")
+            self._connections.remove(raw)
+            self._connections.add(tls)
 
     def _untrack(self, connection: socket.socket) -> None:
         with self._lock:
@@ -371,19 +383,20 @@ class _Request:
         self.headers = headers
 
 
-def _read_head(connection: socket.socket) -> bytes:
-    """The local request head, up to and including its blank line."""
-    data = b""
-    while b"\r\n\r\n" not in data:
+def _read_head(
+    connection: socket.socket, data: bytes = b""
+) -> tuple[bytes, bytes]:
+    """Read through the blank line, keeping any bytes beyond it."""
+    while True:
+        end = data.find(b"\r\n\r\n")
+        if end != -1 and end + 4 <= MAX_HEAD_BYTES:
+            return data[:end + 4], data[end + 4:]
+        if len(data) >= MAX_HEAD_BYTES:
+            raise _BadRequest("head too large")
         chunk = connection.recv(4096)
         if not chunk:
-            break
+            raise _BadRequest("incomplete head")
         data += chunk
-        if len(data) > MAX_HEAD_BYTES:
-            raise _BadRequest("request head too large")
-    if not data:
-        raise _BadRequest("no request")
-    return data
 
 
 def _parse_head(head: bytes) -> _Request:
@@ -416,54 +429,77 @@ def _authority(value: str) -> tuple[str, int]:
     return host, port if port is not None else 443
 
 
-def _absolute_form(request: _Request) -> tuple[str, int, bytes]:
-    """The target of an absolute-form request, and its head in origin form.
+def _absolute_form(request: _Request, https_route=None) -> tuple[str, int, bytes]:
+    """A plain HTTP request in the form its next peer uses.
 
-    An ``http://`` URL arrives as a whole — ``urllib`` sends one when the
-    target is plain — so the bridge opens a tunnel to that origin through the
-    account's proxy and writes the same request there in origin form, where
-    the proxy is no longer part of the exchange.
-
-    An ``https://`` target never arrives this way: every client tunnels it with
-    ``CONNECT``, and writing a plaintext request into a TLS port would fail
-    confusingly. Such a request is answered ``400`` instead.
+    To a TLS proxy this goes in absolute form with that proxy's credentials.
+    A SOCKS5 tunnel goes straight to the origin, which needs origin form.
+    HTTPS targets must use CONNECT; a plain request cannot speak origin TLS.
     """
-    parts = urllib.parse.urlsplit(request.target)
-    if parts.scheme != "http" or not parts.hostname:
-        raise _BadRequest("absolute URL")
-    host = parts.hostname
     try:
-        port = parts.port
+        parts = urllib.parse.urlsplit(request.target)
+        host, port = parts.hostname, parts.port
     except ValueError:
-        raise _BadRequest("port") from None
+        raise _BadRequest("absolute URL") from None
+    if parts.scheme != "http" or not host:
+        raise _BadRequest("absolute URL")
     if port is None:
         port = 80
     selector = parts.path or "/"
     if parts.query:
         selector += "?" + parts.query
-    lines = [f"{request.method} {selector} {request.version}"]
+    target = request.target if https_route is not None else selector
+    lines = [f"{request.method} {target} {request.version}"]
     names = {name.lower() for name, _value in request.headers}
     if "host" not in names:
         authority = f"[{host}]" if ":" in host else host
         lines.append(f"Host: {authority}:{port}")
     for name, value in request.headers:
-        if name.lower() in _HOP_BY_HOP:
+        if name.lower() in _HOP_BY_HOP or name.lower().startswith("proxy-"):
             continue
         lines.append(f"{name}: {value}")
+    if https_route is not None:
+        authorization = _authorization(https_route)
+        if authorization is not None:
+            lines.append(f"Proxy-Authorization: {authorization}")
     lines.append("Connection: close")
     return host, port, ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
 
 
-def _relay(left: socket.socket, right: socket.socket) -> None:
-    """Copy bytes both ways until both directions are closed."""
-    workers = [
-        threading.Thread(target=_pump, args=(left, right), daemon=True),
-        threading.Thread(target=_pump, args=(right, left), daemon=True),
-    ]
-    for worker in workers:
-        worker.start()
-    for worker in workers:
-        worker.join()
+def _relay(
+    left: socket.socket, right: socket.socket, forward_absolute: bool = False
+) -> None:
+    """Copy bytes in both directions; inspect replies to forwarded HTTP."""
+    upload = threading.Thread(target=_pump, args=(left, right), daemon=True)
+    upload.start()
+    try:
+        if forward_absolute:
+            _forward_http_response(right, left)
+        _pump(right, left)
+    finally:
+        if forward_absolute:
+            # A final response can arrive before the client finishes sending
+            # its body. This connection carries only one HTTP exchange.
+            try:
+                left.shutdown(socket.SHUT_RD)
+            except OSError:
+                pass
+            _close_socket(right)
+        upload.join()
+
+
+def _forward_http_response(source: socket.socket, destination: socket.socket) -> None:
+    """Forward the response head and its tail, except for 407 and 3xx."""
+    rest = b""
+    while True:
+        head, rest, status = _response_head(source, rest)
+        if status == 407 or 300 <= status < 400:
+            raise _refusal(status, "the forwarded request")
+        if 100 <= status < 200 and status != 101:
+            destination.sendall(head)
+            continue
+        destination.sendall(head + rest)
+        return
 
 
 def _pump(source: socket.socket, destination: socket.socket) -> None:
@@ -475,10 +511,12 @@ def _pump(source: socket.socket, destination: socket.socket) -> None:
             destination.sendall(data)
     except OSError:
         pass
-    try:
-        destination.shutdown(socket.SHUT_WR)
-    except OSError:
-        pass
+    # SSLSocket.shutdown() disposes of TLS state used by the other pump.
+    if not isinstance(destination, ssl.SSLSocket):
+        try:
+            destination.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
 
 
 def _respond(connection: socket.socket, status: int, reason: str) -> None:
@@ -503,7 +541,7 @@ def _status_of(error: BridgeError) -> int:
         return 407
     if error.status is not None and 300 <= error.status <= 599:
         return error.status
-    if error.kind == "unreachable":
+    if error.kind in ("unreachable", "timeout"):
         return 504
     return 502
 
@@ -513,16 +551,31 @@ def _reason_of(error: BridgeError) -> str:
         return "Proxy Authentication Required"
     if error.kind == "redirect":
         return "Found"
-    if error.kind == "unreachable":
+    if error.kind in ("unreachable", "timeout"):
         return "Gateway Timeout"
     return "Bad Gateway"
+
+
+def _connection_failure(error: OSError) -> BridgeError:
+    if isinstance(error, TimeoutError):
+        return BridgeError("timeout", "the account's proxy connection hit a timeout")
+    return BridgeError(
+        "network", "the account's proxy connection failed (network error)"
+    )
+
+
+def _drop(connection: socket.socket | None, bridge: Bridge | None) -> None:
+    if connection is not None:
+        if bridge is not None:
+            bridge._untrack(connection)
+        _close_socket(connection)
 
 
 def _close_socket(connection: socket.socket | None) -> None:
     if connection is None:
         return
     try:
-        connection.shutdown(socket.SHUT_RDWR)
+        socket.socket.shutdown(connection, socket.SHUT_RDWR)
     except OSError:
         pass
     try:
@@ -562,23 +615,56 @@ def _authority_of(host: str, port: int) -> str:
     return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
 
+def _dial(route, timeout: float, bridge: Bridge | None) -> socket.socket:
+    connection = socket.create_connection(
+        (route.host, _port_of(route)), timeout=timeout
+    )
+    if bridge is not None:
+        try:
+            bridge._track(connection)
+        except OSError:
+            _close_socket(connection)
+            raise
+    return connection
+
+
+def _dial_https(
+    route, timeout: float, context: ssl.SSLContext | None, bridge: Bridge | None
+) -> ssl.SSLSocket:
+    context = context or default_context()
+    raw = _dial(route, timeout, bridge)
+    if bridge is None:
+        try:
+            return context.wrap_socket(raw, server_hostname=route.host)
+        except BaseException:
+            _close_socket(raw)
+            raise
+
+    # Wrapping transfers the descriptor and performs the handshake and trust
+    # checks. Keep a tracked TCP handle that close() can shut down during it.
+    tls = None
+    try:
+        with raw.dup() as duplicate:
+            tls = context.wrap_socket(duplicate, server_hostname=route.host)
+        bridge._replace(raw, tls)
+    except BaseException:
+        _drop(raw, bridge)
+        _close_socket(tls)
+        raise
+    raw.close()  # Do not shut down the TCP connection the TLS socket now owns.
+    return tls
+
+
 def _https_tunnel(
     route,
     host: str,
     port: int,
     timeout: float,
     context: ssl.SSLContext | None,
-) -> socket.socket:
-    """TLS to the proxy, one ``CONNECT``, and the TLS connection back."""
-    raw = socket.create_connection((route.host, _port_of(route)), timeout=timeout)
-    try:
-        raw.settimeout(timeout)
-        tls = (context or default_context()).wrap_socket(
-            raw, server_hostname=route.host
-        )
-    except BaseException:
-        raw.close()
-        raise
+    bridge: Bridge | None,
+) -> tuple[ssl.SSLSocket, bytes]:
+    """TLS to the proxy, then one CONNECT; retain any first tunnel bytes."""
+    tls = _dial_https(route, timeout, context, bridge)
     try:
         authority = _authority_of(host, port)
         lines = [
@@ -589,28 +675,37 @@ def _https_tunnel(
         if authorization is not None:
             lines.append(f"Proxy-Authorization: {authorization}")
         tls.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
-        status = _connect_status(_read_head(tls))
+        _head, rest, status = _response_head(tls)
         if status == 200:
             tls.settimeout(None)
-            return tls
+            return tls, rest
         raise _refusal(status)
     except BaseException:
-        _close_socket(tls)
+        _drop(tls, bridge)
         raise
 
 
-def _connect_status(head: bytes) -> int:
-    """The status code of a proxy's ``CONNECT`` reply."""
-    line = head.split(b"\r\n", 1)[0].decode("latin-1").split(" ")
-    if len(line) < 2 or not line[1].isdigit():
+def _response_head(
+    connection: socket.socket, rest: bytes = b""
+) -> tuple[bytes, bytes, int]:
+    try:
+        head, rest = _read_head(connection, rest)
+    except _BadRequest:
+        raise BridgeError(
+            "unreachable", "the account's proxy did not send a complete HTTP reply"
+        ) from None
+    line = head.split(b"\r\n", 1)[0].split(b" ", 2)
+    if len(line) < 2 or not line[0].startswith(b"HTTP/") or (
+        len(line[1]) != 3 or not line[1].isdigit()
+    ):
         raise BridgeError(
             "unreachable", "the account's proxy did not answer a proxy reply"
         )
-    return int(line[1])
+    return head, rest, int(line[1])
 
 
-def _refusal(status: int) -> BridgeError:
-    """The typed refusal for a non-200 ``CONNECT`` reply."""
+def _refusal(status: int, request: str = "CONNECT") -> BridgeError:
+    """A typed refusal, without any server-supplied text."""
     if status == 407:
         return BridgeError(
             "auth",
@@ -620,8 +715,7 @@ def _refusal(status: int) -> BridgeError:
     if 300 <= status < 400:
         return BridgeError(
             "redirect",
-            f"the proxy answered HTTP {status} to CONNECT instead of opening "
-            "the tunnel",
+            f"the proxy answered HTTP {status} to {request}",
             status=status,
         )
     return BridgeError(
@@ -632,13 +726,12 @@ def _refusal(status: int) -> BridgeError:
     )
 
 
-def _socks5_tunnel(route, host: str, port: int, timeout: float) -> socket.socket:
+def _socks5_tunnel(
+    route, host: str, port: int, timeout: float, bridge: Bridge | None
+) -> socket.socket:
     """A SOCKS5 ``CONNECT`` with remote DNS and optional RFC 1929 auth."""
-    socks = socket.create_connection(
-        (route.host, _port_of(route)), timeout=timeout
-    )
+    socks = _dial(route, timeout, bridge)
     try:
-        socks.settimeout(timeout)
         credentials = _credentials(route)
         methods = [0x00] if credentials is None else [0x00, 0x02]
         socks.sendall(bytes([5, len(methods), *methods]))
@@ -647,7 +740,7 @@ def _socks5_tunnel(route, host: str, port: int, timeout: float) -> socket.socket
             raise BridgeError(
                 "unreachable", "the proxy did not answer a SOCKS5 greeting"
             )
-        if method == 0xFF:
+        if method == 0xFF or (method == 0x02 and credentials is None):
             raise BridgeError(
                 "auth", "the SOCKS5 proxy refused every authentication method"
             )
@@ -679,7 +772,7 @@ def _socks5_tunnel(route, host: str, port: int, timeout: float) -> socket.socket
         socks.settimeout(None)
         return socks
     except BaseException:
-        _close_socket(socks)
+        _drop(socks, bridge)
         raise
 
 

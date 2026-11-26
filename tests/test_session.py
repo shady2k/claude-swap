@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -7060,6 +7061,15 @@ class TestALaunchThroughTheLocalBridge:
 
         assert "secret" not in str(err.value)
         assert foreground == []
+
+
+@pytest.mark.parametrize("status, expected", [(7, 7), (-signal.SIGTERM, 143)])
+def test_foreground_mirrors_the_shell_exit_status(monkeypatch, tmp_path, status, expected):
+    monkeypatch.setattr(session_mod.spawn, "foreground", lambda *a, **k: status)
+    manager = SessionManager(SimpleNamespace(backup_dir=tmp_path, _logger=logging.getLogger()))
+    with pytest.raises(SystemExit) as err:
+        manager._run_foreground("claude", [], env={})
+    assert err.value.code == expected
 
 
 class TestTheAuthStatusProbeThroughTheBridge:

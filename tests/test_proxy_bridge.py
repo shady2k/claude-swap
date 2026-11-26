@@ -18,6 +18,7 @@ where the bridge resolved the target locally could not pass.
 from __future__ import annotations
 
 import base64
+import http.client
 import socket
 import ssl
 import threading
@@ -95,6 +96,36 @@ class TestTheLocalListener:
                 assert held.recv(1) == b""
             held.close()
 
+    @pytest.mark.parametrize("scheme", ["https", "socks5h"])
+    def test_close_cancels_an_upstream_handshake(self, monkeypatch, scheme):
+        proxy_servers.trust_fixture_ca(monkeypatch)
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            listener.settimeout(5)
+            route = account_proxy.parse(f"{scheme}://127.0.0.1:{listener.getsockname()[1]}")
+            with proxy_bridge.Bridge(route) as local:
+                with socket.create_connection((local.host, local.port), timeout=5) as client:
+                    client.sendall(b"CONNECT example.test:443 HTTP/1.1\r\n\r\n")
+                    peer, _ = listener.accept()
+                    with peer:
+                        peer.settimeout(5)
+                        # Receiving the first handshake bytes puts the worker
+                        # inside the protocol handshake before closing it.
+                        assert peer.recv(4096)
+                        started = time.monotonic()
+                        local.close()
+                        assert time.monotonic() - started < 1
+                        with suppress(ConnectionResetError):
+                            while peer.recv(4096):
+                                pass
+                        with suppress(ConnectionResetError):
+                            assert client.recv(1) == b""
+                        assert not local._connections
+                        assert not local._thread.is_alive()
+                        assert not any(worker.is_alive() for worker in local._workers)
+                        assert local.failure is None
+
     def test_a_disallowed_scheme_is_refused_by_the_transport(self):
         class _Ftp:
             scheme = "ftp"
@@ -151,21 +182,112 @@ class TestThroughAnHttpsProxy:
         assert connect["headers"]["proxy-authorization"] == f"Basic {expected}"
         assert origin.hits == 1
 
-    def test_an_http_target_becomes_a_tunnel_to_its_origin(self, monkeypatch):
-        """A plain ``http://`` request is tunneled too, and rewritten."""
+    @pytest.mark.parametrize("scheme", ["https", "socks5h"])
+    def test_plain_http_post_forwards_the_full_body(self, monkeypatch, scheme):
         proxy_servers.trust_fixture_ca(monkeypatch)
-        with proxy_servers.Origin() as origin:
-            with proxy_servers.HttpProxy(tls=True) as upstream:
-                route = account_proxy.parse(
-                    f"https://127.0.0.1:{upstream.port}"
-                )
-                request = urllib.request.Request(f"{origin.url}/json")
+        proxy = (
+            proxy_servers.HttpProxy(tls=True, refuse_plain_connect=True)
+            if scheme == "https" else proxy_servers.Socks5Proxy()
+        )
+        body = b"body in the same write as the headers"
+        with proxy as upstream, proxy_servers.Origin() as origin:
+            credentials = "user:secret@" if scheme == "https" else ""
+            route = account_proxy.parse(f"{scheme}://{credentials}127.0.0.1:{upstream.port}")
+            with proxy_bridge.Bridge(route) as local:
+                with socket.create_connection((local.host, local.port), timeout=5) as client:
+                    client.sendall(
+                        f"POST {origin.url}/json HTTP/1.1\r\n"
+                        f"Content-Length: {len(body)}\r\n"
+                        "Proxy-Authorization: client-credentials\r\n"
+                        "Proxy-Example: client-only\r\n\r\n".encode() + body
+                    )
+                    client.shutdown(socket.SHUT_WR)
+                    with http.client.HTTPResponse(client) as response:
+                        response.begin()
+                        assert response.status == 200
+                        assert response.read() == b'{"ip": "1.2.3.4", "country": "US"}'
+            assert origin.received == [body]
 
-                with route.open(request, timeout=10) as response:
-                    assert response.status == 200
+        if scheme == "https":
+            request = upstream.only("POST")
+            assert request["target"] == f"{origin.url}/json"
+            assert request["headers"]["proxy-authorization"] == (
+                "Basic " + base64.b64encode(b"user:secret").decode()
+            )
+            assert "proxy-example" not in request["headers"]
+            assert not upstream.paths("CONNECT")
+        else:
+            assert upstream.only("CONNECT")["port"] == origin.port
 
-        assert upstream.paths("CONNECT") == [f"127.0.0.1:{origin.port}"]
-        assert origin.hits == 1
+    def test_plain_http_can_wait_for_continue_before_sending_body(self, monkeypatch):
+        proxy_servers.trust_fixture_ca(monkeypatch)
+        body = b"sent after continue"
+
+        class _ContinueProxy(proxy_servers.HttpProxy):
+            def _converse(self, connection):
+                proxy_servers._read_head(connection)
+                connection.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
+                self.record({"body": proxy_servers._recv(connection, len(body))})
+                connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+
+        with _ContinueProxy(tls=True) as upstream:
+            route = account_proxy.parse(f"https://127.0.0.1:{upstream.port}")
+            with proxy_bridge.Bridge(route) as local:
+                with socket.create_connection((local.host, local.port), timeout=5) as client:
+                    client.sendall(
+                        "POST http://example.test/ HTTP/1.1\r\n"
+                        f"Content-Length: {len(body)}\r\n"
+                        "Expect: 100-continue\r\n\r\n".encode()
+                    )
+                    assert proxy_bridge._read_head(client) == (
+                        b"HTTP/1.1 100 Continue\r\n\r\n", b""
+                    )
+                    client.sendall(body)
+                    with http.client.HTTPResponse(client) as response:
+                        response.begin()
+                        assert response.status == 200
+                        assert response.read() == b""
+            assert upstream.recorded() == [{"body": body}]
+
+    @pytest.mark.parametrize("status", [302, 407])
+    def test_plain_http_proxy_refusal_carries_only_static_status(self, monkeypatch, status):
+        proxy_servers.trust_fixture_ca(monkeypatch)
+        with proxy_servers.HttpProxy(tls=True, refuse=status) as upstream:
+            route = account_proxy.parse(f"https://127.0.0.1:{upstream.port}")
+            with proxy_bridge.Bridge(route) as local:
+                with socket.create_connection((local.host, local.port), timeout=5) as client:
+                    client.sendall(b"GET http://example.test/ HTTP/1.1\r\n\r\n")
+                    with http.client.HTTPResponse(client) as response:
+                        response.begin()
+                        assert response.status == status
+                        assert response.getheader("Location") is None
+                        assert response.read() == b""
+                        assert "Refused" not in response.reason
+            assert isinstance(local.failure, proxy_bridge.BridgeError)
+            assert local.failure.status == status
+
+    def test_connect_keeps_bytes_from_the_same_write_as_each_head(self, monkeypatch):
+        proxy_servers.trust_fixture_ca(monkeypatch)
+        request_bytes = b"early client bytes"
+        reply_bytes = b"early server bytes"
+
+        class _EarlyReplyProxy(proxy_servers.HttpProxy):
+            def _converse(self, connection):
+                proxy_servers._read_head(connection)
+                connection.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n" + reply_bytes)
+                self.record({"data": proxy_servers._recv(connection, len(request_bytes))})
+                connection.sendall(b"done")
+
+        with _EarlyReplyProxy(tls=True) as upstream:
+            route = account_proxy.parse(f"https://127.0.0.1:{upstream.port}")
+            with proxy_bridge.Bridge(route) as local:
+                with socket.create_connection((local.host, local.port), timeout=5) as client:
+                    client.sendall(b"CONNECT example.test:443 HTTP/1.1\r\n\r\n" + request_bytes)
+                    head, rest = proxy_bridge._read_head(client)
+                    rest += proxy_servers._recv(client, len(reply_bytes) + len(b"done") - len(rest))
+                    assert head == b"HTTP/1.1 200 Connection Established\r\n\r\n"
+                    assert rest == reply_bytes + b"done"
+            assert upstream.recorded() == [{"data": request_bytes}]
 
     def test_rejected_credentials_are_an_auth_refusal(self, monkeypatch):
         proxy_servers.trust_fixture_ca(monkeypatch)
@@ -224,8 +346,9 @@ class TestThroughAnHttpsProxy:
                     f"https://localhost:{origin.port}/json"
                 )
 
-                with pytest.raises(ssl.SSLCertVerificationError):
+                with pytest.raises(urllib.error.URLError) as err:
                     route.open(request, timeout=10)
+                assert isinstance(err.value.reason, ssl.SSLCertVerificationError)
 
         assert upstream.recorded() == []
         assert origin.hits == 0
@@ -407,6 +530,7 @@ class TestProbe:
                 account_proxy.probe(route)
 
         assert err.value.kind == account_proxy.PROXY_UNREACHABLE
+        assert "TLS error" in str(err.value)
         assert "secret" not in str(err.value)
 
 
@@ -569,11 +693,11 @@ def test_an_unexpected_error_from_the_bridge_is_unreachable():
     assert "boom" not in str(err.value)
 
 
-def test_a_tls_error_from_the_bridge_is_passed_on():
-    with pytest.raises(ssl.SSLCertVerificationError):
-        account_proxy.raise_failure(
-            ssl.SSLCertVerificationError("fixture refusal")
-        )
+def test_a_certificate_error_from_the_bridge_is_wrapped_like_urllib():
+    failure = ssl.SSLCertVerificationError("fixture refusal")
+    with pytest.raises(urllib.error.URLError) as err:
+        account_proxy.raise_failure(failure)
+    assert err.value.reason is failure
 
 
 def test_the_two_tunnel_refusal_helpers_agree_on_the_code():

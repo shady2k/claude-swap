@@ -136,10 +136,11 @@ def _pump(source: socket.socket, target: socket.socket) -> None:
             target.sendall(data)
     except OSError:
         pass
-    try:
-        target.shutdown(socket.SHUT_WR)
-    except OSError:
-        pass
+    if not isinstance(target, ssl.SSLSocket):
+        try:
+            target.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
 
 
 def _close(*sockets: socket.socket | None) -> None:
@@ -284,11 +285,13 @@ class HttpProxy(_Server):
         tls: bool = False,
         refuse: int | None = None,
         forward: bool = True,
+        refuse_plain_connect: bool = False,
         context: ssl.SSLContext | None = None,
     ) -> None:
         self._tls = tls
         self._refuse = refuse
         self._forward = forward
+        self._refuse_plain_connect = refuse_plain_connect
         self._context = context if context is not None else server_context()
         super().__init__()
 
@@ -317,12 +320,16 @@ class HttpProxy(_Server):
         if self._refuse is not None:
             connection.sendall(
                 f"HTTP/1.1 {self._refuse} Refused\r\n"
-                "Content-Length: 0\r\n\r\n".encode("ascii")
+                "Location: http://refused.invalid/\r\n"
+                "Content-Length: 7\r\n\r\nRefused".encode("ascii")
             )
             return
         if method != "CONNECT":
+            self._forward_http(connection, target, head)
+            return
+        if self._refuse_plain_connect and _split_authority(target)[1] != 443:
             connection.sendall(
-                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"
+                b"HTTP/1.1 403 Refused\r\nContent-Length: 0\r\n\r\n"
             )
             return
         connection.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -334,6 +341,29 @@ class HttpProxy(_Server):
             relay(connection, upstream)
         finally:
             _close(upstream)
+
+    def _forward_http(self, client: socket.socket, target: str, received: bytes) -> None:
+        url = urllib.parse.urlsplit(target)
+        head, _, body = received.partition(b"\r\n\r\n")
+        line, *headers = head.split(b"\r\n")
+        path = urllib.parse.urlunsplit(("", "", url.path or "/", url.query, ""))
+        line = line.replace(target.encode("latin-1"), path.encode("latin-1"), 1)
+        headers = [item for item in headers if not item.lower().startswith(b"proxy-")]
+        with socket.create_connection(
+            (url.hostname, url.port or 80), timeout=_TIMEOUT_S
+        ) as origin:
+            origin.sendall(b"\r\n".join([line, *headers]) + b"\r\n\r\n" + body)
+            upload = threading.Thread(target=_pump, args=(client, origin), daemon=True)
+            upload.start()
+            try:
+                while chunk := origin.recv(65536):
+                    client.sendall(chunk)
+            finally:
+                try:
+                    socket.socket.shutdown(client, socket.SHUT_RD)
+                except OSError:
+                    pass
+                upload.join()
 
 
 class Socks5Proxy(_Server):
@@ -472,6 +502,12 @@ class Origin:
                     self.server.body_gate.wait(_TIMEOUT_S)
                 self.wfile.write(self.server.body)
 
+            def do_POST(self) -> None:
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                with self.server.lock:
+                    self.server.received.append(body)
+                self.do_GET()
+
             def log_message(self, *args) -> None:
                 pass
 
@@ -481,6 +517,7 @@ class Origin:
         self._server.hits = 0
         self._server.lock = threading.Lock()
         self._server.body = body
+        self._server.received = []
         self._server.status = status
         self._server.body_gate = body_gate
         if tls:
@@ -501,6 +538,11 @@ class Origin:
     @property
     def hits(self) -> int:
         return self._server.hits
+
+    @property
+    def received(self) -> list[bytes]:
+        with self._lock:
+            return list(self._server.received)
 
     @property
     def url(self) -> str:
