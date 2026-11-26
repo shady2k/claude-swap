@@ -73,6 +73,13 @@ cswap add
 
 Do not run `/logout` first: current Claude Code may revoke the refresh token stored for the account you are leaving.
 
+Or let cswap run the login in an isolated profile, leaving your current login and active account untouched — the recommended way when the new account needs its own proxy or exit country:
+
+```bash
+cswap add --login
+cswap add --login --proxy http://127.0.0.1:3128 --expect-country DE --expect-ip 203.0.113.7
+```
+
 ### Switch accounts
 
 Rotate to the next account:
@@ -239,6 +246,8 @@ cswap list --token-status       # Add source-labelled OAuth token diagnostics
 cswap status                    # Show current account
 cswap add --slot 3              # Add account to a specific slot (prompts before overwrite)
 cswap add --alias dev           # Add account and give it a short alias
+cswap add --login               # Log in a new account without touching the current one
+cswap add --login --proxy http://127.0.0.1:3128 --expect-country DE
 cswap remove 2                  # Remove an account
 cswap disable 2                 # Hold an account out of auto-rotation (keeps its login)
 cswap enable 2                  # Return a disabled account to rotation
@@ -373,7 +382,7 @@ If an imported account is the one you're currently logged in as, activate the im
 
 ### Per-account proxy
 
-`cswap proxy <num|email> <url>` sends every request cswap makes for that account through an HTTP proxy, with no direct fallback, and `cswap add --proxy <url>` sets one while adding. A launch of that account (`cswap run`) also checks the proxy with one `CONNECT` before Claude Code starts and hands Claude Code the same proxy through `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` (and `NO_PROXY` from `run.noProxy`), so an unusable proxy refuses the launch instead of running direct. The setting follows the account through `swap`, `move` and a re-add; before rolling back to a version without proxy support, save the URLs, because that version would talk to the internet directly again. The exact rules are in [proxy.md](https://github.com/realiti4/claude-swap/blob/main/docs/proxy.md).
+`cswap proxy <num|email> <url>` sends every request cswap makes for that account through an HTTP proxy, with no direct fallback, and `cswap add --proxy <url>` sets one while adding. For a new account, `cswap add --login --proxy <url>` is the recommended form: the login itself runs through the proxy, in a temporary profile, so the live login is not disturbed. A launch of that account (`cswap run`) also checks the proxy with one `CONNECT` before Claude Code starts and hands Claude Code the same proxy through `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` (and `NO_PROXY` from `run.noProxy`), so an unusable proxy refuses the launch instead of running direct. The setting follows the account through `swap`, `move` and a re-add; before rolling back to a version without proxy support, save the URLs, because that version would talk to the internet directly again. The exact rules are in [proxy.md](https://github.com/realiti4/claude-swap/blob/main/docs/proxy.md).
 
 `cswap proxy <num|email> --expect-country <CC> --expect-ip <IP>` (either or both) records what that account's exit must be: a launch then measures the exit IP and country through the account's proxy before Claude Code starts, and refuses on a mismatch or when no GeoIP service answers. `--unset-expect` drops the rule, `--unset` drops the proxy and the rule. Details are in [proxy.md](https://github.com/realiti4/claude-swap/blob/main/docs/proxy.md#egress-expectation).
 

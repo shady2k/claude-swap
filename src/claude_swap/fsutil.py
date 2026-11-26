@@ -407,3 +407,20 @@ def can_junction(
         f"junction:{os.path.normcase(to)}",
         lambda probe: make_dir_link(to, probe),
     )
+
+
+def same_path(left: os.PathLike | str, right: os.PathLike | str) -> bool:
+    """Whether ``left`` and ``right`` name the same existing filesystem entry.
+
+    Uses ``os.path.samefile`` so case-insensitive volumes (macOS APFS, Windows
+    NTFS) recognize case-folded collisions while case-sensitive POSIX
+    filesystems treat distinct casings as distinct files. Returns ``False``
+    when either path does not exist, and ``True`` on other ``OSError`` so an
+    unreadable directory never triggers a destructive cleanup.
+    """
+    try:
+        return os.path.samefile(left, right)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True

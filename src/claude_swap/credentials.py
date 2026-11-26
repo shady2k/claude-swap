@@ -33,7 +33,7 @@ from claude_swap.exceptions import (
     CredentialReadError,
     CredentialWriteError,
 )
-from claude_swap.fsutil import atomic_write_text
+from claude_swap.fsutil import atomic_write_text, same_path
 from claude_swap.models import Platform
 from claude_swap.paths import (
     get_claude_config_home,
@@ -1643,28 +1643,38 @@ class CredentialStore:
         if self._host.platform == Platform.MACOS:
             self._delete_backup_keychain_quiet(account_num, email)
 
-    def _delete_account_credentials(self, account_num: str, email: str) -> None:
+    def _delete_account_credentials(
+        self, account_num: str, email: str, *, keep_email: str | None = None
+    ) -> None:
         """Delete account credentials from backup (both backends on macOS).
 
         Removes the ``.enc`` file(s) and, on macOS, the Keychain item(s). The
         Keychain delete is best-effort: if it's locked the item may linger as
         harmless unreferenced cruft (the slot is gone from sequence.json; a re-add
         overwrites it via ``-U``; purge sweeps it). Includes the legacy
-        ``account-None-{email}`` alias.
+        ``account-None-{email}`` alias. When ``keep_email`` is set (e.g. a
+        case-folding slot overwrite), skips files whose on-disk path collides
+        with ``keep_email`` and skips Keychain deletes if the emails match
+        verbatim.
         """
         nums = [account_num]
         if str(account_num) != "None":
             nums.append("None")
         for num in nums:
             enc_file = self._backup_enc_path(num, email)
-            try:
-                if enc_file.exists():
-                    enc_file.unlink()
-            except Exception as e:
-                self._host._logger.warning(f"Failed to delete credentials file: {e}")
-            if self._host.platform == Platform.MACOS:
+            if keep_email is None or not same_path(
+                enc_file, self._backup_enc_path(num, keep_email)
+            ):
+                try:
+                    if enc_file.exists():
+                        enc_file.unlink()
+                except Exception as e:
+                    self._host._logger.warning(f"Failed to delete credentials file: {e}")
+            if self._host.platform == Platform.MACOS and (
+                keep_email is None or email != keep_email
+            ):
                 self._delete_backup_keychain_quiet(num, email)
-            self.delete_previous_backup(num, email)
+            self.delete_previous_backup(num, email, keep_email=keep_email)
 
     def delete_account_credentials_strict(
         self, account_num: str, email: str
@@ -1716,7 +1726,9 @@ class CredentialStore:
                 f"({email}) — aborting before commit"
             )
 
-    def delete_previous_backup(self, account_num: str, email: str) -> None:
+    def delete_previous_backup(
+        self, account_num: str, email: str, *, keep_email: str | None = None
+    ) -> None:
         """Drop a slot key's retained ``.prev`` generation (both backends).
 
         Best-effort, like retention itself. Called from full-key deletion,
@@ -1726,12 +1738,17 @@ class CredentialStore:
         the key's new owner.
         """
         prev_file = self._prev_backup_path(account_num, email)
-        try:
-            if prev_file.exists():
-                prev_file.unlink()
-        except Exception as e:
-            self._host._logger.warning(f"Failed to delete .prev file: {e}")
-        if self._host.platform == Platform.MACOS:
+        if keep_email is None or not same_path(
+            prev_file, self._prev_backup_path(account_num, keep_email)
+        ):
+            try:
+                if prev_file.exists():
+                    prev_file.unlink()
+            except Exception as e:
+                self._host._logger.warning(f"Failed to delete .prev file: {e}")
+        if self._host.platform == Platform.MACOS and (
+            keep_email is None or email != keep_email
+        ):
             try:
                 self._kc_delete_backup_prev(account_num, email)
             except Exception as e:

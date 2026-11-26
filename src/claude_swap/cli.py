@@ -1921,6 +1921,7 @@ Commands:
   %(prog)s switch                     rotate to the next account
   %(prog)s switch <num|email>         switch to a specific account
   %(prog)s add                        add the current account
+  %(prog)s add --login                log in a new account in an isolated profile
   %(prog)s add-token [TOKEN|-]        register a setup-token or API key
   %(prog)s remove <num|email>         remove an account
   %(prog)s disable <num|email>        hold an account out of auto-rotation
@@ -1969,6 +1970,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s import-usage usage.json --hold 600  # adopt another machine's list --json
   %(prog)s add --slot 3                      # add to a specific slot
   %(prog)s add --proxy http://127.0.0.1:3128  # add it with its own proxy
+  %(prog)s add --login --proxy http://127.0.0.1:3128 --expect-country DE
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
   %(prog)s run --auto -- --resume            # best account, no switch
@@ -2032,10 +2034,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         "--email",
         metavar="EMAIL",
         help=(
-            "Email address for the account. Optional with 'add-token'; "
-            "defaults to setup-token-{slot}@token.local (or "
-            "api-key-{slot}@token.local for API keys) since these tokens "
-            "carry no real email metadata."
+            "Email address for the account. Optional with 'add-token' and "
+            "'add --login'; with add-token it defaults to "
+            "setup-token-{slot}@token.local (or api-key-{slot}@token.local "
+            "for API keys) since these tokens carry no real email metadata."
         ),
     )
     parser.add_argument(
@@ -2055,6 +2057,30 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             "Set the account's HTTP proxy, through which every request cswap "
             "makes for it goes (use with 'add'): "
             "http://[user:pass@]host[:port]"
+        ),
+    )
+    parser.add_argument(
+        "--login",
+        action="store_true",
+        help=(
+            "With 'add': run Claude Code's own login in an isolated profile, "
+            "leaving the current default login and active slot untouched"
+        ),
+    )
+    parser.add_argument(
+        "--expect-country",
+        metavar="CC",
+        help=(
+            "With 'add --proxy': the ISO 3166-1 alpha-2 country this account's "
+            "exit must be, checked through the proxy before a login or launch"
+        ),
+    )
+    parser.add_argument(
+        "--expect-ip",
+        metavar="IP",
+        help=(
+            "With 'add --proxy': the exit IPv4/IPv6 address this account must "
+            "have, checked through the proxy before a login or launch"
         ),
     )
     parser.add_argument(
@@ -2306,8 +2332,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.slot is not None and not (args.add_account or args.add_token is not None):
         parser.error("--slot can only be used with 'add' or 'add-token'")
 
-    if args.email is not None and args.add_token is None:
-        parser.error("--email can only be used with 'add-token'")
+    if args.email is not None and args.add_token is None and not (
+        args.add_account and args.login
+    ):
+        parser.error("--email can only be used with 'add-token' or 'add --login'")
 
     if args.account is not None and not args.export:
         parser.error("--account can only be used with 'export'")
@@ -2317,6 +2345,21 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
 
     if args.proxy is not None and not args.add_account:
         parser.error("--proxy can only be used with 'add'")
+
+    if args.login and not args.add_account:
+        parser.error("--login can only be used with 'add'")
+
+    for flag, value in (
+        ("--expect-country", args.expect_country),
+        ("--expect-ip", args.expect_ip),
+    ):
+        if value is not None and not args.add_account:
+            parser.error(f"{flag} can only be used with 'add'")
+
+    if (
+        args.expect_country is not None or args.expect_ip is not None
+    ) and args.proxy is None:
+        parser.error("--expect-country/--expect-ip require --proxy")
 
     if args.force and not (args.import_ or args.switch_to):
         parser.error("--force can only be used with 'import' or 'switch <num|email>'")
@@ -2382,9 +2425,23 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 sys.exit(1)
 
         if args.add_account:
-            switcher.add_account(
-                slot=args.slot, alias=args.alias, proxy=args.proxy
-            )
+            if args.login:
+                switcher.add_account_via_login(
+                    slot=args.slot,
+                    alias=args.alias,
+                    proxy=args.proxy,
+                    expect_country=args.expect_country,
+                    expect_ip=args.expect_ip,
+                    email=args.email,
+                )
+            else:
+                switcher.add_account(
+                    slot=args.slot,
+                    alias=args.alias,
+                    proxy=args.proxy,
+                    expect_country=args.expect_country,
+                    expect_ip=args.expect_ip,
+                )
         elif args.add_token is not None:
             switcher.add_account_from_token(
                 token=args.add_token,
