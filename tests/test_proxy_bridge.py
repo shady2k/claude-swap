@@ -463,6 +463,73 @@ class TestThroughAnHttpsProxy:
         assert origin.hits == 0
 
 
+class TestTheTargetsHostHeader:
+    """The ``Host`` an origin receives through a bridge, and only one of it.
+
+    ``ProxyRoute.open`` pins the target's ``Host`` before ``set_proxy`` points
+    the request at the bridge's loopback address. From there the bridge is a
+    proxy of its own: it forwards the headers it was given, and builds the
+    header only for a request that arrived without one (``_absolute_form``).
+    A second ``Host`` appended to a present one would give the origin two, which
+    is why these tests speak the bridge's protocol directly instead of letting
+    urllib compose the request.
+    """
+
+    @pytest.mark.parametrize("scheme", ["https", "socks5h"])
+    def test_the_host_a_client_gives_is_the_only_one_forwarded(
+        self, monkeypatch, scheme
+    ):
+        proxy_servers.trust_fixture_ca(monkeypatch)
+        with (
+            proxy_servers.Origin() as origin,
+            proxy_servers.proxy_for(scheme) as proxy,
+        ):
+            route = account_proxy.parse(f"{scheme}://127.0.0.1:{proxy.port}")
+            with proxy_bridge.Bridge(route) as local:
+                with socket.create_connection(
+                    (local.host, local.port), timeout=5
+                ) as client:
+                    client.sendall(
+                        f"GET {origin.url}/json HTTP/1.1\r\n"
+                        f"Host: localhost:{origin.port}\r\n\r\n".encode()
+                    )
+                    with http.client.HTTPResponse(client) as response:
+                        response.begin()
+                        assert response.status == 200
+                        assert response.read() == (
+                            b'{"ip": "1.2.3.4", "country": "US"}'
+                        )
+            entry = origin.only("GET")
+
+        assert entry["hosts"] == [f"localhost:{origin.port}"]
+
+    @pytest.mark.parametrize("scheme", ["https", "socks5h"])
+    def test_a_request_without_a_host_gets_exactly_one(
+        self, monkeypatch, scheme
+    ):
+        proxy_servers.trust_fixture_ca(monkeypatch)
+        with (
+            proxy_servers.Origin() as origin,
+            proxy_servers.proxy_for(scheme) as proxy,
+        ):
+            route = account_proxy.parse(f"{scheme}://127.0.0.1:{proxy.port}")
+            with proxy_bridge.Bridge(route) as local:
+                with socket.create_connection(
+                    (local.host, local.port), timeout=5
+                ) as client:
+                    client.sendall(
+                        f"GET {origin.url}/json HTTP/1.1\r\n\r\n".encode()
+                    )
+                    with http.client.HTTPResponse(client) as response:
+                        response.begin()
+                        assert response.status == 200
+            entry = origin.only("GET")
+
+        # Built from the absolute URL the bridge was asked for, once: the
+        # origin is named by its address here, so that is the authority.
+        assert entry["hosts"] == [f"127.0.0.1:{origin.port}"]
+
+
 class TestThroughASocks5Proxy:
     def test_a_domain_target_is_sent_as_a_domain(self, monkeypatch):
         """``socks5h`` means the proxy resolves it: the target name travels

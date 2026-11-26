@@ -35,12 +35,15 @@ with the proxy's address sets ``_tunnel_host`` for an ``https`` target and
 rewrites ``host``/``selector`` to an absolute URL for an ``http`` one;
 ``AbstractHTTPHandler.do_open`` moves ``Proxy-Authorization`` from the
 origin's headers into the ``CONNECT`` headers, so the header never reaches
-the origin. Both halves are exercised in ``tests/test_account_proxy.py``
-against a local proxy: an absolute-form ``http://`` request and a ``CONNECT``
-tunnel. A refused tunnel (407, a redirect) reaches ``open`` as a ``URLError``
-carrying http.client's own phrase, and is re-raised as the same
-``ProxyRouteError`` kinds with that phrase dropped — it is the proxy's text
-and may name a credential.
+the origin. The target's ``Host`` is pinned before that, because ``do_open``
+builds it from ``request.host`` — which ``set_proxy`` has just replaced with
+the proxy's, or the bridge's, address. Without the pin every tunnelled
+request reached its origin as ``Host: 127.0.0.1:<port>``. All of it is
+exercised in ``tests/test_account_proxy.py`` against a local proxy: an
+absolute-form ``http://`` request and a ``CONNECT`` tunnel. A refused tunnel
+(407, a redirect) reaches ``open`` as a ``URLError`` carrying http.client's
+own phrase, and is re-raised as the same ``ProxyRouteError`` kinds with that
+phrase dropped — it is the proxy's text and may name a credential.
 
 The stored value keeps the password in ``sequence.json`` (mode 0600, written
 atomically by the switcher), because cswap has to present it. It is masked
@@ -217,9 +220,16 @@ class ProxyRoute:
         """Send ``request`` through this proxy, refusing to go direct.
 
         The request is modified in place (proxy address, absolute URL or
-        tunnel, ``Proxy-Authorization``), so a caller must pass a request it
-        built for this one attempt — every caller in ``oauth.py`` and
-        ``subscription.py`` does.
+        tunnel, ``Host``, ``Proxy-Authorization``), so a caller must pass a
+        request it built for this one attempt — every caller in ``oauth.py``
+        and ``subscription.py`` does.
+
+        The target's ``Host`` is pinned here, before the address that goes
+        into ``set_proxy`` replaces it: urllib builds the header from
+        ``request.host``, so a tunnelled request would otherwise reach the
+        origin as ``Host: 127.0.0.1:<port>`` (the bridge) or
+        ``Host: <proxy host>:<port>``, and Cloudflare in front of the GeoIP
+        endpoints answers 404/403 to that. A caller's own ``Host`` is kept.
 
         An ``http://`` route is handed to urllib as it always was. The other
         schemes run through a :func:`bridge` opened for this one request: the
@@ -239,6 +249,13 @@ class ProxyRoute:
                 PROXY_INVALID,
                 f"the account's proxy setting is unusable: {self.invalid}",
             )
+        if not request.has_header("Host"):
+            # ``request.host`` is the target until ``set_proxy`` rewrites it,
+            # and it already carries the port when the URL named a
+            # non-default one. Pinned as an unredirected header so a redirect
+            # could not carry the target's name elsewhere; redirects are
+            # refused here anyway.
+            request.add_unredirected_header("Host", request.host)
         if self.needs_bridge:
             return self._open_through_bridge(request, timeout)
         request.set_proxy(f"{self.host}:{self.port}", "http")
