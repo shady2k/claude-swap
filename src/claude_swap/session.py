@@ -54,7 +54,12 @@ refuses the launch when the route cannot be used. An account with an egress
 expectation is then measured through that same route (``egress.check``),
 still before any profile work and outside every lock: a mismatch, a damaged
 rule or an unanswerable chain refuses the launch just as firmly, and so does a
-slot that was given to another account while the checks ran. Nothing here
+slot that was given to another account while the checks ran. A route whose
+scheme urllib cannot speak (``https://``, ``socks5h://``/``socks5://``) is
+carried by a local ``account_proxy.bridge``: the variables name that loopback
+address instead of the account's URL, so the proxy's password never reaches
+the child, and the launch runs Claude Code as a child rather than ``exec``-ing
+it so the bridge lives exactly as long as Claude Code does. Nothing here
 forbids a direct connection at the OS level: a program
 that ignores these variables still goes out directly (``docs/proxy.md``).
 
@@ -72,6 +77,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -80,7 +86,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from claude_swap import account_proxy, egress, macos_keychain, spawn, wrapper
+from claude_swap import (
+    account_proxy,
+    egress,
+    macos_keychain,
+    proxy_bridge,
+    spawn,
+    wrapper,
+)
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
@@ -768,6 +781,7 @@ def _claude_env(
     route: account_proxy.ProxyRoute | None,
     no_proxy: str,
     disable_nonessential_traffic: bool = True,
+    bridge: "proxy_bridge.Bridge | None" = None,
 ) -> dict[str, str]:
     """The environment every Claude Code process cswap starts is given.
 
@@ -785,12 +799,15 @@ def _claude_env(
     For an account with a proxy the account's own variables go in over the
     inherited ones (see ``account_proxy.launch_env``); an account without one
     keeps the proxy variables it inherited, exactly as before the setting
-    existed. Nothing here forbids a direct connection at the OS level: a
-    program that ignores these variables still reaches the internet directly.
+    existed. ``bridge`` is the local bridge of a route whose scheme needs one:
+    Claude Code is then pointed at the loopback address instead of the
+    account's URL, so the proxy's password is not in this environment at all.
+    Nothing here forbids a direct connection at the OS level: a program that
+    ignores these variables still reaches the internet directly.
     """
     env = dict(base)
     if route is not None:
-        env = account_proxy.launch_env(route, no_proxy, env)
+        env = account_proxy.launch_env(route, no_proxy, env, bridge)
     if disable_nonessential_traffic:
         env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
     return env
@@ -817,6 +834,7 @@ def _probe_env(
     route: account_proxy.ProxyRoute | None = None,
     no_proxy: str = DEFAULT_NO_PROXY,
     disable_nonessential_traffic: bool = True,
+    bridge: "proxy_bridge.Bridge | None" = None,
 ) -> dict[str, str]:
     """Env for the auth-status probe: session config dir, auth overrides dropped.
 
@@ -827,7 +845,9 @@ def _probe_env(
     """
     env = {k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS}
     env["CLAUDE_CONFIG_DIR"] = str(session_dir)
-    return _claude_env(env, route, no_proxy, disable_nonessential_traffic)
+    return _claude_env(
+        env, route, no_proxy, disable_nonessential_traffic, bridge
+    )
 
 
 class SessionManager:
@@ -1020,12 +1040,10 @@ class SessionManager:
                     "exit was being checked. Nothing was launched; run the "
                     "command again."
                 )
-            env = self._launch_env(
-                route, self._launch_base_env(account is not None)
-            )
+            env = self._launch_base_env(account is not None)
             # Run on the default login, not on the preset profile.
             env.pop("CLAUDE_CONFIG_DIR", None)
-            self._exec(claude_bin, claude_args, env=env)
+            self._launch(claude_bin, claude_args, route, env)
         if config_dir_preset:
             warning(
                 f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
@@ -1048,7 +1066,7 @@ class SessionManager:
         )
         env = self._launch_base_env(True)
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
-        self._exec(claude_bin, claude_args, env=self._launch_env(route, env))
+        self._launch(claude_bin, claude_args, route, env)
 
     def _launch_base_env(self, scrub_auth_overrides: bool) -> dict[str, str]:
         """This process's environment, less the auth overrides a chosen
@@ -1252,7 +1270,7 @@ class SessionManager:
                 "could not be confirmed while its exit was being checked. "
                 "Nothing was launched; run the command again."
             )
-        self._exec(claude_bin, claude_args, env=self._launch_env(route, env))
+        self._launch(claude_bin, claude_args, route, env)
 
     def _check_proxy(
         self,
@@ -1315,18 +1333,81 @@ class SessionManager:
             ) from None
 
     def _launch_env(
-        self, route: account_proxy.ProxyRoute | None, base: dict[str, str]
+        self,
+        route: account_proxy.ProxyRoute | None,
+        base: dict[str, str],
+        bridge: "proxy_bridge.Bridge | None" = None,
     ) -> dict[str, str]:
         """Environment for one launch (``_claude_env`` with the ``run`` settings)."""
         run = self._run_settings()
         no_proxy = DEFAULT_NO_PROXY if route is None else run.no_proxy
         return _claude_env(
-            base, route, no_proxy, run.disable_nonessential_traffic
+            base, route, no_proxy, run.disable_nonessential_traffic, bridge
         )
 
     def _run_settings(self) -> RunSettings:
         """The ``run`` settings one launch applies (``run`` section of settings.json)."""
         return load_run_settings(self.switcher.backup_dir)
+
+    def _launch(
+        self,
+        claude_bin: str,
+        claude_args: list[str],
+        route: account_proxy.ProxyRoute | None,
+        base_env: dict[str, str],
+    ) -> NoReturn:
+        """Hand the terminal to claude with ``route`` in its environment.
+
+        A route urllib speaks (``http://``) and a direct launch keep `os.exec`:
+        nothing in this process has to outlive it. A route that needs
+        ``account_proxy.bridge`` does not — the bridge lives in this process, so
+        Claude Code runs as a child and this process stays as the thing holding
+        the bridge open, closing it when the child exits, however it exits.
+        That is also why the account's URL never appears in the child's
+        environment (``account_proxy.launch_env``).
+        """
+        if route is None or not route.needs_bridge:
+            self._exec(
+                claude_bin, claude_args, env=self._launch_env(route, base_env)
+            )
+        with account_proxy.bridge(route) as local:
+            self._run_foreground(
+                claude_bin,
+                claude_args,
+                env=self._launch_env(route, base_env, local),
+            )
+
+    def _run_foreground(
+        self, claude_bin: str, claude_args: list[str], env: dict[str, str]
+    ) -> NoReturn:
+        """Run claude as a child, mirror its exit status, never leak the bridge.
+
+        The child keeps the terminal: ``SIGINT`` reaches it through the process
+        group, and this process waits for it instead of dying first and taking
+        the bridge down under a running claude. ``SIGTERM`` is forwarded as
+        well — unlike the terminal's interrupt it is addressed to this process
+        alone, and a bridge left behind leaves Claude Code dialling a closed
+        port. Every path out of here unwinds the launch's ``with`` block, which
+        closes the bridge and joins its threads.
+        """
+        argv = [claude_bin, *claude_args]
+        process = subprocess.Popen(argv, env=env)
+
+        def forward(signum, _frame) -> None:
+            if process.poll() is None:
+                process.send_signal(signum)
+
+        previous = signal.signal(signal.SIGTERM, forward)
+        try:
+            while True:
+                try:
+                    returncode = process.wait()
+                    break
+                except KeyboardInterrupt:
+                    continue
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+        sys.exit(returncode)
 
     def _exec(self, claude_bin: str, claude_args: list[str], env: dict[str, str]) -> NoReturn:
         """Hand the terminal over to claude. Never returns.
@@ -1736,15 +1817,24 @@ class SessionManager:
             return "unreachable"
         run = self._run_settings()
         try:
-            result = spawn.run(
-                [claude_bin, "auth", "status", "--json"],
-                env=_probe_env(
-                    session_dir, route, run.no_proxy, run.disable_nonessential_traffic
-                ),
-                capture_output=True,
-                text=True,
-                timeout=_AUTH_STATUS_TIMEOUT,
-            )
+            # The probe is a network client like the launch (see ``_probe_env``),
+            # so a route that needs the bridge gets one for the length of this
+            # call: the probe's environment carries the loopback address, never
+            # the account's URL.
+            with account_proxy.bridge(route) as local:
+                result = spawn.run(
+                    [claude_bin, "auth", "status", "--json"],
+                    env=_probe_env(
+                        session_dir,
+                        route,
+                        run.no_proxy,
+                        run.disable_nonessential_traffic,
+                        local,
+                    ),
+                    capture_output=True,
+                    text=True,
+                    timeout=_AUTH_STATUS_TIMEOUT,
+                )
         except subprocess.TimeoutExpired:
             # The verdict layer answers what the PROBE established, and a
             # timeout established nothing. Upstream's artifact fallback is a

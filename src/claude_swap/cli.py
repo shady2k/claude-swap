@@ -904,7 +904,10 @@ Examples:
   cswap proxy 2 --unset               # back to a direct connection
   cswap proxy                         # list accounts with a proxy or a rule
 
-Only http:// proxies are supported; HTTPS tunnels through them (CONNECT).
+URL schemes: http:// (port 80), https:// (443), socks5h:// and socks5://
+(1080, remote DNS). http:// is spoken directly; the others run through a
+local bridge on 127.0.0.1 that holds the account's URL, so Claude Code gets
+no proxy password in its environment.
 An expectation needs a proxy on the same account; set one first.
         """,
     )

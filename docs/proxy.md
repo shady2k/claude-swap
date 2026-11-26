@@ -5,9 +5,12 @@
 ## The URL
 
 - `http://[user:pass@]host[:port]`, port 80 when omitted. Credentials are optional and travel as `Proxy-Authorization` (`Basic`) on the proxy request and on the `CONNECT` tunnel; the account's OAuth token is never sent to the proxy.
-- HTTPS endpoints are tunneled through the proxy with `CONNECT`.
-- Only `http://` is accepted: cswap cannot speak TLS to the proxy itself, so an `https://` value would fail later instead of at the command.
+- `https://[user:pass@]host[:port]`, port 443: TLS to the proxy itself, verified against the system trust store with SNI = the proxy's host, then the tunnel inside it.
+- `socks5h://[user:pass@]host[:port]` and the alias `socks5://`, port 1080. The target is always sent as a domain (`ATYP=0x03`, RFC 1928), so the proxy resolves it and nothing leaks a DNS lookup from here; user name and password travel by RFC 1929.
+- HTTPS endpoints are tunneled through the proxy with `CONNECT` whichever scheme carried the tunnel.
 - Anything else is refused before `sequence.json` is touched, with a message that never repeats the value.
+
+The three schemes urllib cannot speak — `https://`, `socks5h://`, `socks5://` — are carried by `proxy_bridge.py`, a local HTTP proxy on `127.0.0.1:0` that speaks the plain proxy protocol to whatever is local and the account's protocol upstream. cswap's own requests go through it, and so does a launch (see [Launching Claude Code](#launching-claude-code)). `http://` keeps the direct urllib path it always had. The mechanics are in the module docstring of `proxy_bridge.py`.
 
 ## Adding a new account through a proxy
 
@@ -45,7 +48,9 @@ A launch of a proxied account — `cswap run`, its plain-claude fast path on the
 
 The account is resolved once, and the login or the slot is read again when the profile is prepared and just before the fast path hands over the terminal: a `switch`, `swap` or `move` landing while the check runs ends the launch there, before any profile of the neighbour is touched, rather than preparing that profile under this account's proxy or running a login the route does not belong to.
 
-**The environment.** That account's route goes into `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY`, in both cases, over whatever the shell carried: Claude Code resolves `https_proxy` before `HTTPS_PROXY`, so an inherited lower-case value would otherwise win, and an inherited `NO_PROXY=*` would switch the proxy off. `NO_PROXY` comes from `run.noProxy` alone — `cswap config set run.noProxy 'localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'` is the default, entries may be separated by commas or spaces (Claude Code documents both), and an entry of `*` is refused because it bypasses the proxy for every host (how a `10.0.0.0/8` entry is read is up to the client that reads it; Claude Code does not document subnet support). An account without a proxy keeps the proxy variables it inherited.
+**The environment.** For an `http://` route, that account's route goes into `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY`, in both cases, over whatever the shell carried: Claude Code resolves `https_proxy` before `HTTPS_PROXY`, so an inherited lower-case value would otherwise win, and an inherited `NO_PROXY=*` would switch the proxy off. `NO_PROXY` comes from `run.noProxy` alone — `cswap config set run.noProxy 'localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'` is the default, entries may be separated by commas or spaces (Claude Code documents both), and an entry of `*` is refused because it bypasses the proxy for every host (how a `10.0.0.0/8` entry is read is up to the client that reads it; Claude Code does not document subnet support). An account without a proxy keeps the proxy variables it inherited.
+
+For an `https://` or `socks5h://`/`socks5://` route the same variables carry `http://127.0.0.1:<port>` instead: a local bridge is opened for the launch and the account's URL never enters Claude Code's environment, so the proxy password does not either. The bridge lives exactly as long as the child — a launch on such a route runs Claude Code as a child of cswap, forwarding `SIGTERM` and mirroring the exit status, where an `http://` launch still `exec`s Claude Code — and it is closed in `finally` on every path, a failed launch included. A refused tunnel reaches Claude Code as a status (`407`, or the proxy's own 4xx/5xx) rather than as a direct connection.
 
 Every `cswap run` also gets `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` ([env-vars](https://code.claude.com/docs/en/env-vars)). That one variable turns off what Claude Code would otherwise send for its own purposes: auto-updates, telemetry, error reporting, `/feedback` and Claude-drafted feedback, release notes, the PR/MR status badge checks, availability checks such as the fast mode check, and the feature flags it fetches — which is what makes Remote Control unavailable in these sessions. `0` does not turn the traffic back on; only unsetting the variable does. `cswap config set run.disableNonessentialTraffic false` is that: cswap then does not set the variable at all (an inherited one is left as the shell has it), so Claude Code keeps its auto-updates and Remote Control. Nothing else about a launch changes.
 
@@ -85,7 +90,9 @@ With a proxy set, none of these falls back to a direct connection:
 | the exit differs from the expectation | a refusal naming expected and measured values |
 | no GeoIP service gave a usable answer | a refusal listing each service's reason |
 
-407 and 3xx are recognised whether they answer the plain request or the `CONNECT` tunnel an HTTPS request travels; the proxy's own status phrase is dropped rather than repeated in the error or the debug log, because a proxy may put a credential in it.
+407 and 3xx are recognised whether they answer the plain request or the `CONNECT` tunnel an HTTPS request travels; the proxy's own status phrase is dropped rather than repeated in the error or the debug log, because a proxy may put a credential in it. An `https://` proxy's own certificate is verified like any other endpoint: an untrusted or expired one refuses the request (and the launch) instead of tunnelling anything.
+
+When the egress check cannot get an answer, each service's reason names the cause rather than "network": `TLS error` for a refused certificate or a TLS failure, `CONNECT HTTP <code>` for a tunnel the proxy refused with a status of its own, `timeout`, and `network error` for everything else. The code is kept, the proxy's phrase is not.
 
 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` and the platform's proxy settings are not consulted, and `NO_PROXY`/`no_proxy` is ignored in both spellings: a bypass there would turn the same request into a direct connection. A refused request changes no credential and strikes no token, so a dead proxy never marks an account as needing a re-login — the row shows the error and backs off.
 

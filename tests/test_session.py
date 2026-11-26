@@ -12,11 +12,13 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import unicodedata
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -68,6 +70,7 @@ from claude_swap.session import (
 )
 from claude_swap.settings import load_run_settings, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
+from tests import proxy_servers
 
 ACCOUNT_EMAIL = "account2@example.com"
 ACCOUNT_NUM = "2"
@@ -6874,3 +6877,210 @@ class TestDefaultLoginSignedOut:
         monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
 
         assert manager._default_login_signed_out() is True
+
+
+# ---------------------------------------------------------------------------
+# a launch whose scheme needs the local bridge
+# ---------------------------------------------------------------------------
+
+
+def _wait_for_refusal(port: int | None, timeout: float = 5.0) -> None:
+    """Wait until nothing listens on ``port`` any more."""
+    assert port is not None
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            connection = socket.create_connection(("127.0.0.1", port), timeout=1)
+        except OSError:
+            return
+        connection.close()
+        time.sleep(0.02)
+    raise AssertionError(f"the bridge on {port} is still listening")
+
+
+def _bridge_port(url: str) -> int | None:
+    return urlsplit(url).port
+
+
+@pytest.fixture
+def foreground(monkeypatch):
+    """Stand in for the resident child launch, recording every call.
+
+    The bridged path runs claude as a child (``_run_foreground``) instead of
+    ``exec``-ing it, so the tests patch that seam and read the environment it
+    was handed.
+    """
+    calls: list[_ExecCalled] = []
+
+    def fake_run(self, claude_bin, claude_args, env):
+        call = _ExecCalled(claude_bin, [claude_bin, *claude_args], env)
+        calls.append(call)
+        raise call
+
+    monkeypatch.setattr(
+        session_mod.SessionManager, "_run_foreground", fake_run
+    )
+    monkeypatch.setattr(
+        session_mod.shutil, "which", lambda name: f"/fake/bin/{name}"
+    )
+    return calls
+
+
+class TestALaunchThroughTheLocalBridge:
+    """An ``https://`` or ``socks5h://`` account launches through a bridge.
+
+    The child is handed ``http://127.0.0.1:<port>`` and never the account's
+    own URL: the proxy's password stays in this process, which is also why the
+    launch stays resident instead of ``exec``-ing claude.
+    """
+
+    def test_the_child_reads_the_bridge_not_the_accounts_url(
+        self,
+        manager,
+        foreground,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        monkeypatch,
+    ):
+        proxy_servers.trust_fixture_ca(monkeypatch)
+        with proxy_servers.HttpProxy(tls=True, forward=False) as upstream:
+            manager.switcher.set_account_proxy(
+                ACCOUNT_NUM, f"https://user:secret@127.0.0.1:{upstream.port}"
+            )
+
+            with pytest.raises(_ExecCalled) as exc:
+                manager.run("2", [])
+
+            assert upstream.paths("CONNECT") == ["api.anthropic.com:443"]
+
+        env = exc.value.env
+        assert env["HTTPS_PROXY"] == env["https_proxy"] == env["all_proxy"]
+        assert env["HTTPS_PROXY"].startswith("http://127.0.0.1:")
+        assert "secret" not in " ".join(env.values())
+        assert env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+        # The bridge lived exactly as long as the child call.
+        _wait_for_refusal(_bridge_port(env["HTTPS_PROXY"]))
+
+    def test_a_socks5h_account_gets_the_same_environment(
+        self,
+        manager,
+        foreground,
+        auth_status_tracks_seed,
+        refresh_rotates,
+    ):
+        with proxy_servers.Socks5Proxy() as upstream:
+            manager.switcher.set_account_proxy(
+                ACCOUNT_NUM, f"socks5h://127.0.0.1:{upstream.port}"
+            )
+
+            with pytest.raises(_ExecCalled) as exc:
+                manager.run("2", [])
+
+        assert exc.value.env["HTTPS_PROXY"].startswith("http://127.0.0.1:")
+        # Remote DNS: the pre-start check's target left as a domain.
+        assert upstream.only("CONNECT")["atyp"] == 3
+
+    def test_an_http_proxy_keeps_the_exec_path(
+        self,
+        manager,
+        capture_exec,
+        foreground,
+        stream_proxy,
+        auth_status_tracks_seed,
+        refresh_rotates,
+    ):
+        """Nothing changed for the scheme urllib speaks itself."""
+        manager.switcher.set_account_proxy(ACCOUNT_NUM, stream_proxy.url)
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        assert foreground == []
+        assert exc.value.env["HTTPS_PROXY"] == stream_proxy.url
+
+    def test_the_bridge_is_closed_when_the_child_fails(
+        self,
+        manager,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        monkeypatch,
+    ):
+        seen: dict[str, str] = {}
+
+        def explode(self, claude_bin, claude_args, env):
+            seen["url"] = env["HTTPS_PROXY"]
+            raise RuntimeError("the child died")
+
+        monkeypatch.setattr(
+            session_mod.SessionManager, "_run_foreground", explode
+        )
+        monkeypatch.setattr(
+            session_mod.shutil, "which", lambda name: f"/fake/bin/{name}"
+        )
+        with proxy_servers.Socks5Proxy() as upstream:
+            manager.switcher.set_account_proxy(
+                ACCOUNT_NUM, f"socks5h://127.0.0.1:{upstream.port}"
+            )
+
+            with pytest.raises(RuntimeError, match="the child died"):
+                manager.run("2", [])
+
+        _wait_for_refusal(_bridge_port(seen["url"]))
+
+    def test_the_fast_path_and_the_default_login_use_the_bridge_too(
+        self,
+        manager,
+        foreground,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        monkeypatch,
+    ):
+        with proxy_servers.Socks5Proxy() as upstream:
+            manager.switcher.set_account_proxy(
+                ACCOUNT_NUM, f"socks5h://127.0.0.1:{upstream.port}"
+            )
+            _active_default_login(monkeypatch, manager)
+
+            with pytest.raises(_ExecCalled) as exc:
+                manager.run("2", [])
+
+        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
+        assert exc.value.env["HTTPS_PROXY"].startswith("http://127.0.0.1:")
+
+    def test_a_refused_proxy_still_stops_the_launch(
+        self, manager, foreground, monkeypatch
+    ):
+        with proxy_servers.HttpProxy(tls=True, refuse=407) as upstream:
+            manager.switcher.set_account_proxy(
+                ACCOUNT_NUM, f"https://user:secret@127.0.0.1:{upstream.port}"
+            )
+
+            with pytest.raises(SessionError, match="cannot be used") as err:
+                manager.run("2", [])
+
+        assert "secret" not in str(err.value)
+        assert foreground == []
+
+
+class TestTheAuthStatusProbeThroughTheBridge:
+    def test_the_probe_reads_the_bridge_and_never_the_url(
+        self,
+        manager,
+        foreground,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        monkeypatch,
+    ):
+        proxy_servers.trust_fixture_ca(monkeypatch)
+        with proxy_servers.HttpProxy(tls=True, forward=False) as upstream:
+            manager.switcher.set_account_proxy(
+                ACCOUNT_NUM, f"https://user:secret@127.0.0.1:{upstream.port}"
+            )
+
+            with pytest.raises(_ExecCalled):
+                manager.run("2", [])
+
+        assert auth_status_tracks_seed
+        for probe_env in auth_status_tracks_seed:
+            assert probe_env["HTTPS_PROXY"].startswith("http://127.0.0.1:")
+            assert "secret" not in " ".join(probe_env.values())

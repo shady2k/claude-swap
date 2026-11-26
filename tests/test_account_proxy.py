@@ -328,8 +328,8 @@ class TestParse:
             "",
             "   ",
             "127.0.0.1:3128",          # no scheme
-            "https://127.0.0.1:3128",  # urllib cannot speak TLS to the proxy
-            "socks5://127.0.0.1:1080",
+            "ftp://127.0.0.1:3128",  # no transport speaks it
+            "socks4://127.0.0.1:1080",
             "http://",                 # no host
             "http://:3128",
             "http://127.0.0.1:0",
@@ -346,7 +346,7 @@ class TestParse:
 
     def test_the_error_never_repeats_the_password(self):
         with pytest.raises(account_proxy.ProxyUrlError) as err:
-            account_proxy.parse("https://user:secret@127.0.0.1:3128")
+            account_proxy.parse("ftp://user:secret@127.0.0.1:3128")
         assert "secret" not in str(err.value)
 
     def test_absent_field_is_direct(self):
@@ -369,13 +369,110 @@ class TestParse:
 
     def test_a_stored_value_that_does_not_parse_blocks_instead_of_going_direct(self):
         route = account_proxy.route_for(
-            {"proxy": "https://user:secret@127.0.0.1:3128"}
+            {"proxy": "ftp://user:secret@127.0.0.1:3128"}
         )
         assert route is not None and route.invalid
         assert "secret" not in route.display()  # the stored value is not echoed
         with pytest.raises(account_proxy.ProxyRouteError) as err:
             route.open(urllib.request.Request("http://127.0.0.1:1/"))
         assert err.value.kind == account_proxy.PROXY_INVALID
+
+
+class TestScheme:
+    """Which schemes a route accepts, and what each one stores."""
+
+    @pytest.mark.parametrize(
+        ("url", "scheme", "port"),
+        [
+            ("http://proxy.example", "http", 80),
+            ("https://proxy.example", "https", 443),
+            ("socks5h://proxy.example", "socks5h", 1080),
+            ("socks5://proxy.example", "socks5", 1080),
+        ],
+    )
+    def test_each_scheme_has_its_default_port(self, url, scheme, port):
+        route = account_proxy.parse(url)
+        assert route.scheme == scheme
+        assert route.port == port
+
+    @pytest.mark.parametrize(
+        ("typed", "stored"),
+        [
+            ("HTTPS://User:p%40ss@Proxy.Example:8443/",
+             "https://User:p%40ss@proxy.example:8443"),
+            ("socks5h://user:pw@proxy.example:1080",
+             "socks5h://user:pw@proxy.example:1080"),
+            ("socks5://user:pw@proxy.example:1080",
+             "socks5://user:pw@proxy.example:1080"),
+        ],
+    )
+    def test_the_stored_form_round_trips(self, typed, stored):
+        route = account_proxy.parse(typed)
+        assert route.text() == stored
+        assert account_proxy.parse(stored).text() == stored
+
+    @pytest.mark.parametrize(
+        ("url", "shown"),
+        [
+            ("https://user:secret@127.0.0.1:8443",
+             "https://user:***@127.0.0.1:8443"),
+            ("socks5h://user:secret@127.0.0.1:1080",
+             "socks5h://user:***@127.0.0.1:1080"),
+        ],
+    )
+    def test_display_keeps_the_scheme_and_masks_the_password(
+        self, url, shown
+    ):
+        route = account_proxy.parse(url)
+        assert route.display() == shown
+        assert "secret" in route.text()
+
+    @pytest.mark.parametrize(
+        "value",
+        ["ftp://127.0.0.1:21", "socks4://127.0.0.1:1080", "httpss://h:1",
+         "h:3128"],
+    )
+    def test_another_scheme_is_refused_without_echoing_the_url(self, value):
+        with pytest.raises(account_proxy.ProxyUrlError) as err:
+            account_proxy.parse(value)
+        assert value.split("://")[-1] not in str(err.value)
+
+    def test_only_the_bridged_schemes_need_the_bridge(self):
+        assert not account_proxy.parse("http://h:80").needs_bridge
+        for url in ("https://h:443", "socks5h://h:1080", "socks5://h:1080"):
+            assert account_proxy.parse(url).needs_bridge
+
+    def test_a_route_without_a_scheme_field_is_http(self):
+        """Constructors that predate the field stay direct."""
+        route = account_proxy.ProxyRoute(host="127.0.0.1", port=3128)
+        assert route.scheme == "http"
+        assert route.text() == "http://127.0.0.1:3128"
+        assert not route.needs_bridge
+
+
+class TestSchemeStorage:
+    """What a bridged scheme leaves in ``sequence.json``."""
+
+    @pytest.mark.parametrize(
+        ("url", "stored"),
+        [
+            ("https://user:pw@127.0.0.1:8443",
+             "https://user:pw@127.0.0.1:8443"),
+            ("socks5h://user:pw@127.0.0.1:1080",
+             "socks5h://user:pw@127.0.0.1:1080"),
+            ("socks5://127.0.0.1:1080", "socks5://127.0.0.1:1080"),
+        ],
+    )
+    def test_it_is_stored_canonically_and_read_back(
+        self, temp_home: Path, sample_sequence_data: dict, url, stored
+    ):
+        s = _switcher(sample_sequence_data)
+        _num, masked = s.set_account_proxy("1", url)
+        assert s._get_sequence_data()["accounts"]["1"]["proxy"] == stored
+        assert account_proxy.route_for(
+            s._get_sequence_data()["accounts"]["1"]
+        ).text() == stored
+        assert "pw" not in masked
 
 
 class TestRouteTransport:
@@ -536,7 +633,7 @@ class TestSettingLifecycle:
         s = _switcher(sample_sequence_data)
         before = s.sequence_file.read_bytes()
         with pytest.raises(ValidationError):
-            s.set_account_proxy("1", "socks5://127.0.0.1:1080")
+            s.set_account_proxy("1", "socks4://127.0.0.1:1080")
         assert s.sequence_file.read_bytes() == before
 
     def test_the_proxy_moves_with_the_account_on_swap_and_move(
@@ -701,7 +798,7 @@ class TestSettingLifecycle:
     ):
         s = _switcher(sample_sequence_data)
         with pytest.raises(ValidationError):
-            s.add_account(slot=3, proxy="https://127.0.0.1:3128")
+            s.add_account(slot=3, proxy="ftp://127.0.0.1:3128")
         assert "3" not in s._get_sequence_data()["accounts"]
 
 
@@ -862,7 +959,7 @@ class TestRouting:
         _endpoints(monkeypatch, origin.url)
         s = _switcher(sample_sequence_data)
         data = s._get_sequence_data()
-        data["accounts"]["1"]["proxy"] = "socks5://127.0.0.1:1080"
+        data["accounts"]["1"]["proxy"] = "socks4://127.0.0.1:1080"
         s._write_json(s.sequence_file, data)
         record = s._fetch_account_usage(_info(s, 1, CREDS_OK))
         assert record.error == account_proxy.PROXY_INVALID

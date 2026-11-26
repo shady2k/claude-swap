@@ -12,11 +12,14 @@ import errno
 import json
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -32,6 +35,7 @@ from claude_swap.models import Platform
 from claude_swap.session import AUTH_OVERRIDE_ENV_VARS
 from claude_swap.settings import DEFAULT_NO_PROXY, RunSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
+from tests import proxy_servers
 
 NEW_TOKEN = "sk-ant-oat01-NEW-ACCOUNT-TEST-TOKEN"
 NEW_REFRESH = "rt-new-account-test-refresh"
@@ -653,7 +657,7 @@ class TestAddLogin:
             ({"slot": 0}, ConfigError),
             ({"alias": "-bad"}, ValidationError),
             ({"email": "not-an-email"}, ValidationError),
-            ({"proxy": "https://127.0.0.1:3128"}, ValidationError),
+            ({"proxy": "ftp://127.0.0.1:3128"}, ValidationError),
             ({"proxy": "http://127.0.0.1:3128", "expect_country": "ZZ"}, ValidationError),
             ({"proxy": "http://127.0.0.1:3128", "expect_ip": "999.1.1.1"}, ValidationError),
         ],
@@ -1822,7 +1826,7 @@ class TestAddExpectations:
         "kwargs",
         [
             {"slot": 0},
-            {"proxy": "https://127.0.0.1:3128"},
+            {"proxy": "ftp://127.0.0.1:3128"},
             {"proxy": "http://127.0.0.1:3128", "expect_country": "ZZ"},
             {"proxy": "http://127.0.0.1:3128", "expect_ip": "999.1.1.1"},
         ],
@@ -2125,3 +2129,52 @@ class TestAddLoginCLI:
         err = capsys.readouterr().err
         assert "secret" not in err
         assert "<URL>" in err
+
+
+class TestALoginThroughTheLocalBridge:
+    """``cswap add --login --proxy https://…`` reads the proxy through a bridge.
+
+    The child is handed the bridge's loopback address, so the login exchange
+    follows the account's proxy without its password ever entering the login
+    child's environment.
+    """
+
+    def test_the_login_child_reads_the_bridge(
+        self, temp_home, claude_bin, checks_pass, monkeypatch,
+    ):
+        proxy_servers.trust_fixture_ca(monkeypatch)
+        switcher = _switcher()
+        _seed(switcher, {"1": _account("live@example.com")})
+        record = {}
+        monkeypatch.setattr("claude_swap.login.spawn.run", _login_mock(record))
+
+        with proxy_servers.HttpProxy(tls=True, forward=False) as upstream:
+            switcher.add_account_via_login(
+                slot=2,
+                proxy=f"https://user:secret@127.0.0.1:{upstream.port}",
+            )
+            env = record["env"]
+            assert env["HTTPS_PROXY"] == env["https_proxy"] == env["all_proxy"]
+            assert env["HTTPS_PROXY"].startswith("http://127.0.0.1:")
+            assert "secret" not in " ".join(env.values())
+            bridge_port = urlsplit(env["HTTPS_PROXY"]).port
+            upstream_port = upstream.port
+
+        # The bridge is gone once the login returned, and the account's own
+        # URL is what the slot stores.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                connection = socket.create_connection(
+                    ("127.0.0.1", bridge_port), timeout=1
+                )
+            except OSError:
+                break
+            connection.close()
+            time.sleep(0.02)
+        else:
+            raise AssertionError("the login's bridge is still listening")
+        stored = switcher._get_sequence_data()["accounts"]["2"]["proxy"]
+        assert stored == f"https://user:secret@127.0.0.1:{upstream_port}"
+        # The pre-start probe was the account's route, not the bridge.
+        assert checks_pass["probe"][0].scheme == "https"

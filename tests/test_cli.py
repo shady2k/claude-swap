@@ -2636,10 +2636,10 @@ class TestProxyCommand:
         before = switcher.sequence_file.read_bytes()
         with patch("os.geteuid", return_value=1000, create=True):
             with pytest.raises(SystemExit) as exc:
-                cli._proxy_command(["2", "https://user:secret@127.0.0.1:3128"])
+                cli._proxy_command(["2", "ftp://user:secret@127.0.0.1:3128"])
         assert exc.value.code == 1
         err = capsys.readouterr().err
-        assert "only http://" in err
+        assert "scheme must be one of http, https, socks5h or socks5" in err
         assert "secret" not in err
         assert switcher.sequence_file.read_bytes() == before
 
