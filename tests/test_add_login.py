@@ -1405,6 +1405,268 @@ class TestLoginCommitSafety:
         assert not list(switcher.credentials_dir.glob(".swap-staging-*"))
         assert switcher._get_sequence_data()["accounts"]["2"]["organizationUuid"] == "org-new"
 
+    @staticmethod
+    def _simulate_case_insensitive_fs(monkeypatch, switcher: ClaudeAccountSwitcher) -> None:
+        from claude_swap import fsutil
+
+        targets = (switcher.configs_dir.resolve(), switcher.credentials_dir.resolve())
+
+        def _fold(path):
+            p = Path(path)
+            if p.parent.resolve() in targets and not p.name.startswith(".swap-staging-"):
+                return p.with_name(p.name.casefold())
+            return p
+
+        real_samefile = os.path.samefile
+
+        def folded_samefile(left, right):
+            return real_samefile(_fold(left), _fold(right))
+
+        monkeypatch.setattr(os.path, "samefile", folded_samefile)
+
+        real_replace = fsutil.replace_with_retry
+
+        def folded_replace(src, dst, **kwargs):
+            return real_replace(src, _fold(dst), **kwargs)
+
+        monkeypatch.setattr(fsutil, "replace_with_retry", folded_replace)
+
+        path_cls = type(switcher.backup_dir)
+        for method_name in ("stat", "lstat", "exists", "open", "unlink"):
+            orig = getattr(path_cls, method_name)
+
+            def make_wrapper(fn):
+                def wrapper(self, *args, **kwargs):
+                    return fn(_fold(self), *args, **kwargs)
+
+                return wrapper
+
+            monkeypatch.setattr(path_cls, method_name, make_wrapper(orig))
+
+    @pytest.mark.parametrize("case_insensitive", [False, True], ids=["posix", "casefold-fs"])
+    @pytest.mark.parametrize("use_login", [True, False], ids=["login", "plain"])
+    def test_case_folding_email_overwrite_keeps_new_files_on_success(
+        self, temp_home, claude_bin, checks_pass, monkeypatch, case_insensitive, use_login,
+    ):
+        switcher = _switcher()
+        if case_insensitive:
+            self._simulate_case_insensitive_fs(monkeypatch, switcher)
+        old_email = "b@EXAMPLE.COM"
+        new_email = "b@example.com"
+        _seed(switcher, {
+            "1": _account("live@example.com"),
+            "2": _account(old_email, org="org-old", org_name="Old Org"),
+        })
+        self._seed_files(switcher, "2", old_email)
+        new_config = json.dumps({
+            "oauthAccount": {
+                "emailAddress": new_email,
+                "accountUuid": "uuid-new",
+                "organizationUuid": "org-new",
+                "organizationName": "New Org",
+            }
+        })
+
+        if use_login:
+            monkeypatch.setattr(
+                "claude_swap.login.spawn.run",
+                _login_mock({}, config=new_config),
+            )
+            switcher.add_account_via_login(slot=2, assume_yes=True)
+        else:
+            monkeypatch.setattr(
+                "claude_swap.switcher.ClaudeAccountSwitcher._read_capture_credentials",
+                lambda self: NEW_CREDS,
+            )
+            switcher._get_claude_config_path().write_text(new_config, encoding="utf-8")
+            switcher.add_account(slot=2, assume_yes=True)
+
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["2"]["email"] == new_email
+        assert data["accounts"]["2"]["organizationUuid"] == "org-new"
+        assert switcher._read_account_credentials("2", new_email) == NEW_CREDS
+        assert switcher._read_account_config("2", new_email) == new_config
+        assert switcher._account_is_switchable("2")
+        assert not list(switcher.credentials_dir.glob(".swap-staging-*"))
+        if not case_insensitive and os.name == "posix" and sys.platform != "darwin":
+            assert not switcher._config_backup_path("2", old_email).exists()
+            assert not switcher._store._backup_enc_path("2", old_email).exists()
+
+    @pytest.mark.parametrize("case_insensitive", [False, True], ids=["posix", "casefold-fs"])
+    def test_case_folding_email_write_failure_restores_old_material(
+        self, temp_home, claude_bin, checks_pass, monkeypatch, case_insensitive,
+    ):
+        switcher = _switcher()
+        if case_insensitive:
+            self._simulate_case_insensitive_fs(monkeypatch, switcher)
+        old_email = "b@EXAMPLE.COM"
+        new_email = "b@example.com"
+        _seed(switcher, {
+            "1": _account("live@example.com"),
+            "2": _account(old_email, org="org-old", org_name="Old Org"),
+        })
+        self._seed_files(switcher, "2", old_email)
+        before = switcher.sequence_file.read_bytes()
+        new_config = json.dumps({
+            "oauthAccount": {
+                "emailAddress": new_email,
+                "accountUuid": "uuid-new",
+                "organizationUuid": "org-new",
+                "organizationName": "New Org",
+            }
+        })
+        monkeypatch.setattr(
+            "claude_swap.login.spawn.run",
+            _login_mock({}, config=new_config),
+        )
+
+        real_write_json = switcher._write_json
+
+        def fail_sequence(path, data):
+            if path == switcher.sequence_file:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real_write_json(path, data)
+
+        monkeypatch.setattr(switcher, "_write_json", fail_sequence)
+
+        with pytest.raises(OSError) as exc:
+            switcher.add_account_via_login(slot=2, assume_yes=True)
+        assert exc.value.errno == errno.ENOSPC
+
+        assert switcher.sequence_file.read_bytes() == before
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["2"]["email"] == old_email
+        assert data["accounts"]["2"]["organizationUuid"] == "org-old"
+        assert switcher._read_account_credentials("2", old_email) == self.OLD_CREDS
+        assert switcher._read_account_config("2", old_email) == self.OLD_CONFIG
+        assert not list(switcher.credentials_dir.glob(".swap-staging-*"))
+        if not case_insensitive and os.name == "posix" and sys.platform != "darwin":
+            assert switcher._read_account_credentials("2", new_email) == ""
+            assert switcher._read_account_config("2", new_email) == ""
+
+    @pytest.mark.parametrize("case_insensitive", [False, True], ids=["posix", "casefold-fs"])
+    def test_case_folding_email_write_and_rollback_failure_keeps_staging_files(
+        self, temp_home, claude_bin, checks_pass, monkeypatch, capsys, caplog, case_insensitive,
+    ):
+        switcher = _switcher()
+        if case_insensitive:
+            self._simulate_case_insensitive_fs(monkeypatch, switcher)
+        old_email = "b@EXAMPLE.COM"
+        new_email = "b@example.com"
+        _seed(switcher, {
+            "1": _account("live@example.com"),
+            "2": _account(old_email, org="org-old", org_name="Old Org"),
+        })
+        self._seed_files(switcher, "2", old_email)
+        before = switcher.sequence_file.read_bytes()
+        new_config = json.dumps({
+            "oauthAccount": {
+                "emailAddress": new_email,
+                "accountUuid": "uuid-new",
+                "organizationUuid": "org-new",
+                "organizationName": "New Org",
+            }
+        })
+        monkeypatch.setattr(
+            "claude_swap.login.spawn.run",
+            _login_mock({}, config=new_config),
+        )
+
+        real_write_creds = switcher._write_account_credentials
+        cred_calls = {"n": 0}
+
+        def fail_on_rollback_creds(num, email, creds):
+            cred_calls["n"] += 1
+            if cred_calls["n"] >= 2:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real_write_creds(num, email, creds)
+
+        def fail_config(num, email, config):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(
+            switcher, "_write_account_credentials", fail_on_rollback_creds
+        )
+        monkeypatch.setattr(switcher, "_write_account_config", fail_config)
+
+        with pytest.raises(OSError) as exc:
+            switcher.add_account_via_login(slot=2, assume_yes=True)
+        assert exc.value.errno == errno.ENOSPC
+
+        assert switcher.sequence_file.read_bytes() == before
+        assert switcher._get_sequence_data()["accounts"]["2"]["email"] == old_email
+        staged_creds = switcher.credentials_dir / ".swap-staging-creds-2.json"
+        staged_config = switcher.credentials_dir / ".swap-staging-config-2.json"
+        assert staged_creds.read_text(encoding="utf-8") == self.OLD_CREDS
+        assert staged_config.read_text(encoding="utf-8") == self.OLD_CONFIG
+        out = capsys.readouterr().out
+        assert str(staged_creds) in out
+        assert str(staged_config) in out
+        assert str(staged_creds) in caplog.text
+
+    def test_case_folding_email_macos_keychain_and_apfs_overwrite(
+        self, temp_home, claude_bin, checks_pass, block_real_keychain, monkeypatch,
+    ):
+        from claude_swap.credentials import SECURITY_SERVICE
+
+        monkeypatch.setattr(
+            Platform, "detect", classmethod(lambda cls: Platform.MACOS)
+        )
+        switcher = _switcher()
+        self._simulate_case_insensitive_fs(monkeypatch, switcher)
+        old_email = "b@EXAMPLE.COM"
+        new_email = "b@example.com"
+        _seed(switcher, {
+            "1": _account("live@example.com"),
+            "2": _account(old_email, org="org-old", org_name="Old Org"),
+        })
+        self._seed_files(switcher, "2", old_email)
+        new_config = json.dumps({
+            "oauthAccount": {
+                "emailAddress": new_email,
+                "accountUuid": "uuid-new",
+                "organizationUuid": "org-new",
+                "organizationName": "New Org",
+            }
+        })
+        monkeypatch.setattr(
+            "claude_swap.login.spawn.run",
+            _login_mock({}, config=new_config),
+        )
+
+        # First verify rollback preserves old Keychain item and shared APFS config.
+        real_write_json = switcher._write_json
+
+        def fail_sequence(path, data):
+            if path == switcher.sequence_file:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real_write_json(path, data)
+
+        monkeypatch.setattr(switcher, "_write_json", fail_sequence)
+        with pytest.raises(OSError):
+            switcher.add_account_via_login(slot=2, assume_yes=True)
+
+        assert block_real_keychain.get_password(
+            SECURITY_SERVICE, f"account-2-{old_email}"
+        ) == self.OLD_CREDS
+        assert block_real_keychain.get_password(
+            SECURITY_SERVICE, f"account-2-{new_email}"
+        ) is None
+        assert switcher._read_account_config("2", old_email) == self.OLD_CONFIG
+
+        # Now let the overwrite succeed: new Keychain item and shared APFS config stay.
+        monkeypatch.setattr(switcher, "_write_json", real_write_json)
+        switcher.add_account_via_login(slot=2, assume_yes=True)
+
+        assert block_real_keychain.get_password(
+            SECURITY_SERVICE, f"account-2-{new_email}"
+        ) == NEW_CREDS
+        assert block_real_keychain.get_password(
+            SECURITY_SERVICE, f"account-2-{old_email}"
+        ) is None
+        assert switcher._read_account_config("2", new_email) == new_config
+        assert switcher._account_is_switchable("2")
+
 class TestIsolatedProfileCleanup:
     def test_the_directory_is_removed_on_success_and_on_error(self):
         captured = []

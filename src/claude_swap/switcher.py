@@ -58,6 +58,7 @@ from claude_swap.fsutil import (
     atomic_write_bytes,
     atomic_write_text,
     read_text_with_retry,
+    same_path,
 )
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
@@ -1247,12 +1248,19 @@ class ClaudeAccountSwitcher:
                     "expires.", account_num, exc_info=True,
                 )
 
-    def _delete_account_credentials(self, account_num: str, email: str) -> None:
-        self._store._delete_account_credentials(account_num, email)
+    def _delete_account_credentials(
+        self, account_num: str, email: str, *, keep_email: str | None = None
+    ) -> None:
+        self._store._delete_account_credentials(
+            account_num, email, keep_email=keep_email
+        )
 
     def _delete_account_credentials_strict(self, account_num: str, email: str) -> None:
         """Pre-commit clear that raises when the key still reads non-empty."""
         self._store.delete_account_credentials_strict(account_num, email)
+
+    def _config_backup_path(self, account_num: str, email: str) -> Path:
+        return self.configs_dir / f".claude-config-{account_num}-{email}.json"
 
     def _delete_account_files(self, account_num: str, email: str) -> None:
         """Delete all backup files for an account (credentials + config).
@@ -1266,15 +1274,29 @@ class ClaudeAccountSwitcher:
         Raises:
             SessionError: a live session-mode instance is using this account.
         """
+        self._delete_account_files_except(account_num, email)
+
+    def _delete_account_files_except(
+        self, account_num: str, email: str, *, keep_email: str | None = None
+    ) -> None:
+        """Delete slot backup files, skipping paths that collide with ``keep_email``."""
         self._ensure_no_live_session(account_num, email, "the operation")
-        self._delete_account_credentials(account_num, email)
-        config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
-        if config_file.exists():
-            config_file.unlink()
+        self._delete_account_credentials(account_num, email, keep_email=keep_email)
+        config_file = self._config_backup_path(account_num, email)
+        if keep_email is None or not same_path(
+            config_file, self._config_backup_path(account_num, keep_email)
+        ):
+            if config_file.exists():
+                config_file.unlink()
         self._delete_session_profile(account_num, email)
 
     def _best_effort_cleanup(
-        self, account_num: str, email: str, what: str
+        self,
+        account_num: str,
+        email: str,
+        what: str,
+        *,
+        keep_email: str | None = None,
     ) -> None:
         """Drop a slot's files after its record left the registry, or log.
 
@@ -1283,7 +1305,12 @@ class ClaudeAccountSwitcher:
         slot as unwritten.
         """
         try:
-            self._delete_account_files(account_num, email)
+            if keep_email is None:
+                self._delete_account_files(account_num, email)
+            else:
+                self._delete_account_files_except(
+                    account_num, email, keep_email=keep_email
+                )
         except Exception as e:
             self._logger.error(
                 f"Stale {what} files left under {account_num} ({email}): {e}"
@@ -1305,7 +1332,7 @@ class ClaudeAccountSwitcher:
 
     def _read_account_config(self, account_num: str, email: str) -> str:
         """Read account config from backup."""
-        config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
+        config_file = self._config_backup_path(account_num, email)
         if config_file.exists():
             return config_file.read_text(encoding="utf-8")
         return ""
@@ -1335,7 +1362,7 @@ class ClaudeAccountSwitcher:
         self, account_num: str, email: str, config: str
     ) -> None:
         """Write account config to backup."""
-        config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
+        config_file = self._config_backup_path(account_num, email)
         # Atomic: a torn backup config is a broken future restore.
         atomic_write_text(config_file, config)
 
@@ -1974,8 +2001,7 @@ class ClaudeAccountSwitcher:
         every caller either needs the abort (write-or-clear) or already
         wraps and counts the failure (rollback, stray cleanup).
         """
-        config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
-        config_file.unlink(missing_ok=True)
+        self._config_backup_path(account_num, email).unlink(missing_ok=True)
 
     def _discard_staging(self, staging: dict[str, Path]) -> None:
         """Remove staged pre-swap copies, telling the user about survivors.
@@ -5702,9 +5728,14 @@ class ClaudeAccountSwitcher:
         cannot claim the freed slot before old backups go.
         """
         old_email = occupant.get("email", "")
+        same_key = (
+            bool(occupant)
+            and bool(old_email)
+            and old_email.casefold() == email.casefold()
+        )
         saved_old: tuple[str, str] | None = None
         staging: dict[str, Path] = {}
-        if occupant and old_email == email:
+        if same_key:
             saved_old = (
                 self._read_backup_or_abort(account_num, old_email),
                 self._read_account_config(account_num, old_email),
@@ -5768,6 +5799,24 @@ class ClaudeAccountSwitcher:
                     )
                 if not failures and old_creds:
                     self._store.delete_previous_backup(account_num, old_email)
+                if old_email != email:
+                    # On case-sensitive filesystems the new casing wrote separate
+                    # files; on case-insensitive volumes `same_path` prevents
+                    # deleting the entry just restored for `old_email`.
+                    try:
+                        self._delete_account_credentials(
+                            account_num, email, keep_email=old_email
+                        )
+                        if not same_path(
+                            self._config_backup_path(account_num, email),
+                            self._config_backup_path(account_num, old_email),
+                        ):
+                            self._delete_config_backup(account_num, email)
+                    except Exception as e:
+                        failures += 1
+                        self._logger.error(
+                            f"Cleanup after failed {operation} is incomplete: {e}"
+                        )
             else:
                 try:
                     self._delete_account_credentials(account_num, email)
@@ -5796,11 +5845,7 @@ class ClaudeAccountSwitcher:
         # new record, and keeping cleanup under ``self.lock_file`` prevents a
         # concurrent ``move``/``swap`` from occupying the freed slot first.
         if displaced_other:
-            if old_email != email:
-                self._best_effort_cleanup(
-                    account_num, old_email, "displaced slot"
-                )
-            else:
+            if old_email == email:
                 try:
                     self._delete_session_profile(account_num, old_email)
                 except Exception as e:
@@ -5808,6 +5853,13 @@ class ClaudeAccountSwitcher:
                         f"Stale session profile left at slot {account_num} "
                         f"({old_email}): {e}"
                     )
+            else:
+                self._best_effort_cleanup(
+                    account_num,
+                    old_email,
+                    "displaced slot",
+                    keep_email=email if same_key else None,
+                )
         if migrate_from is not None:
             self._best_effort_cleanup(
                 migrate_from, migrate_email, "migrated slot"
