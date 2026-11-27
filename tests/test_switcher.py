@@ -1132,6 +1132,30 @@ class TestFetchAccountUsageSessionProfile:
         assert kwargs.get("refresh_via") is None
         assert switcher.read_account_credentials("2", "test@example.com") == backup
 
+    def test_same_generation_profile_with_unreadable_record_is_not_refreshed(
+        self, temp_home: Path
+    ):
+        """Ownership is decided for a profile on the backup's own generation
+        too: with a session record that cannot be read, adoption answers
+        undecidable and the fetch keeps the read-only mode instead of
+        refreshing the backup. That refresh would spend a grant a claude
+        behind the unreadable record may still be rotating."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        creds = _oauth_creds("sk-backup", -3600)
+        switcher._write_account_credentials("2", "test@example.com", creds)
+        session_dir = self._seed_exited_profile(switcher, creds)
+        (session_dir / "sessions").mkdir()
+        (session_dir / "sessions" / "9999.json").write_text("not json{{{")
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})) as mock_fetch:
+            record = switcher._fetch_account_usage(self._info(creds))
+
+        mock_fetch.assert_not_called()
+        assert record.sentinel == USAGE_TOKEN_EXPIRED
+        assert switcher.read_account_credentials("2", "test@example.com") == creds
+
     def test_lock_contention_keeps_the_profile_read_only(self, temp_home: Path):
         """cswap's lock held elsewhere: adoption cannot be decided this pass,
         and the fetch reads the profile's credential read-only instead of

@@ -4189,8 +4189,8 @@ class ClaudeAccountSwitcher:
         """The slot's current credential generation, read-only.
 
         The one answer to "which generation represents this account now",
-        shared by the usage fetch (``_fetch_account_usage``) and the passes
-        that skip it (the collector's no-claim branch and every display row).
+        shared by the passes that read a row's state without sending a
+        request (the collector's no-claim branch and every display row).
         A session profile that rotated past the backup is that generation; a
         profile cswap cannot use as this slot's current one — same
         generation, behind a re-login in the backup, stale-marked, another
@@ -7400,7 +7400,10 @@ class ClaudeAccountSwitcher:
         # credential (``isolated_mode``), so there is no locked-refresh-of-the-
         # default-login path left to take.
 
-        from claude_swap.session import session_identity_drifted
+        from claude_swap.session import (
+            read_session_credentials,
+            session_identity_drifted,
+        )
 
         has_live_session = bool(self._live_session_pids(str(num), email))
 
@@ -7409,11 +7412,13 @@ class ClaudeAccountSwitcher:
         # and the backup only catches up once the session exits (adopted
         # below), so while one is live the backup's refresh token is a
         # consumed generation the server 401s forever — usage would silently
-        # freeze at the last pre-session measurement. The generation decision
-        # is the SAME one the collector uses when it skips the request
-        # (``_current_credential``), so the two paths cannot disagree.
+        # freeze at the last pre-session measurement. Fetch with the profile's
+        # newest credential, strictly read-only (is_active=True: no refresh,
+        # no persist): rotating the profile's family here would log the live
+        # claude out the same way.
         session_dir = self._session_dir(str(num), email)
-        if session_identity_drifted(session_dir, email, org_uuid):
+        session_creds = read_session_credentials(session_dir)
+        if session_creds and session_identity_drifted(session_dir, email, org_uuid):
             # An in-session /login re-pointed the profile at a different
             # account; fetching with its credential would record THAT
             # account's usage under this slot's label. The profile no longer
@@ -7424,23 +7429,23 @@ class ClaudeAccountSwitcher:
                 f"Session profile for account {num} is logged in as a "
                 f"different account; fetching usage from the backup credential"
             )
+            session_creds = None
             has_live_session = False
-
-        current = self._current_credential(str(num), email, org_uuid, creds)
-        profile = current if current != creds else None
-        if profile is not None and not has_live_session:
+        if session_creds and not has_live_session:
             # The session has exited, so its family is nobody's to rotate but
             # the store's: adopt the profile head into the backup (which is a
             # consumed generation until then) and take the idle path below,
-            # refresh included, on that credential. An adoption that could not
-            # be decided -- a session record that could not be read, lock
-            # contention, an unreadable profile identity, a failed write --
-            # leaves both copies as they were AND keeps the profile's
-            # credential for the read-only fetch below, as before adoption
-            # existed: the backup path would POST a grant the profile may
-            # already have consumed (invalid_grant, and a healthy slot
-            # struck), or rotate a family that a claude behind the unreadable
-            # record still owns.
+            # refresh included, on that credential. A profile already on the
+            # backup's generation, or behind a fresh re-login in the backup,
+            # needs no adoption and takes the same path on the backup. An
+            # adoption that could not be decided -- a session record that
+            # could not be read, lock contention, an unreadable profile
+            # identity, a failed write -- leaves both copies as they were
+            # AND keeps the profile's credential for the read-only fetch
+            # below, as before adoption existed: the backup path would POST
+            # a grant the profile may already have consumed (invalid_grant,
+            # and a healthy slot struck), or rotate a family that a claude
+            # behind the unreadable record still owns.
             try:
                 adopted = self._adopt_session_credential(str(num), email, org_uuid)
             except LockError:
@@ -7457,19 +7462,19 @@ class ClaudeAccountSwitcher:
                 )
                 adopted = None
             if adopted:
-                creds = profile
+                creds = session_creds
             if adopted is not None:
-                profile = None
-        if profile is not None:
-            profile_oauth = oauth.extract_oauth_data(profile)
-            if profile_oauth and profile_oauth.get("accessToken"):
+                session_creds = None
+        if session_creds:
+            session_oauth = oauth.extract_oauth_data(session_creds)
+            if session_oauth and session_oauth.get("accessToken"):
                 # The live claude refreshes lazily on its next API call;
                 # requesting now would just 401 (same rule as the owned
                 # active account in _fetch_active_usage).
-                if oauth.is_oauth_token_expired(profile_oauth.get("expiresAt")):
+                if oauth.is_oauth_token_expired(session_oauth.get("expiresAt")):
                     return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
                 return self._read_only_fetch(
-                    str(num), email, profile, rejected_fp, last_usage,
+                    str(num), email, session_creds, rejected_fp, last_usage,
                     route,
                 )
 
@@ -7778,28 +7783,35 @@ class ClaudeAccountSwitcher:
         is_active: bool,
         org_uuid: str = "",
     ) -> bool:
-        """Fingerprint-bound dead verdict against the CURRENT generation.
+        """Fingerprint-bound dead verdict against EVERY stored source.
 
-        A strike condemns the generation whose grant the server refused, so
-        the verdict follows the generation the slot would use now
-        (``_session_profile_newer_than``): a session profile that rotated
-        past the backup supersedes it. A strike on the superseded backup
-        therefore heals, and one on the profile holds: a confirmed
-        invalid_grant for the generation the slot uses now. The caller's
-        ``stored`` is its copy of the backup: a matching copy holds without
-        a read, and a cached one may over-hold but never heal.
+        For an idle slot ``info[5]`` is the backup, the only source a strike
+        can bind to. The ACTIVE slot has two stored sources — ``info[5]`` is
+        the LIVE credential, but ``_fetch_active_usage``'s recovery branch
+        legitimately POSTs (and binds the strike to) the slot BACKUP.
+        Comparing the strike only against the live bytes mis-heals it on
+        every pass whenever the two lineages differ — the strike/heal/re-POST
+        loop that keeps a dead backup out of quarantine forever. The strike
+        holds while ANY stored source still matches the struck generation.
 
-        HEALING always needs a fresh read, and the caller spends a "healed"
-        answer on ``clear_dead_token`` — a persisted write that also lifts
-        the backoff. With another process rotating the slot, a stale
-        fingerprint would heal the new generation's strike on every pass and
-        each pass POSTs its dead grant again. So an unreadable source holds:
-        "no source matches" is unproven, and one momentary lock must not
-        un-quarantine a genuinely dead account permanently. With no strike
-        at threshold there is nothing to bind, so nothing is read at all.
-        A matching caller's copy holds without any read, unless a newer
-        profile supersedes it; it is never a source of healing. ``is_active``
-        stays for the callers and does not change the procedure.
+        Holding needs no read beyond the caller's ``stored``; HEALING always
+        re-reads the backup fresh, for idle slots too. ``stored`` may be a
+        display-cached backup (``_build_accounts_info`` reads with
+        ``cached=True``) and the caller spends a "healed" answer on
+        ``clear_dead_token`` — a persisted write that also lifts the backoff.
+        With the cache holding generation A while another process rotated
+        the slot to B and B was struck, a cached fingerprint "heals" B's
+        strike on every pass and each pass POSTs B's dead grant again. A
+        stale fingerprint may only ever over-hold; it must never heal. With
+        no strike at threshold there is nothing to bind, so nothing is read
+        at all (the active slot's backup used to be read on every pass for
+        this). ``is_active`` no longer changes the procedure; it stays for
+        the callers.
+
+        A session profile that rotated past the backup
+        (``_session_profile_newer_than``) is the slot's newest generation and
+        replaces the backup as the source the strike binds to: a strike on
+        the superseded backup heals, one on the profile holds.
         """
         if not entry.token_dead():
             return False
