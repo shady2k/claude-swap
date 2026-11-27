@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from claude_swap import __version__
-from claude_swap import cli
+from claude_swap import cli, wrapper
 from claude_swap.credentials import ActiveCredentials
 from claude_swap.printer import warning
 from claude_swap.settings import set_setting
@@ -1177,6 +1177,109 @@ class TestUpdateCheckSetting:
 
         set_setting(tmp_path, "updates.check", "false")
         self._run_list(tmp_path).assert_not_called()
+
+
+class TestWrapperIntegration:
+    @pytest.fixture(autouse=True)
+    def set_up(self, temp_home, tmp_path, monkeypatch):
+        self.backup = tmp_path / "backup"
+        self.link = temp_home / ".local" / "claude-swap" / "bin" / "claude"
+        self.profile = temp_home / ".bashrc"
+        real = tmp_path / "claude"
+        real.write_text("#!/bin/sh\nexit 0\n")
+        real.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        monkeypatch.setenv("SHELL", "/bin/bash")
+        monkeypatch.delenv("CSWAP_CLAUDE_BIN", raising=False)
+        set_setting(self.backup, "updates.check", "false")
+        monkeypatch.setattr(cli.paths, "get_backup_root", lambda: self.backup)
+
+    def run_add(self, monkeypatch, *args, interactive=True, success=True):
+        fake = MagicMock(backup_dir=self.backup)
+        fake._is_running_in_container.return_value = True
+        fake.add_account.return_value = success
+        fake.add_account_via_login.return_value = success
+        monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda **_: fake)
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: interactive)
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: interactive)
+        monkeypatch.setattr(sys, "argv", ["cswap", "add", *args])
+        cli.main()
+        return fake
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX wrapper")
+    @pytest.mark.parametrize(("answer", "args"), [("", ()), ("y", ("--login",))])
+    def test_add_accepts_wrapper(self, answer, args, monkeypatch):
+        prompt = MagicMock(return_value=answer)
+        monkeypatch.setattr("builtins.input", prompt)
+        fake = self.run_add(monkeypatch, *args)
+        add = fake.add_account_via_login if args else fake.add_account
+        add.assert_called_once()
+        assert "Install claude wrapper" in prompt.call_args.args[0]
+        assert self.link.is_symlink() and self.profile.exists()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX wrapper")
+    @pytest.mark.parametrize("answer", ["n", EOFError, KeyboardInterrupt])
+    def test_add_decline_is_remembered(self, answer, monkeypatch):
+        prompt = MagicMock(
+            return_value=answer, side_effect=answer if isinstance(answer, type) else None
+        )
+        monkeypatch.setattr("builtins.input", prompt)
+        self.run_add(monkeypatch)
+        self.run_add(monkeypatch)
+        prompt.assert_called_once()
+        assert not self.link.exists() and not self.profile.exists()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX wrapper")
+    def test_add_skips_prompt_for_scripts_and_cancelled_add(self, monkeypatch, capsys):
+        prompt = MagicMock(return_value="")
+        monkeypatch.setattr("builtins.input", prompt)
+        self.run_add(monkeypatch, interactive=False)
+        assert "cswap wrapper install" in capsys.readouterr().out
+        self.run_add(monkeypatch, success=False)
+        assert "cswap wrapper install" not in capsys.readouterr().out
+        with pytest.raises(SystemExit) as exc:
+            self.run_add(monkeypatch, "--json")
+        assert exc.value.code == 2
+        assert "cswap wrapper install" not in capsys.readouterr().out
+        assert not self.link.exists() and not self.profile.exists()
+        prompt.assert_not_called()
+        self.run_add(monkeypatch)
+        prompt.assert_called_once()
+
+    def test_wrapper_subcommands_report_unsupported_os(self, monkeypatch, capsys):
+        monkeypatch.setattr(wrapper, "supported", lambda: False)
+        monkeypatch.setattr(sys, "argv", ["cswap", "wrapper", "status"])
+        cli.main()
+        assert "Linux and macOS" in capsys.readouterr().out
+        for action in ("install", "uninstall"):
+            monkeypatch.setattr(sys, "argv", ["cswap", "wrapper", action])
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+            assert exc.value.code == 1
+            assert "Linux and macOS" in capsys.readouterr().err
+        assert not self.link.exists() and not self.profile.exists()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX wrapper")
+    def test_status_hint_is_text_only_and_skipped_for_active_wrapper(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "_is_running_in_container", lambda self: True
+        )
+        monkeypatch.setattr(sys, "argv", ["cswap", "status"])
+        cli.main()
+        assert "cswap wrapper install" in capsys.readouterr().out
+        monkeypatch.setattr(sys, "argv", ["cswap", "status", "--json"])
+        cli.main()
+        assert isinstance(json.loads(capsys.readouterr().out), dict)
+
+        monkeypatch.setattr(sys, "argv", ["cswap", "status"])
+        wrapper_dir = self.link.parent
+        wrapper_dir.mkdir(parents=True)
+        self.link.symlink_to(wrapper.WRAPPER_PATH)
+        monkeypatch.setenv("PATH", os.pathsep.join([str(wrapper_dir), os.environ["PATH"]]))
+        cli.main()
+        assert "cswap wrapper install" not in capsys.readouterr().out
 
 
 class TestCLICommands:

@@ -11,7 +11,14 @@ import re
 import shlex
 import sys
 
-from claude_swap import __version__, account_proxy, launch_agent, paths, printer
+from claude_swap import (
+    __version__,
+    account_proxy,
+    launch_agent,
+    paths,
+    printer,
+    wrapper,
+)
 from claude_swap.exceptions import (
     ClaudeSwitchError,
     EgressCheckError,
@@ -443,35 +450,87 @@ def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
 
 
 def _wrapper_command(argv: list[str]) -> None:
-    """Handle `cswap wrapper`: print the thin `claude` wrapper's path.
-
-    The install itself is a symlink the user makes, because the wrapper has to
-    sit in a directory ahead of the real Claude Code in ``PATH`` and only they
-    know which one that is. Pre-dispatched before the main parser for the same
-    reason as `run`: the main parser's required mutually-exclusive group can't
-    hold a positional subcommand. Rules: ``docs/auto-launch.md``.
-    """
+    """Manage the launcher, or print the shipped script for manual setup."""
     parser = argparse.ArgumentParser(
         prog="cswap wrapper",
-        description=(
-            "Print the path of claude-swap's thin `claude` wrapper: a symlink "
-            "to it, ahead of the real Claude Code in PATH, makes every "
-            "`claude` launch the account recorded in cswap's state "
-            "(`cswap run --active`) in that account's own profile."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Example:
-  mkdir -p ~/.local/claude-swap/bin
-  ln -s "$(cswap wrapper)" ~/.local/claude-swap/bin/claude
-  export PATH="$HOME/.local/claude-swap/bin:$PATH"
-        """,
+        description="Manage the launcher that makes 'claude' use the active cswap account.",
+        epilog="With no subcommand, print the path of the shipped wrapper script.",
     )
-    parser.parse_args(argv)
+    commands = parser.add_subparsers(dest="command")
+    for name, help_text in (
+        ("install", "install the claude launcher and set up PATH"),
+        ("uninstall", "remove the launcher and its PATH setup"),
+    ):
+        command = commands.add_parser(name, help=help_text)
+        command.add_argument(
+            "--dir", metavar="PATH",
+            help="launcher directory (default: ~/.local/claude-swap/bin)",
+        )
+    commands.add_parser("status", help="show the launcher, PATH and real Claude Code")
+    args = parser.parse_args(argv)
 
-    from claude_swap import wrapper
+    if args.command is None:
+        print(wrapper.WRAPPER_PATH)
+        return
+    if not wrapper.supported():
+        if args.command != "status":
+            error(wrapper.UNSUPPORTED)
+            sys.exit(1)
+        print(wrapper.UNSUPPORTED)
+        return
+    try:
+        if args.command == "install":
+            print(wrapper.install(args.dir))
+        elif args.command == "uninstall":
+            print(wrapper.uninstall(args.dir))
+        else:
+            status = wrapper.status()
+            print(status.summary)
+            print(status.path_summary)
+            print(f"Real Claude Code: {status.real or 'not found'}")
+            if status.installed and not status.active:
+                print("Open a new shell or put the wrapper directory before Claude Code in PATH.")
+    except (ClaudeSwitchError, OSError) as exc:
+        error(f"Error: {exc}")
+        sys.exit(1)
 
-    print(wrapper.WRAPPER_PATH)
+
+def _offer_wrapper(switcher: ClaudeAccountSwitcher) -> None:
+    if not wrapper.needs_setup(for_add=True):
+        return
+    try:
+        interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        interactive = False
+    if not interactive:
+        print(wrapper.INSTALL_HINT)
+        return
+
+    marker = switcher.backup_dir / "cache" / "wrapper-prompted"
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        # Claim the one-time prompt before reading input, including EOF and ^C.
+        marker.touch(exist_ok=False)
+    except FileExistsError:
+        return
+    except OSError as exc:
+        warning(
+            f"Could not record the wrapper prompt: {exc}. {wrapper.INSTALL_HINT}",
+            file=sys.stderr,
+        )
+        return
+    try:
+        answer = input(
+            "Install claude wrapper so 'claude' uses your active cswap account? [Y/n] "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if answer in ("", "y", "yes"):
+        try:
+            print(wrapper.install())
+        except (ClaudeSwitchError, OSError) as exc:
+            warning(f"Could not install the Claude wrapper: {exc}", file=sys.stderr)
 
 
 def _rate_limit_hook(tail: list[str], account: tuple[str, str, str]) -> list[str]:
@@ -2023,7 +2082,7 @@ Commands:
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
   %(prog)s run --auto [-- ...]        run the account with the most quota left
-  %(prog)s wrapper                    print the path of the thin `claude` wrapper
+  %(prog)s wrapper                    manage the `claude` wrapper (see wrapper --help)
   %(prog)s map <num|email> [path]     map a directory to an account
   %(prog)s map                        list directory mappings
   %(prog)s unmap [path]               remove a directory mapping
@@ -2520,7 +2579,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
 
         if args.add_account:
             if args.login:
-                switcher.add_account_via_login(
+                saved = switcher.add_account_via_login(
                     slot=args.slot,
                     alias=args.alias,
                     proxy=args.proxy,
@@ -2529,13 +2588,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                     email=args.email,
                 )
             else:
-                switcher.add_account(
+                saved = switcher.add_account(
                     slot=args.slot,
                     alias=args.alias,
                     proxy=args.proxy,
                     expect_country=args.expect_country,
                     expect_ip=args.expect_ip,
                 )
+            if saved and not args.json:
+                _offer_wrapper(switcher)
         elif args.add_token is not None:
             switcher.add_account_from_token(
                 token=args.add_token,
@@ -2582,6 +2643,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             )
         elif args.status:
             payload = switcher.status(json_output=args.json)
+            if not args.json and wrapper.needs_setup():
+                print(f"  {dimmed(wrapper.INSTALL_HINT)}")
         elif args.purge:
             switcher.purge()
             if sys.platform == "darwin":

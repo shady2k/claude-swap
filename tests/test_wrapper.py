@@ -322,3 +322,180 @@ class TestTheRealCliAcceptsIt:
         assert "No active account is recorded" in result.stderr
         assert "unrecognized arguments" not in result.stderr
         assert not (tmp_path / "real.json").exists()
+
+
+class TestWrapperCommands:
+    @pytest.fixture(autouse=True)
+    def set_up(self, temp_home, tmp_path, monkeypatch):
+        self.bin = temp_home / ".local" / "claude-swap" / "bin"
+        self.real = _script(tmp_path / "real" / "claude", FAKE_CLAUDE)
+        self.profile = temp_home / ".bashrc"
+        monkeypatch.setenv("SHELL", "/bin/bash")
+        monkeypatch.setenv("PATH", str(self.real.parent))
+        monkeypatch.delenv("CSWAP_CLAUDE_BIN", raising=False)
+
+    def run_command(self, monkeypatch, *args):
+        from claude_swap.cli import main
+
+        monkeypatch.setattr(sys, "argv", ["cswap", "wrapper", *args])
+        main()
+
+    def test_print_shipped_script(self, monkeypatch, capsys):
+        self.run_command(monkeypatch)
+        assert capsys.readouterr().out == f"{wrapper.WRAPPER_PATH}\n"
+
+    @pytest.mark.parametrize(
+        ("shell", "profile", "command"),
+        [
+            ("bash", ".bashrc", b"export PATH="),
+            ("zsh", ".zshrc", b"export PATH="),
+            ("fish", ".config/fish/config.fish", b"set -gx PATH "),
+        ],
+    )
+    def test_install_repeat_and_clean_uninstall(
+        self, shell, profile, command, temp_home, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("SHELL", f"/bin/{shell}")
+        profile = temp_home / profile
+        profile.parent.mkdir(parents=True, exist_ok=True)
+        original = b"# keep this comment\r\n# keep bytes and absent final newline: \xff"
+        profile.write_bytes(original)
+        profile.chmod(0o640)
+
+        self.run_command(monkeypatch, "install")
+        link = self.bin / "claude"
+        assert link.is_symlink() and link.resolve() == wrapper.WRAPPER_PATH.resolve()
+        edited = profile.read_bytes()
+        assert edited.startswith(original) and command in edited
+        assert b"claude-swap" in edited
+        assert profile.stat().st_mode & 0o777 == 0o640
+        self.run_command(monkeypatch, "install")
+        assert profile.read_bytes() == edited
+
+        self.run_command(monkeypatch, "uninstall")
+        assert not os.path.lexists(link)
+        assert profile.read_bytes() == original
+        self.run_command(monkeypatch, "uninstall")
+        assert profile.read_bytes() == original
+        assert "Wrapper is not installed" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("on_path", [False, True])
+    def test_custom_install_dir(self, on_path, temp_home, monkeypatch, capsys):
+        custom = temp_home / "custom bin"
+        if on_path:
+            alias = temp_home / "path-alias"
+            alias.symlink_to(custom, target_is_directory=True)
+            monkeypatch.setenv("PATH", f"~/path-alias/:{self.real.parent}")
+        self.run_command(monkeypatch, "install", "--dir", "~/custom bin")
+        assert (custom / "claude").is_symlink()
+        assert self.profile.exists() is not on_path
+        capsys.readouterr()
+        if on_path:
+            monkeypatch.setenv("PATH", f"{custom}:{self.real.parent}")
+        self.run_command(monkeypatch, "status")
+        output = capsys.readouterr().out
+        installed_dir = custom if on_path else custom.resolve()
+        assert f"Installed at {installed_dir / 'claude'}" in output
+        assert str(self.real) in output
+        assert ("Active in PATH" in output) is on_path
+        self.run_command(monkeypatch, "uninstall", "--dir", str(custom))
+        assert not (custom / "claude").exists()
+        if not on_path:
+            assert self.profile.read_bytes() == b""
+
+    @pytest.mark.parametrize("action", ["install", "uninstall"])
+    @pytest.mark.parametrize("kind", ["file", "binary", "dangling", "fifo"])
+    def test_refuses_to_touch_foreign_target(self, action, kind, monkeypatch, capsys):
+        self.bin.mkdir(parents=True)
+        target = self.bin / "claude"
+        if kind == "file":
+            target.write_text("user data")
+        elif kind == "binary":
+            target.symlink_to(self.real)
+        elif kind == "dangling":
+            target.symlink_to(self.bin / "missing")
+        else:
+            os.mkfifo(target)
+        before = target.lstat()
+        self.profile.write_text("# keep me\n")
+
+        with pytest.raises(SystemExit) as exc:
+            self.run_command(monkeypatch, action)
+        assert exc.value.code == 1
+        assert "Refusing" in capsys.readouterr().err
+        assert target.lstat().st_ino == before.st_ino
+        assert self.profile.read_text() == "# keep me\n"
+
+    def test_requires_real_claude(self, monkeypatch, capsys):
+        monkeypatch.setenv("PATH", "")
+        with pytest.raises(SystemExit) as exc:
+            self.run_command(monkeypatch, "install")
+        assert exc.value.code == 1
+        assert "real Claude Code" in capsys.readouterr().err
+        assert not self.bin.exists() and not self.profile.exists()
+
+    def test_unknown_shell_gives_manual_path(self, temp_home, monkeypatch, capsys):
+        monkeypatch.setenv("SHELL", "/bin/unknown")
+        self.run_command(monkeypatch, "install")
+        assert f'export PATH={self.bin}:"$PATH"' in capsys.readouterr().out
+        assert (self.bin / "claude").is_symlink()
+        assert not self.profile.exists()
+        assert not (temp_home / ".zshrc").exists()
+        assert not (temp_home / ".config").exists()
+
+    def test_status_finds_custom_install_without_a_profile(self, temp_home, monkeypatch, capsys):
+        monkeypatch.setenv("SHELL", "/bin/unknown")
+        custom = temp_home / "custom"
+        self.run_command(monkeypatch, "install", "--dir", str(custom))
+        capsys.readouterr()
+        self.run_command(monkeypatch, "status")
+        assert f"Installed at {custom.resolve() / 'claude'}" in capsys.readouterr().out
+        self.run_command(monkeypatch, "uninstall", "--dir", str(custom))
+        capsys.readouterr()
+        self.run_command(monkeypatch, "status")
+        assert "Wrapper is not installed" in capsys.readouterr().out
+
+    def test_profile_edit_follows_symlink_and_quotes_path(
+        self, temp_home, tmp_path, monkeypatch
+    ):
+        import subprocess
+
+        profile = tmp_path / "dotfiles-bash"
+        profile.write_bytes(b"# my profile\n")
+        self.profile.symlink_to(profile)
+        custom = temp_home / "my bin' \\$HOME"
+
+        self.run_command(monkeypatch, "install", "--dir", str(custom))
+        result = subprocess.run(
+            ["/bin/sh", "-c", '. "$1"; command -v claude', "sh", str(self.profile)],
+            check=True, capture_output=True, text=True,
+        )
+        assert Path(result.stdout.strip()) == custom / "claude"
+        self.run_command(monkeypatch, "uninstall", "--dir", str(custom))
+        assert self.profile.is_symlink()
+        assert profile.read_bytes() == b"# my profile\n"
+
+    def test_profile_error_rolls_back_new_symlink(self, monkeypatch, capsys):
+        self.profile.mkdir()
+        with pytest.raises(SystemExit) as exc:
+            self.run_command(monkeypatch, "install")
+        assert exc.value.code == 1
+        assert "Shell profile" in capsys.readouterr().err
+        assert not os.path.lexists(self.bin / "claude")
+        assert self.profile.is_dir()
+
+    def test_uninstall_after_shell_change_only_removes_its_own_block(
+        self, temp_home, monkeypatch
+    ):
+        self.profile.write_bytes(b"# user line")
+        self.run_command(monkeypatch, "install")
+        other = temp_home / "other"
+        self.run_command(monkeypatch, "install", "--dir", str(other))
+        with self.profile.open("ab") as fh:
+            fh.write(b"# another user line\n")
+        monkeypatch.setenv("SHELL", "/bin/zsh")
+
+        self.run_command(monkeypatch, "uninstall")
+        assert (other / "claude").is_symlink()
+        self.run_command(monkeypatch, "uninstall", "--dir", str(other))
+        assert self.profile.read_bytes() == b"# user line\n# another user line\n"

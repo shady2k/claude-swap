@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import os
 import sys
 import threading
 import time
@@ -895,6 +896,7 @@ class TestDashboard:
                 "disable-menu",
                 "remove-menu",
                 "theme-menu",
+                "wrapper-menu",
                 "quit",
             ]
             # nest into Add (index 3), then back out with escape
@@ -906,6 +908,46 @@ class TestDashboard:
             await pilot.pause()
             ids = [item.action_id for item in menu.query(MenuItem)]
             assert ids[0] == "switch"
+
+    async def test_wrapper_menu(self, temp_home, tmp_path, monkeypatch):
+        from textual.widgets import Static
+
+        from claude_swap import wrapper
+        from claude_swap.tui.widgets import MenuItem
+
+        real = tmp_path / "claude"
+        real.write_text("#!/bin/sh\nexit 0\n")
+        real.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        monkeypatch.setenv("SHELL", "/bin/bash")
+        monkeypatch.delenv("CSWAP_CLAUDE_BIN", raising=False)
+        link = temp_home / ".local" / "claude-swap" / "bin" / "claude"
+        app = make_app(FakeSwitcher([make_account(1, active=True)], tmp_path))
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "wrapper-menu")
+
+            def menu_text():
+                return "\n".join(
+                    str(item.query_one(Static).render())
+                    for item in app.screen.query(MenuItem)
+                )
+
+            if sys.platform == "win32":
+                assert "Linux and macOS" in menu_text()
+                return
+            assert "Wrapper is not installed" in menu_text()
+            await menu_select(pilot, "wrapper-install")
+            assert link.is_symlink() and link.resolve() == wrapper.WRAPPER_PATH.resolve()
+            assert f"Installed at {link}" in menu_text()
+            assert "Inactive in PATH" in menu_text()
+            monkeypatch.setenv("PATH", os.pathsep.join([str(link.parent), str(tmp_path)]))
+            await menu_select(pilot, "back")
+            await menu_select(pilot, "wrapper-menu")
+            assert "Active in PATH" in menu_text()
+            await menu_select(pilot, f"wrapper-uninstall:{link.parent}")
+            assert not link.exists()
+            assert "Wrapper is not installed" in menu_text()
 
     async def test_remove_menu_shows_alias_before_email(self, tmp_path):
         fake = FakeSwitcher(
