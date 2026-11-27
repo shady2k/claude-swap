@@ -80,6 +80,8 @@ A caller only nominates accounts. Whether a request is actually sent is decided 
 
 The fetch runs with no store lock held. `UsageStore.record` then merges the result: a success replaces the last good reading and stores the next poll time from `poll_policy.py`; a failure only updates the backoff fields, so the last good reading keeps being shown.
 
+The collector's pass that sends no request and every display row resolve "which credential generation is this account now" through `switcher._current_credential` (a newer session profile, else the backup). A display consults it only when the stored copy itself is due, so a repaint does not read every profile.
+
 Read next: the module docstrings of `usage_store.py`, `poll_policy.py` and `snapshot_source.py`.
 
 ### A switch

@@ -86,22 +86,74 @@ class SnapshotSource:
         prev: AccountSnapshot | None,
         taken_at: float,
     ) -> AccountSnapshot:
+        """Keep the newer account's rows, and a transient warning only while
+        the generation ``acc`` represents now still satisfies it.
+
+        The sentinel is a live overlay, never persisted: a store-only repaint
+        can legitimately miss it. It is therefore carried across a repaint
+        with the same measurement — but only when ``sentinel_still_applies``
+        says the CURRENT credential still meets the condition. A rotated
+        profile (or a replaced token) therefore clears a warning instead of
+        inheriting it forever.
+        """
         if prev is None or account_identity(acc) != account_identity(prev):
             return acc
 
         prev_fetched = prev.usage.fetched_at
         fetched = acc.usage.fetched_at
         if prev_fetched is not None and (fetched is None or fetched < prev_fetched):
-            return replace(acc, usage=_with_current_age(prev.usage, taken_at))
+            usage = _with_current_age(prev.usage, taken_at)
+            if usage.sentinel == USAGE_TOKEN_EXPIRED and not sentinel_still_applies(
+                prev.usage, acc
+            ):
+                usage = replace(usage, sentinel=None)
+            return replace(acc, usage=usage)
         if acc.usage.sentinel is not None:
             return acc
 
         if (
             prev.usage.sentinel == USAGE_TOKEN_EXPIRED
             and fetched == prev_fetched
+            and sentinel_still_applies(prev.usage, acc)
         ):
-            return replace(acc, usage=replace(acc.usage, sentinel=USAGE_TOKEN_EXPIRED))
+            return replace(
+                acc, usage=replace(acc.usage, sentinel=USAGE_TOKEN_EXPIRED)
+            )
         return acc
+
+
+def sentinel_still_applies(prev: UsageEntry, acc: AccountSnapshot) -> bool:
+    """Whether a transient token-expired warning still describes ``acc``.
+
+    ``prev`` is the row that carried the warning. A locally expired access
+    token carries no rejected fingerprint: the warning applies while the
+    current generation is still expired. A token the server refused carries
+    the refused access token's fingerprint: it applies while that token is
+    still the account's current one. Any other sentinel does not travel this
+    way.
+    """
+    if prev.sentinel != USAGE_TOKEN_EXPIRED:
+        return False
+    if prev.rejected_fingerprint is not None:
+        return acc.access_token_fingerprint == prev.rejected_fingerprint
+    return acc.token_expired
+
+
+def reconciled_usage(
+    current: AccountSnapshot, incoming: UsageEntry
+) -> UsageEntry:
+    """The usage row a late worker may contribute to a newer snapshot.
+
+    ``current`` already holds the newer snapshot's usage. A transient
+    token-expired warning from the incoming row is taken only while it still
+    describes the current generation; a cleared warning must not come back
+    from a worker that finished after the rotation.
+    """
+    if incoming.sentinel == USAGE_TOKEN_EXPIRED and not sentinel_still_applies(
+        incoming, current
+    ):
+        return current.usage
+    return incoming
 
 
 def account_identity(acc: AccountSnapshot) -> tuple[str, str, str]:

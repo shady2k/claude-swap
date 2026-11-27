@@ -348,7 +348,7 @@ _ROUTE_UNCONFIRMED = (
 )
 
 SENTINEL_NOTES = {
-    USAGE_TOKEN_EXPIRED: "token expired — refresh deferred this pass; retries automatically",
+    USAGE_TOKEN_EXPIRED: "refresh at the next Claude Code launch",
     USAGE_FOREIGN_CREDENTIAL: "live credential belongs to another account — a switch repairs it",
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
@@ -2657,6 +2657,8 @@ class ClaudeAccountSwitcher:
             n = str(num)
             if is_active:
                 active_number = n
+            display_creds = self._display_credential(num, email, org_uuid, creds)
+            display_oauth = oauth.extract_oauth_data(display_creds) or {}
             accounts.append(
                 AccountSnapshot(
                     number=n,
@@ -2669,7 +2671,13 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
-                    login_expires_at=oauth.login_expires_at_epoch(creds),
+                    login_expires_at=oauth.login_expires_at_epoch(display_creds),
+                    token_expired=oauth.is_oauth_token_expired(
+                        display_oauth.get("expiresAt")
+                    ),
+                    access_token_fingerprint=oauth.access_token_fingerprint(
+                        display_creds
+                    ),
                     policy=self._policy_from_data(seq_data, n),
                     subscription_plan=plans.get(n),
                 )
@@ -4129,6 +4137,26 @@ class ClaudeAccountSwitcher:
         the switch guard stays on its safe side; the adopting write, which
         needs positive evidence, checks the identity itself.
         """
+        backup, unreadable = self._read_account_credentials_ex(account_num, email)
+        if unreadable:
+            return None
+        return self._session_profile_newer_than(
+            account_num, email, org_uuid, backup
+        )
+
+    def _session_profile_newer_than(
+        self, account_num: str, email: str, org_uuid: str, backup: str
+    ) -> str | None:
+        """The profile's credential when it is a newer generation than
+        ``backup``, else None.
+
+        The comparison half of ``_session_profile_ahead``, for callers that
+        already hold their copy of the backup — a display row's cached read,
+        or the strike scan's fresh one — and must not trigger another backup
+        read. Same rules: a stale-marked, drifted, same-generation or
+        unreadable profile answers None, and only a later access-token issue
+        time counts as newer.
+        """
         from claude_swap.session import (
             is_session_stale,
             read_session_credentials,
@@ -4140,9 +4168,6 @@ class ClaudeAccountSwitcher:
             return None
         profile = read_session_credentials(session_dir)
         if not profile or session_identity_drifted(session_dir, email, org_uuid):
-            return None
-        backup, unreadable = self._read_account_credentials_ex(account_num, email)
-        if unreadable:
             return None
         if oauth.credential_fingerprint(profile) == oauth.credential_fingerprint(
             backup
@@ -4157,6 +4182,57 @@ class ClaudeAccountSwitcher:
         except (TypeError, ValueError):
             return None
         return profile if newer else None
+
+    def _current_credential(
+        self, account_num: str, email: str, org_uuid: str, stored: str
+    ) -> str:
+        """The slot's current credential generation, read-only.
+
+        The one answer to "which generation represents this account now",
+        shared by the passes that read a row's state without sending a
+        request (the collector's no-claim branch and every display row).
+        A session profile that rotated past the backup is that generation; a
+        profile cswap cannot use as this slot's current one — same
+        generation, behind a re-login in the backup, stale-marked, another
+        account's, or unreadable — leaves the stored backup as the truth,
+        exactly as ``_session_profile_ahead`` decides. The caller's copy is
+        the comparison point, so no extra backup read is spent here. Reads
+        only: promoting the profile into the backup is the fetch path's job
+        (``_adopt_session_credential``), never a display pass's.
+        """
+        if not stored or looks_like_api_key(stored):
+            return stored
+        ahead = self._session_profile_newer_than(
+            str(account_num), email, org_uuid, stored
+        )
+        return ahead or stored
+
+    def _display_credential(
+        self, account_num: str, email: str, org_uuid: str, stored: str
+    ) -> str:
+        """The credential a display row reads its state from, read-only.
+
+        The state of a healthy stored copy cannot be changed by a newer
+        profile: generations are ordered by access-token expiry, so a newer
+        one expires later. Only ``loginExpiresAt`` can differ, and the row
+        needs it only once the stored login is inside the re-login window.
+        So the shared generation decision is consulted only when the stored
+        copy itself asks for attention — an expired access token or a due
+        login. This is what keeps a TUI repaint from reading every profile
+        (a Keychain spawn per account on macOS) when nothing would change.
+        """
+        if not stored or looks_like_api_key(stored):
+            return stored
+        oauth_data = oauth.extract_oauth_data(stored) or {}
+        due = oauth.is_oauth_token_expired(oauth_data.get("expiresAt")) or (
+            oauth.login_time_left(
+                oauth.login_expires_at_epoch(stored), quarantined=False
+            )
+            is not None
+        )
+        if not due:
+            return stored
+        return self._current_credential(account_num, email, org_uuid, stored)
 
     def _adopt_session_credential(
         self, account_num: str, email: str, org_uuid: str
@@ -7547,7 +7623,7 @@ class ClaudeAccountSwitcher:
                 continue
             entry = entries[num]
             _i = info_by_num[num]
-            if self._entry_token_dead(entry, num, _i[1], _i[5], _i[4]):
+            if self._entry_token_dead(entry, num, _i[1], _i[5], _i[4], _i[3]):
                 sentinels[num] = USAGE_RELOGIN_REQUIRED
             elif entry.auth_dead_strikes and entry.token_dead():
                 # Struck, but no stored source still matches the condemned
@@ -7602,10 +7678,26 @@ class ClaudeAccountSwitcher:
                 # gap to idle-hold over. The fetch path refreshes the token
                 # once the hold lapses.
                 continue
-            active_oauth = oauth.extract_oauth_data(info[5])
-            if active_oauth and oauth.is_oauth_token_expired(
-                active_oauth.get("expiresAt")
+            # The row's CURRENT generation, not the backup it superseded: a
+            # session profile that rotated past an expired backup is still
+            # able to read the quota, and flagging the backup's expiry would
+            # hide that reading behind a false "token expired". Only a
+            # locally expired stored copy can lead here — a newer profile
+            # expires later — so a healthy row costs no profile read.
+            stored_oauth = oauth.extract_oauth_data(info[5]) or {}
+            stored_expires = stored_oauth.get("expiresAt")
+            if (
+                isinstance(stored_expires, (int, float))
+                and not oauth.is_oauth_token_expired(stored_expires)
             ):
+                # A numeric, unexpired stored token means the newer profile
+                # (if any) expires later — also unexpired. No read is needed.
+                continue
+            current_creds = self._current_credential(
+                num, info[1], info[3], info[5]
+            )
+            current_oauth = oauth.extract_oauth_data(current_creds) or {}
+            if oauth.is_oauth_token_expired(current_oauth.get("expiresAt")):
                 sentinels[num] = USAGE_TOKEN_EXPIRED
 
         if claims:
@@ -7629,7 +7721,7 @@ class ClaudeAccountSwitcher:
             for num in accepted:
                 _i = info_by_num[num]
                 if self._entry_token_dead(
-                    entries[num], num, _i[1], _i[5], _i[4]
+                    entries[num], num, _i[1], _i[5], _i[4], _i[3]
                 ):
                     sentinels[num] = USAGE_RELOGIN_REQUIRED
 
@@ -7680,7 +7772,7 @@ class ClaudeAccountSwitcher:
         # The stored source, as _build_accounts_info reports it: every slot's
         # backup.
         stored = backup
-        return self._entry_token_dead(entry, num, email, stored, is_active)
+        return self._entry_token_dead(entry, num, email, stored, is_active, org)
 
     def _entry_token_dead(
         self,
@@ -7689,6 +7781,7 @@ class ClaudeAccountSwitcher:
         email: str,
         stored: str,
         is_active: bool,
+        org_uuid: str = "",
     ) -> bool:
         """Fingerprint-bound dead verdict against EVERY stored source.
 
@@ -7714,25 +7807,44 @@ class ClaudeAccountSwitcher:
         at all (the active slot's backup used to be read on every pass for
         this). ``is_active`` no longer changes the procedure; it stays for
         the callers.
+
+        A session profile that rotated past the backup
+        (``_session_profile_newer_than``) is the slot's newest generation and
+        replaces the backup as the source the strike binds to: a strike on
+        the superseded backup heals, one on the profile holds.
         """
         if not entry.token_dead():
             return False
         if entry.token_dead(stored_fp=oauth.credential_fingerprint(stored)):
-            return True
+            # A matching cached copy holds with no read at all, unless a
+            # newer session profile supersedes it; then the profile is the
+            # generation the strike is judged against.
+            profile = self._session_profile_newer_than(
+                num, email, org_uuid, stored
+            )
+            if profile is None:
+                return True
+            return entry.token_dead(
+                stored_fp=oauth.credential_fingerprint(profile)
+            )
         backup, unreadable = self._read_account_credentials_ex(num, email)
         if unreadable:
             # The source that could still carry the struck generation cannot
-            # be seen, so "no stored source matches" is unproven — and the
-            # caller's `elif` spends that answer on `clear_dead_token`, which
-            # zeroes authDeadStrikes AND struckFingerprint in the PERSISTED
-            # store. One momentary lock would un-quarantine a genuinely dead
-            # account permanently and resume POSTing its dead grant. Holding
-            # the strike costs one pass of "re-login needed" on a row that
+            # be seen, so "no source matches" is unproven — and the caller's
+            # `elif` spends that answer on `clear_dead_token`, which zeroes
+            # authDeadStrikes AND struckFingerprint in the PERSISTED store.
+            # One momentary lock would un-quarantine a genuinely dead account
+            # permanently and resume POSTing its dead grant. Holding the
+            # strike costs one pass of "re-login needed" on a row that
             # already took AUTH_DEAD_STRIKES invalid_grants; erasing it costs
             # the quarantine itself.
             return True
-        return bool(backup) and entry.token_dead(
-            stored_fp=oauth.credential_fingerprint(backup)
+        current = (
+            self._session_profile_newer_than(num, email, org_uuid, backup)
+            or backup
+        )
+        return bool(current) and entry.token_dead(
+            stored_fp=oauth.credential_fingerprint(current)
         )
 
     def _plans_after_fetch(
@@ -8302,6 +8414,7 @@ class ClaudeAccountSwitcher:
                 active_num = num
             entry = entries[str(num)]
             record = (seq_data.get("accounts") or {}).get(str(num))
+            display_creds = self._display_credential(num, email, org_uuid, creds)
             # JSON carries the decision-grade value: last-good only while it is
             # recent enough to act on (≤ STALE_OK_S), else unavailable. Showing
             # older measurements is a human-display affordance only — scripts
@@ -8320,7 +8433,7 @@ class ClaudeAccountSwitcher:
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
                     policy=self._policy_from_data(seq_data, str(num)),
-                    login_expires_at=oauth.login_expires_at_iso(creds),
+                    login_expires_at=oauth.login_expires_at_iso(display_creds),
                     subscription_plan=(plans or {}).get(str(num)),
                     proxy=account_proxy.describe(record) or "",
                     expected=egress.json_fields(record),
@@ -8401,7 +8514,8 @@ class ClaudeAccountSwitcher:
                 markers += f" {muted('(disabled)')}"
             markers += _plan_marker(plans.get(str(num)), self._usage_store.clock())
             print(f"  {num}: {label}{tag}{markers}")
-            login_expires_at = oauth.login_expires_at_epoch(creds)
+            display_creds = self._display_credential(num, email, org_uuid, creds)
+            login_expires_at = oauth.login_expires_at_epoch(display_creds)
             for line in _usage_entry_lines(entries[str(num)], login_expires_at):
                 print(f"     {line}")
             expectation = egress.describe(
@@ -8477,9 +8591,10 @@ class ClaudeAccountSwitcher:
         the slot a second time from a fresh registry is what let a `move`
         between the two reads send this token through a direct route.
         """
-        num, _email, _org_name, _org_uuid, _is_active, creds, _alias, _route = row
+        num, email, _org_name, org_uuid, _is_active, creds, _alias, _route = row
         entry = self._collect_usage_entries([row])[str(num)]
-        return entry, oauth.login_expires_at_epoch(creds)
+        display_creds = self._display_credential(num, email, org_uuid, creds)
+        return entry, oauth.login_expires_at_epoch(display_creds)
 
     def _active_snapshot_row(self) -> "AccountInfo | None":
         """The live login's row, or None when it is not a managed slot."""
