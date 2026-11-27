@@ -17,6 +17,7 @@ No global command palette: actions live where their context is.
 
 from __future__ import annotations
 
+import asyncio
 from functools import partial
 from typing import TYPE_CHECKING, Callable
 
@@ -25,6 +26,8 @@ from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import Footer, ListView, Static
 
+from claude_swap import wrapper
+from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.models import AccountsSnapshot
 from claude_swap.tui.widgets import AccountItem, AccountsPanel, MenuItem
 
@@ -81,6 +84,7 @@ class DashboardScreen(Screen):
             ("Disable / enable account…", "disable-menu"),
             ("Remove account…", "remove-menu"),
             ("Theme…", "theme-menu"),
+            ("Claude wrapper…", "wrapper-menu"),
             ("Quit", "quit"),
         ]
 
@@ -129,6 +133,32 @@ class DashboardScreen(Screen):
         entries.append(_BACK)
         return entries
 
+    async def _wrapper_entries(self) -> MenuEntries:
+        if not wrapper.supported():
+            return [(wrapper.UNSUPPORTED, "wrapper-info"), _BACK]
+        status = await asyncio.to_thread(wrapper.status)
+        action = ("Install wrapper", "wrapper-install")
+        if status.installed:
+            action = ("Uninstall wrapper", f"wrapper-uninstall:{status.installed.parent}")
+        return [
+            action,
+            (status.summary, "wrapper-info"),
+            (status.path_summary, "wrapper-info"),
+            _BACK,
+        ]
+
+    async def _refresh_wrapper_menu(self) -> None:
+        """Redraw the submenu after setup, unless the user already left it.
+
+        The setup runs in a thread while the menu stays usable, so Esc can
+        close the submenu before it returns; writing ``_menu_stack[-1]`` then
+        would relabel the root menu and leave Esc with nothing to go back to.
+        """
+        if not self._menu_stack or self._menu_stack[-1][0] != "claude wrapper":
+            return
+        self._menu_stack[-1] = ("claude wrapper", await self._wrapper_entries())
+        await self._render_menu()
+
     async def _push_menu(self, title: str, entries: MenuEntries) -> None:
         self._menu_stack.append((title, entries))
         await self._render_menu()
@@ -145,7 +175,7 @@ class DashboardScreen(Screen):
         menu = self.query_one("#menu", ListView)
         await menu.clear()
         await menu.extend(
-            MenuItem(label, action_id, muted=(action_id == "back"))
+            MenuItem(label, action_id, muted=(action_id in ("back", "wrapper-info")))
             for label, action_id in entries
         )
         menu.index = 0
@@ -181,6 +211,21 @@ class DashboardScreen(Screen):
             app.confirm_remove(number, email)
         elif action_id == "theme-menu":
             await self._push_menu("theme", self._theme_entries())
+        elif action_id == "wrapper-menu":
+            await self._push_menu("claude wrapper", await self._wrapper_entries())
+        elif action_id == "wrapper-install" or action_id.startswith("wrapper-uninstall:"):
+            try:
+                if action_id == "wrapper-install":
+                    message = await asyncio.to_thread(wrapper.install)
+                else:
+                    directory = action_id.split(":", 1)[1]
+                    message = await asyncio.to_thread(wrapper.uninstall, directory)
+                app.notify(message)
+            except (ClaudeSwitchError, OSError) as exc:
+                app.notify(str(exc), severity="error")
+            await self._refresh_wrapper_menu()
+        elif action_id == "wrapper-info":
+            return
         elif action_id.startswith("theme:"):
             name = action_id.split(":", 1)[1]
             app.apply_theme(name)

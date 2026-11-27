@@ -4961,8 +4961,8 @@ class ClaudeAccountSwitcher:
         proxy: str | None = None,
         expect_country: str | None = None,
         expect_ip: str | None = None,
-    ) -> None:
-        """Add current account to managed accounts.
+    ) -> bool:
+        """Add the current account and return whether its login was saved.
 
         Args:
             slot: Specify the slot number to store the account in.
@@ -5130,7 +5130,7 @@ class ClaudeAccountSwitcher:
                 f"{accent('Updated credentials')} for Account {account_num} "
                 f"({current_email} {muted(f'[{tag}]')})."
             )
-            return
+            return True
 
         # Determine slot number and collect confirmation decisions
         # (no destructive operations until new account is verified readable)
@@ -5172,10 +5172,10 @@ class ClaudeAccountSwitcher:
                             answer = input(f"Overwrite slot {slot}? [y/N] ").strip().lower()
                         except (EOFError, KeyboardInterrupt):
                             print(f"\n{dimmed('Cancelled')}")
-                            return
+                            return False
                         if answer not in ("y", "yes"):
                             print(dimmed("Cancelled"))
-                            return
+                            return False
                     displace_slot = (
                         account_num,
                         existing_email,
@@ -5365,6 +5365,7 @@ class ClaudeAccountSwitcher:
         if migrate_from:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
+        return True
 
     def _confirm_slot_overwrite(
         self, slot: int, existing: dict, assume_yes: bool
@@ -5477,7 +5478,7 @@ class ClaudeAccountSwitcher:
         expect_ip: str | None = None,
         email: str | None = None,
         assume_yes: bool = False,
-    ) -> None:
+    ) -> bool:
         """Add an account by running ``claude auth login`` in a throwaway profile.
 
         Unlike :meth:`add_account`, nothing of the live login is read or
@@ -5492,7 +5493,8 @@ class ClaudeAccountSwitcher:
         egress expectation through that same proxy before Claude Code starts,
         outside every file lock. The overwrite question is asked after the
         login (only then is the account's identity known) and the final
-        write re-reads the slot under the account lock.
+        write re-reads the slot under the account lock. Return whether the
+        login was saved.
 
         ``email`` is forwarded to ``claude auth login --email``; the account
         metadata Claude Code writes remains the source of the imported
@@ -5638,7 +5640,7 @@ class ClaudeAccountSwitcher:
                 slot, result.email, result.organization_uuid, assume_yes
             )
             if plan is None:
-                return
+                return False
             _, displacing = plan
             self._commit_login_slot(
                 slot=slot,
@@ -5650,6 +5652,7 @@ class ClaudeAccountSwitcher:
                 country=country,
                 ip=ip,
             )
+        return True
 
     @staticmethod
     def _resolve_login_route(

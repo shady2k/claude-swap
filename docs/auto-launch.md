@@ -11,18 +11,45 @@ another terminal keeps the account it started with.
 itself: the managed account with the most remaining quota, without changing the
 recorded active slot. The rest of this page describes it.
 
-The thin `claude` wrapper runs `--active` for every launch. Put a symlink to it in a
-directory of its own, ahead of the real Claude Code in `PATH` — **not** in the
-directory Claude Code's own installer keeps its launcher in (`~/.local/bin` on
-Linux and macOS, which it links into `versions/`, so a symlink there either
-fails with `File exists` or replaces that launcher and leaves nothing else on
-`PATH` to run):
+## Install the Claude wrapper
+
+The wrapper is available on Linux and macOS. Accept the one-time prompt after
+`cswap add` or `cswap add --login`, use **Claude wrapper…** in the TUI menu, or run:
+
+```bash
+cswap wrapper install
+cswap wrapper status
+```
+
+The installer puts a symlink at `~/.local/claude-swap/bin/claude` and adds a
+marked `PATH` block to the profile for your `$SHELL` (`~/.bashrc`, `~/.zshrc`,
+or `~/.config/fish/config.fish`). Open a new shell or source that profile to
+activate it. For another shell, add the directory ahead of the real Claude Code
+in its `PATH` setup using the instruction printed by the installer.
+
+Use `cswap wrapper install --dir PATH` to choose a different directory. If
+that directory is already in `PATH`, the installer skips the profile edit.
+It must still come before the real Claude Code for the wrapper to be active.
+Installation requires a real, executable Claude Code on `PATH` or at
+`CSWAP_CLAUDE_BIN`, and refuses to replace an existing file it does not
+recognize as the wrapper.
+
+`cswap wrapper status` shows the wrapper's location, which `claude` the
+current `PATH` selects, and where cswap finds the real executable.
+`cswap wrapper uninstall` removes the wrapper and its marked block. Pass the
+same `--dir PATH` to uninstall from a custom directory.
+
+For manual setup, `cswap wrapper` prints the shipped script's path. Create
+the symlink and prepend its directory to `PATH`, for example in Bash or Zsh.
 
 ```bash
 mkdir -p ~/.local/claude-swap/bin
 ln -s "$(cswap wrapper)" ~/.local/claude-swap/bin/claude
 export PATH="$HOME/.local/claude-swap/bin:$PATH"
 ```
+
+To make a manual setup persistent, add that `PATH` entry to your shell's
+profile and remove the entry yourself if you uninstall the wrapper.
 
 Every `claude`, `claude --resume` and `claude -p "…"` then runs the account
 recorded as active, in its own profile, with its arguments passed through
@@ -193,10 +220,9 @@ answers them where they belong rather than starting one:
 
 ## The wrapper
 
-`cswap wrapper` prints the path of the shipped script (`scripts/claude` in the
-package); install it as a symlink, because a symlink is what the documentation
-below is written for and what keeps the package's copy a single file to update.
-What it does:
+The wrapper is a symlink to the shipped script (`scripts/claude` in the package),
+so it picks up updates to the package's script. The script handles each launch
+as follows.
 
 - `export DISABLE_AUTOUPDATER=1` before anything else: Claude Code's own updater
   would otherwise install a second, unwrapped launcher under `~/.local/bin` or

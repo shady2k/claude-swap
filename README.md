@@ -65,6 +65,8 @@ Log into Claude Code with your first account, then:
 cswap add
 ```
 
+On Linux and macOS, accept the setup prompt after `cswap add` or run `cswap wrapper install`. Open a new shell so `claude` launches the account selected by `cswap switch`. See [wrapper setup](docs/auto-launch.md#install-the-claude-wrapper).
+
 ### Add more accounts
 
 Log in with another account, then:
@@ -186,13 +188,6 @@ cswap run 2 --no-share-history  # keep this account's chat history to itself
 Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP servers, etc.) and share its chat history, so a conversation started under one account shows up in `--resume` under the others. Every launch runs in a session profile: nothing is ever started on a login in `~/.claude`.
 
 In this fork `cswap run` with no account and no directory mapping launches the active account, and refuses when none is recorded — it never falls back to a plain `claude` on `~/.claude`.
-
-<details>
-<summary>Pick the account for you — the <code>claude</code> wrapper</summary>
-
-`mkdir -p ~/.local/claude-swap/bin && ln -s "$(cswap wrapper)" ~/.local/claude-swap/bin/claude`, with that directory ahead of the real Claude Code in `PATH`, makes every `claude` (and `claude --resume`) run `cswap run --active` — the account recorded as active, in its own session profile with its own proxy. Flip accounts with `cswap switch`; nothing about `~/.claude` changes. `--version`/`-v`/`--help`/`-h` go straight to the real binary without a quota check, and `CSWAP_CLAUDE_BIN` names the real Claude Code when it is not on `PATH`. The rules are in [docs/auto-launch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-launch.md).
-
-</details>
 
 <details>
 <summary>How it behaves — chat history, MCP servers, tokens</summary>
@@ -479,7 +474,7 @@ cswap add-token --email user@example.com     # optional label override
 - [docs/auto-switch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-switch.md) — the exact auto-switch rules: hysteresis margins, landing rules, per-account thresholds and tiers, polling cadence. Read it to find out why it did or didn't switch.
 - [docs/json-output.md](https://github.com/realiti4/claude-swap/blob/main/docs/json-output.md) — every field in `--json` output, including the optional ones. Read it before writing a script against `cswap list --json` or `cswap auto --json`.
 - [docs/menubar.md](https://github.com/realiti4/claude-swap/blob/main/docs/menubar.md) — how the macOS menu bar runs under launchd: start at login, the wrapper app in `/Applications`, file locations, upgrades, the Login Items switch. Read it when the icon is missing or the service misbehaves.
-- [docs/auto-launch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-launch.md) — launching the recorded active account: what the `claude` wrapper runs, how `cswap run --auto` ranks accounts when asked, how the next launch follows an exhausted account, and the non-essential-traffic switch.
+- [docs/auto-launch.md](docs/auto-launch.md) — installing the `claude` wrapper, launching the active account, quota ranking, and switching after rate limits.
 - [docs/proxy.md](https://github.com/realiti4/claude-swap/blob/main/docs/proxy.md) — the per-account proxy: the URL forms, what it routes, the fail-closed cases and how they are reported, storage, export and rollback.
 
 `cswap --help` and `cswap <command> --help` document every flag.
