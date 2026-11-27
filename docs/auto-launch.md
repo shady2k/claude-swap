@@ -21,11 +21,25 @@ cswap wrapper install
 cswap wrapper status
 ```
 
-The installer puts a symlink at `~/.local/claude-swap/bin/claude` and adds a
-marked `PATH` block to the profile for your `$SHELL` (`~/.bashrc`, `~/.zshrc`,
-or `~/.config/fish/config.fish`). Open a new shell or source that profile to
-activate it. For another shell, add the directory ahead of the real Claude Code
-in its `PATH` setup using the instruction printed by the installer.
+The installer puts the symlink where `claude` is resolved from without any
+profile edit when it can: `~/.local/bin/claude`, provided `~/.local/bin` is
+already on `PATH` ahead of the real Claude Code and nothing else is there. The
+wrapper is then resolved by any program that runs `claude` with that `PATH`,
+including background services and IDEs that never read a shell profile. A
+shell that already ran the real `claude` keeps the path it cached, so drop it
+with `hash -r` in Bash or `rehash` in Zsh; the installer's message names both,
+because the shell that runs cswap need not be the one `$SHELL` names.
+
+Otherwise — the name is taken by a real or foreign `claude`, `~/.local/bin` is
+not on `PATH` or comes after the real one, or it is not writable — the symlink
+goes to `~/.local/claude-swap/bin/claude` and a marked `PATH` block is added to
+the profile for your `$SHELL` (`~/.bashrc`, `~/.zshrc`, or
+`~/.config/fish/config.fish`). Open a new shell or source that profile to
+activate it; background services and IDEs do not read the profile, so add that
+directory to their `PATH` yourself if they need the wrapper — they only see it
+when their own `PATH` resolves `claude` to it. For another shell,
+add the directory ahead of the real Claude Code in its `PATH` setup using the
+instruction printed by the installer.
 
 Use `cswap wrapper install --dir PATH` to choose a different directory. If
 that directory is already in `PATH`, the installer skips the profile edit.
@@ -35,9 +49,14 @@ Installation requires a real, executable Claude Code on `PATH` or at
 recognize as the wrapper.
 
 `cswap wrapper status` shows the wrapper's location, which `claude` the
-current `PATH` selects, and where cswap finds the real executable.
-`cswap wrapper uninstall` removes the wrapper and its marked block. Pass the
-same `--dir PATH` to uninstall from a custom directory.
+current `PATH` selects, and where cswap finds the real executable. Both it and
+`cswap wrapper uninstall` without `--dir` look in both standard directories,
+so they find the wrapper whichever one the installer used, and uninstall
+removes it from both; a real `claude` in either directory is left untouched.
+**Claude wrapper…** in the TUI follows the same rule: Uninstall cleans the
+standard directories together and only a custom `--dir` by itself. `cswap
+wrapper uninstall` removes the wrapper and the marked blocks it added. Pass
+the same `--dir PATH` to uninstall from a custom directory.
 
 For manual setup, `cswap wrapper` prints the shipped script's path. Create
 the symlink and prepend its directory to `PATH`, for example in Bash or Zsh.

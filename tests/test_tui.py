@@ -945,9 +945,165 @@ class TestDashboard:
             await menu_select(pilot, "back")
             await menu_select(pilot, "wrapper-menu")
             assert "Active in PATH" in menu_text()
-            await menu_select(pilot, f"wrapper-uninstall:{link.parent}")
+            await menu_select(pilot, "wrapper-uninstall")
             assert not link.exists()
             assert "Wrapper is not installed" in menu_text()
+
+    async def test_wrapper_menu_installs_into_local_bin_ahead_of_claude(
+        self, temp_home, tmp_path, monkeypatch
+    ):
+        """When `~/.local/bin` is already on PATH before the real `claude`,
+        the menu installs there and removes it from there."""
+        if sys.platform == "win32":
+            pytest.skip("the wrapper is installed on Linux and macOS only")
+        from textual.widgets import Static
+
+        from claude_swap import wrapper
+        from claude_swap.tui.widgets import MenuItem
+
+        real = tmp_path / "real" / "claude"
+        real.parent.mkdir()
+        real.write_text("#!/bin/sh\nexit 0\n")
+        real.chmod(0o755)
+        local_bin = temp_home / ".local" / "bin"
+        monkeypatch.setenv("PATH", os.pathsep.join([str(local_bin), str(real.parent)]))
+        monkeypatch.setenv("SHELL", "/bin/bash")
+        monkeypatch.delenv("CSWAP_CLAUDE_BIN", raising=False)
+        link = local_bin / "claude"
+        app = make_app(FakeSwitcher([make_account(1, active=True)], tmp_path))
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "wrapper-menu")
+
+            def menu_text():
+                return "\n".join(
+                    str(item.query_one(Static).render())
+                    for item in app.screen.query(MenuItem)
+                )
+
+            assert "Wrapper is not installed" in menu_text()
+            await menu_select(pilot, "wrapper-install")
+            assert link.is_symlink() and link.resolve() == wrapper.WRAPPER_PATH.resolve()
+            assert f"Installed at {link}" in menu_text()
+            assert "Active in PATH" in menu_text()
+            assert not (temp_home / ".bashrc").exists()
+            await menu_select(pilot, "wrapper-uninstall")
+            assert not os.path.lexists(link)
+            assert "Wrapper is not installed" in menu_text()
+
+    async def test_wrapper_menu_uninstall_clears_both_standard_wrappers(
+        self, temp_home, tmp_path, monkeypatch
+    ):
+        """A second standard wrapper must not survive the menu's Uninstall:
+        `claude` would keep launching through it."""
+        if sys.platform == "win32":
+            pytest.skip("the wrapper is installed on Linux and macOS only")
+        from claude_swap import wrapper
+        from claude_swap.tui.widgets import MenuItem
+
+        real = tmp_path / "real" / "claude"
+        real.parent.mkdir()
+        real.write_text("#!/bin/sh\nexit 0\n")
+        real.chmod(0o755)
+        local_bin = temp_home / ".local" / "bin"
+        fallback = temp_home / ".local" / "claude-swap" / "bin"
+        monkeypatch.setenv("SHELL", "/bin/bash")
+        monkeypatch.delenv("CSWAP_CLAUDE_BIN", raising=False)
+        monkeypatch.setenv("PATH", str(real.parent))
+        wrapper.install()
+        assert (fallback / "claude").is_symlink()
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join([str(fallback), str(local_bin), str(real.parent)]),
+        )
+        wrapper.install()
+        assert (local_bin / "claude").is_symlink()
+        profile = temp_home / ".bashrc"
+        assert b"export PATH=" in profile.read_bytes()
+        app = make_app(FakeSwitcher([make_account(1, active=True)], tmp_path))
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "wrapper-menu")
+            ids = [
+                item.action_id
+                for item in app.screen.query(MenuItem)
+            ]
+            assert "wrapper-uninstall" in ids
+
+            await menu_select(pilot, "wrapper-uninstall")
+
+            assert not os.path.lexists(fallback / "claude")
+            assert not os.path.lexists(local_bin / "claude")
+            assert profile.read_bytes() == b""
+
+    async def test_wrapper_menu_uninstall_keeps_a_custom_dir_targeted(
+        self, temp_home, tmp_path, monkeypatch
+    ):
+        """A custom `--dir` is not one of the standard places, so the menu
+        keeps removing exactly that directory."""
+        if sys.platform == "win32":
+            pytest.skip("the wrapper is installed on Linux and macOS only")
+        from claude_swap import wrapper
+        from claude_swap.tui.widgets import MenuItem
+
+        real = tmp_path / "real" / "claude"
+        real.parent.mkdir()
+        real.write_text("#!/bin/sh\nexit 0\n")
+        real.chmod(0o755)
+        custom = tmp_path / "custom"
+        monkeypatch.setenv("PATH", str(real.parent))
+        monkeypatch.setenv("SHELL", "/bin/bash")
+        monkeypatch.delenv("CSWAP_CLAUDE_BIN", raising=False)
+        wrapper.install(custom)
+        app = make_app(FakeSwitcher([make_account(1, active=True)], tmp_path))
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "wrapper-menu")
+            ids = [
+                item.action_id
+                for item in app.screen.query(MenuItem)
+            ]
+            assert f"wrapper-uninstall:{custom}" in ids
+
+            await menu_select(pilot, f"wrapper-uninstall:{custom}")
+
+            assert not os.path.lexists(custom / "claude")
+
+    async def test_wrapper_menu_keeps_a_custom_dir_standard_lookalike_targeted(
+        self, temp_home, tmp_path, monkeypatch
+    ):
+        """A `~/.local/bin` spelled through a directory that no longer exists
+        is not a standard directory: the menu keeps its removal aimed at the
+        custom `--dir` and that wrapper is the one removed."""
+        if sys.platform == "win32":
+            pytest.skip("the wrapper is installed on Linux and macOS only")
+        from claude_swap import wrapper
+        from claude_swap.tui.widgets import MenuItem
+
+        real = tmp_path / "real" / "claude"
+        real.parent.mkdir()
+        real.write_text("#!/bin/sh\nexit 0\n")
+        real.chmod(0o755)
+        local_bin = temp_home / ".local" / "bin"
+        custom = local_bin.parent / "custom-bin"
+        monkeypatch.setenv("PATH", str(real.parent))
+        monkeypatch.setenv("SHELL", "/bin/bash")
+        monkeypatch.delenv("CSWAP_CLAUDE_BIN", raising=False)
+        wrapper.install(custom)
+        local_bin.symlink_to(local_bin.parent / "gone" / ".." / "custom-bin")
+        app = make_app(FakeSwitcher([make_account(1, active=True)], tmp_path))
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "wrapper-menu")
+            ids = [
+                item.action_id
+                for item in app.screen.query(MenuItem)
+            ]
+            assert f"wrapper-uninstall:{custom}" in ids
+
+            await menu_select(pilot, f"wrapper-uninstall:{custom}")
+
+            assert not os.path.lexists(custom / "claude")
 
     async def test_leaving_the_wrapper_menu_during_setup_keeps_the_root_menu(
         self, temp_home, tmp_path, monkeypatch

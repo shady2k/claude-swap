@@ -139,7 +139,16 @@ class DashboardScreen(Screen):
         status = await asyncio.to_thread(wrapper.status)
         action = ("Install wrapper", "wrapper-install")
         if status.installed:
-            action = ("Uninstall wrapper", f"wrapper-uninstall:{status.installed.parent}")
+            directory = status.installed.parent
+            # Both standard directories belong to one install: aiming the
+            # removal at the one on screen would leave the other wrapper
+            # launching `claude`. A custom `--dir` is removed by itself.
+            action_id = (
+                "wrapper-uninstall"
+                if wrapper.is_standard_directory(directory)
+                else f"wrapper-uninstall:{directory}"
+            )
+            action = ("Uninstall wrapper", action_id)
         return [
             action,
             (status.summary, "wrapper-info"),
@@ -213,13 +222,15 @@ class DashboardScreen(Screen):
             await self._push_menu("theme", self._theme_entries())
         elif action_id == "wrapper-menu":
             await self._push_menu("claude wrapper", await self._wrapper_entries())
-        elif action_id == "wrapper-install" or action_id.startswith("wrapper-uninstall:"):
+        elif action_id == "wrapper-install" or action_id.startswith("wrapper-uninstall"):
             try:
                 if action_id == "wrapper-install":
                     message = await asyncio.to_thread(wrapper.install)
-                else:
+                elif action_id.startswith("wrapper-uninstall:"):
                     directory = action_id.split(":", 1)[1]
                     message = await asyncio.to_thread(wrapper.uninstall, directory)
+                else:
+                    message = await asyncio.to_thread(wrapper.uninstall)
                 app.notify(message)
             except (ClaudeSwitchError, OSError) as exc:
                 app.notify(str(exc), severity="error")

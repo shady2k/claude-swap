@@ -30,6 +30,16 @@ Installation owns a symlink and a marked PATH block for its directory.
 Profile edits preserve the original bytes outside the block and follow a
 symlinked profile. The cached list of custom directories lets status find the
 wrapper before PATH is updated. A lock serializes CLI and TUI setup changes.
+
+With no ``--dir`` the installer prefers ``~/.local/bin`` when that directory
+already comes before the real Claude Code on ``PATH`` and its ``claude`` is
+free: the symlink is active in the running session and visible to background
+services and IDEs that never read a shell profile, and no profile is edited.
+A shell that already resolved the real ``claude`` keeps it cached until
+``hash -r`` (Bash) or ``rehash`` (Zsh), so the message names both: the shell
+that runs cswap need not be the one ``$SHELL`` names. Every other case falls
+back to the private ``~/.local/claude-swap/bin`` and the marked profile block,
+which is what an install always did.
 """
 
 from __future__ import annotations
@@ -100,9 +110,24 @@ def supported() -> bool:
     return sys.platform in ("linux", "darwin")
 
 
+def _preferred_directory() -> Path:
+    """The user directory that is usually on PATH ahead of an installed tool."""
+    return Path.home() / ".local" / "bin"
+
+
+def _fallback_directory() -> Path:
+    """The private directory an install falls back to."""
+    return Path.home() / ".local" / "claude-swap" / "bin"
+
+
+def _standard_directories() -> tuple[Path, Path]:
+    """Both places an install without ``--dir`` may put the wrapper."""
+    return (_preferred_directory(), _fallback_directory())
+
+
 def _directory(directory: str | Path | None = None) -> Path:
     if directory is None:
-        return Path.home() / ".local" / "claude-swap" / "bin"
+        return _fallback_directory()
     if not directory:
         raise ConfigError("Provide a directory after --dir.")
     try:
@@ -136,9 +161,125 @@ def _same_directory(left: Path, right: Path) -> bool:
         return False
 
 
+def is_standard_directory(directory: str | os.PathLike[str]) -> bool:
+    """Whether ``directory`` is one of the two places an install uses.
+
+    ``uninstall()`` without an argument cleans both, so a caller holding a
+    path can tell whether a removal aimed at it would leave the other one
+    launching ``claude``. The comparison is ``samefile``, which asks the OS:
+    a syntactic lookalike such as a ``~/.local/bin`` symlink through a
+    directory that no longer exists is not a standard directory and must not
+    make the caller clean the wrong place. The answer is therefore about an
+    existing directory, which is what a caller holding an installed wrapper
+    has.
+    """
+    target = Path(directory)
+    return any(
+        _same_directory(target, candidate)
+        for candidate in _standard_directories()
+    )
+
+
+def _directory_index(directory: Path, dirs: list[Path]) -> int | None:
+    """The first ``dirs`` entry that the OS resolves to ``directory``.
+
+    An existing directory is compared with ``samefile``, which asks the OS.
+    One an install is about to create cannot be compared that way yet: the
+    missing segments are collected from the nearest existing parent up, and an
+    entry matches only when its own last segments are exactly those names and
+    the rest of it is that parent, again by ``samefile``. A ``..`` is never
+    removed on the way, so ``~/.local/gone/../bin`` stays three segments and
+    does not match ``~/.local/bin`` while ``gone`` is missing — a lookup
+    through it answers ``ENOENT``, so the OS would never resolve ``claude``
+    there.
+    """
+    if os.path.lexists(directory):
+        for index, entry in enumerate(dirs):
+            if _same_directory(entry, directory):
+                return index
+        return None
+    missing: list[str] = []
+    base = directory
+    while not os.path.lexists(base) and base != base.parent:
+        missing.append(base.name)
+        base = base.parent
+    if not missing or not os.path.isdir(base):
+        return None
+    suffix = tuple(reversed(missing))
+    for index, entry in enumerate(dirs):
+        parts = entry.parts
+        if (
+            len(parts) > len(suffix)
+            and parts[-len(suffix):] == suffix
+            and _same_directory(Path(*parts[:-len(suffix)]), base)
+        ):
+            return index
+    return None
+
+
+def _first_real_index(dirs: list[Path]) -> int | None:
+    """The first ``dirs`` entry whose ``claude`` is a real binary, not ours."""
+    for index, entry in enumerate(dirs):
+        candidate = entry / "claude"
+        if (
+            os.path.isfile(candidate)
+            and os.access(candidate, os.X_OK)
+            and not is_wrapper(candidate)
+        ):
+            return index
+    return None
+
+
+def _can_create(directory: Path) -> bool:
+    """Whether ``directory`` can be created, or written to when it exists.
+
+    ``lexists`` asks whether the name is taken, which is what ``mkdir`` runs
+    into: a symlink to a removed directory is not a directory and cannot be
+    written or created at, so it must not be mistaken for a missing path.
+    """
+    if os.path.lexists(directory):
+        return os.path.isdir(directory) and os.access(directory, os.W_OK | os.X_OK)
+    parent = directory.parent
+    while not os.path.lexists(parent) and parent != parent.parent:
+        parent = parent.parent
+    return os.path.isdir(parent) and os.access(parent, os.W_OK | os.X_OK)
+
+
+def _preferred_fits() -> bool:
+    """Whether ``~/.local/bin`` can take the wrapper ahead of the real claude.
+
+    A directory that is not on ``PATH``, comes after the first real ``claude``
+    there, cannot be written, or already holds someone else's ``claude`` would
+    make the install inactive, destructive, or both, so it is not chosen.
+    Toolchain and virtualenv directories on ``PATH`` are never considered:
+    ``~/.local/bin`` is the one default, which keeps ``status`` and
+    ``uninstall`` predictable.
+    """
+    directory = _preferred_directory()
+    target = directory / "claude"
+    if os.path.lexists(target) and not is_wrapper(target):
+        return False
+    dirs = _path_dirs()
+    index = _directory_index(directory, dirs)
+    if index is None or not _can_create(directory):
+        return False
+    first_real = _first_real_index(dirs)
+    return first_real is None or index < first_real
+
+
 def needs_setup(*, for_add: bool = False) -> bool:
-    """Whether to suggest setup in text status or after a successful add."""
-    if not supported() or (for_add and is_wrapper(_directory() / "claude")):
+    """Whether to suggest setup in text status or after a successful add.
+
+    The prompt after ``add`` is about the standard install only. A wrapper
+    someone put in a custom ``--dir`` that is not on ``PATH`` yet still
+    leaves ``claude`` resolving elsewhere, so it does not suppress the
+    suggestion.
+    """
+    if not supported():
+        return False
+    if for_add and any(
+        is_wrapper(directory / "claude") for directory in _standard_directories()
+    ):
         return False
     command = shutil.which("claude")
     return command is None or not is_wrapper(command)
@@ -176,7 +317,7 @@ def status() -> WrapperStatus:
 
 
 def _installed_path() -> Path | None:
-    for directory in (_directory(), *_path_dirs()):
+    for directory in (*_standard_directories(), *_path_dirs()):
         target = directory.absolute() / "claude"
         if is_wrapper(target):
             return target
@@ -280,20 +421,40 @@ def _install_lock() -> FileLock:
     return FileLock(_cache_dir() / "wrapper-install.lock")
 
 
+def _remove_blocks(directory: Path) -> bool:
+    """Remove this directory's marked PATH block from every known profile."""
+    removed = False
+    for relative in _PROFILES.values():
+        profile = Path.home() / relative
+        if profile.is_file() and _edit_profile(profile, directory):
+            removed = True
+    return removed
+
+
 def install(directory: str | Path | None = None) -> str:
-    """Install the launcher after checking its destination and the real binary."""
+    """Install the launcher after checking its destination and the real binary.
+
+    Without ``--dir`` the wrapper goes into ``~/.local/bin`` when that
+    directory already comes before the real Claude Code on ``PATH``, so it is
+    active in the running session and visible to services that never read a
+    shell profile. Otherwise the private directory and its marked profile
+    block are used, as before. An explicit ``--dir`` is never second-guessed.
+    """
     from claude_swap.session import find_claude
 
     if not supported():
         raise ConfigError(UNSUPPORTED)
-    target = _directory(directory) / "claude"
     with _install_lock():
-        exists = _target_exists(target)
         if find_claude() is None:
             raise ConfigError(
                 "The real Claude Code binary was not found. Put it on PATH "
                 "or set CSWAP_CLAUDE_BIN to its executable."
             )
+        smart = directory is None and _preferred_fits()
+        target = (
+            _preferred_directory() if smart else _directory(directory)
+        ) / "claude"
+        exists = _target_exists(target)
         if any(char in str(target.parent) for char in (os.pathsep, "\n", "\r")):
             raise ConfigError(
                 "The wrapper directory cannot contain a PATH separator or line break."
@@ -308,7 +469,9 @@ def install(directory: str | Path | None = None) -> str:
             os.path.realpath(entry) == canonical or _same_directory(entry, target.parent)
             for entry in _path_dirs()
         )
-        manage_path = directory is None or not on_path
+        # ~/.local/bin needs no banner and no profile line: it is already on
+        # PATH and it is what background services see.
+        manage_path = not smart and (directory is None or not on_path)
         if not exists and not (WRAPPER_PATH.is_file() and os.access(WRAPPER_PATH, os.X_OK)):
             raise ConfigError(f"The shipped wrapper is not executable at {WRAPPER_PATH}.")
         if directory is not None:
@@ -326,31 +489,70 @@ def install(directory: str | Path | None = None) -> str:
             raise
 
     message = f"Installed at {target}."
+    if smart:
+        # The shell keeps the path it resolved a command to. A `claude` run
+        # before this install is still the real binary until the cache is
+        # dropped, even though `claude` now resolves to the wrapper. Both
+        # commands are named: the shell running cswap need not be the one
+        # `$SHELL` names.
+        message += (
+            " If you already ran 'claude' in this shell, run 'hash -r' (Bash)"
+            " or 'rehash' (Zsh)."
+        )
     if manage_path and profile is None:
         return f"{message} Add this to your shell's PATH setup: {_path_line(target.parent, shell)}"
     if needs_setup():
         if manage_path and profile is not None:
-            return f"{message} Open a new shell or source ~/{profile} to update PATH."
-        return f"{message} Place {target.parent} before Claude Code in PATH."
+            message += f" Open a new shell or source ~/{profile} to update PATH."
+        else:
+            message += f" Place {target.parent} before Claude Code in PATH."
+    if manage_path and profile is not None:
+        message += (
+            " Background services and IDEs that do not read your shell profile"
+            f" see the wrapper only when {target.parent} is on their PATH."
+        )
     return message
 
 
 def uninstall(directory: str | Path | None = None) -> str:
-    """Remove the owned launcher and its PATH block from supported profiles."""
+    """Remove the owned launcher and the PATH blocks the installer added.
+
+    Without ``--dir`` both standard directories are checked, so the wrapper is
+    removed wherever ``install`` put it. A real or foreign ``claude`` in the
+    other directory is left alone and is not an error: nothing of ours is
+    there to remove. An explicit ``--dir`` keeps the strict refusal.
+    """
     if not supported():
         raise ConfigError(UNSUPPORTED)
-    target = _directory(directory) / "claude"
-    with _install_lock():
-        exists = _target_exists(target)
-        removed_block = False
-        for relative in _PROFILES.values():
-            profile = Path.home() / relative
-            if profile.is_file() and _edit_profile(profile, target.parent):
-                removed_block = True
-        if exists:
-            target.unlink()
-        if directory is not None:
+    if directory is not None:
+        target = _directory(directory) / "claude"
+        with _install_lock():
+            exists = _target_exists(target)
+            removed_block = _remove_blocks(target.parent)
+            if exists:
+                target.unlink()
             _record_custom_dir(target.parent, installed=False)
-    if exists or removed_block:
-        return f"Removed wrapper setup for {target}."
-    return f"Wrapper is not installed at {target}."
+        if exists or removed_block:
+            return f"Removed wrapper setup for {target}."
+        return f"Wrapper is not installed at {target}."
+
+    directories = _standard_directories()
+    with _install_lock():
+        removed = []
+        for candidate in directories:
+            target = candidate / "claude"
+            # One standard directory may be a symlink to the other, which
+            # makes both paths the same file: check it is still ours right
+            # before removing it, so the second pass is a no-op instead of
+            # an error that would skip the profile cleanup.
+            if is_wrapper(target):
+                target.unlink()
+                removed.append(target)
+        removed_block = False
+        for candidate in directories:
+            removed_block = _remove_blocks(candidate) or removed_block
+    if removed:
+        return "Removed wrapper setup for " + ", ".join(str(path) for path in removed) + "."
+    if removed_block:
+        return f"Removed wrapper setup for {_fallback_directory() / 'claude'}."
+    return f"Wrapper is not installed at {_fallback_directory() / 'claude'}."
