@@ -269,4 +269,7 @@ through that proxy.
 
 It drops an inherited `CLAUDE_SECURESTORAGE_CONFIG_DIR` for the same reason, and
 says so: that variable moves the credential store Claude Code reads, and a
-session profile is the store this launch seeds and asks for by name.
+session profile is the store this launch seeds and asks for by name. The launch's
+own token refresh ignores it too, and so does the check that the account is not
+simply the global `~/.claude` login: both are about the store cswap manages, not
+the one the shell redirected.

@@ -5994,6 +5994,142 @@ class TestBootstrapRefreshRoutesThroughGate:
         assert "called" not in direct
 
 
+class TestTheStoreRedirectIsNotTheLiveLogin:
+    """The refresh inside ``cswap run`` judges the DEFAULT profile's login.
+
+    A session profile reads the slot's backup through its own directory, never
+    the store an inherited ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` names — so that
+    variable carries no evidence either way. Bytes in it must not invent a
+    match with a login the default profile does not have, and must not hide
+    the one it does.
+    """
+
+    @staticmethod
+    def _gate_calls(monkeypatch) -> list[dict]:
+        """Record each gate call's kwargs, then run the REAL gate."""
+        real = ClaudeAccountSwitcher.consume_backup_grant
+        calls: list[dict] = []
+
+        def spy(self, num, email, snapshot, **kw):
+            calls.append(kw)
+            return real(self, num, email, snapshot, **kw)
+
+        monkeypatch.setattr(ClaudeAccountSwitcher, "consume_backup_grant", spy)
+        return calls
+
+    @staticmethod
+    def _post_rotates(monkeypatch) -> list[str]:
+        """The only network seam: the token POST, answered with a rotation."""
+        posted: list[str] = []
+
+        def post(credentials, **kw):
+            posted.append(credentials)
+            return oauth.RefreshOutcome(ROTATED_CREDS, None)
+
+        monkeypatch.setattr(
+            "claude_swap.oauth.try_refresh_oauth_credentials", post
+        )
+        return posted
+
+    def test_the_bootstrap_refresh_reaches_the_gate(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
+    ):
+        """An inherited redirect is not a ``store-unmirrored`` refusal.
+
+        The gate's own top-level check is what used to refuse here, so the
+        session profile could never be refreshed; the gate now runs, and the
+        session tells it the variable does not apply to its claude.
+        """
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/somewhere/else")
+        gate_calls = self._gate_calls(monkeypatch)
+        posted = self._post_rotates(monkeypatch)
+
+        session_dir, _, _ = manager.setup_session(ACCOUNT_NUM, share=False)
+
+        assert posted, "the gate deferred instead of consuming the slot's grant"
+        assert gate_calls, "the bootstrap refresh bypassed the gate"
+        assert all(
+            call.get("ignore_securestorage_env") is True for call in gate_calls
+        )
+        assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
+        assert (
+            seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+            == ROTATED_CREDS
+        )
+
+    @pytest.mark.parametrize("shape", ["a-copy-of-the-same", "unreadable"])
+    def test_a_copy_in_the_redirected_store_decides_nothing(
+        self,
+        manager,
+        seeded_switcher,
+        auth_status_tracks_seed,
+        monkeypatch,
+        tmp_path,
+        shape,
+    ):
+        """The redirected store's bytes are neither the live login nor a read
+        failure of it.
+
+        Holding the same credential, they used to answer "the live login holds
+        this grant" and refuse the launch as if the user were about to run two
+        Claude Codes on one login; unreadable, they used to defer the refresh
+        as a transient network-shaped failure. The default profile is empty in
+        both shapes, so the refresh is safe and must happen.
+        """
+        redirected = tmp_path / "redirected-store"
+        redirected.mkdir()
+        if shape == "a-copy-of-the-same":
+            (redirected / ".credentials.json").write_text(
+                CREDS, encoding="utf-8"
+            )
+        else:
+            # Present but unreadable as a file, on every platform.
+            (redirected / ".credentials.json").mkdir()
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(redirected))
+        posted = self._post_rotates(monkeypatch)
+
+        session_dir, _, _ = manager.setup_session(ACCOUNT_NUM, share=False)
+
+        assert posted, "the redirected store's bytes decided the live login"
+        assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
+
+    def test_the_default_login_is_still_what_a_session_must_not_duplicate(
+        self,
+        manager,
+        temp_home,
+        seeded_switcher,
+        auth_status_tracks_seed,
+        monkeypatch,
+        tmp_path,
+    ):
+        """A real match in ``~/.claude`` is not hidden by an empty redirect.
+
+        The refusal is about two Claude Codes on one one-time login, and the
+        login that matters is the default profile's. With that login in place,
+        a ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` naming an empty directory changes
+        nothing: the gate declines, no grant is POSTed, and ``_bootstrap``
+        refuses the copy too.
+        """
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            CREDS, encoding="utf-8"
+        )
+        empty_store = tmp_path / "redirected-store"
+        empty_store.mkdir()
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(empty_store))
+        posted = self._post_rotates(monkeypatch)
+
+        with pytest.raises(SessionError, match="also the login in the global"):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+        assert posted == [], "consumed a grant the live login holds"
+
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        with pytest.raises(SessionError, match="also the login in the global"):
+            manager._bootstrap(session_dir, ACCOUNT_NUM, ACCOUNT_EMAIL, ORG_UUID)
+        assert not (session_dir / ".credentials.json").exists()
+
+
 class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
     """A one-time grant consumed for THIS pass must reach the profile it was for.
 

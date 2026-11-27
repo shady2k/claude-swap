@@ -1548,7 +1548,8 @@ class SessionManager:
         # refuses: a live store that cannot be read is no reason to fail a
         # launch the stored credentials can serve.
         if self.switcher._live_login_holds(
-            self.switcher.read_account_credentials(account_num, email) or ""
+            self.switcher.read_account_credentials(account_num, email) or "",
+            ignore_securestorage_env=True,
         ):
             raise self._live_login_error(account_num)
 
