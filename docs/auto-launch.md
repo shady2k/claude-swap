@@ -93,14 +93,41 @@ in this order:
   (`EXHAUSTED_INTERVAL_S`) rather than being parked until its advertised reset,
   so a bucket Anthropic resets or tops up early is seen — but that is slower than
   a launch.
-- **Claude Code's own report.** A launch of `--auto` passes a `StopFailure` hook
-  (`--settings`, matcher `rate_limit`). When the server refuses a turn on the
-  rate limit, the hook records the moment against that account — by
-  `(email, organization)`, not by slot — and the next launch ranks that account
-  below any other one with quota until a reading newer than the report arrives.
-  A newer reading is the only thing that clears it: there is no deadline to
-  expire. If every account is marked, the best of them is launched anyway (a
-  plain 429 produces the same report).
+- **Claude Code's own report.** Every launch that runs the recorded active
+  account — `--active` (what the thin `claude` wrapper runs) and the fallback
+  launch when the directory has no `cswap map` — passes a `StopFailure` hook
+  (`--settings`, matcher `rate_limit`); `--auto` carries the same hook for the launch it picks itself. A user `--settings`
+  on the command line and one-word subcommands (`auth`, `doctor`, …) keep the
+  hook off, exactly as with `--auto`: in front of a subcommand `--settings`
+  turns the line into a prompt (measured on 2.1.329), and a user's own
+  `--settings` owns that switch.
+
+  When the server refuses a turn on the rate limit, the hook records the
+  moment against that account — by `(email, organization)`, not by slot — and,
+  if the refused account is still the recorded active slot, that slot moves to
+  the best other suitable one right then: an unmarked slot with the most
+  cached headroom above zero wins (ties in rotation order); when no other
+  slot has a cached reading, the next unmarked suitable slot in rotation
+  order takes over — so the next `claude` picks a different account even with
+  no `cswap auto` running. When every other suitable slot is marked (its
+  reading predates a `StopFailure` report, so its headroom is stale evidence),
+  the marked slot with the oldest report takes over — ties in rotation order —
+  so a refusal never pins the active slot on the refused account. The move
+  writes only `activeAccountNumber` and `lastUpdated` into `sequence.json`
+  (never `~/.claude`, never the Keychain), prints nothing, and costs no
+  network request: it reads the usage store's already-cached readings and
+  the stop marks. A `cswap switch`, `cswap next` or another session that
+  already moved the active slot wins — nothing changes. If no other suitable
+  slot exists (one account, or everything else disabled / an API key /
+  without credentials / exhausted) the recorded slot stays.
+
+  The same evidence rule guards `--strategy best`: a slot whose stop mark is
+  newer than its cached reading is provably stale and can never win the pick,
+  so a `cswap switch --strategy best` pass right after a refusal cannot roll
+  the active slot back onto the account that just refused. A newer reading is
+  the only thing that clears a mark: there is no deadline to expire. If every
+  account is marked, the best of them is launched anyway (a plain 429
+  produces the same report).
 
 Claude Code 2.1.329 was the version measured for this: a 429 carrying
 `anthropic-ratelimit-unified-status: rejected` ran the hook with

@@ -380,7 +380,7 @@ def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
             slot, account = _active_account(switcher)
             manager.run(
                 slot,
-                tail,
+                _rate_limit_hook(tail, account),
                 share=not args.no_share,
                 share_history=args.share_history,
                 require_session=args.require_session,
@@ -428,7 +428,7 @@ def _run_launch(args: argparse.Namespace, tail: list[str]) -> None:
         slot, account = _active_account(switcher)
         manager.run(
             slot,
-            tail,
+            _rate_limit_hook(tail, account),
             share=not args.no_share,
             share_history=args.share_history,
             require_session=args.require_session,
@@ -522,11 +522,18 @@ def _rate_limit_hook(tail: list[str], account: tuple[str, str, str]) -> list[str
 def _rate_limited_command(argv: list[str]) -> None:
     """Handle `cswap rate-limited EMAIL [ORG]`: the StopFailure hook's target.
 
-    Not a user command. `cswap run --auto` passes it in the hook settings it
-    hands Claude Code (``_rate_limit_hook``); it records that the server
-    refused this account on its rate limit, which is what makes the next
-    launch prefer another one (``ClaudeAccountSwitcher.record_stop_failure``).
-    Silent: a hook's output is not the user's.
+    Not a user command. Every launch that runs the recorded active account —
+    `cswap run --active` (what the thin `claude` wrapper runs) and the
+    fallback launch when the directory has no `cswap map` — passes the
+    `StopFailure` hook through `--settings` the same way (`--auto` already
+    did, via ``_rate_limit_hook``). It records that the server refused this
+    account on its rate limit, which is what makes the next launch prefer
+    another one: ``ClaudeAccountSwitcher.record_stop_failure`` stamps
+    `cache/stop-failure.json` and delegates to
+    ``isolated_mode.switch_active_after_rate_limit`` to move the recorded
+    active slot off the refused account in `sequence.json` (only while that
+    account is still the recorded slot; `activeAccountNumber`/`lastUpdated`
+    only). Silent: a hook's output is not the user's.
     """
     parser = argparse.ArgumentParser(prog="cswap rate-limited", add_help=False)
     parser.add_argument("email")

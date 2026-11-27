@@ -22,6 +22,7 @@ from claude_swap.credentials import CredentialStore
 from claude_swap.exceptions import ConfigError, SessionError, SwitchError
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.usage_store import UsageEntry
 
 CREDS_1 = json.dumps({
     "claudeAiOauth": {"accessToken": "sk-1", "refreshToken": "rt-1",
@@ -410,7 +411,14 @@ class TestTheLaunchOnTheActiveSlot:
 
         (args, kwargs), = calls
         assert args[0] == "2"
-        assert args[1] == ["--resume"]
+        claude_args = args[1]
+        # `--active` carries the StopFailure hook the recorded account was
+        # resolved with: `--settings` first, the user's words after it.
+        assert claude_args[0] == "--settings"
+        hook = json.loads(claude_args[1])["hooks"]["StopFailure"][0]
+        assert hook["matcher"] == "rate_limit"
+        assert "rate-limited b@example.com" in hook["hooks"][0]["command"]
+        assert claude_args[2:] == ["--resume"]
         # The triple pins the launch to the account that was resolved.
         assert kwargs["account"] == ("2", "b@example.com", "")
 
@@ -1101,7 +1109,12 @@ class TestTheActiveLaunchUsesItsOwnRoute:
         assert seen["route"] is not None
         assert excinfo.value.env["HTTPS_PROXY"] == seen["route"].text()
         assert excinfo.value.env["HTTPS_PROXY"].startswith("http://127.0.0.1:")
-        assert excinfo.value.argv[1:] == ["-p", "hi"]
+        # `--active` carries the StopFailure hook for the recorded account.
+        assert excinfo.value.argv[1] == "--settings"
+        hook = json.loads(excinfo.value.argv[2])["hooks"]["StopFailure"][0]
+        assert hook["matcher"] == "rate_limit"
+        assert "rate-limited a@example.com" in hook["hooks"][0]["command"]
+        assert excinfo.value.argv[3:] == ["-p", "hi"]
 
     def test_an_account_without_a_proxy_keeps_what_it_inherited(
         self, temp_home: Path, monkeypatch
@@ -1243,3 +1256,348 @@ class TestClaudeCommandsOnTheActiveLaunch:
         assert args[1] == tail
         assert kwargs["account"] == ("1", "a@example.com", "")
         manager.exec_default.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# StopFailure during a launch on the recorded active slot
+# ---------------------------------------------------------------------------
+
+
+class _FakeUsageStore:
+    """Cache-only usage store: ``entries`` returns the injected readings."""
+
+    def __init__(self, by_num, now=1000.0):
+        self.by_num = by_num
+        self._now = now
+
+    def clock(self):
+        return self._now
+
+    def entries(self, identities, models=()):
+        return {num: self.by_num.get(num, UsageEntry()) for num in identities}
+
+
+def _headroom_entry(pct, fetched_at=None):
+    """A reading with headroom 100-pct (None when pct is None)."""
+    if pct is None:
+        return UsageEntry()
+    return UsageEntry(
+        last_good={"five_hour": {"pct": pct}, "seven_day": {"pct": pct}},
+        fetched_at=fetched_at,
+        age_s=0.0,
+    )
+
+
+def _set_active(s, num):
+    data = s._get_sequence_data()
+    data["activeAccountNumber"] = num
+    s._write_json(s.sequence_file, data)
+
+
+class TestStopFailureMovesTheActiveSlot:
+    def test_moves_to_best_unmarked_headroom(self, temp_home: Path):
+        from claude_swap import isolated_mode
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _seed(s, 2, "b@example.com")
+        _seed(s, 3, "c@example.com")
+        _set_active(s, 1)
+        # Slot 3 has the most headroom (20% used); 2 is nearly spent.
+        s._usage_store = _FakeUsageStore({"2": _headroom_entry(90), "3": _headroom_entry(20)})
+        s._stop_failure_marks = lambda: {("a@example.com", ""): 5000.0}
+
+        changed = isolated_mode.switch_active_after_rate_limit(s, "a@example.com", "")
+
+        data = s._get_sequence_data()
+        assert changed is True
+        assert data["activeAccountNumber"] == 3
+
+    def test_marked_slot_with_stale_high_headroom_is_skipped(self, temp_home: Path):
+        from claude_swap import isolated_mode
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _seed(s, 2, "b@example.com")
+        _seed(s, 3, "c@example.com")
+        _set_active(s, 1)
+        # 2 looks best (10% used) but its StopFailure mark is newer than its
+        # reading; 3 is honest at 40% used.
+        marks = {("a@example.com", ""): 5000.0, ("b@example.com", ""): 5000.0}
+        s._usage_store = _FakeUsageStore(
+            {"2": _headroom_entry(10, fetched_at=1000.0), "3": _headroom_entry(40)}
+        )
+        s._stop_failure_marks = lambda: marks
+
+        isolated_mode.switch_active_after_rate_limit(s, "a@example.com", "")
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+
+    def test_reading_newer_than_the_mark_clears_it(self, temp_home: Path):
+        from claude_swap import isolated_mode
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _seed(s, 2, "b@example.com")
+        _seed(s, 3, "c@example.com")
+        _set_active(s, 1)
+        marks = {("b@example.com", ""): 2000.0}
+        s._usage_store = _FakeUsageStore(
+            {"2": _headroom_entry(5, fetched_at=3000.0), "3": _headroom_entry(60)}
+        )
+        s._stop_failure_marks = lambda: marks
+
+        # A reading from after the mark is fresh evidence: 2 wins outright.
+        isolated_mode.switch_active_after_rate_limit(s, "a@example.com", "")
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_empty_usage_cache_rotates_to_next_suitable_slot(self, temp_home: Path):
+        from claude_swap import isolated_mode
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _seed(s, 2, "b@example.com")
+        _seed(s, 3, "c@example.com")
+        _set_active(s, 1)
+        s._usage_store = _FakeUsageStore({})
+        s._stop_failure_marks = lambda: {}
+
+        isolated_mode.switch_active_after_rate_limit(s, "a@example.com", "")
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_skips_disabled_api_key_and_unprepared_slots(self, temp_home: Path):
+        from claude_swap import isolated_mode
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _seed(s, 2, "b@example.com")
+        _seed(s, 3, "c@example.com")
+        _seed(s, 4, "d@example.com")
+        _set_active(s, 1)
+        data = s._get_sequence_data()
+        data["accounts"]["2"]["disabled"] = True
+        data["accounts"]["3"]["kind"] = "api_key"
+        s._write_json(s.sequence_file, data)
+        # slot 4 has no stored config backup → not switchable
+        s._config_backup_path("4", "d@example.com").unlink()
+        s._usage_store = _FakeUsageStore({})
+        s._stop_failure_marks = lambda: {}
+
+        isolated_mode.switch_active_after_rate_limit(s, "a@example.com", "")
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 1  # nothing usable
+
+    def test_headroom_at_or_below_zero_is_never_picked(self, temp_home: Path):
+        from claude_swap import isolated_mode
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _seed(s, 2, "b@example.com")
+        _seed(s, 3, "c@example.com")
+        _set_active(s, 1)
+        # 2 is spent (100% used → headroom 0); 3 has no reading at all → the
+        # rotation fallback takes 3.
+        s._usage_store = _FakeUsageStore({"2": _headroom_entry(100), "3": UsageEntry()})
+        s._stop_failure_marks = lambda: {}
+
+        isolated_mode.switch_active_after_rate_limit(s, "a@example.com", "")
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+
+    def test_no_switch_when_active_already_moved_away(self, temp_home: Path):
+        from claude_swap import isolated_mode
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _seed(s, 2, "b@example.com")
+        _set_active(s, 2)
+        s._usage_store = _FakeUsageStore({"1": _headroom_entry(5)})
+        s._stop_failure_marks = lambda: {}
+
+        changed = isolated_mode.switch_active_after_rate_limit(s, "a@example.com", "")
+
+        assert changed is False
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_no_switch_with_a_single_account(self, temp_home: Path):
+        from claude_swap import isolated_mode
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _set_active(s, 1)
+        s._usage_store = _FakeUsageStore({})
+        s._stop_failure_marks = lambda: {}
+
+        changed = isolated_mode.switch_active_after_rate_limit(s, "a@example.com", "")
+
+        assert changed is False
+
+    def test_writes_only_sequence_fields_and_prints_nothing(
+        self, temp_home: Path, capsys
+    ):
+        from claude_swap import isolated_mode
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _seed(s, 2, "b@example.com", CREDS_2)
+        _set_active(s, 1)
+        before_sequence = json.loads(s.sequence_file.read_text())
+        roots = [temp_home / ".claude", s.credentials_dir, s.configs_dir]
+        before = {root: _tree(root) for root in roots if root.exists()}
+        s._usage_store = _FakeUsageStore({"2": _headroom_entry(30)})
+        s._stop_failure_marks = lambda: {}
+
+        changed = isolated_mode.switch_active_after_rate_limit(s, "a@example.com", "")
+
+        captured = capsys.readouterr()
+        assert captured.out == "" and captured.err == ""
+        after = {root: _tree(root) for root in roots if root.exists()}
+        assert after == before, "a hook move wrote outside sequence.json"
+        after_sequence = json.loads(s.sequence_file.read_text())
+        assert after_sequence["activeAccountNumber"] == 2
+        diff = {
+            k for k in set(before_sequence) | set(after_sequence)
+            if before_sequence.get(k) != after_sequence.get(k)
+        }
+        assert diff <= {"activeAccountNumber", "lastUpdated"}
+
+    def test_record_stop_failure_moves_active_and_marks_the_account(
+        self, temp_home: Path, capsys
+    ):
+        """The hook target writes the mark and moves the recorded active slot.
+
+        Integration through ``record_stop_failure`` itself: the mark lands in
+        ``cache/stop-failure.json`` keyed by account, the active slot moves by
+        rotation (empty usage cache), and nothing is printed.
+        """
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _seed(s, 2, "b@example.com", CREDS_2)
+        _set_active(s, 1)
+        s._usage_store = _FakeUsageStore({})
+        marks_before = s._stop_failure_marks()
+        claude_tree_before = _tree(temp_home / ".claude")
+
+        s.record_stop_failure("a@example.com", "")
+
+        data = s._get_sequence_data()
+        assert data["activeAccountNumber"] == 2
+        assert s._stop_failure_marks() == {("a@example.com", ""): s._usage_store.clock()}
+        captured = capsys.readouterr()
+        assert captured.out == "" and captured.err == ""
+        # The mark file is inside the backup dir — ~/.claude is byte-for-byte untouched.
+        assert _tree(temp_home / ".claude") == claude_tree_before
+
+
+class TestStopFailurePickRules:
+    def test_marked_slot_with_oldest_mark_wins_when_all_marked(self, temp_home: Path):
+        from claude_swap import isolated_mode
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _seed(s, 2, "b@example.com", CREDS_2)
+        _seed(s, 3, "c@example.com")
+        _set_active(s, 2)
+        # No usage cache: the rotation fallback would apply, but both other
+        # slots are marked — slot 1's report is older than slot 3's, so the
+        # active slot moves back to slot 1 (its reading, if any, predates the
+        # report and is stale evidence either way).
+        s._usage_store = _FakeUsageStore({})
+        s._stop_failure_marks = lambda: {
+            ("a@example.com", ""): 1000.0,
+            ("c@example.com", ""): 5000.0,
+        }
+
+        changed = isolated_mode.switch_active_after_rate_limit(s, "b@example.com", "")
+
+        assert changed is True
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_unmarked_headroom_tie_breaks_in_rotation_order(self, temp_home: Path):
+        from claude_swap import isolated_mode
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _seed(s, 2, "b@example.com", CREDS_2)
+        _seed(s, 3, "c@example.com")
+        _set_active(s, 3)
+        # Slots 1 and 2 have the same cached headroom; 1 comes first in the
+        # rotation, so it wins — not 2.
+        s._usage_store = _FakeUsageStore(
+            {"1": _headroom_entry(30), "2": _headroom_entry(30)}
+        )
+        s._stop_failure_marks = lambda: {}
+
+        changed = isolated_mode.switch_active_after_rate_limit(s, "c@example.com", "")
+
+        assert changed is True
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_rotation_walk_starts_after_the_active_slot(self, temp_home: Path):
+        from claude_swap import isolated_mode
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _seed(s, 2, "b@example.com", CREDS_2)
+        _seed(s, 3, "c@example.com")
+        _set_active(s, 2)
+        # No cached readings anywhere: the fallback walks rotation order
+        # starting after the active slot — 3, then 1 — and takes 3.
+        s._usage_store = _FakeUsageStore({})
+        s._stop_failure_marks = lambda: {}
+
+        changed = isolated_mode.switch_active_after_rate_limit(s, "b@example.com", "")
+
+        assert changed is True
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+
+    def test_credential_less_slot_is_skipped_not_only_config_less(self, temp_home: Path):
+        """The credential check in `_account_is_switchable` must decide.
+
+        The first slot the fallback walk reaches (4 → 1 → 2, active is 3)
+        keeps its config backup but has no stored credential. A regression
+        that stopped checking credentials would take slot 4 and this test
+        would fail; the walk has to keep going until slot 1, the only
+        suitable one.
+        """
+        from claude_swap import isolated_mode
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com", CREDS_2)
+        _seed(s, 2, "b@example.com")
+        _seed(s, 3, "c@example.com")
+        _seed(s, 4, "d@example.com", CREDS_2)
+        _set_active(s, 3)
+        # Slot 4 — first in the walk — has its config backup but no stored
+        # credential, so it is not suitable.
+        s._store._backup_enc_path("4", "d@example.com").unlink()
+        s._store._backup_enc_path("2", "b@example.com").unlink()
+        s._usage_store = _FakeUsageStore({})
+        s._stop_failure_marks = lambda: {}
+
+        changed = isolated_mode.switch_active_after_rate_limit(s, "c@example.com", "")
+
+        assert changed is True
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_exhausted_unmarked_slots_fall_back_to_oldest_marked(self, temp_home: Path):
+        from claude_swap import isolated_mode
+
+        s = _switcher()
+        _seed(s, 1, "a@example.com")
+        _seed(s, 2, "b@example.com", CREDS_2)
+        _seed(s, 3, "c@example.com")
+        _set_active(s, 1)
+        # Slot 2 is unmarked but spent (headroom 0); slot 3 is marked. The
+        # marked slot with the oldest report takes over — never the spent one.
+        s._usage_store = _FakeUsageStore(
+            {"2": _headroom_entry(100), "3": _headroom_entry(5)}
+        )
+        s._stop_failure_marks = lambda: {("c@example.com", ""): 1000.0}
+
+        changed = isolated_mode.switch_active_after_rate_limit(s, "a@example.com", "")
+
+        assert changed is True
+        assert s._get_sequence_data()["activeAccountNumber"] == 3

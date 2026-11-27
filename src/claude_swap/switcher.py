@@ -7760,11 +7760,27 @@ class ClaudeAccountSwitcher:
                 f"Post-switch poll re-plan failed (switch itself succeeded): {e}"
             )
 
+    def _usage_entries_by_account(self, fetch=None) -> dict[str, UsageEntry]:
+        """One store-backed :class:`UsageEntry` per managed account.
+
+        ``fetch=None`` (on-demand callers: ``--list``/``--status``/switch
+        strategies, dashboards) lets every account be fetched when its plan
+        says so — ``switch(strategy="best")`` runs through this helper, so a
+        ``best`` pass still gathers a reading when the store is empty. The
+        decision engine passes an explicit empty set only for its fallback
+        pass, when no pre-collected entries are handed in, so the store's
+        already-cached readings are all that is read. The ``StopFailure``
+        hook never calls this helper — ``switch_active_after_rate_limit``
+        reads ``_usage_store.entries`` directly.
+        """
+        accounts_info = self._build_accounts_info()
+        return self._collect_usage_entries(accounts_info, fetch=fetch)
+
     def _usage_by_account(self) -> dict[str, dict | str | None]:
         """Map account number → decision-grade usage value for managed accounts."""
-        accounts_info = self._build_accounts_info()
-        entries = self._collect_usage_entries(accounts_info)
-        return {num: entry.decision_value() for num, entry in entries.items()}
+        return {
+            num: entry.decision_value() for num, entry in self._usage_entries_by_account().items()
+        }
 
     def _warn_inert_models(
         self,
@@ -7806,6 +7822,9 @@ class ClaudeAccountSwitcher:
         current_num: str | None,
         models: tuple[str, ...] = (),
         usage: dict | None = None,
+        *,
+        entries: dict[str, UsageEntry] | None = None,
+        marks: dict[tuple[str, str], float] | None = None,
     ) -> tuple[str | None, str]:
         """Decide the ``best`` strategy target relative to the current account.
 
@@ -7816,7 +7835,17 @@ class ClaudeAccountSwitcher:
         can't be proven beneficial, it stays put; bare ``cswap --switch``
         remains the way to force a plain rotation. ``models`` folds the named
         per-model weekly windows into every headroom comparison (see
-        ``oauth.account_headroom``). Returns ``(target, note)``:
+        ``oauth.account_headroom``).
+
+        The protection belongs to this ``cswap switch --strategy best`` decision
+        (``cswap auto`` ranks candidates in
+        ``AutoSwitchEngine._rank_candidates`` — a separate backlog task;
+        ``autoswitch.py`` is untouched here). A slot carrying a ``StopFailure``
+        mark newer than its cached reading (``_rate_limit_marked``) is never
+        recommended: the reading predates Claude Code's refusal, so its
+        headroom is provably stale and a ``--strategy best`` pass right after a
+        refusal would otherwise roll the active slot back onto the account that
+        just refused. Returns ``(target, note)``:
 
         - ``(num, "")`` — switch to ``num`` (strictly more headroom than current)
         - ``(None, "current-unavailable")`` — current account's usage is unknown,
@@ -7834,6 +7863,7 @@ class ClaudeAccountSwitcher:
         Never raises on network failure.
         """
         data = self._get_sequence_data() or {}
+        accounts = data.get("accounts") or {}
         others = [
             str(n) for n in data.get("sequence", [])
             if str(n) != str(current_num)
@@ -7845,15 +7875,32 @@ class ClaudeAccountSwitcher:
 
         if usage is None:
             usage = self._usage_by_account()
+        if entries is None:
+            entries = self._usage_entries_by_account(fetch=set())
+        marks = self._stop_failure_marks() if marks is None else marks
+        identity_of = {
+            num: (accounts.get(num, {}).get("email", ""),
+                  accounts.get(num, {}).get("organizationUuid", "") or "")
+            for num in others
+        }
+
         current_headroom = oauth.account_headroom(usage.get(str(current_num)), models)
         if current_headroom is None:
             # Can't measure where the user is → can't prove any target is
             # better. Stay rather than risk moving onto a worse account.
             return None, "current-unavailable"
 
-        scored = [
-            (oauth.account_headroom(usage.get(num), models), num) for num in others
-        ]
+        scored = []
+        for num in others:
+            entry = entries.get(num)
+            email, org = identity_of[num]
+            at = marks.get((email, org or ""))
+            if at is not None and (entry is None or entry.fetched_at is None or entry.fetched_at < at):
+                # The reading predates a StopFailure report: its headroom is
+                # stale evidence, so this slot cannot win the pick.
+                scored.append((None, num))
+                continue
+            scored.append((oauth.account_headroom(usage.get(num), models), num))
         known = [(h, num) for h, num in scored if h is not None]
         if not known:
             return None, "no-comparison"
@@ -8025,10 +8072,17 @@ class ClaudeAccountSwitcher:
     def record_stop_failure(self, email: str, org_uuid: str) -> None:
         """Note that Claude Code reported a rate-limit stop on this account.
 
-        Called by the ``StopFailure`` hook ``cswap run --auto`` passes
-        (``cli._rate_limit_hook``); see ``docs/auto-launch.md``. Stored by
-        ``(email, organization)`` rather than slot, because a ``swap`` moves
-        slots and the mark belongs to the account.
+        Called by the ``StopFailure`` hook every launch that runs the recorded
+        active account passes — ``cswap run --active`` (what the thin ``claude``
+        wrapper runs), the fallback launch when the directory has no ``cswap
+        map``, and ``--auto`` (``cli._rate_limit_hook``); see
+        ``docs/auto-launch.md``. Stored by ``(email, organization)`` rather than
+        slot, because a ``swap`` moves slots and the mark belongs to the
+        account. After stamping the mark it delegates to
+        ``isolated_mode.switch_active_after_rate_limit`` to move the recorded
+        active slot off the refused account in ``sequence.json`` — only while
+        that account is still the recorded slot, writing
+        ``activeAccountNumber``/``lastUpdated`` only.
         """
         path = self.backup_dir / "cache" / STOP_FAILURE_FILE
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -8044,6 +8098,21 @@ class ClaudeAccountSwitcher:
                     for (account, org), at in marks.items()
                 ],
             })
+        # The launch that recorded the account keeps going (a refusal is a
+        # refused turn, not a dead account); what changes is the account the
+        # next `claude` picks. The hook stays silent and writes nothing
+        # outside the store: move the recorded active slot off this account
+        # using only already-cached readings — no network — and only when it
+        # is still the slot recorded in sequence.json.
+        try:
+            from claude_swap import isolated_mode
+
+            isolated_mode.switch_active_after_rate_limit(self, email, org_uuid)
+        except Exception as e:  # noqa: BLE001 - a missed move must not fail the hook
+            self._logger.warning(
+                f"Could not move the active slot off {email} after a rate-limit "
+                f"stop: {e}"
+            )
 
     def _stop_failure_marks(self) -> dict[tuple[str, str], float]:
         """``(email, organization) → epoch`` of the recorded rate-limit stops."""
@@ -8696,11 +8765,18 @@ class ClaudeAccountSwitcher:
         # Usage-aware "jump to most headroom". Only switches when another
         # account is provably better; otherwise stays put (never moves onto a
         # worse or unverifiable account). Bare `cswap --switch` rotates anyway.
+        # One store pass: `entries` feeds both the headroom values (via
+        # `decision_value()`) and the stop-mark staleness check.
         if strategy == "best":
-            best_usage = self._usage_by_account()
+            entries = self._usage_entries_by_account()
+            best_usage = {num: entry.decision_value() for num, entry in entries.items()}
             self._warn_inert_models(best_usage, models, json_output, warnings)
             target, note = self._select_best_switchable(
-                current_num, models, best_usage
+                current_num,
+                models,
+                best_usage,
+                entries=entries,
+                marks=self._stop_failure_marks(),
             )
             if target is not None:
                 op = isolated_mode.activate(
