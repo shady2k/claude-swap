@@ -464,7 +464,10 @@ def _wrapper_command(argv: list[str]) -> None:
         command = commands.add_parser(name, help=help_text)
         command.add_argument(
             "--dir", metavar="PATH",
-            help="launcher directory (default: ~/.local/claude-swap/bin)",
+            help=(
+                "launcher directory (default: ~/.local/bin when it comes first "
+                "in PATH, else ~/.local/claude-swap/bin)"
+            ),
         )
     commands.add_parser("status", help="show the launcher, PATH and real Claude Code")
     args = parser.parse_args(argv)

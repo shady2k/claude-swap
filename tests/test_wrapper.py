@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -450,12 +451,40 @@ class TestWrapperCommands:
         before = target.lstat()
         self.profile.write_text("# keep me\n")
 
+        # A named directory keeps the strict refusal; without --dir the
+        # harmless no-op is below.
+        args = ["--dir", str(self.bin)] if action == "uninstall" else []
         with pytest.raises(SystemExit) as exc:
-            self.run_command(monkeypatch, action)
+            self.run_command(monkeypatch, action, *args)
         assert exc.value.code == 1
         assert "Refusing" in capsys.readouterr().err
         assert target.lstat().st_ino == before.st_ino
         assert self.profile.read_text() == "# keep me\n"
+
+    @pytest.mark.parametrize("kind", ["file", "binary", "dangling", "fifo"])
+    def test_uninstall_without_dir_leaves_a_foreign_target_alone(
+        self, kind, monkeypatch, capsys
+    ):
+        """A real or foreign `claude` in a standard directory is not ours to
+        remove, and its presence is not an error when no wrapper is installed."""
+        self.bin.mkdir(parents=True)
+        target = self.bin / "claude"
+        if kind == "file":
+            target.write_text("user data")
+        elif kind == "binary":
+            target.symlink_to(self.real)
+        elif kind == "dangling":
+            target.symlink_to(self.bin / "missing")
+        else:
+            os.mkfifo(target)
+        before = target.lstat()
+        self.profile.write_text("# keep me\n")
+
+        self.run_command(monkeypatch, "uninstall")
+
+        assert target.lstat().st_ino == before.st_ino
+        assert self.profile.read_text() == "# keep me\n"
+        assert "Wrapper is not installed" in capsys.readouterr().out
 
     def test_requires_real_claude(self, monkeypatch, capsys):
         monkeypatch.setenv("PATH", "")
@@ -530,3 +559,132 @@ class TestWrapperCommands:
         assert (other / "claude").is_symlink()
         self.run_command(monkeypatch, "uninstall", "--dir", str(other))
         assert self.profile.read_bytes() == b"# user line\n# another user line\n"
+
+
+class TestSmartInstallDirectory:
+    """`install` without --dir prefers a `~/.local/bin` already on PATH.
+
+    The directory is the one user-local place that is normally ahead of the
+    real Claude Code in `PATH`, so a symlink there needs no profile edit and
+    is seen by background services and IDEs at once. Every other case keeps
+    the private directory and its marked profile block.
+    """
+
+    @pytest.fixture(autouse=True)
+    def set_up(self, temp_home, tmp_path, monkeypatch):
+        self.home = temp_home
+        self.local_bin = temp_home / ".local" / "bin"
+        self.fallback = temp_home / ".local" / "claude-swap" / "bin"
+        self.real = _script(tmp_path / "real" / "claude", FAKE_CLAUDE)
+        self.profile = temp_home / ".bashrc"
+        monkeypatch.setenv("SHELL", "/bin/bash")
+        monkeypatch.delenv("CSWAP_CLAUDE_BIN", raising=False)
+
+    def set_path(self, monkeypatch, *entries: Path) -> None:
+        monkeypatch.setenv("PATH", os.pathsep.join(str(entry) for entry in entries))
+
+    @staticmethod
+    def profiles(home: Path) -> list[Path]:
+        return [
+            home / ".bashrc",
+            home / ".zshrc",
+            home / ".config" / "fish" / "config.fish",
+        ]
+
+    def test_a_local_bin_ahead_of_the_real_claude_hosts_the_wrapper(
+        self, monkeypatch
+    ):
+        """`~/.local/bin` is created when needed, stays out of the profiles,
+        and the wrapper is active the moment it lands."""
+        self.set_path(monkeypatch, self.local_bin, self.real.parent)
+
+        message = wrapper.install()
+
+        link = self.local_bin / "claude"
+        assert link.is_symlink() and link.resolve() == wrapper.WRAPPER_PATH.resolve()
+        assert message == f"Installed at {link}."
+        assert all(not profile.exists() for profile in self.profiles(self.home))
+        assert wrapper.is_wrapper(shutil.which("claude"))
+        assert not wrapper.needs_setup(for_add=True)
+        assert not wrapper.needs_setup()
+
+        # Repeat install: same symlink, same answer, no second block anywhere.
+        before = link.lstat().st_ino
+        assert wrapper.install() == message
+        assert link.lstat().st_ino == before
+        assert all(not profile.exists() for profile in self.profiles(self.home))
+
+    def test_a_real_claude_in_local_bin_keeps_the_wrapper_out_of_it(
+        self, monkeypatch
+    ):
+        """A `claude` that is not ours is never replaced, and the private
+        directory plus the profile line is used instead."""
+        self.local_bin.mkdir(parents=True)
+        occupant = self.local_bin / "claude"
+        occupant.symlink_to(self.real)
+        self.set_path(monkeypatch, self.local_bin, self.real.parent)
+
+        message = wrapper.install()
+
+        assert occupant.is_symlink() and occupant.resolve() == self.real.resolve()
+        assert (self.fallback / "claude").is_symlink()
+        assert b"export PATH=" in self.profile.read_bytes()
+        assert "Open a new shell" in message
+        assert "do not read your shell profile" in message
+
+    @pytest.mark.parametrize("placement", ["after", "absent"])
+    def test_other_path_shapes_fall_back_to_the_private_directory(
+        self, placement, monkeypatch
+    ):
+        if placement == "after":
+            self.set_path(monkeypatch, self.real.parent, self.local_bin)
+        else:
+            self.set_path(monkeypatch, self.real.parent)
+
+        message = wrapper.install()
+
+        assert (self.fallback / "claude").is_symlink()
+        assert not os.path.lexists(self.local_bin / "claude")
+        assert b"export PATH=" in self.profile.read_bytes()
+        assert "Open a new shell" in message
+        assert "do not read your shell profile" in message
+
+    def test_cswap_claude_bin_outside_path_still_takes_local_bin(self, monkeypatch):
+        """The real binary may be named by CSWAP_CLAUDE_BIN only; the wrapper
+        still belongs where `claude` is resolved from."""
+        monkeypatch.setenv("CSWAP_CLAUDE_BIN", str(self.real))
+        self.set_path(monkeypatch, self.local_bin)
+
+        message = wrapper.install()
+
+        assert (self.local_bin / "claude").is_symlink()
+        assert all(not profile.exists() for profile in self.profiles(self.home))
+        assert "do not read your shell profile" not in message
+
+    def test_status_and_uninstall_find_the_wrapper_in_local_bin(self, monkeypatch):
+        self.set_path(monkeypatch, self.local_bin, self.real.parent)
+        wrapper.install()
+        link = self.local_bin / "claude"
+
+        found = wrapper.status()
+        assert found.installed is not None and found.installed.samefile(link)
+        assert found.active
+        assert wrapper.uninstall() == f"Removed wrapper setup for {link}."
+        assert not os.path.lexists(link)
+        assert wrapper.status().installed is None
+
+    def test_uninstall_leaves_a_real_claude_in_local_bin_alone(self, monkeypatch):
+        self.local_bin.mkdir(parents=True)
+        occupant = self.local_bin / "claude"
+        occupant.symlink_to(self.real)
+        self.set_path(monkeypatch, self.real.parent)
+        wrapper.install()
+        link = self.fallback / "claude"
+        assert link.is_symlink()
+
+        message = wrapper.uninstall()
+
+        assert not os.path.lexists(link)
+        assert occupant.is_symlink() and occupant.resolve() == self.real.resolve()
+        assert message.startswith("Removed wrapper setup")
+        assert self.profile.read_bytes() == b""

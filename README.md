@@ -65,7 +65,7 @@ Log into Claude Code with your first account, then:
 cswap add
 ```
 
-On Linux and macOS, accept the setup prompt after `cswap add` or run `cswap wrapper install`. Open a new shell so `claude` launches the account selected by `cswap switch`. See [wrapper setup](docs/auto-launch.md#install-the-claude-wrapper).
+On Linux and macOS, accept the setup prompt after `cswap add` or run `cswap wrapper install`. It installs into `~/.local/bin` when that is already on `PATH` ahead of the real `claude`, so it is active at once; otherwise it uses `~/.local/claude-swap/bin` and updates your shell profile. See [wrapper setup](docs/auto-launch.md#install-the-claude-wrapper).
 
 ### Add more accounts
 
