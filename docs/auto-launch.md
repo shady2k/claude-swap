@@ -24,8 +24,11 @@ cswap wrapper status
 The installer puts the symlink where `claude` is resolved from without any
 profile edit when it can: `~/.local/bin/claude`, provided `~/.local/bin` is
 already on `PATH` ahead of the real Claude Code and nothing else is there. The
-wrapper is then active in the running session and in background services and
-IDEs that never read a shell profile.
+wrapper is then resolved by any program that runs `claude` with that `PATH`,
+including background services and IDEs that never read a shell profile. A
+shell that already ran the real `claude` keeps the path it cached, so drop it
+with `hash -r` in Bash or `rehash` in Zsh; the installer's message names the
+one for your shell.
 
 Otherwise — the name is taken by a real or foreign `claude`, `~/.local/bin` is
 not on `PATH` or comes after the real one, or it is not writable — the symlink
@@ -33,7 +36,8 @@ goes to `~/.local/claude-swap/bin/claude` and a marked `PATH` block is added to
 the profile for your `$SHELL` (`~/.bashrc`, `~/.zshrc`, or
 `~/.config/fish/config.fish`). Open a new shell or source that profile to
 activate it; background services and IDEs do not read the profile, so add that
-directory to their `PATH` yourself if they need the wrapper. For another shell,
+directory to their `PATH` yourself if they need the wrapper — they only see it
+when their own `PATH` resolves `claude` to it. For another shell,
 add the directory ahead of the real Claude Code in its `PATH` setup using the
 instruction printed by the installer.
 

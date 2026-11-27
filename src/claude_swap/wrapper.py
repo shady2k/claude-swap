@@ -35,8 +35,11 @@ With no ``--dir`` the installer prefers ``~/.local/bin`` when that directory
 already comes before the real Claude Code on ``PATH`` and its ``claude`` is
 free: the symlink is active in the running session and visible to background
 services and IDEs that never read a shell profile, and no profile is edited.
-Every other case falls back to the private ``~/.local/claude-swap/bin`` and
-the marked profile block, which is what an install always did.
+A shell that already resolved the real ``claude`` keeps it cached until
+``hash -r`` (Bash) or ``rehash`` (Zsh), so the message names the one for
+``$SHELL``. Every other case falls back to the private
+``~/.local/claude-swap/bin`` and the marked profile block, which is what an
+install always did.
 """
 
 from __future__ import annotations
@@ -181,11 +184,16 @@ def _first_real_index(dirs: list[Path]) -> int | None:
 
 
 def _can_create(directory: Path) -> bool:
-    """Whether ``directory`` can be created, or written to when it exists."""
-    if os.path.exists(directory):
+    """Whether ``directory`` can be created, or written to when it exists.
+
+    ``lexists`` asks whether the name is taken, which is what ``mkdir`` runs
+    into: a symlink to a removed directory is not a directory and cannot be
+    written or created at, so it must not be mistaken for a missing path.
+    """
+    if os.path.lexists(directory):
         return os.path.isdir(directory) and os.access(directory, os.W_OK | os.X_OK)
     parent = directory.parent
-    while not os.path.exists(parent) and parent != parent.parent:
+    while not os.path.lexists(parent) and parent != parent.parent:
         parent = parent.parent
     return os.path.isdir(parent) and os.access(parent, os.W_OK | os.X_OK)
 
@@ -213,10 +221,18 @@ def _preferred_fits() -> bool:
 
 
 def needs_setup(*, for_add: bool = False) -> bool:
-    """Whether to suggest setup in text status or after a successful add."""
+    """Whether to suggest setup in text status or after a successful add.
+
+    The prompt after ``add`` is about the standard install only. A wrapper
+    someone put in a custom ``--dir`` that is not on ``PATH`` yet still
+    leaves ``claude`` resolving elsewhere, so it does not suppress the
+    suggestion.
+    """
     if not supported():
         return False
-    if for_add and _installed_path() is not None:
+    if for_add and any(
+        is_wrapper(directory / "claude") for directory in _standard_directories()
+    ):
         return False
     command = shutil.which("claude")
     return command is None or not is_wrapper(command)
@@ -426,6 +442,13 @@ def install(directory: str | Path | None = None) -> str:
             raise
 
     message = f"Installed at {target}."
+    if smart:
+        # The shell keeps the path it resolved a command to. A `claude` run
+        # before this install is still the real binary until the cache is
+        # dropped, even though `claude` now resolves to the wrapper.
+        reset = {"bash": "hash -r", "zsh": "rehash"}.get(shell)
+        if reset is not None:
+            message += f" If you already ran 'claude' in this shell, run '{reset}'."
     if manage_path and profile is None:
         return f"{message} Add this to your shell's PATH setup: {_path_line(target.parent, shell)}"
     if needs_setup():
@@ -465,13 +488,16 @@ def uninstall(directory: str | Path | None = None) -> str:
 
     directories = _standard_directories()
     with _install_lock():
-        removed = [
-            candidate / "claude"
-            for candidate in directories
-            if is_wrapper(candidate / "claude")
-        ]
-        for target in removed:
-            target.unlink()
+        removed = []
+        for candidate in directories:
+            target = candidate / "claude"
+            # One standard directory may be a symlink to the other, which
+            # makes both paths the same file: check it is still ours right
+            # before removing it, so the second pass is a no-op instead of
+            # an error that would skip the profile cleanup.
+            if is_wrapper(target):
+                target.unlink()
+                removed.append(target)
         removed_block = False
         for candidate in directories:
             removed_block = _remove_blocks(candidate) or removed_block

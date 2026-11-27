@@ -602,7 +602,10 @@ class TestSmartInstallDirectory:
 
         link = self.local_bin / "claude"
         assert link.is_symlink() and link.resolve() == wrapper.WRAPPER_PATH.resolve()
-        assert message == f"Installed at {link}."
+        assert message == (
+            f"Installed at {link}."
+            " If you already ran 'claude' in this shell, run 'hash -r'."
+        )
         assert all(not profile.exists() for profile in self.profiles(self.home))
         assert wrapper.is_wrapper(shutil.which("claude"))
         assert not wrapper.needs_setup(for_add=True)
@@ -648,6 +651,35 @@ class TestSmartInstallDirectory:
         assert b"export PATH=" in self.profile.read_bytes()
         assert "Open a new shell" in message
         assert "do not read your shell profile" in message
+        # The standard install is done, so `cswap add` stops asking for it
+        # even though `claude` still resolves to the real binary here.
+        assert not wrapper.needs_setup(for_add=True)
+        assert wrapper.needs_setup()
+
+    def test_a_dangling_local_bin_falls_back(self, monkeypatch):
+        """A `~/.local/bin` symlink to a removed directory is named on PATH but
+        cannot hold anything, so the private directory is used."""
+        self.local_bin.parent.mkdir(parents=True)
+        self.local_bin.symlink_to(self.local_bin.parent / "gone")
+        self.set_path(monkeypatch, self.local_bin, self.real.parent)
+
+        message = wrapper.install()
+
+        assert (self.fallback / "claude").is_symlink()
+        assert b"export PATH=" in self.profile.read_bytes()
+        assert "Open a new shell" in message
+
+    def test_a_zsh_shell_is_told_to_rehash(self, monkeypatch):
+        monkeypatch.setenv("SHELL", "/usr/bin/zsh")
+        self.set_path(monkeypatch, self.local_bin, self.real.parent)
+
+        message = wrapper.install()
+
+        assert message == (
+            f"Installed at {self.local_bin / 'claude'}."
+            " If you already ran 'claude' in this shell, run 'rehash'."
+        )
+        assert not (self.home / ".zshrc").exists()
 
     def test_cswap_claude_bin_outside_path_still_takes_local_bin(self, monkeypatch):
         """The real binary may be named by CSWAP_CLAUDE_BIN only; the wrapper
@@ -688,3 +720,34 @@ class TestSmartInstallDirectory:
         assert occupant.is_symlink() and occupant.resolve() == self.real.resolve()
         assert message.startswith("Removed wrapper setup")
         assert self.profile.read_bytes() == b""
+
+    def test_uninstall_when_local_bin_links_to_the_private_directory(
+        self, monkeypatch
+    ):
+        """`~/.local/bin` may be a symlink to the private directory, so both
+        standard paths are one file: it is removed once and the profile block
+        still goes."""
+        self.local_bin.parent.mkdir(parents=True)
+        self.fallback.mkdir(parents=True)
+        self.local_bin.symlink_to(self.fallback)
+        self.set_path(monkeypatch, self.real.parent)
+        wrapper.install()
+        link = self.fallback / "claude"
+        assert link.is_symlink()
+        assert b"export PATH=" in self.profile.read_bytes()
+
+        message = wrapper.uninstall()
+
+        assert not os.path.lexists(link)
+        assert "Removed wrapper setup" in message
+        assert self.profile.read_bytes() == b""
+
+    def test_needs_setup_ignores_a_wrapper_outside_path(self, monkeypatch, tmp_path):
+        """A hand-installed wrapper in a custom directory that PATH does not
+        reach leaves `cswap add` asking for the standard setup."""
+        custom = tmp_path / "custom"
+        self.set_path(monkeypatch, self.real.parent)
+        wrapper.install(custom)
+        assert wrapper.is_wrapper(custom / "claude")
+
+        assert wrapper.needs_setup(for_add=True)
