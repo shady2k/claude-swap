@@ -780,10 +780,51 @@ class TestSmartInstallDirectory:
 
     def test_only_the_standard_directories_are_standard(self, monkeypatch, tmp_path):
         """The TUI asks this before choosing an uninstall target, so a custom
-        `--dir` must not be mistaken for one of the two standard places."""
+        `--dir` must not be mistaken for one of the two standard places.
+
+        The comparison asks the OS, so both standard directories exist here:
+        a directory an install reported it put the wrapper in exists.
+        """
         self.set_path(monkeypatch, self.real.parent)
+        self.local_bin.mkdir(parents=True)
+        self.fallback.mkdir(parents=True)
         wrapper.install(tmp_path / "custom")
 
         assert wrapper.is_standard_directory(self.local_bin)
         assert wrapper.is_standard_directory(self.fallback)
         assert not wrapper.is_standard_directory(tmp_path / "custom")
+        assert not wrapper.is_standard_directory(self.local_bin / "missing")
+
+    def test_a_dangling_local_bin_does_not_make_a_custom_dir_standard(
+        self, monkeypatch, tmp_path
+    ):
+        """`~/.local/bin` spelled through a directory that no longer exists
+        looks like the wrapper's custom directory character by character, but
+        the OS resolves neither of them, so the custom directory stays custom
+        and the TUI keeps its removal aimed at it."""
+        self.set_path(monkeypatch, self.local_bin, self.real.parent)
+        custom = self.local_bin.parent / "custom-bin"
+        wrapper.install(custom)
+        self.local_bin.symlink_to(self.local_bin.parent / "gone" / ".." / "custom-bin")
+
+        assert not wrapper.is_standard_directory(custom)
+
+    def test_a_local_bin_reached_through_a_missing_directory_is_not_on_path(
+        self, monkeypatch
+    ):
+        """A PATH entry that is a symlink to `$HOME/.local/gone/../bin`
+        carries no missing names of its own, so the suffix rule cannot reject
+        it: the OS answers `ENOENT` for a lookup through it while `gone` is
+        missing, and the private directory is used instead."""
+        self.local_bin.parent.mkdir(parents=True)
+        path_bin = self.home / "path-bin"
+        path_bin.symlink_to(self.local_bin.parent / "gone" / ".." / "bin")
+        self.set_path(monkeypatch, path_bin, self.real.parent)
+
+        message = wrapper.install()
+
+        assert (self.fallback / "claude").is_symlink()
+        assert not os.path.lexists(self.local_bin / "claude")
+        assert b"export PATH=" in self.profile.read_bytes()
+        assert "Open a new shell" in message
+        assert "do not read your shell profile" in message

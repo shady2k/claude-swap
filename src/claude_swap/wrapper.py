@@ -166,51 +166,53 @@ def is_standard_directory(directory: str | os.PathLike[str]) -> bool:
 
     ``uninstall()`` without an argument cleans both, so a caller holding a
     path can tell whether a removal aimed at it would leave the other one
-    launching ``claude``. A standard directory that does not exist yet is
-    still answered, since the comparison falls back to the resolved paths.
+    launching ``claude``. The comparison is ``samefile``, which asks the OS:
+    a syntactic lookalike such as a ``~/.local/bin`` symlink through a
+    directory that no longer exists is not a standard directory and must not
+    make the caller clean the wrong place. The answer is therefore about an
+    existing directory, which is what a caller holding an installed wrapper
+    has.
     """
-    real = os.path.realpath(directory)
+    target = Path(directory)
     return any(
-        real == os.path.realpath(candidate)
-        or _same_directory(Path(directory), candidate)
+        _same_directory(target, candidate)
         for candidate in _standard_directories()
     )
-
-
-def _entry_reaches(entry: Path) -> bool:
-    """Whether every ``..`` in a PATH entry follows a directory that exists.
-
-    ``realpath`` removes a ``..`` without asking the OS, so
-    ``~/.local/gone/../bin`` looks like ``~/.local/bin`` although a lookup
-    through it answers ``ENOENT``. For a directory an install is about to
-    create, this is the only way to tell an entry that will reach it from one
-    that will not.
-    """
-    parts = entry.parts
-    for index, part in enumerate(parts):
-        if part != os.pardir:
-            continue
-        if not os.path.isdir(Path(*parts[:index])):
-            return False
-    return True
 
 
 def _directory_index(directory: Path, dirs: list[Path]) -> int | None:
     """The first ``dirs`` entry that the OS resolves to ``directory``.
 
     An existing directory is compared with ``samefile``, which asks the OS.
-    One an install is about to create cannot be compared that way yet, so the
-    lexical answer is taken only when the entry's own ``..`` segments resolve,
-    or a PATH entry through a missing directory would look like it reaches it.
+    One an install is about to create cannot be compared that way yet: the
+    missing segments are collected from the nearest existing parent up, and an
+    entry matches only when its own last segments are exactly those names and
+    the rest of it is that parent, again by ``samefile``. A ``..`` is never
+    removed on the way, so ``~/.local/gone/../bin`` stays three segments and
+    does not match ``~/.local/bin`` while ``gone`` is missing — a lookup
+    through it answers ``ENOENT``, so the OS would never resolve ``claude``
+    there.
     """
     if os.path.lexists(directory):
         for index, entry in enumerate(dirs):
             if _same_directory(entry, directory):
                 return index
         return None
-    canonical = os.path.realpath(directory)
+    missing: list[str] = []
+    base = directory
+    while not os.path.lexists(base) and base != base.parent:
+        missing.append(base.name)
+        base = base.parent
+    if not missing or not os.path.isdir(base):
+        return None
+    suffix = tuple(reversed(missing))
     for index, entry in enumerate(dirs):
-        if os.path.realpath(entry) == canonical and _entry_reaches(entry):
+        parts = entry.parts
+        if (
+            len(parts) > len(suffix)
+            and parts[-len(suffix):] == suffix
+            and _same_directory(Path(*parts[:-len(suffix)]), base)
+        ):
             return index
     return None
 
