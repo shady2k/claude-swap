@@ -261,6 +261,15 @@ class AccountSnapshot:
     # unreadable; see oauth.login_expires_at_epoch. Feeds the "re-login in
     # 5d 12h" note every account view shows while the login is due.
     login_expires_at: float | None = None
+    # Whether the current generation's access token is locally expired at
+    # snapshot time (see ``ClaudeAccountSwitcher._current_credential``). A
+    # transient ``token_expired`` warning survives a repaint only while this
+    # stays true; see ``snapshot_source``.
+    token_expired: bool = False
+    # Fingerprint of that access token, or None for a credential without one.
+    # A server-refused warning survives a repaint only while this still
+    # matches the refused token.
+    access_token_fingerprint: str | None = None
 
     @property
     def display_tag(self) -> str:

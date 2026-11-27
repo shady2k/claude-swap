@@ -416,19 +416,32 @@ class TestSnapshotSource:
         source.take(store_only=True)
         assert fake.fetch_sets == [set()]
 
-    def test_expired_sentinel_retained_until_fetched_at_advances(self, tmp_path):
+    def test_expired_sentinel_retained_only_while_the_token_is_still_expired(
+        self, tmp_path
+    ):
+        """The transient warning may cross a store-only repaint, but only
+        while the generation the new snapshot represents is still expired;
+        a rotated (fresh) token clears it instead of inheriting it."""
         expired = make_account(
             1,
             active=True,
             entry=make_usage_at(100.0, sentinel=USAGE_TOKEN_EXPIRED),
         )
-        fresh_same_stamp = make_account(1, active=True, entry=make_usage_at(100.0))
+        still_expired = dataclasses.replace(
+            make_account(1, active=True, entry=make_usage_at(100.0)),
+            token_expired=True,
+        )
+        rotated = make_account(1, active=True, entry=make_usage_at(100.0))
         fresh_new_stamp = make_account(1, active=True, entry=make_usage_at(101.0))
         fake, source = self._source(tmp_path, [expired])
 
         assert source.take().accounts[0].usage.sentinel == USAGE_TOKEN_EXPIRED
-        fake._accounts = [fresh_same_stamp]
+        fake._accounts = [still_expired]
         assert source.take(store_only=True).accounts[0].usage.sentinel == USAGE_TOKEN_EXPIRED
+        fake._accounts = [rotated]
+        assert source.take(store_only=True).accounts[0].usage.sentinel is None, (
+            "a warning outlived the generation it described"
+        )
         fake._accounts = [fresh_new_stamp]
         assert source.take(store_only=True).accounts[0].usage.sentinel is None
 
