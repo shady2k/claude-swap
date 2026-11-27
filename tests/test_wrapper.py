@@ -403,6 +403,37 @@ class TestWrapperCommands:
         if not on_path:
             assert self.profile.read_bytes() == b""
 
+    def test_custom_dir_ignores_a_path_entry_it_cannot_stat(
+        self, temp_home, tmp_path, monkeypatch, capsys
+    ):
+        """A PATH entry below a plain file raises ENOTDIR, not ENOENT; it is
+        not the directory being installed into, so the profile gets the block."""
+        plain_file = tmp_path / "plain-file"
+        plain_file.write_text("a file, not a directory")
+        monkeypatch.setenv(
+            "PATH", os.pathsep.join([f"{plain_file}/bin", str(self.real.parent)])
+        )
+        custom = temp_home / "custom"
+
+        self.run_command(monkeypatch, "install", "--dir", str(custom))
+
+        assert (custom / "claude").is_symlink()
+        assert b"export PATH=" in self.profile.read_bytes()
+
+    def test_an_empty_path_does_not_mean_the_current_directory(
+        self, temp_home, tmp_path, monkeypatch, capsys
+    ):
+        """PATH="" searches nothing; the directory cswap runs in is not on it."""
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)
+        monkeypatch.setenv("PATH", "")
+        monkeypatch.setenv("CSWAP_CLAUDE_BIN", str(self.real))
+
+        self.run_command(monkeypatch, "install", "--dir", ".")
+
+        assert b"export PATH=" in self.profile.read_bytes()
+
     @pytest.mark.parametrize("action", ["install", "uninstall"])
     @pytest.mark.parametrize("kind", ["file", "binary", "dangling", "fifo"])
     def test_refuses_to_touch_foreign_target(self, action, kind, monkeypatch, capsys):

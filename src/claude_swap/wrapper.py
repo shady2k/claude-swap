@@ -46,7 +46,7 @@ from pathlib import Path
 
 from claude_swap import paths
 from claude_swap.exceptions import ConfigError
-from claude_swap.fsutil import atomic_write_bytes, atomic_write_text, same_path
+from claude_swap.fsutil import atomic_write_bytes, atomic_write_text
 from claude_swap.locking import FileLock
 
 #: The shipped script. ``cswap wrapper`` prints this; the wheel carries it.
@@ -112,7 +112,28 @@ def _directory(directory: str | Path | None = None) -> Path:
 
 
 def _path_dirs() -> list[Path]:
+    # An empty PATH searches nothing. ``os.get_exec_path`` answers it with
+    # ``[""]``, which would become the current directory: a wrapper in the
+    # directory cswap happens to run in would look installed.
+    if os.environ.get("PATH") == "":
+        return []
     return [Path(os.path.expanduser(entry)) for entry in os.get_exec_path()]
+
+
+def _same_directory(left: Path, right: Path) -> bool:
+    """Whether ``left`` is the directory ``right``.
+
+    ``os.path.samefile`` raises when either side cannot be stat'ed: a PATH
+    entry below a plain file (``ENOTDIR``), a directory we may not enter,
+    a looping symlink. Such an entry is not this directory, so the answer is
+    ``False``. ``fsutil.same_path`` is not used here because it answers
+    ``True`` on an unreadable path, which would skip the profile edit for a
+    directory that is not on PATH at all.
+    """
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        return False
 
 
 def needs_setup(*, for_add: bool = False) -> bool:
@@ -284,7 +305,7 @@ def install(directory: str | Path | None = None) -> str:
         profile = _PROFILES.get(shell)
         canonical = os.path.realpath(target.parent)
         on_path = any(
-            os.path.realpath(entry) == canonical or same_path(entry, target.parent)
+            os.path.realpath(entry) == canonical or _same_directory(entry, target.parent)
             for entry in _path_dirs()
         )
         manage_path = directory is None or not on_path

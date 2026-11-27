@@ -949,6 +949,47 @@ class TestDashboard:
             assert not link.exists()
             assert "Wrapper is not installed" in menu_text()
 
+    async def test_leaving_the_wrapper_menu_during_setup_keeps_the_root_menu(
+        self, temp_home, tmp_path, monkeypatch
+    ):
+        """Setup runs in a thread and the menu stays usable: Esc while it
+        waits must leave the root menu in place, not become the submenu."""
+        if sys.platform == "win32":
+            pytest.skip("the wrapper is installed on Linux and macOS only")
+        from textual.widgets import ListView
+
+        from claude_swap import wrapper
+        from claude_swap.tui.widgets import MenuItem
+
+        real = tmp_path / "claude"
+        real.write_text("#!/bin/sh\nexit 0\n")
+        real.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        monkeypatch.setenv("SHELL", "/bin/bash")
+        monkeypatch.delenv("CSWAP_CLAUDE_BIN", raising=False)
+        app = make_app(FakeSwitcher([make_account(1, active=True)], tmp_path))
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            dashboard = app.screen
+            await menu_select(pilot, "wrapper-menu")
+            loop = asyncio.get_running_loop()
+
+            def install_while_the_user_leaves() -> str:
+                future = asyncio.run_coroutine_threadsafe(
+                    dashboard._pop_menu(), loop
+                )
+                assert future.result(5) is None
+                return "Installed."
+
+            monkeypatch.setattr(wrapper, "install", install_while_the_user_leaves)
+            await menu_select(pilot, "wrapper-install")
+
+            assert [title for title, _ in dashboard._menu_stack] == ["menu"]
+            menu = app.screen.query_one("#menu", ListView)
+            ids = [item.action_id for item in menu.query(MenuItem)]
+            assert ids[0] == "switch"
+            assert "wrapper-menu" in ids
+
     async def test_remove_menu_shows_alias_before_email(self, tmp_path):
         fake = FakeSwitcher(
             [

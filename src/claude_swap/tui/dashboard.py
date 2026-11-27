@@ -147,6 +147,18 @@ class DashboardScreen(Screen):
             _BACK,
         ]
 
+    async def _refresh_wrapper_menu(self) -> None:
+        """Redraw the submenu after setup, unless the user already left it.
+
+        The setup runs in a thread while the menu stays usable, so Esc can
+        close the submenu before it returns; writing ``_menu_stack[-1]`` then
+        would relabel the root menu and leave Esc with nothing to go back to.
+        """
+        if not self._menu_stack or self._menu_stack[-1][0] != "claude wrapper":
+            return
+        self._menu_stack[-1] = ("claude wrapper", await self._wrapper_entries())
+        await self._render_menu()
+
     async def _push_menu(self, title: str, entries: MenuEntries) -> None:
         self._menu_stack.append((title, entries))
         await self._render_menu()
@@ -211,8 +223,7 @@ class DashboardScreen(Screen):
                 app.notify(message)
             except (ClaudeSwitchError, OSError) as exc:
                 app.notify(str(exc), severity="error")
-            self._menu_stack[-1] = ("claude wrapper", await self._wrapper_entries())
-            await self._render_menu()
+            await self._refresh_wrapper_menu()
         elif action_id == "wrapper-info":
             return
         elif action_id.startswith("theme:"):
