@@ -1465,7 +1465,8 @@ class TestSessionProfileDisplay:
             snapshot = switcher.accounts_snapshot(fetch=set())
 
         for out in (listed, status):
-            assert "token expired" in out
+            assert "refresh at the next Claude Code launch" in out
+            assert "token expired" not in out
             assert "re-login needed" not in out
 
         active = snapshot.accounts[0]
@@ -1473,7 +1474,8 @@ class TestSessionProfileDisplay:
         from claude_swap.tui.widgets import account_card_text
 
         card = account_card_text(active, 100).plain
-        assert "token expired" in card and "⚠" not in card
+        assert "refresh at the next Claude Code launch" in card
+        assert "token expired" not in card and "⚠" not in card
 
     def test_invalid_grant_on_the_current_generation_keeps_the_warning(
         self, temp_home: Path, sample_sequence_data: dict, capsys

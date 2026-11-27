@@ -125,6 +125,19 @@ def _setup(temp_home: Path, sample_sequence_data: dict):
     return switcher, backup_expired, candidate_fresh
 
 
+def _setup_healthy(temp_home: Path, sample_sequence_data: dict):
+    """Both slots have fresh backups AND fresh profiles, with a fresh cache."""
+    switcher, _backup, _candidate = _setup(temp_home, sample_sequence_data)
+    for num, email, token in (
+        ("1", "a1@example.com", "sk-backup-1"),
+        ("2", "a2@example.com", "sk-backup-2"),
+    ):
+        _write_slot(switcher, num, email, _creds(token, 7200))
+        _write_profile(switcher, num, email, _creds(token + "-profile", 7200))
+    _seed_cache(switcher)
+    return switcher
+
+
 def _no_network():
     return patch(
         "claude_swap.oauth.try_fetch_usage_for_account",
@@ -261,6 +274,35 @@ def test_a_rotated_profile_clears_a_carried_token_expired_warning(
         assert active.usage.sentinel is None
         assert active.usage.decision_value()["five_hour"]["pct"] == 81.0
         assert active.token_expired is False
+
+
+def test_a_healthy_display_pass_reads_no_session_profiles(
+    temp_home: Path, sample_sequence_data: dict
+):
+    """Display gating: a healthy stored copy makes the profile's state
+    irrelevant, so a repaint must not read N profiles (macOS Keychain spawns)."""
+    from claude_swap import session as session_mod
+
+    switcher = _setup_healthy(temp_home, sample_sequence_data)
+    real = session_mod.read_session_credentials
+    calls: list[Path] = []
+
+    def counted(path):
+        calls.append(path)
+        return real(path)
+
+    with patch.object(session_mod, "read_session_credentials", side_effect=counted), \
+         _no_network():
+        switcher.accounts_snapshot(fetch=set())
+        menu_calls = len(calls)
+        calls.clear()
+        switcher.list_accounts()
+        list_calls = len(calls)
+        calls.clear()
+        switcher.status()
+        status_calls = len(calls)
+
+    assert (menu_calls, list_calls, status_calls) == (0, 0, 0)
 
 
 def test_the_tui_merge_does_not_restore_a_cleared_warning():

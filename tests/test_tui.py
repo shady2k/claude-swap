@@ -309,7 +309,7 @@ class TestFormatting:
         # active account, not that the user must re-login.
         assert (
             tui_data.sentinel_label(USAGE_TOKEN_EXPIRED)
-            == "token expired — refresh deferred this pass; retries automatically"
+            == "refresh at the next Claude Code launch"
         )
         from claude_swap.switcher import SENTINEL_NOTES
 
@@ -330,11 +330,12 @@ class TestFormatting:
             age_s=720.0,
         )
         card = account_card_text(make_account(1, active=True, entry=entry), 80).plain
-        assert "token expired — refresh deferred this pass; retries automatically" in card
+        assert "refresh at the next Claude Code launch" in card
         assert "last seen 53% used" in card
         # An expired access token is refreshed on the next launch: a dot,
         # never the warning glyph that a dead login carries.
-        assert "· token expired" in card and "⚠" not in card
+        assert "· refresh at the next Claude Code launch" in card
+        assert "token expired" not in card and "⚠" not in card
 
         no_history = account_card_text(
             make_account(1, entry=UsageEntry(sentinel=USAGE_TOKEN_EXPIRED)), 80

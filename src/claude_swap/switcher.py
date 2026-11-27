@@ -348,7 +348,7 @@ _ROUTE_UNCONFIRMED = (
 )
 
 SENTINEL_NOTES = {
-    USAGE_TOKEN_EXPIRED: "token expired — refresh deferred this pass; retries automatically",
+    USAGE_TOKEN_EXPIRED: "refresh at the next Claude Code launch",
     USAGE_FOREIGN_CREDENTIAL: "live credential belongs to another account — a switch repairs it",
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
@@ -2657,7 +2657,7 @@ class ClaudeAccountSwitcher:
             n = str(num)
             if is_active:
                 active_number = n
-            display_creds = self._current_credential(num, email, org_uuid, creds)
+            display_creds = self._display_credential(num, email, org_uuid, creds)
             display_oauth = oauth.extract_oauth_data(display_creds) or {}
             accounts.append(
                 AccountSnapshot(
@@ -4206,6 +4206,33 @@ class ClaudeAccountSwitcher:
             str(account_num), email, org_uuid, stored
         )
         return ahead or stored
+
+    def _display_credential(
+        self, account_num: str, email: str, org_uuid: str, stored: str
+    ) -> str:
+        """The credential a display row reads its state from, read-only.
+
+        The state of a healthy stored copy cannot be changed by a newer
+        profile: generations are ordered by access-token expiry, so a newer
+        one expires later. Only ``loginExpiresAt`` can differ, and the row
+        needs it only once the stored login is inside the re-login window.
+        So the shared generation decision is consulted only when the stored
+        copy itself asks for attention — an expired access token or a due
+        login. This is what keeps a TUI repaint from reading every profile
+        (a Keychain spawn per account on macOS) when nothing would change.
+        """
+        if not stored or looks_like_api_key(stored):
+            return stored
+        oauth_data = oauth.extract_oauth_data(stored) or {}
+        due = oauth.is_oauth_token_expired(oauth_data.get("expiresAt")) or (
+            oauth.login_time_left(
+                oauth.login_expires_at_epoch(stored), quarantined=False
+            )
+            is not None
+        )
+        if not due:
+            return stored
+        return self._current_credential(account_num, email, org_uuid, stored)
 
     def _adopt_session_credential(
         self, account_num: str, email: str, org_uuid: str
@@ -8375,7 +8402,7 @@ class ClaudeAccountSwitcher:
                 active_num = num
             entry = entries[str(num)]
             record = (seq_data.get("accounts") or {}).get(str(num))
-            display_creds = self._current_credential(num, email, org_uuid, creds)
+            display_creds = self._display_credential(num, email, org_uuid, creds)
             # JSON carries the decision-grade value: last-good only while it is
             # recent enough to act on (≤ STALE_OK_S), else unavailable. Showing
             # older measurements is a human-display affordance only — scripts
@@ -8475,7 +8502,7 @@ class ClaudeAccountSwitcher:
                 markers += f" {muted('(disabled)')}"
             markers += _plan_marker(plans.get(str(num)), self._usage_store.clock())
             print(f"  {num}: {label}{tag}{markers}")
-            display_creds = self._current_credential(num, email, org_uuid, creds)
+            display_creds = self._display_credential(num, email, org_uuid, creds)
             login_expires_at = oauth.login_expires_at_epoch(display_creds)
             for line in _usage_entry_lines(entries[str(num)], login_expires_at):
                 print(f"     {line}")
@@ -8554,7 +8581,7 @@ class ClaudeAccountSwitcher:
         """
         num, email, _org_name, org_uuid, _is_active, creds, _alias, _route = row
         entry = self._collect_usage_entries([row])[str(num)]
-        display_creds = self._current_credential(num, email, org_uuid, creds)
+        display_creds = self._display_credential(num, email, org_uuid, creds)
         return entry, oauth.login_expires_at_epoch(display_creds)
 
     def _active_snapshot_row(self) -> "AccountInfo | None":
