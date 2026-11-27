@@ -604,7 +604,8 @@ class TestSmartInstallDirectory:
         assert link.is_symlink() and link.resolve() == wrapper.WRAPPER_PATH.resolve()
         assert message == (
             f"Installed at {link}."
-            " If you already ran 'claude' in this shell, run 'hash -r'."
+            " If you already ran 'claude' in this shell, run 'hash -r' (Bash)"
+            " or 'rehash' (Zsh)."
         )
         assert all(not profile.exists() for profile in self.profiles(self.home))
         assert wrapper.is_wrapper(shutil.which("claude"))
@@ -669,7 +670,31 @@ class TestSmartInstallDirectory:
         assert b"export PATH=" in self.profile.read_bytes()
         assert "Open a new shell" in message
 
-    def test_a_zsh_shell_is_told_to_rehash(self, monkeypatch):
+    @pytest.mark.parametrize("exists", [True, False])
+    def test_a_local_bin_behind_a_missing_directory_falls_back(
+        self, exists, monkeypatch
+    ):
+        """`$HOME/.local/gone/../bin` collapses to `~/.local/bin` lexically,
+        but a lookup through it answers ENOENT while `gone` is missing, so
+        the OS never resolves `claude` there and the private directory is
+        used, whether `~/.local/bin` exists yet or not."""
+        self.local_bin.parent.mkdir(parents=True)
+        if exists:
+            self.local_bin.mkdir()
+        broken = self.local_bin.parent / "gone" / ".." / "bin"
+        self.set_path(monkeypatch, broken, self.real.parent)
+
+        message = wrapper.install()
+
+        assert (self.fallback / "claude").is_symlink()
+        assert not os.path.lexists(self.local_bin / "claude")
+        assert b"export PATH=" in self.profile.read_bytes()
+        assert "Open a new shell" in message
+        assert "do not read your shell profile" in message
+
+    def test_the_shell_cache_advice_names_both_shells(self, monkeypatch):
+        """The hint follows the shell that will run it, not `$SHELL`: a Bash
+        started from Zsh still needs `hash -r`."""
         monkeypatch.setenv("SHELL", "/usr/bin/zsh")
         self.set_path(monkeypatch, self.local_bin, self.real.parent)
 
@@ -677,7 +702,8 @@ class TestSmartInstallDirectory:
 
         assert message == (
             f"Installed at {self.local_bin / 'claude'}."
-            " If you already ran 'claude' in this shell, run 'rehash'."
+            " If you already ran 'claude' in this shell, run 'hash -r' (Bash)"
+            " or 'rehash' (Zsh)."
         )
         assert not (self.home / ".zshrc").exists()
 
@@ -751,3 +777,13 @@ class TestSmartInstallDirectory:
         assert wrapper.is_wrapper(custom / "claude")
 
         assert wrapper.needs_setup(for_add=True)
+
+    def test_only_the_standard_directories_are_standard(self, monkeypatch, tmp_path):
+        """The TUI asks this before choosing an uninstall target, so a custom
+        `--dir` must not be mistaken for one of the two standard places."""
+        self.set_path(monkeypatch, self.real.parent)
+        wrapper.install(tmp_path / "custom")
+
+        assert wrapper.is_standard_directory(self.local_bin)
+        assert wrapper.is_standard_directory(self.fallback)
+        assert not wrapper.is_standard_directory(tmp_path / "custom")

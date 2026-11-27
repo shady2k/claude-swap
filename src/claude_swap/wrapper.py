@@ -36,10 +36,10 @@ already comes before the real Claude Code on ``PATH`` and its ``claude`` is
 free: the symlink is active in the running session and visible to background
 services and IDEs that never read a shell profile, and no profile is edited.
 A shell that already resolved the real ``claude`` keeps it cached until
-``hash -r`` (Bash) or ``rehash`` (Zsh), so the message names the one for
-``$SHELL``. Every other case falls back to the private
-``~/.local/claude-swap/bin`` and the marked profile block, which is what an
-install always did.
+``hash -r`` (Bash) or ``rehash`` (Zsh), so the message names both: the shell
+that runs cswap need not be the one ``$SHELL`` names. Every other case falls
+back to the private ``~/.local/claude-swap/bin`` and the marked profile block,
+which is what an install always did.
 """
 
 from __future__ import annotations
@@ -161,11 +161,56 @@ def _same_directory(left: Path, right: Path) -> bool:
         return False
 
 
+def is_standard_directory(directory: str | os.PathLike[str]) -> bool:
+    """Whether ``directory`` is one of the two places an install uses.
+
+    ``uninstall()`` without an argument cleans both, so a caller holding a
+    path can tell whether a removal aimed at it would leave the other one
+    launching ``claude``. A standard directory that does not exist yet is
+    still answered, since the comparison falls back to the resolved paths.
+    """
+    real = os.path.realpath(directory)
+    return any(
+        real == os.path.realpath(candidate)
+        or _same_directory(Path(directory), candidate)
+        for candidate in _standard_directories()
+    )
+
+
+def _entry_reaches(entry: Path) -> bool:
+    """Whether every ``..`` in a PATH entry follows a directory that exists.
+
+    ``realpath`` removes a ``..`` without asking the OS, so
+    ``~/.local/gone/../bin`` looks like ``~/.local/bin`` although a lookup
+    through it answers ``ENOENT``. For a directory an install is about to
+    create, this is the only way to tell an entry that will reach it from one
+    that will not.
+    """
+    parts = entry.parts
+    for index, part in enumerate(parts):
+        if part != os.pardir:
+            continue
+        if not os.path.isdir(Path(*parts[:index])):
+            return False
+    return True
+
+
 def _directory_index(directory: Path, dirs: list[Path]) -> int | None:
-    """The first ``dirs`` entry that is ``directory``, following symlinks."""
+    """The first ``dirs`` entry that the OS resolves to ``directory``.
+
+    An existing directory is compared with ``samefile``, which asks the OS.
+    One an install is about to create cannot be compared that way yet, so the
+    lexical answer is taken only when the entry's own ``..`` segments resolve,
+    or a PATH entry through a missing directory would look like it reaches it.
+    """
+    if os.path.lexists(directory):
+        for index, entry in enumerate(dirs):
+            if _same_directory(entry, directory):
+                return index
+        return None
     canonical = os.path.realpath(directory)
     for index, entry in enumerate(dirs):
-        if os.path.realpath(entry) == canonical or _same_directory(entry, directory):
+        if os.path.realpath(entry) == canonical and _entry_reaches(entry):
             return index
     return None
 
@@ -445,10 +490,13 @@ def install(directory: str | Path | None = None) -> str:
     if smart:
         # The shell keeps the path it resolved a command to. A `claude` run
         # before this install is still the real binary until the cache is
-        # dropped, even though `claude` now resolves to the wrapper.
-        reset = {"bash": "hash -r", "zsh": "rehash"}.get(shell)
-        if reset is not None:
-            message += f" If you already ran 'claude' in this shell, run '{reset}'."
+        # dropped, even though `claude` now resolves to the wrapper. Both
+        # commands are named: the shell running cswap need not be the one
+        # `$SHELL` names.
+        message += (
+            " If you already ran 'claude' in this shell, run 'hash -r' (Bash)"
+            " or 'rehash' (Zsh)."
+        )
     if manage_path and profile is None:
         return f"{message} Add this to your shell's PATH setup: {_path_line(target.parent, shell)}"
     if needs_setup():
