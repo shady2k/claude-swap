@@ -332,6 +332,9 @@ class TestFormatting:
         card = account_card_text(make_account(1, active=True, entry=entry), 80).plain
         assert "token expired — refresh deferred this pass; retries automatically" in card
         assert "last seen 53% used" in card
+        # An expired access token is refreshed on the next launch: a dot,
+        # never the warning glyph that a dead login carries.
+        assert "· token expired" in card and "⚠" not in card
 
         no_history = account_card_text(
             make_account(1, entry=UsageEntry(sentinel=USAGE_TOKEN_EXPIRED)), 80

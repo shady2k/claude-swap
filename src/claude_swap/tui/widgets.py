@@ -16,7 +16,11 @@ from rich.text import Text
 from textual.widgets import ListItem, Static
 
 from claude_swap import oauth, pace, subscription
-from claude_swap.json_output import USAGE_API_KEY, USAGE_RELOGIN_REQUIRED
+from claude_swap.json_output import (
+    USAGE_API_KEY,
+    USAGE_RELOGIN_REQUIRED,
+    USAGE_TOKEN_EXPIRED,
+)
 from claude_swap.models import AccountSnapshot
 from claude_swap.oauth import FIVE_HOUR_LABEL
 from claude_swap.printer import format_age
@@ -27,6 +31,11 @@ from claude_swap.tui.theme import Palette
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
+
+# Informational sentinel states: an API-key account has no quota, and an
+# expired access token is refreshed by Claude Code on its next launch. Their
+# TUI marker is a dot, never the warning glyph.
+_NEUTRAL_SENTINELS = (USAGE_API_KEY, USAGE_TOKEN_EXPIRED)
 
 _BAR_FILLED = "━"
 _BAR_HALF = "╸"
@@ -288,8 +297,9 @@ def account_card_text(
     sentinel = acc.usage.sentinel
     if sentinel is not None:
         text.append("\n    ")
-        style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
-        marker = "·" if sentinel == USAGE_API_KEY else "⚠"
+        neutral = sentinel in _NEUTRAL_SENTINELS
+        style = palette.muted if neutral else palette.sev_warn
+        marker = "·" if neutral else "⚠"
         text.append(f"{marker} {data.sentinel_label(sentinel)}", style=style)
         # Same supplementary line `cswap list` prints: the last good
         # measurement behind the sentinel (API-key accounts have no quota to
@@ -395,7 +405,11 @@ def mini_account_text(
 
     sentinel = acc.usage.sentinel
     if sentinel is not None:
-        style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
+        style = (
+            palette.muted
+            if sentinel in _NEUTRAL_SENTINELS
+            else palette.sev_warn
+        )
         text.append(data.sentinel_label(sentinel), style=style)
         return _end_mini(text, acc, login, now, palette)
 

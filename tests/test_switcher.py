@@ -1308,6 +1308,226 @@ class TestFetchAccountUsageSessionProfile:
         assert kwargs.get("is_active") is True
 
 
+class TestSessionProfileDisplay:
+    """Displays read the slot's current generation: a session profile that
+    rotated past the backup, not the backup it superseded.
+
+    The profile is read for the row and never promoted into the backup here;
+    adoption stays on the fetch path and needs a quiescent profile.
+    """
+
+    def _switcher(
+        self, temp_home: Path, sample_sequence_data: dict
+    ) -> ClaudeAccountSwitcher:
+        sample_sequence_data["activeAccountNumber"] = 1
+        sample_sequence_data["accounts"]["1"]["email"] = "a1@example.com"
+        sample_sequence_data["accounts"]["2"]["email"] = "a2@example.com"
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        return switcher
+
+    @staticmethod
+    def _creds(token: str, access_in: float, login_in: float) -> str:
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": token,
+            "refreshToken": f"rt-{token}",
+            "expiresAt": int((time.time() + access_in) * 1000),
+            "refreshTokenExpiresAt": int((time.time() + login_in) * 1000),
+        }})
+
+    @staticmethod
+    def _write_profile(
+        switcher: ClaudeAccountSwitcher, num: str, email: str, creds: str
+    ) -> None:
+        session_dir = switcher._session_dir(num, email)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text(creds)
+        (session_dir / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": email, "organizationUuid": ""}
+        }))
+
+    @staticmethod
+    def _seed_usage(switcher: ClaudeAccountSwitcher) -> None:
+        """Fresh readings, so the planner skips the request this pass."""
+        switcher._usage_store.record(
+            {
+                "1": FetchRecord(usage={
+                    "five_hour": {"pct": 10.0},
+                    "seven_day": {"pct": 20.0},
+                }),
+                "2": FetchRecord(usage={
+                    "five_hour": {"pct": 30.0},
+                    "seven_day": {"pct": 40.0},
+                }),
+            },
+            {"1": ("a1@example.com", ""), "2": ("a2@example.com", "")},
+        )
+
+    def test_newer_profile_is_shown_when_the_planner_skips_the_request(
+        self, temp_home: Path, sample_sequence_data: dict, capsys
+    ):
+        """An expired backup must not shadow the profile's state or quota.
+
+        Both rows are served from the store (a scheduler-skipped pass), so the
+        backup's expired access token and lapsed login are the only sources
+        the old display had — and they are not this slot's current generation.
+        """
+        switcher = self._switcher(temp_home, sample_sequence_data)
+        backups = {
+            "1": self._creds("sk-backup-1", -3600, -3600),
+            "2": self._creds("sk-backup-2", -3600, -3600),
+        }
+        profiles = {
+            "1": self._creds("sk-profile-1", 7200, 30 * 86400),
+            "2": self._creds("sk-profile-2", 7200, 30 * 86400),
+        }
+        for num, email in (("1", "a1@example.com"), ("2", "a2@example.com")):
+            switcher._write_account_credentials(num, email, backups[num])
+            self._write_profile(switcher, num, email, profiles[num])
+        self._seed_usage(switcher)
+
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            side_effect=AssertionError("the planner skipped this pass"),
+        ):
+            switcher.list_accounts()
+            listed = capsys.readouterr().out
+            switcher.status()
+            status = capsys.readouterr().out
+            payload = switcher.list_accounts(json_output=True)
+
+        for out in (listed, status):
+            assert "re-login needed" not in out
+            assert "token expired" not in out
+            assert "login:" not in out
+            assert "5h:" in out and "7d:" in out
+
+        rows = {row["number"]: row for row in payload["accounts"]}
+        assert rows[1]["usageStatus"] == "ok"
+        assert rows[1]["loginExpiresAt"] == oauth.login_expires_at_iso(profiles["1"])
+
+    def test_a_strike_on_the_superseded_backup_heals_behind_the_profile(
+        self, temp_home: Path, sample_sequence_data: dict, capsys
+    ):
+        """invalid_grant condemned the backup; the profile is the generation
+        the slot uses now, so the row must not keep saying re-login."""
+        switcher = self._switcher(temp_home, sample_sequence_data)
+        backup = self._creds("sk-backup-1", -3600, 30 * 86400)
+        profile = self._creds("sk-profile-1", 7200, 30 * 86400)
+        switcher._write_account_credentials("1", "a1@example.com", backup)
+        self._write_profile(switcher, "1", "a1@example.com", profile)
+        self._seed_usage(switcher)
+        switcher._usage_store.record(
+            {"1": FetchRecord(
+                error="invalid_grant",
+                struck_fp=oauth.credential_fingerprint(backup),
+            )},
+            {"1": ("a1@example.com", "")},
+        )
+
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            side_effect=AssertionError("the planner skipped this pass"),
+        ):
+            switcher.list_accounts()
+            listed = capsys.readouterr().out
+
+        assert "re-login needed" not in listed
+        assert "5h:" in listed
+
+    def test_both_copies_expired_is_a_refresh_line_without_a_warning_marker(
+        self, temp_home: Path, sample_sequence_data: dict, capsys
+    ):
+        """Profile and backup expired with Claude Code idle: the next launch
+        refreshes the token, which is information, not a warning."""
+        switcher = self._switcher(temp_home, sample_sequence_data)
+        backups = {
+            "1": self._creds("sk-backup-1", -7200, 30 * 86400),
+            "2": self._creds("sk-backup-2", 7200, 30 * 86400),
+        }
+        profiles = {
+            "1": self._creds("sk-profile-1", -3600, 30 * 86400),
+        }
+        switcher._write_account_credentials("1", "a1@example.com", backups["1"])
+        switcher._write_account_credentials("2", "a2@example.com", backups["2"])
+        self._write_profile(switcher, "1", "a1@example.com", profiles["1"])
+        self._seed_usage(switcher)
+
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            side_effect=AssertionError("the planner skipped this pass"),
+        ):
+            switcher.list_accounts()
+            listed = capsys.readouterr().out
+            switcher.status()
+            status = capsys.readouterr().out
+            snapshot = switcher.accounts_snapshot(fetch=set())
+
+        for out in (listed, status):
+            assert "token expired" in out
+            assert "re-login needed" not in out
+
+        active = snapshot.accounts[0]
+        assert active.usage.sentinel == USAGE_TOKEN_EXPIRED
+        from claude_swap.tui.widgets import account_card_text
+
+        card = account_card_text(active, 100).plain
+        assert "token expired" in card and "⚠" not in card
+
+    def test_invalid_grant_on_the_current_generation_keeps_the_warning(
+        self, temp_home: Path, sample_sequence_data: dict, capsys
+    ):
+        """A refused grant for the profile generation is the actual token's
+        death, so both CLI outputs must keep the re-login warning."""
+        switcher = self._switcher(temp_home, sample_sequence_data)
+        backup = self._creds("sk-backup-1", -3600, 30 * 86400)
+        profile = self._creds("sk-profile-1", 7200, 30 * 86400)
+        switcher._write_account_credentials("1", "a1@example.com", backup)
+        self._write_profile(switcher, "1", "a1@example.com", profile)
+        self._seed_usage(switcher)
+        switcher._usage_store.record(
+            {"1": FetchRecord(
+                error="invalid_grant",
+                struck_fp=oauth.credential_fingerprint(profile),
+            )},
+            {"1": ("a1@example.com", "")},
+        )
+
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            side_effect=AssertionError("a quarantined slot sends no request"),
+        ):
+            switcher.list_accounts()
+            listed = capsys.readouterr().out
+            switcher.status()
+            status = capsys.readouterr().out
+
+        assert "re-login needed" in listed
+        assert "re-login needed" in status
+
+    def test_a_credential_read_error_stays_visible_behind_a_healthy_profile(
+        self, temp_home: Path, sample_sequence_data: dict, capsys
+    ):
+        """An unreadable backup is not permission to show the profile: the
+        row keeps its keychain-unavailable state."""
+        switcher = self._switcher(temp_home, sample_sequence_data)
+        profile = self._creds("sk-profile-1", 7200, 30 * 86400)
+        self._write_profile(switcher, "1", "a1@example.com", profile)
+        self._seed_usage(switcher)
+
+        with patch.object(switcher, "_read_account_credentials", return_value=""), \
+             patch.object(
+                 switcher, "_read_account_credentials_ex", return_value=("", True)
+             ), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as fetch:
+            switcher.list_accounts()
+            listed = capsys.readouterr().out
+
+        assert "keychain unavailable" in listed
+        fetch.assert_not_called()
+
+
 class TestSetupTokenHeaderProbeWiring:
     """``usage.headerProbe`` reaches every fetch, and a probed setup-token
     account is paced by the store like any other fetch."""

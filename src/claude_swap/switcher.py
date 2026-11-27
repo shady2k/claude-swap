@@ -2669,7 +2669,9 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
-                    login_expires_at=oauth.login_expires_at_epoch(creds),
+                    login_expires_at=oauth.login_expires_at_epoch(
+                        self._display_credential(num, email, org_uuid, creds)
+                    ),
                     policy=self._policy_from_data(seq_data, n),
                     subscription_plan=plans.get(n),
                 )
@@ -4129,6 +4131,26 @@ class ClaudeAccountSwitcher:
         the switch guard stays on its safe side; the adopting write, which
         needs positive evidence, checks the identity itself.
         """
+        backup, unreadable = self._read_account_credentials_ex(account_num, email)
+        if unreadable:
+            return None
+        return self._session_profile_newer_than(
+            account_num, email, org_uuid, backup
+        )
+
+    def _session_profile_newer_than(
+        self, account_num: str, email: str, org_uuid: str, backup: str
+    ) -> str | None:
+        """The profile's credential when it is a newer generation than
+        ``backup``, else None.
+
+        The comparison half of ``_session_profile_ahead``, for callers that
+        already hold their copy of the backup — a display row's cached read,
+        or the strike scan's fresh one — and must not trigger another backup
+        read. Same rules: a stale-marked, drifted, same-generation or
+        unreadable profile answers None, and only a later access-token issue
+        time counts as newer.
+        """
         from claude_swap.session import (
             is_session_stale,
             read_session_credentials,
@@ -4140,9 +4162,6 @@ class ClaudeAccountSwitcher:
             return None
         profile = read_session_credentials(session_dir)
         if not profile or session_identity_drifted(session_dir, email, org_uuid):
-            return None
-        backup, unreadable = self._read_account_credentials_ex(account_num, email)
-        if unreadable:
             return None
         if oauth.credential_fingerprint(profile) == oauth.credential_fingerprint(
             backup
@@ -4157,6 +4176,54 @@ class ClaudeAccountSwitcher:
         except (TypeError, ValueError):
             return None
         return profile if newer else None
+
+    def _current_credential(
+        self, account_num: str, email: str, org_uuid: str, stored: str
+    ) -> str:
+        """The slot's current credential generation, read-only.
+
+        A session profile that rotated past the backup holds this account's
+        newest generation, so a display row that needs it follows the
+        profile's state, not the backup it superseded. A profile cswap cannot use
+        as this slot's current one — same generation, behind a re-login in
+        the backup, stale-marked, another account's, or unreadable — leaves
+        the stored backup as the truth, exactly as ``_session_profile_ahead``
+        decides. The caller's copy is the comparison point, so a display pass
+        triggers no extra backup read. Reads only: promoting the profile into
+        the backup belongs to the fetch path (``_adopt_session_credential``),
+        and a display pass must not write.
+        """
+        if not stored or looks_like_api_key(stored):
+            return stored
+        ahead = self._session_profile_newer_than(
+            str(account_num), email, org_uuid, stored
+        )
+        return ahead or stored
+
+    def _display_credential(
+        self, account_num: str, email: str, org_uuid: str, stored: str
+    ) -> str:
+        """The credential a display row reads its state from, read-only.
+
+        Only a stored copy whose own state is due — an expired access token,
+        or a login inside the re-login window — can produce a false warning,
+        so only then is the session profile consulted. In the common case the
+        stored backup is healthy and the row needs no profile read: the TUI
+        repaints every few seconds, and an unpaced Keychain read per account
+        per tick would defeat the backup read cache.
+        """
+        if not stored or looks_like_api_key(stored):
+            return stored
+        oauth_data = oauth.extract_oauth_data(stored) or {}
+        due = oauth.is_oauth_token_expired(oauth_data.get("expiresAt")) or (
+            oauth.login_time_left(
+                oauth.login_expires_at_epoch(stored), quarantined=False
+            )
+            is not None
+        )
+        if not due:
+            return stored
+        return self._current_credential(account_num, email, org_uuid, stored)
 
     def _adopt_session_credential(
         self, account_num: str, email: str, org_uuid: str
@@ -7547,7 +7614,7 @@ class ClaudeAccountSwitcher:
                 continue
             entry = entries[num]
             _i = info_by_num[num]
-            if self._entry_token_dead(entry, num, _i[1], _i[5], _i[4]):
+            if self._entry_token_dead(entry, num, _i[1], _i[5], _i[4], _i[3]):
                 sentinels[num] = USAGE_RELOGIN_REQUIRED
             elif entry.auth_dead_strikes and entry.token_dead():
                 # Struck, but no stored source still matches the condemned
@@ -7602,7 +7669,14 @@ class ClaudeAccountSwitcher:
                 # gap to idle-hold over. The fetch path refreshes the token
                 # once the hold lapses.
                 continue
-            active_oauth = oauth.extract_oauth_data(info[5])
+            # The row's CURRENT generation, not the backup it superseded: a
+            # session profile that rotated past an expired backup is still
+            # able to read the quota, and flagging the backup's expiry would
+            # hide that reading behind a false "token expired".
+            display_creds = self._display_credential(
+                num, info[1], info[3], info[5]
+            )
+            active_oauth = oauth.extract_oauth_data(display_creds)
             if active_oauth and oauth.is_oauth_token_expired(
                 active_oauth.get("expiresAt")
             ):
@@ -7629,7 +7703,7 @@ class ClaudeAccountSwitcher:
             for num in accepted:
                 _i = info_by_num[num]
                 if self._entry_token_dead(
-                    entries[num], num, _i[1], _i[5], _i[4]
+                    entries[num], num, _i[1], _i[5], _i[4], _i[3]
                 ):
                     sentinels[num] = USAGE_RELOGIN_REQUIRED
 
@@ -7680,7 +7754,7 @@ class ClaudeAccountSwitcher:
         # The stored source, as _build_accounts_info reports it: every slot's
         # backup.
         stored = backup
-        return self._entry_token_dead(entry, num, email, stored, is_active)
+        return self._entry_token_dead(entry, num, email, stored, is_active, org)
 
     def _entry_token_dead(
         self,
@@ -7689,50 +7763,63 @@ class ClaudeAccountSwitcher:
         email: str,
         stored: str,
         is_active: bool,
+        org_uuid: str = "",
     ) -> bool:
-        """Fingerprint-bound dead verdict against EVERY stored source.
+        """Fingerprint-bound dead verdict against the CURRENT generation.
 
-        For an idle slot ``info[5]`` is the backup, the only source a strike
-        can bind to. The ACTIVE slot has two stored sources — ``info[5]`` is
-        the LIVE credential, but ``_fetch_active_usage``'s recovery branch
-        legitimately POSTs (and binds the strike to) the slot BACKUP.
-        Comparing the strike only against the live bytes mis-heals it on
-        every pass whenever the two lineages differ — the strike/heal/re-POST
-        loop that keeps a dead backup out of quarantine forever. The strike
-        holds while ANY stored source still matches the struck generation.
+        A strike condemns the generation whose grant the server refused, so
+        the verdict follows the generation the slot would use now
+        (``_session_profile_newer_than``): a session profile that rotated
+        past the backup supersedes it. A strike on the superseded backup
+        therefore heals, and one on the profile holds: a confirmed
+        invalid_grant for the generation the slot uses now. The caller's
+        ``stored`` is its copy of the backup: a matching copy holds without
+        a read, and a cached one may over-hold but never heal.
 
-        Holding needs no read beyond the caller's ``stored``; HEALING always
-        re-reads the backup fresh, for idle slots too. ``stored`` may be a
-        display-cached backup (``_build_accounts_info`` reads with
-        ``cached=True``) and the caller spends a "healed" answer on
-        ``clear_dead_token`` — a persisted write that also lifts the backoff.
-        With the cache holding generation A while another process rotated
-        the slot to B and B was struck, a cached fingerprint "heals" B's
-        strike on every pass and each pass POSTs B's dead grant again. A
-        stale fingerprint may only ever over-hold; it must never heal. With
-        no strike at threshold there is nothing to bind, so nothing is read
-        at all (the active slot's backup used to be read on every pass for
-        this). ``is_active`` no longer changes the procedure; it stays for
-        the callers.
+        HEALING always needs a fresh read, and the caller spends a "healed"
+        answer on ``clear_dead_token`` — a persisted write that also lifts
+        the backoff. With another process rotating the slot, a stale
+        fingerprint would heal the new generation's strike on every pass and
+        each pass POSTs its dead grant again. So an unreadable source holds:
+        "no source matches" is unproven, and one momentary lock must not
+        un-quarantine a genuinely dead account permanently. With no strike
+        at threshold there is nothing to bind, so nothing is read at all.
+        A matching caller's copy holds without any read, unless a newer
+        profile supersedes it; it is never a source of healing. ``is_active``
+        stays for the callers and does not change the procedure.
         """
         if not entry.token_dead():
             return False
         if entry.token_dead(stored_fp=oauth.credential_fingerprint(stored)):
-            return True
+            # A matching cached copy holds with no read at all, unless a
+            # newer session profile supersedes it; then the profile is the
+            # generation the strike is judged against.
+            profile = self._session_profile_newer_than(
+                num, email, org_uuid, stored
+            )
+            if profile is None:
+                return True
+            return entry.token_dead(
+                stored_fp=oauth.credential_fingerprint(profile)
+            )
         backup, unreadable = self._read_account_credentials_ex(num, email)
         if unreadable:
             # The source that could still carry the struck generation cannot
-            # be seen, so "no stored source matches" is unproven — and the
-            # caller's `elif` spends that answer on `clear_dead_token`, which
-            # zeroes authDeadStrikes AND struckFingerprint in the PERSISTED
-            # store. One momentary lock would un-quarantine a genuinely dead
-            # account permanently and resume POSTing its dead grant. Holding
-            # the strike costs one pass of "re-login needed" on a row that
+            # be seen, so "no source matches" is unproven — and the caller's
+            # `elif` spends that answer on `clear_dead_token`, which zeroes
+            # authDeadStrikes AND struckFingerprint in the PERSISTED store.
+            # One momentary lock would un-quarantine a genuinely dead account
+            # permanently and resume POSTing its dead grant. Holding the
+            # strike costs one pass of "re-login needed" on a row that
             # already took AUTH_DEAD_STRIKES invalid_grants; erasing it costs
             # the quarantine itself.
             return True
-        return bool(backup) and entry.token_dead(
-            stored_fp=oauth.credential_fingerprint(backup)
+        current = (
+            self._session_profile_newer_than(num, email, org_uuid, backup)
+            or backup
+        )
+        return bool(current) and entry.token_dead(
+            stored_fp=oauth.credential_fingerprint(current)
         )
 
     def _plans_after_fetch(
@@ -8302,6 +8389,7 @@ class ClaudeAccountSwitcher:
                 active_num = num
             entry = entries[str(num)]
             record = (seq_data.get("accounts") or {}).get(str(num))
+            display_creds = self._display_credential(num, email, org_uuid, creds)
             # JSON carries the decision-grade value: last-good only while it is
             # recent enough to act on (≤ STALE_OK_S), else unavailable. Showing
             # older measurements is a human-display affordance only — scripts
@@ -8320,7 +8408,7 @@ class ClaudeAccountSwitcher:
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
                     policy=self._policy_from_data(seq_data, str(num)),
-                    login_expires_at=oauth.login_expires_at_iso(creds),
+                    login_expires_at=oauth.login_expires_at_iso(display_creds),
                     subscription_plan=(plans or {}).get(str(num)),
                     proxy=account_proxy.describe(record) or "",
                     expected=egress.json_fields(record),
@@ -8401,7 +8489,8 @@ class ClaudeAccountSwitcher:
                 markers += f" {muted('(disabled)')}"
             markers += _plan_marker(plans.get(str(num)), self._usage_store.clock())
             print(f"  {num}: {label}{tag}{markers}")
-            login_expires_at = oauth.login_expires_at_epoch(creds)
+            display_creds = self._display_credential(num, email, org_uuid, creds)
+            login_expires_at = oauth.login_expires_at_epoch(display_creds)
             for line in _usage_entry_lines(entries[str(num)], login_expires_at):
                 print(f"     {line}")
             expectation = egress.describe(
@@ -8477,9 +8566,10 @@ class ClaudeAccountSwitcher:
         the slot a second time from a fresh registry is what let a `move`
         between the two reads send this token through a direct route.
         """
-        num, _email, _org_name, _org_uuid, _is_active, creds, _alias, _route = row
+        num, email, _org_name, org_uuid, _is_active, creds, _alias, _route = row
         entry = self._collect_usage_entries([row])[str(num)]
-        return entry, oauth.login_expires_at_epoch(creds)
+        display_creds = self._display_credential(num, email, org_uuid, creds)
+        return entry, oauth.login_expires_at_epoch(display_creds)
 
     def _active_snapshot_row(self) -> "AccountInfo | None":
         """The live login's row, or None when it is not a managed slot."""
