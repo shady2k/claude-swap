@@ -1003,6 +1003,9 @@ class ClaudeAccountSwitcher:
     def _read_active_credentials(self) -> ActiveCredentials:
         return self._store._read_active_credentials()
 
+    def _read_default_login(self) -> ActiveCredentials:
+        return self._store._read_default_login()
+
     def _refuse_degraded_capture(self) -> str | None:
         """Refuse to CAPTURE bytes a degraded read produced.
 
@@ -3151,6 +3154,8 @@ class ClaudeAccountSwitcher:
         email: str,
         snapshot: str,
         expected_org: str | None = None,
+        *,
+        ignore_securestorage_env: bool = False,
     ) -> "oauth.RefreshOutcome":
         """The gate through which a backup refresh token is consumed.
 
@@ -3192,6 +3197,14 @@ class ClaudeAccountSwitcher:
         under the lock before it reads the grant, and writes the successor by
         the slot the account owns AFTER the POST — a `move`/`swap` in flight
         must neither spend another account's grant nor lose this successor.
+
+        ``ignore_securestorage_env`` is for the one caller whose claude does
+        not read the store the shell redirected: a ``cswap run`` session
+        profile seeds from the slot's backup into its own ``session_dir`` and
+        points claude at that directory, so the two stores this gate could
+        confuse are not either of the ones it touches (``session.py`` passes
+        it). It also makes the live-login check below ask about the DEFAULT
+        profile's login, which is the one the session must not duplicate.
         """
         # Store-resolution parity: CC ≥2.1.220 honors
         # CLAUDE_SECURESTORAGE_CONFIG_DIR for its credential store. cswap
@@ -3202,7 +3215,9 @@ class ClaudeAccountSwitcher:
         # reads/writes the redirected one is the stale-copy failure class by
         # construction — refuse (transient, so nothing strikes) rather than
         # operate on a store CC left behind.
-        if os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+        if not ignore_securestorage_env and os.environ.get(
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR"
+        ):
             self._logger.warning(
                 "CLAUDE_SECURESTORAGE_CONFIG_DIR is set; cswap mirrors it "
                 "when capturing a credential but not when consuming one, "
@@ -3239,7 +3254,11 @@ class ClaudeAccountSwitcher:
             return oauth.RefreshOutcome(None, "consume-busy")
         try:
             return self._consume_backup_grant_locked(
-                account_num, email, snapshot, expected_org=expected_org
+                account_num,
+                email,
+                snapshot,
+                expected_org=expected_org,
+                ignore_securestorage_env=ignore_securestorage_env,
             )
         finally:
             consume_lock.release()
@@ -3250,6 +3269,8 @@ class ClaudeAccountSwitcher:
         email: str,
         snapshot: str,
         expected_org: str | None = None,
+        *,
+        ignore_securestorage_env: bool = False,
     ) -> "oauth.RefreshOutcome":
         """Body of ``consume_backup_grant``; caller holds the consume lock."""
         from claude_swap.session import (
@@ -3451,7 +3472,9 @@ class ClaudeAccountSwitcher:
             # never fires and the POST proceeds.
             return oauth.RefreshOutcome(refresh_input, None, None, consumed_fp)
 
-        live_holds = self._live_login_holds(refresh_input)
+        live_holds = self._live_login_holds(
+            refresh_input, ignore_securestorage_env=ignore_securestorage_env
+        )
         if live_holds is None:
             # Whether the live login holds this grant cannot be told. Same
             # rule as an unreadable backup above: defer, nothing consumed.
@@ -3679,7 +3702,9 @@ class ClaudeAccountSwitcher:
             outcome_creds, None, result.token_account, consumed_fp
         )
 
-    def _live_login_holds(self, credentials: str) -> bool | None:
+    def _live_login_holds(
+        self, credentials: str, *, ignore_securestorage_env: bool = False
+    ) -> bool | None:
         """Whether the live store holds the refresh token in ``credentials``.
 
         True on an exact match. False when ``credentials`` carry no refresh
@@ -3688,11 +3713,19 @@ class ClaudeAccountSwitcher:
         error, an unreadable Keychain, or a Keychain failure that a fallback
         file covered, whose bytes may be an older generation than the one
         Claude Code holds. Never raises.
+
+        ``ignore_securestorage_env`` reads the DEFAULT profile's login instead
+        of the store the environment points at, for the caller whose claude
+        does not read that store (see ``consume_backup_grant``).
         """
         if not (oauth.extract_oauth_data(credentials) or {}).get("refreshToken"):
             return False
         try:
-            live = self._read_active_credentials()
+            live = (
+                self._read_default_login()
+                if ignore_securestorage_env
+                else self._read_active_credentials()
+            )
         except Exception:
             self._logger.debug("live credential read failed", exc_info=True)
             return None

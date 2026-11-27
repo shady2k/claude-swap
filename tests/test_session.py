@@ -249,7 +249,7 @@ def refresh_rotates(monkeypatch):
     real one does (bootstrap re-reads the backup afterwards)."""
     calls: list[str] = []
 
-    def fake_gate(self, account_num: str, email: str, snapshot: str):
+    def fake_gate(self, account_num: str, email: str, snapshot: str, **_):
         from claude_swap import oauth as oauth_mod
         calls.append(snapshot)
         self._write_account_credentials(account_num, email, ROTATED_CREDS)
@@ -322,6 +322,20 @@ class TestHelpers:
         env = _probe_env(tmp_path)
         assert "ANTHROPIC_API_KEY" not in env
         assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+        assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path)
+
+    @pytest.mark.parametrize("value", ["/somewhere/else", ""])
+    def test_probe_env_drops_the_secure_store_redirect(
+        self, monkeypatch, tmp_path, value
+    ):
+        """An inherited ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` names the store
+        the probe would read instead of the profile's own, where the shell
+        may have pointed it at another login's credential — so it is dropped
+        whether it holds a path or claude's defined-but-empty spelling of the
+        default store."""
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", value)
+        env = _probe_env(tmp_path)
+        assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in env
         assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path)
 
     def test_scan_live_sessions_missing_dir(self, tmp_path):
@@ -479,12 +493,67 @@ class TestBootstrap:
         assert len(refresh_rotates) == refresh_calls_after_bootstrap  # no new refresh
         assert (session_dir / ".credentials.json").read_text() == first_creds
 
+    @pytest.mark.parametrize("value", ["/somewhere/else", ""])
+    def test_a_store_redirect_does_not_invalidate_a_valid_profile(
+        self, manager, monkeypatch, auth_status_tracks_seed, refresh_rotates, value
+    ):
+        """The shell's ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` is not evidence
+        about a session profile.
+
+        Claude Code resolves its credential store from that variable whenever
+        it is defined, so a probe inheriting it reads another profile —
+        answers "not logged in" — and a launch that was reusing a good
+        profile rebuilds it and spends a token refresh. The probe is given no
+        such redirect; the fake claude below reads the store the way Claude
+        Code does, so an inherited variable would fail the second launch.
+        """
+        session_dir, _, _ = manager.setup_session("2", share=False)
+        creds_before = (session_dir / ".credentials.json").read_text()
+        refreshes_before = len(refresh_rotates)
+        probe_envs: list[dict] = []
+
+        def claude_reads_the_store_it_is_pointed_at(cmd, env=None, **kwargs):
+            probe_envs.append(env)
+            if env.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+                store = Path(env["CLAUDE_SECURESTORAGE_CONFIG_DIR"])
+            elif "CLAUDE_SECURESTORAGE_CONFIG_DIR" in env:
+                store = Path.home() / ".claude"  # defined-but-empty
+            else:
+                store = Path(env["CLAUDE_CONFIG_DIR"])
+            if (store / ".credentials.json").exists():
+                payload = {
+                    "loggedIn": True,
+                    "authMethod": "claude.ai",
+                    "email": ACCOUNT_EMAIL,
+                    "orgId": ORG_UUID,
+                }
+            else:
+                payload = {"loggedIn": False, "authMethod": "none"}
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps(payload), stderr=""
+            )
+
+        monkeypatch.setattr(
+            session_mod.subprocess, "run", claude_reads_the_store_it_is_pointed_at
+        )
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", value)
+
+        session_dir2, _, _ = manager.setup_session("2", share=False)
+
+        assert session_dir2 == session_dir
+        assert len(refresh_rotates) == refreshes_before
+        assert (session_dir / ".credentials.json").read_text() == creds_before
+        assert probe_envs, "test premise: the profile was probed"
+        assert all(
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in env for env in probe_envs
+        )
+
     def test_refresh_failure_uses_stored_creds(
         self, manager, auth_status_tracks_seed, monkeypatch, capsys
     ):
         monkeypatch.setattr(
             ClaudeAccountSwitcher, "consume_backup_grant",
-            lambda self, num, email, snap: oauth.RefreshOutcome(
+            lambda self, num, email, snap, **_: oauth.RefreshOutcome(
                 None, "transient"
             ),
         )
@@ -581,7 +650,7 @@ class TestBootstrap:
         refresh_calls = []
         monkeypatch.setattr(
             ClaudeAccountSwitcher, "consume_backup_grant",
-            lambda self, num, email, snap: refresh_calls.append(snap)
+            lambda self, num, email, snap, **_: refresh_calls.append(snap)
             or oauth.RefreshOutcome(None, "transient"),
         )
 
@@ -1718,7 +1787,36 @@ class TestRun:
         assert "ANTHROPIC_AUTH_TOKEN" not in exc.value.env
         assert exc.value.env["UNRELATED_VAR"] == "kept"
 
+    @pytest.mark.parametrize("value", ["/somewhere/else", ""])
+    def test_an_inherited_store_redirect_is_not_passed_to_claude(
+        self,
+        manager,
+        capture_exec,
+        monkeypatch,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        capsys,
+        value,
+    ):
+        """The session profile holds this account's credential; a store the
+        shell pointed elsewhere must not reach the child.
 
+        ``""`` is the case a truthiness check misses: Claude Code reads it as
+        "the default store", so the session would run on the global login.
+        """
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", value)
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [])
+
+        assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in exc.value.env
+        assert all(
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in env
+            for env in auth_status_tracks_seed
+        )
+        assert "CLAUDE_SECURESTORAGE_CONFIG_DIR is already set" in (
+            capsys.readouterr().out
+        )
 
     def test_an_automatic_launch_refuses_a_slot_that_moved(
         self, manager, capture_exec, monkeypatch
@@ -5863,7 +5961,7 @@ class TestBootstrapRefreshRoutesThroughGate:
         })
         gate = {}
 
-        def mock_gate(num, email, snapshot):
+        def mock_gate(num, email, snapshot, **kw):
             gate["args"] = (num, email)
             return oauth_mod.RefreshOutcome(fresh, None)
 
@@ -5896,6 +5994,142 @@ class TestBootstrapRefreshRoutesThroughGate:
         assert "called" not in direct
 
 
+class TestTheStoreRedirectIsNotTheLiveLogin:
+    """The refresh inside ``cswap run`` judges the DEFAULT profile's login.
+
+    A session profile reads the slot's backup through its own directory, never
+    the store an inherited ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` names — so that
+    variable carries no evidence either way. Bytes in it must not invent a
+    match with a login the default profile does not have, and must not hide
+    the one it does.
+    """
+
+    @staticmethod
+    def _gate_calls(monkeypatch) -> list[dict]:
+        """Record each gate call's kwargs, then run the REAL gate."""
+        real = ClaudeAccountSwitcher.consume_backup_grant
+        calls: list[dict] = []
+
+        def spy(self, num, email, snapshot, **kw):
+            calls.append(kw)
+            return real(self, num, email, snapshot, **kw)
+
+        monkeypatch.setattr(ClaudeAccountSwitcher, "consume_backup_grant", spy)
+        return calls
+
+    @staticmethod
+    def _post_rotates(monkeypatch) -> list[str]:
+        """The only network seam: the token POST, answered with a rotation."""
+        posted: list[str] = []
+
+        def post(credentials, **kw):
+            posted.append(credentials)
+            return oauth.RefreshOutcome(ROTATED_CREDS, None)
+
+        monkeypatch.setattr(
+            "claude_swap.oauth.try_refresh_oauth_credentials", post
+        )
+        return posted
+
+    def test_the_bootstrap_refresh_reaches_the_gate(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
+    ):
+        """An inherited redirect is not a ``store-unmirrored`` refusal.
+
+        The gate's own top-level check is what used to refuse here, so the
+        session profile could never be refreshed; the gate now runs, and the
+        session tells it the variable does not apply to its claude.
+        """
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/somewhere/else")
+        gate_calls = self._gate_calls(monkeypatch)
+        posted = self._post_rotates(monkeypatch)
+
+        session_dir, _, _ = manager.setup_session(ACCOUNT_NUM, share=False)
+
+        assert posted, "the gate deferred instead of consuming the slot's grant"
+        assert gate_calls, "the bootstrap refresh bypassed the gate"
+        assert all(
+            call.get("ignore_securestorage_env") is True for call in gate_calls
+        )
+        assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
+        assert (
+            seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL)
+            == ROTATED_CREDS
+        )
+
+    @pytest.mark.parametrize("shape", ["a-copy-of-the-same", "unreadable"])
+    def test_a_copy_in_the_redirected_store_decides_nothing(
+        self,
+        manager,
+        seeded_switcher,
+        auth_status_tracks_seed,
+        monkeypatch,
+        tmp_path,
+        shape,
+    ):
+        """The redirected store's bytes are neither the live login nor a read
+        failure of it.
+
+        Holding the same credential, they used to answer "the live login holds
+        this grant" and refuse the launch as if the user were about to run two
+        Claude Codes on one login; unreadable, they used to defer the refresh
+        as a transient network-shaped failure. The default profile is empty in
+        both shapes, so the refresh is safe and must happen.
+        """
+        redirected = tmp_path / "redirected-store"
+        redirected.mkdir()
+        if shape == "a-copy-of-the-same":
+            (redirected / ".credentials.json").write_text(
+                CREDS, encoding="utf-8"
+            )
+        else:
+            # Present but unreadable as a file, on every platform.
+            (redirected / ".credentials.json").mkdir()
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(redirected))
+        posted = self._post_rotates(monkeypatch)
+
+        session_dir, _, _ = manager.setup_session(ACCOUNT_NUM, share=False)
+
+        assert posted, "the redirected store's bytes decided the live login"
+        assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
+
+    def test_the_default_login_is_still_what_a_session_must_not_duplicate(
+        self,
+        manager,
+        temp_home,
+        seeded_switcher,
+        auth_status_tracks_seed,
+        monkeypatch,
+        tmp_path,
+    ):
+        """A real match in ``~/.claude`` is not hidden by an empty redirect.
+
+        The refusal is about two Claude Codes on one one-time login, and the
+        login that matters is the default profile's. With that login in place,
+        a ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` naming an empty directory changes
+        nothing: the gate declines, no grant is POSTed, and ``_bootstrap``
+        refuses the copy too.
+        """
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            CREDS, encoding="utf-8"
+        )
+        empty_store = tmp_path / "redirected-store"
+        empty_store.mkdir()
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(empty_store))
+        posted = self._post_rotates(monkeypatch)
+
+        with pytest.raises(SessionError, match="also the login in the global"):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+        assert posted == [], "consumed a grant the live login holds"
+
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        with pytest.raises(SessionError, match="also the login in the global"):
+            manager._bootstrap(session_dir, ACCOUNT_NUM, ACCOUNT_EMAIL, ORG_UUID)
+        assert not (session_dir / ".credentials.json").exists()
+
+
 class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
     """A one-time grant consumed for THIS pass must reach the profile it was for.
 
@@ -5916,7 +6150,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         )
 
         # The gate rotates the backup, exactly as the real one does.
-        def fake_gate(self, num, email, snapshot):
+        def fake_gate(self, num, email, snapshot, **_):
             self._write_account_credentials(num, email, ROTATED_CREDS)
             return oauth.RefreshOutcome(ROTATED_CREDS, None)
 
@@ -5968,7 +6202,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
 
-        def fake_gate(self, num, email, snapshot):
+        def fake_gate(self, num, email, snapshot, **_):
             self._write_account_credentials(num, email, ROTATED_CREDS)
             return oauth.RefreshOutcome(ROTATED_CREDS, None)
 
@@ -6082,7 +6316,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         )
         session_dir.mkdir(parents=True, exist_ok=True)
 
-        def gate_consumes_then_fails_to_persist(self, num, email, snapshot):
+        def gate_consumes_then_fails_to_persist(self, num, email, snapshot, **_):
             # Grant spent; successor NOT written to the backup, which still
             # holds CREDS, but it DID reach the stash. Exactly the shape
             # switcher.py returns when the persist fails and the successor is
@@ -6133,7 +6367,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         monkeypatch.setattr(
             ClaudeAccountSwitcher,
             "consume_backup_grant",
-            lambda self, num, email, snap: oauth.RefreshOutcome(
+            lambda self, num, email, snap, **_: oauth.RefreshOutcome(
                 ROTATED_CREDS, "transient", stashed=False
             ),
         )

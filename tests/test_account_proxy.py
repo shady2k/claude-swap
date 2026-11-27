@@ -1333,7 +1333,7 @@ class TestRouting:
         real = s._live_login_holds
         moved: list[bool] = []
 
-        def swap_then_answer(credentials):
+        def swap_then_answer(credentials, **_):
             if not moved:
                 moved.append(True)
                 data = s._get_sequence_data()

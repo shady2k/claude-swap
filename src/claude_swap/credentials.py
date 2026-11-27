@@ -844,6 +844,53 @@ class CredentialStore:
         # UI distinguishes it from a real empty slot.
         return ActiveCredentials("", keychain_failed, keychain_failed)
 
+    def _read_default_login(self) -> ActiveCredentials:
+        """Read the DEFAULT profile's OAuth credential, whatever the shell exported.
+
+        The one caller asks whether the login about to be copied into a session
+        profile is also the login a plain ``claude`` keeps, and that login lives
+        in ``~/.claude`` and the unsuffixed Keychain item — not in whatever
+        ``CLAUDE_SECURESTORAGE_CONFIG_DIR``/``CLAUDE_CONFIG_DIR`` point this
+        process at. :meth:`_read_active_credentials` resolves its store from
+        those variables, which is right for cswap's own store operations and
+        wrong here: a ``cswap run`` session seeds from the slot's backup into
+        its own directory and never reads the redirected store, so bytes there
+        are not evidence about this login.
+
+        Same backends as :meth:`_read_active_credentials` minus the
+        environment-scoped ones, with the same unreadable/degraded reporting so
+        the caller treats "cannot tell" as such. A managed API key is not read:
+        it carries no refresh token, so it can never be the OAuth login asked
+        about.
+        """
+        keychain_failed = False
+        if self._use_keychain():
+            value, keychain_failed = self._read_one_oauth_keychain(
+                CLAUDE_CODE_KEYCHAIN_SERVICE
+            )
+            self._active_read_failed = keychain_failed
+            if value:
+                return ActiveCredentials(value, False)
+        elif self._residual_verdict is False or (
+            self._active_read_failed or self._keychain_unreadable
+        ):
+            # The Keychain cannot be asked this process, so an empty file below
+            # proves nothing about the item Claude Code reads first.
+            keychain_failed = True
+
+        cred_file = get_default_claude_config_home() / ".credentials.json"
+        if cred_file.exists():
+            try:
+                text = cred_file.read_text(encoding="utf-8")
+            except Exception as e:
+                self._host._logger.error(
+                    f"Failed to read the default credentials file: {e}"
+                )
+                return ActiveCredentials(None, keychain_failed, keychain_failed)
+            if text.strip():
+                return ActiveCredentials(text, False, keychain_failed)
+        return ActiveCredentials("", keychain_failed, keychain_failed)
+
     def _read_managed_key(self) -> str:
         """Read the active managed API key, or "" when absent. Non-mutating.
 

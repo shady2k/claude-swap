@@ -881,8 +881,15 @@ def _probe_env(
     Claude Code being spawned into the profile — a network client as ever — so
     the probe gets the environment the launch will (:func:`_claude_env`). By
     then the proxy has already answered the pre-start check.
+
+    ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` is dropped for the same reason the
+    launch drops it: defined (a path, or defined-but-empty for the default
+    store) it moves the credential store Claude Code reads away from what the
+    probe is asked about — the session profile — and the shell's value may
+    name another login's.
     """
     env = {k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS}
+    env.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
     env["CLAUDE_CONFIG_DIR"] = str(session_dir)
     return _claude_env(
         env, route, no_proxy, disable_nonessential_traffic, bridge
@@ -1008,6 +1015,14 @@ class SessionManager:
                 f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
                 "overriding it for this launch."
             )
+        # Checked for PRESENCE, not truth: defined-but-empty is claude's own
+        # spelling of "the default store", so an empty value redirects the
+        # credential store just as a path does.
+        if "CLAUDE_SECURESTORAGE_CONFIG_DIR" in os.environ:
+            warning(
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR is already set; ignoring it "
+                "for this session, which keeps its own profile's login."
+            )
 
         _warn_auth_overrides()
 
@@ -1024,6 +1039,11 @@ class SessionManager:
             f"{muted('[session mode]')}"
         )
         env = self._launch_base_env(True)
+        # The session profile holds this account's credential, and the probe
+        # just confirmed it there: a store the shell redirected claude to
+        # would be another login's. ``exec_default`` keeps the
+        # variable for a launch that is not a session profile.
+        env.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
         self._launch(claude_bin, claude_args, route, env)
 
@@ -1356,7 +1376,7 @@ class SessionManager:
         pre_creds = self.switcher.read_account_credentials(account_num, email)
         if pre_creds and self._has_refresh_token(pre_creds):
             outcome = self.switcher.consume_backup_grant(
-                account_num, email, pre_creds
+                account_num, email, pre_creds, ignore_securestorage_env=True
             )
             if outcome.error is not None and outcome.credentials:
                 # `error is None` is the gate's own "the slot is freshened
@@ -1528,7 +1548,8 @@ class SessionManager:
         # refuses: a live store that cannot be read is no reason to fail a
         # launch the stored credentials can serve.
         if self.switcher._live_login_holds(
-            self.switcher.read_account_credentials(account_num, email) or ""
+            self.switcher.read_account_credentials(account_num, email) or "",
+            ignore_securestorage_env=True,
         ):
             raise self._live_login_error(account_num)
 
