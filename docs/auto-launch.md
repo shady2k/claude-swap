@@ -266,3 +266,7 @@ overrides (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and the rest of
 `AUTH_OVERRIDE_ENV_VARS`): the account, and the proxy it was checked with, were
 chosen for the user, and an exported key would bill someone else's credential
 through that proxy.
+
+It drops an inherited `CLAUDE_SECURESTORAGE_CONFIG_DIR` for the same reason, and
+says so: that variable moves the credential store Claude Code reads, and a
+session profile is the store this launch seeds and asks for by name.

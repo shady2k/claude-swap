@@ -13143,6 +13143,36 @@ class TestStoreResolutionParity:
         mock_post.assert_not_called()
         assert result.error == "store-unmirrored"
 
+    def test_a_session_launch_is_exempt_from_the_refusal(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """A session profile never reads the store that variable names.
+
+        It is seeded from the slot's backup into its own ``session_dir``, so
+        ``session.py`` asks the gate to ignore the redirect; every
+        other caller keeps the refusal above.
+        """
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/tmp/other")
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        creds = json.dumps({
+            "claudeAiOauth": {"accessToken": "a", "refreshToken": "rt",
+                              "expiresAt": 1000}})
+        s._write_account_credentials("1", "account1@example.com", creds)
+        fresh = json.dumps({
+            "claudeAiOauth": {"accessToken": "b", "refreshToken": "rt2",
+                              "expiresAt": 9999999999000}})
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(fresh, None)) as mock_post:
+            result = s.consume_backup_grant(
+                "1", "account1@example.com", creds,
+                ignore_securestorage_env=True,
+            )
+        mock_post.assert_called_once()
+        assert result.error is None
+        assert result.credentials == fresh
+
     def test_session_shell_config_dir_refuses_switch(
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict, monkeypatch

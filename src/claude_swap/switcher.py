@@ -3151,6 +3151,8 @@ class ClaudeAccountSwitcher:
         email: str,
         snapshot: str,
         expected_org: str | None = None,
+        *,
+        ignore_securestorage_env: bool = False,
     ) -> "oauth.RefreshOutcome":
         """The gate through which a backup refresh token is consumed.
 
@@ -3192,6 +3194,13 @@ class ClaudeAccountSwitcher:
         under the lock before it reads the grant, and writes the successor by
         the slot the account owns AFTER the POST — a `move`/`swap` in flight
         must neither spend another account's grant nor lose this successor.
+
+        ``ignore_securestorage_env`` is for the one caller whose claude does
+        not read the store the shell redirected: a ``cswap run`` session
+        profile seeds from the slot's backup into its own ``session_dir`` and
+        points claude at that directory, so the two stores this gate could
+        confuse are not either of the ones it touches (``session.py`` passes
+        it).
         """
         # Store-resolution parity: CC ≥2.1.220 honors
         # CLAUDE_SECURESTORAGE_CONFIG_DIR for its credential store. cswap
@@ -3202,7 +3211,9 @@ class ClaudeAccountSwitcher:
         # reads/writes the redirected one is the stale-copy failure class by
         # construction — refuse (transient, so nothing strikes) rather than
         # operate on a store CC left behind.
-        if os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+        if not ignore_securestorage_env and os.environ.get(
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR"
+        ):
             self._logger.warning(
                 "CLAUDE_SECURESTORAGE_CONFIG_DIR is set; cswap mirrors it "
                 "when capturing a credential but not when consuming one, "
