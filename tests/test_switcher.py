@@ -6648,6 +6648,33 @@ class TestUsageAwareSwitch:
 
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
+    def test_best_gathers_quota_with_fetch_none(self, temp_home: Path):
+        """Regression: `switch(strategy="best")` collects quota with fetch=None.
+
+        The decision's single store pass must let the poll plan decide what
+        gets fetched (fetch=None) instead of freezing the cache (fetch=set()).
+        With an empty store the accounts are due, so the fetch path runs; a
+        stale-cache-only pass would skip it and the assertion below fails.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        fetched = []
+
+        def fake_run_usage_fetches(infos, entries=None):
+            fetched.append([info[0] for info in infos])
+            return {}
+
+        s._run_usage_fetches = fake_run_usage_fetches
+
+        with patch.object(s, "list_accounts"):
+            s.switch(strategy="best")
+
+        assert fetched, "switch(strategy='best') did not poll the usage store"
+        assert set(fetched[0]) == {1, 2}
+
     def test_best_stays_when_current_is_already_best(self, temp_home: Path, capsys):
         """Regression: strategy "best" must NOT move you onto a worse account when you
         already hold the most headroom (real-world bug: 89% current vs 100% other)."""

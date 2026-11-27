@@ -7765,8 +7765,13 @@ class ClaudeAccountSwitcher:
 
         ``fetch=None`` (on-demand callers: ``--list``/``--status``/switch
         strategies, dashboards) lets every account be fetched when its plan
-        says so; the hook's never-network callers pass an empty set so the
-        store's already-cached readings are all that is read.
+        says so — ``switch(strategy="best")`` runs through this helper, so a
+        ``best`` pass still gathers a reading when the store is empty. The
+        decision engine passes an explicit empty set only for its fallback
+        pass, when no pre-collected entries are handed in, so the store's
+        already-cached readings are all that is read. The ``StopFailure``
+        hook never calls this helper — ``switch_active_after_rate_limit``
+        reads ``_usage_store.entries`` directly.
         """
         accounts_info = self._build_accounts_info()
         return self._collect_usage_entries(accounts_info, fetch=fetch)
@@ -8063,6 +8068,7 @@ class ClaudeAccountSwitcher:
         return at is not None and (
             entry.fetched_at is None or entry.fetched_at < at
         )
+
     def record_stop_failure(self, email: str, org_uuid: str) -> None:
         """Note that Claude Code reported a rate-limit stop on this account.
 
@@ -8762,7 +8768,7 @@ class ClaudeAccountSwitcher:
         # One store pass: `entries` feeds both the headroom values (via
         # `decision_value()`) and the stop-mark staleness check.
         if strategy == "best":
-            entries = self._usage_entries_by_account(fetch=set())
+            entries = self._usage_entries_by_account()
             best_usage = {num: entry.decision_value() for num, entry in entries.items()}
             self._warn_inert_models(best_usage, models, json_output, warnings)
             target, note = self._select_best_switchable(

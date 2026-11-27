@@ -1554,23 +1554,33 @@ class TestStopFailurePickRules:
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
     def test_credential_less_slot_is_skipped_not_only_config_less(self, temp_home: Path):
+        """The credential check in `_account_is_switchable` must decide.
+
+        The first slot the fallback walk reaches (4 → 1 → 2, active is 3)
+        keeps its config backup but has no stored credential. A regression
+        that stopped checking credentials would take slot 4 and this test
+        would fail; the walk has to keep going until slot 1, the only
+        suitable one.
+        """
         from claude_swap import isolated_mode
 
         s = _switcher()
-        _seed(s, 1, "a@example.com")
-        _seed(s, 2, "b@example.com", CREDS_2)
+        _seed(s, 1, "a@example.com", CREDS_2)
+        _seed(s, 2, "b@example.com")
         _seed(s, 3, "c@example.com")
         _seed(s, 4, "d@example.com", CREDS_2)
-        _set_active(s, 1)
-        # Slot 4 has its config backup but no stored credential → not suitable.
+        _set_active(s, 3)
+        # Slot 4 — first in the walk — has its config backup but no stored
+        # credential, so it is not suitable.
         s._store._backup_enc_path("4", "d@example.com").unlink()
+        s._store._backup_enc_path("2", "b@example.com").unlink()
         s._usage_store = _FakeUsageStore({})
         s._stop_failure_marks = lambda: {}
 
-        changed = isolated_mode.switch_active_after_rate_limit(s, "a@example.com", "")
+        changed = isolated_mode.switch_active_after_rate_limit(s, "c@example.com", "")
 
         assert changed is True
-        assert s._get_sequence_data()["activeAccountNumber"] == 2
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
 
     def test_exhausted_unmarked_slots_fall_back_to_oldest_marked(self, temp_home: Path):
         from claude_swap import isolated_mode

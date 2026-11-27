@@ -427,6 +427,7 @@ def report_global_login(switcher: "ClaudeAccountSwitcher") -> None:
     if notice:
         warning(notice)
 
+
 def _suitable_slot_numbers(
     switcher: "ClaudeAccountSwitcher", data: dict, active_key: str
 ) -> list[str]:
@@ -446,7 +447,6 @@ def _suitable_slot_numbers(
         record = accounts[key]
         if record.get("disabled") or record.get("kind") == "api_key":
             continue
-        email = record.get("email", "")
         if not switcher._account_is_switchable(key):
             continue
         suitable.append(key)
