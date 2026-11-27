@@ -33,13 +33,13 @@ uv run cswap help
 Releases of this fork are published as GitHub Release assets, not on PyPI:
 
 ```bash
-uv tool install --force https://github.com/shady2k/claude-swap/releases/download/v1.2.0-shady2k.5/claude_swap-1.2.0.post5-py3-none-any.whl
+uv tool install --force https://github.com/shady2k/claude-swap/releases/download/v1.2.0-shady2k.6/claude_swap-1.2.0.post6-py3-none-any.whl
 ```
 
 Or install straight from the release tag:
 
 ```bash
-uv tool install --force "git+https://github.com/shady2k/claude-swap.git@v1.2.0-shady2k.5"
+uv tool install --force "git+https://github.com/shady2k/claude-swap.git@v1.2.0-shady2k.6"
 ```
 
 ### Updating
